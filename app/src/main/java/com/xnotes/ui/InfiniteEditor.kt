@@ -87,6 +87,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
     var document: InfiniteDocument = InfiniteDocument()
         private set
 
+    lateinit var externalDrop: com.xnotes.platform.ExternalDrop.Receiver
+        internal set
+
     val history = History()
 
     val view = InfiniteCanvasView(appContext)
@@ -1534,6 +1537,31 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         history.push(AddCanvasItem(document, item))
         markDirty()
         refresh()
+    }
+
+    /** Keep a pending drop tied to the canvas that was open when the user released it. */
+    fun prepareExternalDrop(viewportPoint: Pt, dir: java.io.File): com.xnotes.platform.ExternalDrop.Target {
+        val doc = document
+        val at = viewport.viewportToContent(viewportPoint)
+        val area = viewport.visibleContentRect()
+        return com.xnotes.platform.ExternalDrop.Target(dir) { content ->
+            if (document !== doc || !surfaces.isAttachedToWindow) false else {
+                commitText()
+                val items = com.xnotes.core.importing.DropPlacement.items(
+                    content, at, area, false, inkColor, textPointSize, textFace, textMeasurer, textAsLabel = true,
+                )
+                if (items.isEmpty()) false else {
+                    document.addAll(items)
+                    history.push(AddCanvasItems(document, items))
+                    selection.select(items)
+                    armTool(Tool.SELECT)
+                    markDirty()
+                    refresh()
+                    publishOverlay()
+                    true
+                }
+            }
+        }
     }
 
     /**
