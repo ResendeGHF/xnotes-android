@@ -45,6 +45,9 @@ interface Command {
      * the old and the new one.
      */
     fun touchedMarkups(): List<Pair<Page, TextMarkup>> = emptyList()
+
+    /** The items this edit put in as new: a finished stroke, a drawn shape, a paste. A recording gives them their moment. */
+    fun added(): List<CanvasItem> = emptyList()
 }
 
 /** Append an item to a page (finishing a stroke, pasting/inserting, new text). */
@@ -58,6 +61,23 @@ class AddItem(private val page: Page, private val item: CanvasItem) : Command {
     }
 
     override fun touched(locate: (CanvasItem) -> Page?) = listOf(page to item)
+
+    override fun added() = listOf(item)
+}
+
+/** Put an item in at z position [at] on a page: a dropped colour's fill, under the lines it fills. */
+class InsertItem(private val page: Page, private val item: CanvasItem, private val at: Int) : Command {
+    override fun redo() {
+        if (!page.items.containsRef(item)) page.items.add(at.coerceIn(0, page.items.size), item)
+    }
+
+    override fun undo() {
+        page.items.removeRef(item)
+    }
+
+    override fun touched(locate: (CanvasItem) -> Page?) = listOf(page to item)
+
+    override fun added() = listOf(item)
 }
 
 /** Append several items to a page as one edit (paste / duplicate). */
@@ -71,6 +91,8 @@ class AddItems(private val page: Page, private val items: List<CanvasItem>) : Co
     }
 
     override fun touched(locate: (CanvasItem) -> Page?) = items.map { page to it }
+
+    override fun added() = items
 }
 
 /** Remove a set of (page, item) pairs (object erase, or delete selection). */
@@ -284,9 +306,10 @@ class RefillShapes(private val entries: List<Entry>) : Command {
     override fun touched(locate: (CanvasItem) -> Page?) = pagedItems(entries.map { it.shape }, locate)
 
     companion object {
-        /** The entries that recolour [shapes]' fills in [color] (null: each in its outline's), unchanged ones left out. */
+        /** The entries that recolour [shapes]' fills in [color] (null: each in its outline's, which a dropped colour has none of), unchanged ones left out. */
         fun of(shapes: List<ShapeItem>, color: Rgba?): List<Entry> = shapes.mapNotNull { s ->
             val f = s.fillRgba ?: return@mapNotNull null
+            if (color == null && s.isFill) return@mapNotNull null
             val next = (color ?: s.strokeRgba).copy(a = f.a)
             if (next == f) null else Entry(s, f, next)
         }
@@ -385,6 +408,8 @@ class CompositeCommand(private val commands: List<Command>) : Command {
     }
 
     override fun touchedMarkups(): List<Pair<Page, TextMarkup>> = commands.flatMap { it.touchedMarkups() }
+
+    override fun added(): List<CanvasItem> = commands.flatMap { it.added() }
 }
 
 /** Delete a page (reversible by re-inserting at its original index). */
@@ -400,6 +425,44 @@ class DeletePage(
     override fun undo() {
         if (!document.pages.containsRef(page)) {
             document.pages.add(index.coerceIn(0, document.pages.size), page)
+        }
+    }
+}
+
+/**
+ * Put the pages in a new order: [before] and [after] hold the same pages. Built before it is
+ * applied, so it can note which page each bookmark points at and carry the bookmark along.
+ */
+class MovePages(
+    private val document: Document,
+    private val before: List<Page>,
+    private val after: List<Page>,
+) : Command {
+    private val marks = document.bookmarks.mapNotNull { mark -> before.getOrNull(mark.page)?.let { mark to it } }
+
+    override fun redo() = arrange(after)
+
+    override fun undo() = arrange(before)
+
+    private fun arrange(order: List<Page>) {
+        val pages = document.pages
+        // Pages never override equals, so these sets compare by reference. A page this move never
+        // knew stays in the note, after the rest.
+        val present = HashSet(pages)
+        val known = HashSet(order)
+        val next = order.filter { it in present } + pages.filter { it !in known }
+        pages.clear()
+        pages.addAll(next)
+        for ((mark, page) in marks) next.indexOf(page).takeIf { it >= 0 }?.let { mark.page = it }
+    }
+
+    companion object {
+        /** [pages] with [moving] taken out, kept in their order, and put back together before the page at [gap], an index into [pages]. */
+        fun <T> order(pages: List<T>, moving: Collection<T>, gap: Int): List<T> {
+            val carried = HashSet(moving)
+            val stay = pages.filter { it !in carried }
+            val at = pages.subList(0, gap.coerceIn(0, pages.size)).count { it !in carried }
+            return stay.subList(0, at) + pages.filter { it in carried } + stay.subList(at, stay.size)
         }
     }
 }

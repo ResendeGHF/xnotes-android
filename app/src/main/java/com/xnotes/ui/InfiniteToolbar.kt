@@ -53,6 +53,8 @@ fun InfiniteToolbar(
     onTakePhoto: () -> Unit = {},
     onClosePane: (() -> Unit)? = null,
     onOpenMathStudio: () -> Unit = {},
+    onInsertAudio: () -> Unit = {},
+    onRecordAudio: () -> Unit = {},
 ) {
     // The stroke tools use the same designed drawables the paged toolbar does, so a pen looks like
     // a pen on either canvas rather than like a generic glyph.
@@ -129,25 +131,20 @@ fun InfiniteToolbar(
                         active = editor.wandEnabled,
                     ) { editor.toggleWand() }
 
-                    ToolbarItem.IMAGE -> Box {
-                        var imageMenu by remember { mutableStateOf(false) }
-                        ToolbarIcon(XnotesIcons.image, stringResource(R.string.insert_image)) { imageMenu = true }
-                        androidx.compose.material3.DropdownMenu(expanded = imageMenu, onDismissRequest = { imageMenu = false }) {
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { androidx.compose.material3.Text(stringResource(R.string.insert_image_ellipsis)) },
-                                onClick = { imageMenu = false; onInsertImage() },
-                            )
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { androidx.compose.material3.Text(stringResource(R.string.take_photo)) },
-                                onClick = { imageMenu = false; onTakePhoto() },
-                            )
-                        }
-                    }
+                    ToolbarItem.IMAGE -> InsertButton(
+                        owner = editor,
+                        imageRows = listOf(
+                            InsertRow(XnotesIcons.image, stringResource(R.string.insert_image_ellipsis)) { onInsertImage() },
+                            InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
+                        ),
+                        onAudioFromFile = onInsertAudio,
+                        onRecord = onRecordAudio,
+                    )
 
                     ToolbarItem.COLORS ->
                         editor.toolbarColors.take(editor.toolbarColorCount).forEachIndexed { i, color ->
                             Box {
-                                Swatch(color.toComposeColor(), active = editor.activeColorIndex == i) {
+                                Swatch(color.toComposeColor(), active = editor.activeColorIndex == i, drag = editor, ink = color) {
                                     if (editor.activeColorIndex == i) switcherIndex = i else editor.pickColor(i)
                                 }
                                 if (switcherIndex == i) ColorSwitcherPopup(editor, i) { switcherIndex = null }

@@ -27,7 +27,7 @@ android {
         targetSdk = 36
         versionCode = 99
         // <upstream xnotes version>-<notes fork version>
-        versionName = "0.9.4-0.46"
+        versionName = "0.9.5-0.46"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -145,6 +145,9 @@ dependencies {
     implementation(libs.latex.base)
     implementation(libs.latex.parser)
     implementation(libs.latex.renderer)
+    implementation(libs.commonmark.footnotes)
+    implementation(libs.commonmark.frontmatter)
+    implementation(libs.commonmark.alerts)
     implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.ui.tooling)
     implementation(libs.lottie.compose)

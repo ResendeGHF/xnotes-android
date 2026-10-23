@@ -5,12 +5,20 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
+import com.xnotes.R
 import com.xnotes.canvas.InteractionController
+import com.xnotes.core.fill.ColorDrop
+import com.xnotes.core.fill.DropAction
+import com.xnotes.core.fill.FillGrid
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.history.Command
+import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.EditLabel
 import com.xnotes.core.history.History
 import com.xnotes.core.history.LockItems
+import com.xnotes.core.history.RefillShapes
 import com.xnotes.core.history.RestyleItems
 import com.xnotes.core.infinite.AddCanvasItem
 import com.xnotes.core.infinite.AddCanvasItems
@@ -18,6 +26,7 @@ import com.xnotes.core.infinite.CanvasBackground
 import com.xnotes.core.infinite.CanvasSelection
 import com.xnotes.core.infinite.CanvasViewport
 import com.xnotes.core.infinite.EraseCanvasItems
+import com.xnotes.core.infinite.InsertCanvasItem
 import com.xnotes.core.infinite.MeshPart
 import com.xnotes.core.infinite.MeshedItem
 import com.xnotes.core.infinite.Minimap
@@ -36,6 +45,7 @@ import com.xnotes.core.model.DrawStyle
 import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.PageLayers
 import com.xnotes.core.model.deepCopyAll
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Labelled
@@ -45,6 +55,8 @@ import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextStyle
 import com.xnotes.core.pal.FontFace
+import com.xnotes.core.pal.Renderer
+import com.xnotes.core.pal.TextMeasurer
 import com.xnotes.core.tools.InkPalette
 import com.xnotes.core.tools.ShapeConfig
 import com.xnotes.core.tools.Tool
@@ -65,8 +77,11 @@ import com.xnotes.ui.theme.Palette
  * creates no temp directories of its own at construction: [Editor]'s constructor purges the shared
  * ones, so a second object doing the same would delete the open note's live files.
  */
+/** How near ink a finger tap during playback may land to play from it, in dp. */
+private const val INK_TAP_DP = 8.0
+
 @Stable
-class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongPressMenuHost, TextEditHost, ToastHost {
+class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongPressMenuHost, TextEditHost, ToastHost, ColorDropHost, AudioHost {
 
     private val appContext = context.applicationContext
 
@@ -122,6 +137,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         onDoubleTap = { vp, toolType, selectedBefore -> onDoubleTap(vp, toolType, selectedBefore) },
         isEditingText = { editingLabel != null },
         onCommitText = { commitText() },
+        onAudioTap = { tapAudio(it) },
+        onUserMovedView = { AudioPlayback.userMoved(this) },
     )
 
     private val devicePxPerDp = appContext.resources.displayMetrics.density.toDouble()
@@ -251,13 +268,16 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
      */
     private val modelListener = object : InfiniteDocument.Listener {
         override fun onItemAdded(item: CanvasItem) {
+            itemsRevision++
             pushItem(item)
         }
 
         override fun onItemRemoved(item: CanvasItem) {
+            itemsRevision++
             // Drop any mesh job still running for it, so its result cannot file the record again.
             if (item is ImageItem) vectorMeshGen.remove(item)
             scene.remove(item)
+            if (item === AudioPlayback.session?.item) AudioPlayback.closeIfGone(this@InfiniteEditor)
         }
 
         override fun onOrderChanged() {
@@ -273,8 +293,10 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         }
 
         override fun onReset() {
+            itemsRevision++
             rebuildScene()
             view.publish()
+            AudioPlayback.closeIfGone(this@InfiniteEditor)
         }
     }
 
@@ -293,6 +315,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         scene.decodeOn = { work -> decodeExecutor.execute(work) }
         scene.onOutOfMemory = { short -> view.post { outOfMemory = short } }
         document.listener = modelListener
+        // Whatever is added while this canvas records takes the recording's moment.
+        history.onPush = { command -> AudioRecording.stamp(this, command.added()) }
     }
 
     /**
@@ -544,6 +568,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         if (selection.isEmpty) return
         val clones = selection.items.deepCopyAll(textMeasurer)
         for (clone in clones) clone.translate(DUPLICATE_NUDGE, DUPLICATE_NUDGE)
+        com.xnotes.core.audio.RecordingIds.adopt(clones, document.items, moves = false)
         document.addAll(clones)
         history.push(AddCanvasItems(document, clones))
         selection.select(clones)
@@ -627,6 +652,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
             dy = atContent.y - bounds.top
         }
         for (clone in clones) clone.translate(dx, dy)
+        com.xnotes.core.audio.RecordingIds.adopt(clones, document.items, moves = clipboardFromCut)
         document.addAll(clones)
         history.push(AddCanvasItems(document, clones))
         showToast("Inserted")
@@ -1004,6 +1030,110 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
 
     override fun rememberSwatchColor(index: Int) {
         toolbarColors.getOrNull(index)?.let { onColorRemembered?.invoke(it) }
+    }
+
+    // --- colour drop ---
+
+    /** Where a colour drag looks for areas, fixed for the drag: the screen and a margin round it, and what lies there. */
+    private var dropWindow: Rect? = null
+    private var dropItems: List<CanvasItem> = emptyList()
+
+    private val colorDropper = ColorDropper(object : DropSurface {
+        override fun beginDrop() {
+            if (editingLabel != null) commitText()
+            interaction.clearSelection()
+            val seen = viewport.visibleContentRect()
+            val window = seen.outset(maxOf(seen.w, seen.h) * DROP_MARGIN)
+            dropWindow = window
+            dropItems = document.itemsIn(window)
+        }
+
+        override fun spotAt(view: Pt): DropSpot? {
+            val window = dropWindow ?: return null
+            if (view.x < 0.0 || view.y < 0.0 || view.x >= this@InfiniteEditor.view.width || view.y >= this@InfiniteEditor.view.height) return null
+            val zoom = viewport.zoom
+            val grid = FillGrid.fitting(window, zoom, DROP_CELL_BUDGET)
+            return DropSpot(
+                frame = 0,
+                key = window,
+                at = viewport.viewportToContent(view),
+                items = dropItems,
+                grid = grid,
+                reach = DROP_REACH_DP * devicePxPerDp / zoom,
+                smallHole = (DROP_SMALL_HOLE_MM / 25.4 * appContext.resources.displayMetrics.xdpi / zoom * grid.scale).toInt(),
+            )
+        }
+
+        override fun applyDrop(spot: DropSpot, action: DropAction, color: Rgba) = applyColorDrop(action, color)
+
+        override fun viewInWindow(): Offset {
+            val at = IntArray(2).also { view.getLocationInWindow(it) }
+            return Offset(at[0].toFloat(), at[1].toFloat())
+        }
+
+        override val measurer: TextMeasurer get() = textMeasurer
+    })
+
+    override val colorDrag: ColorDrag? get() = colorDropper.drag
+
+    override fun beginColorDrag(color: Rgba, window: Offset) = colorDropper.begin(color, window)
+
+    override fun moveColorDrag(window: Offset) = colorDropper.move(window)
+
+    override fun endColorDrag(window: Offset) = colorDropper.end(window)
+
+    override fun cancelColorDrag() = colorDropper.cancel()
+
+    override fun canvasInWindow(): androidx.compose.ui.geometry.Rect {
+        val at = IntArray(2).also { view.getLocationInWindow(it) }
+        return androidx.compose.ui.geometry.Rect(at[0].toFloat(), at[1].toFloat(), (at[0] + view.width).toFloat(), (at[1] + view.height).toFloat())
+    }
+
+    override fun enterDropFrame(r: Renderer, frame: Int) {
+        r.scale(viewport.zoom, viewport.zoom)
+        r.translate(-viewport.scrollX, -viewport.scrollY)
+    }
+
+    /** Fired with a short message for the user, such as why a drop did nothing. */
+    var onSay: ((String) -> Unit)? = null
+
+    /** Carry out a colour drop as one undo step, or say why nothing happened. */
+    private fun applyColorDrop(action: DropAction, color: Rgba) {
+        val command: Command = when (action) {
+            is DropAction.Recolour -> {
+                val item = action.item.takeIf { document.containsRef(it) } ?: return
+                val before = DrawStyle.of(item) ?: return
+                OnCanvas(document, RestyleItems(listOf(RestyleItems.Entry(item, before, before.copy(color = color)))), listOf(item))
+            }
+            is DropAction.FillShape -> refillCommand(action.shape, color) ?: return
+            is DropAction.Refill -> refillCommand(action.fill, color) ?: return
+            is DropAction.AddFill -> {
+                val gone = action.replaced.filter { document.containsRef(it) }
+                val after = document.items.filter { item -> gone.none { it === item } }
+                // A canvas has no typed text, but its fills keep to the bottom just as a page's do.
+                val at = action.above?.let { a -> after.indexOfFirst { it === a } + 1 }?.takeIf { it > 0 }
+                    ?: PageLayers.underText(after)
+                val insert = InsertCanvasItem(document, action.fill, at)
+                if (gone.isEmpty()) insert else CompositeCommand(listOf(EraseCanvasItems.capture(document, gone), insert))
+            }
+            DropAction.NotClosed -> {
+                onSay?.invoke(appContext.getString(R.string.colour_drop_not_closed))
+                return
+            }
+            DropAction.None -> return
+        }
+        command.redo()
+        history.push(command)
+        markDirty()
+        refresh()
+        publishOverlay()
+    }
+
+    /** The edit that gives [shape] the dropped [color] as its fill, or null when it is no longer on the canvas. */
+    private fun refillCommand(shape: ShapeItem, color: Rgba): Command? {
+        if (!document.containsRef(shape)) return null
+        val refill = RefillShapes(listOf(ColorDrop.refill(shape, color)))
+        return OnCanvas(document, refill, listOf(shape))
     }
 
     override val hostToolbarColorCount: Int get() = toolbarColorCount
@@ -1507,6 +1637,170 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         return true
     }
 
+    /** Place [audio] as a pill in the middle of the view, sized for this zoom, selected so it can be dragged at once. */
+    fun placeAudio(audio: com.xnotes.core.model.AudioData, name: String, rid: Int? = null): com.xnotes.core.model.AudioItem {
+        val box = com.xnotes.core.model.AudioItem.boxAt(viewport.centerContent, document.dpi, viewport.zoom)
+        // A recording keeps its own id, so the ink written during it stays tied, unless a pill took it meanwhile.
+        val taken = rid != null && document.items.any { it is com.xnotes.core.model.AudioItem && it.rid == rid }
+        val item = com.xnotes.core.model.AudioItem(audio, box, name, rid?.takeUnless { taken } ?: freshRecordingId(), textMeasurer)
+        document.add(item)
+        history.push(AddCanvasItem(document, item))
+        selection.select(listOf(item))
+        markDirty()
+        refresh()
+        publishOverlay()
+        return item
+    }
+
+    /** Shows a message to the user, with an optional button; the paged editor that owns this canvas sets it. */
+    var onMessage: ((String, Pair<String, () -> Unit>?) -> Unit)? = null
+
+    override fun audioRepaint(item: com.xnotes.core.model.AudioItem) = audioChanged(item, save = false)
+
+    override fun holdsAudio(item: com.xnotes.core.model.AudioItem): Boolean = document.containsRef(item)
+
+    override fun audioPositionKey(rid: Int): String? = document.path?.let { "$it#$rid" }
+
+    override fun audioFailed() {
+        onMessage?.invoke(appContext.getString(com.xnotes.R.string.err_audio_unplayable), null)
+    }
+
+    override fun audioBusy() {
+        onMessage?.invoke(appContext.getString(com.xnotes.R.string.audio_off_while_recording), null)
+    }
+
+    override fun freshRecordingId(): Int = com.xnotes.core.audio.RecordingIds.next(document.items)
+
+    override fun placeRecording(audio: com.xnotes.core.model.AudioData, name: String, rid: Int) = placeAudio(audio, name, rid)
+
+    override fun recordingMoved(item: com.xnotes.core.model.AudioItem, audio: com.xnotes.core.model.AudioData) {
+        if (!document.containsRef(item)) return
+        item.audio = audio
+        audioChanged(item)
+    }
+
+    override val recordingKey: String get() = document.path?.let { "canvas|$it" } ?: "canvas-session"
+
+    /** Place recordings a crash left behind for this canvas, once it has a size to place them in the middle of. */
+    fun recoverRecordings(fromSession: Boolean, tries: Int = 0) {
+        view.postDelayed({
+            if (view.width <= 0 || view.height <= 0) {
+                if (tries < 40) recoverRecordings(fromSession, tries + 1)
+                return@postDelayed
+            }
+            val keys = listOfNotNull(document.path?.let { "canvas|$it" }, "canvas-session".takeIf { fromSession })
+            AudioRecording.recover(this, keys)
+        }, 250L)
+    }
+
+    override fun recordingMessage(text: String, action: Pair<String, () -> Unit>?) {
+        onMessage?.invoke(text, action)
+    }
+
+    override val recordingDir: java.io.File get() = imageDir ?: appContext.filesDir
+
+    override val recordingTitle: String get() = title
+
+    /**
+     * A finger tap at [at] on a pill plays it (see [AudioPlayback.tap]); during playback a tap on ink
+     * written during that recording plays from a little before it. False when neither is there.
+     */
+    fun tapAudio(at: Pt): Boolean {
+        val reach = INK_TAP_DP * devicePxPerDp / viewport.zoom
+        val near = document.itemsIn(Rect(at.x - reach, at.y - reach, 2 * reach, 2 * reach))
+        val item = near.lastOrNull { it is com.xnotes.core.model.AudioItem && it.contains(at) } as? com.xnotes.core.model.AudioItem
+        if (item != null) {
+            AudioPlayback.tap(this, item, at)
+            return true
+        }
+        val s = AudioPlayback.session?.takeIf { it.owner === this } ?: return false
+        val ink = near.lastOrNull { it.sync?.rid == s.item.rid && (it.contains(at) || it.intersectsCircle(at.x, at.y, reach)) } ?: return false
+        AudioPlayback.playFromMoment(ink.sync!!.ms)
+        return true
+    }
+
+    /** The playing recording's items in moment order, kept until the canvas changes. */
+    private var syncIndex: com.xnotes.core.audio.SyncIndex<Unit>? = null
+    private var syncIndexRevision = -1
+
+    /** Bumped by every item added, removed or reloaded, so the index above knows it is stale. */
+    private var itemsRevision = 0
+
+    private fun syncIndexFor(rid: Int): com.xnotes.core.audio.SyncIndex<Unit> {
+        syncIndex?.takeIf { it.rid == rid && syncIndexRevision == itemsRevision }?.let { return it }
+        return com.xnotes.core.audio.SyncIndex(rid, document.items.filter { it.sync?.rid == rid }.map { Unit to it }).also {
+            syncIndex = it
+            syncIndexRevision = itemsRevision
+        }
+    }
+
+    override fun audioPlayhead(rid: Int?, from: Int, to: Int) {
+        val prev = scene.fade
+        val next = rid?.let { com.xnotes.core.audio.InkFade(it, to) }
+        scene.fade = next
+        if (prev == null && next == null) return
+        // A fade is two uniforms' worth of work on this canvas, so a frame is drawn only when it changes what shows.
+        if (prev != null && next != null && prev.rid == next.rid) {
+            val crossed = syncIndexFor(next.rid).between(minOf(from, to), maxOf(from, to))
+            if (crossed.isEmpty()) return
+            if (to > from && AudioPlayback.follow && AudioPlayback.session?.playing == true) followInk(crossed.last().item)
+        }
+        view.publish()
+    }
+
+    /** Bring ink the playback just reached into the middle of the view, the zoom kept; nothing when it is on screen. */
+    private fun followInk(item: CanvasItem) {
+        val b = item.paintBounds()
+        val v = viewport.visibleContentRect()
+        if (v.contains(b.topLeft) && v.contains(Pt(b.right, b.bottom))) return
+        viewport.centerOn(b.centerX, b.centerY)
+        onViewChanged()
+    }
+
+    override fun selectedAudio(): com.xnotes.core.model.AudioItem? = selection.items.singleOrNull() as? com.xnotes.core.model.AudioItem
+
+    override fun playSelectedAudio() {
+        val item = selectedAudio() ?: return
+        val s = AudioPlayback.session
+        if (s != null && s.item === item) AudioPlayback.toggle() else AudioPlayback.open(this, item)
+    }
+
+    override fun renameSelectedAudio(name: String) {
+        val item = selectedAudio() ?: return
+        val next = name.trim()
+        if (next.isEmpty() || next == item.name) return
+        val command = OnCanvas(document, com.xnotes.core.history.RenameAudio(item, item.name, next), listOf(item))
+        command.redo()
+        history.push(command)
+        markDirty()
+        refresh()
+    }
+
+    override fun unlinkSelectedAudio() {
+        val item = selectedAudio() ?: return
+        val marks = document.items.mapNotNull { it.sync?.takeIf { m -> m.rid == item.rid }?.let { m -> it to m } }
+        if (marks.isEmpty()) {
+            onMessage?.invoke(appContext.getString(com.xnotes.R.string.audio_nothing_linked), null)
+            return
+        }
+        val command = com.xnotes.core.history.UnlinkSync(marks)
+        command.redo()
+        history.push(command)
+        itemsRevision++
+        markDirty()
+        refresh()
+        view.publish()
+        onMessage?.invoke(appContext.getString(com.xnotes.R.string.audio_unlinked), appContext.getString(com.xnotes.R.string.undo) to { undo() })
+    }
+
+    /** [item] changed how it looks (its waveform arrived, or playback moved): mesh it again and keep the change. */
+    fun audioChanged(item: com.xnotes.core.model.AudioItem, save: Boolean = true) {
+        if (document.items.none { it === item }) return
+        document.itemsChanged(listOf(item))
+        if (save) markDirty()
+        view.publish()
+    }
+
     /** Pen up on an eraser drag: the whole drag is one undoable edit, however much it cut. */
     private fun commitErase(session: EraseSession) {
         val command = session.buildCommand() ?: return
@@ -1827,7 +2121,17 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         this.palette = palette
         view.paperColor = document.background.paperColor ?: palette.paper
         view.accent = palette.accent
+        // The pills are meshed in the accent, so a new one means new triangles for each.
+        val look = com.xnotes.core.model.AudioLook.current
+        if (look != meshedAudioLook) {
+            meshedAudioLook = look
+            for (item in document.items) if (item is com.xnotes.core.model.AudioItem) pushItem(item)
+            view.publish()
+        }
     }
+
+    /** The look the canvas's pills were last meshed in. */
+    private var meshedAudioLook: com.xnotes.core.model.AudioLook? = null
 
     // --- documents ---
 
@@ -1836,6 +2140,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
     }
 
     fun replaceDocument(next: InfiniteDocument) {
+        AudioRecording.stopFor(this) // closing the canvas places its recording
+        AudioPlayback.closeFor(this)
         clearFading() // whatever was melting belongs to the outgoing canvas
         // An open label belongs to the outgoing canvas too; its history goes with it.
         editingLabel?.labelHidden = false

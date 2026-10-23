@@ -11,7 +11,7 @@ json = "20240303"
 pdfboxAndroid = "2.0.27.0"
 androidsvg = "1.4"
 mlkitDigitalInk = "18.1.0"
-commonmark = "0.30.0"
+commonmark = "0.30.1"
 kxml2 = "2.3.0"
 latex = "1.5.0-kt2.1.0"
 onnxruntime = "1.30.0"
@@ -47,6 +47,9 @@ latex-parser = { group = "io.github.huarangmeng", name = "latex-parser", version
 latex-renderer = { group = "io.github.huarangmeng", name = "latex-renderer", version.ref = "latex" }
 onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 lottie-compose = { module = "com.airbnb.android:lottie-compose", version.ref = "lottie" }
+commonmark-footnotes = { group = "org.commonmark", name = "commonmark-ext-footnotes", version.ref = "commonmark" }
+commonmark-frontmatter = { group = "org.commonmark", name = "commonmark-ext-yaml-front-matter", version.ref = "commonmark" }
+commonmark-alerts = { group = "org.commonmark", name = "commonmark-ext-gfm-alerts", version.ref = "commonmark" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -20,6 +20,7 @@ import com.xnotes.core.history.LockItems
 import com.xnotes.core.history.EditLabel
 import com.xnotes.core.history.EditText
 import com.xnotes.core.history.MoveItems
+import com.xnotes.core.history.RefillShapes
 import com.xnotes.core.history.ReorderItems
 import com.xnotes.core.history.RemoveMarkup
 import com.xnotes.core.history.ReplacePageItems
@@ -40,6 +41,8 @@ import com.xnotes.core.model.deepCopyAll
 import com.xnotes.core.model.GeoHandle
 import com.xnotes.core.history.ReplaceImage
 import com.xnotes.core.model.ImageData
+import com.xnotes.core.model.EraseRule
+import com.xnotes.core.model.AudioItem
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.RectHandle
@@ -199,6 +202,12 @@ class InteractionController(
      *  selecting, markups and PDF links since those sit on top. True when it opened one. */
     var onItemLinkTap: ((pageIndex: Int, pageLocal: Pt) -> Boolean)? = null
 
+    /** The view was panned or pinched by hand, as distinct from moved by the app. */
+    var onUserMovedView: (() -> Unit)? = null
+
+    /** A finger tap that may land on an audio pill, at [pageLocal] on page [pageIndex]; true when one took it. */
+    var onAudioTap: ((pageIndex: Int, pageLocal: Pt) -> Boolean)? = null
+
     /**
      * A tap that may open a markup, at viewport point [at]: a pan tap ([withLink], so a menu can offer
      * the link under it) or the markup tool's. True when a markup or its note icon took it.
@@ -248,10 +257,9 @@ class InteractionController(
     /** Reader mode: every pointer pans and follows links, and a long press only selects PDF text. */
     var readOnly: Boolean = false
 
-    /** Side button as last seen on the hover/generic-motion stream or a stylus-button KeyEvent
-     *  (Feeder C, for Bluetooth pens that report it only there); read only at touch-down, so a
-     *  press after the pen is already down does not activate the mapped tool. */
-    private var stylusButtonHeld = false
+    /** The side button, latched as on the infinite canvas; read only at touch-down, so a press
+     *  after the pen is already down does not activate the mapped tool. */
+    private val stylusButtons = StylusButtonLatch()
 
     /** When true, the side-button tool also runs off the hover stream (no contact needed); eraser/pan only. */
     var penButtonHover: Boolean = false
@@ -385,6 +393,8 @@ class InteractionController(
     private val eraseSnapshots = linkedMapOf<Page, List<CanvasItem>>()
     /** The text markups this erase took off, one [RemoveMarkup] each in the order taken, so undo puts them back in place. */
     private val eraseMarkups = mutableListOf<RemoveMarkup>()
+    /** Filled shapes whose fill alone this erase took, with the fill each had. */
+    private val eraseUnfilled = mutableListOf<RefillShapes.Entry>()
     private var eraserCursor: Pt? = null // viewport pixels
     /** Tool armed just before the eraser was selected, for the "switch back after erasing" option. */
     private var toolBeforeEraser: Tool? = null
@@ -580,9 +590,24 @@ class InteractionController(
             item === editingText || item === editingLabel || item in followed || frontInk?.holding(item) == true ||
                 selection.any { it.item === item }
         }
+        // A selected fill under the typed text stays under the ink, moving with the drag.
+        state.paintLiftedUnderText = { page, r ->
+            for (sel in selection) {
+                if (sel.item in followed || state.document.pages.getOrNull(sel.pageIndex) !== page) continue
+                if (!state.isUnderText(page, sel.item)) continue
+                r.withSave {
+                    r.translate(moveOffset.x, moveOffset.y)
+                    state.applyPageTransform(r, page)
+                    state.paintItem(sel.item, r)
+                }
+            }
+        }
     }
 
     val hasSelection: Boolean get() = selection.isNotEmpty()
+
+    /** The selected items, in the order they were picked. */
+    fun selectedItems(): List<CanvasItem> = selection.map { it.item }
 
     fun configFor(t: Tool): ToolConfig = toolConfigs[t] ?: ToolDefaults.configFor(t)
 
@@ -679,9 +704,7 @@ class InteractionController(
     /** Drive the side-button tool (eraser/pan) off the hover stream while the button is held and
      *  "activate during hover" is on, so the pen erases or pans without touching the screen. */
     private fun handleHoverAction(e: MotionEvent): Boolean {
-        val buttonNow = e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS &&
-            e.actionMasked != MotionEvent.ACTION_HOVER_EXIT &&
-            ((e.buttonState and STYLUS_BUTTON_MASK) != 0 || stylusButtonHeld)
+        val buttonNow = e.actionMasked != MotionEvent.ACTION_HOVER_EXIT && stylusButtons.heldFor(e)
         val want = penButtonHover && buttonNow &&
             (penButtonTool == Tool.ERASER && !readOnly || penButtonTool == Tool.PAN)
         val vx = e.x.toDouble()
@@ -727,27 +750,15 @@ class InteractionController(
      *  (ACTION_BUTTON_PRESS/RELEASE), never in the touch buttonState. Latch it here; a release
      *  here also ends an in-progress hover gesture even if the pen has not moved. */
     fun onGenericMotion(e: MotionEvent) {
-        if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) {
-            stylusButtonHeld = (e.buttonState and STYLUS_BUTTON_MASK) != 0
-            if (!stylusButtonHeld && hoverActionTool != null) endHoverAction()
-        }
+        if (stylusButtons.onGenericMotion(e) && hoverActionTool != null) endHoverAction()
     }
 
     /** Feeder C: Bluetooth/USI pens often deliver the side button only as a KeyEvent, never in any
-     *  MotionEvent buttonState. Latch those into the same held flag ([down] true on key-down); a
-     *  key-up also ends a live hover gesture. Returns true if the key was a stylus side button, so
-     *  the host consumes it. */
+     *  MotionEvent buttonState. Latch those ([down] true on key-down); a key-up also ends a live
+     *  hover gesture. Returns true if the key was a stylus side button, so the host consumes it. */
     fun onStylusButtonKey(keyCode: Int, down: Boolean): Boolean {
-        if (keyCode != KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY &&
-            keyCode != KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY &&
-            keyCode != KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY &&
-            keyCode != KeyEvent.KEYCODE_STYLUS_BUTTON_TAIL &&
-            keyCode != VENDOR_HELD_BUTTON_KEYCODE
-        ) {
-            return false
-        }
-        stylusButtonHeld = down
-        if (!down && hoverActionTool != null) endHoverAction()
+        if (!stylusButtons.onKey(keyCode, down)) return false
+        if (!stylusButtons.held && hoverActionTool != null) endHoverAction()
         return true
     }
 
@@ -775,8 +786,7 @@ class InteractionController(
         //  - the stylus eraser end, or the held side button, force the eraser/side-button tool;
         //  - a finger pans unless finger-draw is enabled;
         //  - otherwise the armed tool.
-        val buttonHeld = drawingIsStylus &&
-            ((e.buttonState and STYLUS_BUTTON_MASK) != 0 || stylusButtonHeld)
+        val buttonHeld = stylusButtons.heldFor(e)
         val effectiveTool: Tool = when {
             readOnly -> Tool.PAN
             toolType == MotionEvent.TOOL_TYPE_ERASER -> Tool.ERASER
@@ -1106,6 +1116,7 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content)
         val local = pageIndex?.let { state.toPageSpace(it, content) }
         if (pageIndex != null && local != null && onItemLinkTap?.invoke(pageIndex, local) == true) return true
+        if (pageIndex != null && local != null && onAudioTap?.invoke(pageIndex, local) == true) return true
         if (tool == Tool.SELECT && fingerTapSelect(content)) return true
         if (onMarkupTap?.invoke(state.contentToViewport(content), true) == true) return true
         val cb = onLinkTap ?: return false
@@ -1460,14 +1471,13 @@ class InteractionController(
         val radius = stroke.config.baseWidth / 2.0 + Scribble.TOUCH_DP / dpPerUnit
         val reach = Rect.bounding(path).outset(radius)
         val candidates = ArrayList<Any>()
-        page.items.filterTo(candidates) {
-            !it.locked && it !is ImageItem && it !is TextItem && it.paintBounds().intersects(reach)
-        }
+        page.items.filterTo(candidates) { EraseRule.erasable(it) && it.paintBounds().intersects(reach) }
         if (eraser.eraseMarkups) candidates.addAll(page.markups)
         val ptPerPx = 72.0 / state.document.dpi
+        // A scribble is ink, so it takes only lines, never a fill.
         val taken = Scribble.taken(passes, radius, candidates) { c, x, y, r ->
             when (c) {
-                is CanvasItem -> c.intersectsCircle(x, y, r)
+                is CanvasItem -> EraseRule.touchesLine(c, x, y, r)
                 is TextMarkup -> MarkupPainter.touches(c, x * ptPerPx, y * ptPerPx, r * ptPerPx)
                 else -> false
             }
@@ -1511,6 +1521,7 @@ class InteractionController(
         eraseRemovals.clear()
         eraseSnapshots.clear()
         eraseMarkups.clear()
+        eraseUnfilled.clear()
         mode = PointerMode.ERASE
         eraseAt(vx, vy)
     }
@@ -1557,15 +1568,13 @@ class InteractionController(
         return true
     }
 
-    /** STROKE mode: remove every stroke/shape the eraser circle touches. Images and text boxes are
-     *  deliberately-placed and protected (delete those via select + delete). Returns the repaint
-     *  region, or null if nothing changed. */
+    /** STROKE mode: remove every stroke/shape the eraser circle touches, and every fill it touches at
+     *  all. Images and text boxes are deliberately-placed and protected (delete those via select +
+     *  delete). Returns the repaint region, or null if nothing changed. */
     private fun eraseStrokesFromPage(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
-        val toRemove = page.items.filter {
-            !it.locked && it !is ImageItem && it !is TextItem && it.intersectsCircle(cx, cy, radius)
-        }
-        if (toRemove.isEmpty()) return null
-        var dirty: Rect? = null
+        var dirty = unfillOnPage(page, cx, cy, radius)
+        val toRemove = page.items.filter { EraseRule.takes(it, cx, cy, radius) }
+        if (toRemove.isEmpty()) return dirty
         for (item in toRemove) {
             page.items.remove(item)
             eraseRemovals.add(page to item)
@@ -1579,12 +1588,15 @@ class InteractionController(
      *  circle, spliced in at the original's z-position. Text and images are left untouched. Returns
      *  the repaint region, or null if nothing changed. */
     private fun eraseAreaFromPage(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
-        var dirty: Rect? = null
+        var dirty = unfillOnPage(page, cx, cy, radius)
         var i = 0
         while (i < page.items.size) {
             val item = page.items[i]
-            val frags: List<CanvasItem>? = if (item.locked) {
+            val frags: List<CanvasItem>? = if (!EraseRule.erasable(item)) {
                 null
+            } else if (item is ShapeItem && item.isFill) {
+                // A fill is never cut: whatever the eraser touches of it, it takes whole.
+                if (EraseRule.takes(item, cx, cy, radius)) emptyList() else null
             } else {
                 when (item) {
                     is Stroke -> item.erasedBy(cx, cy, radius)
@@ -1601,6 +1613,7 @@ class InteractionController(
             }
             // Snapshot the page's items on first contact this gesture, before mutating it.
             if (!eraseSnapshots.containsKey(page)) eraseSnapshots[page] = page.items.toList()
+            for (f in frags) f.sync = item.sync // pieces were written when the whole was
             val b = frags.fold(item.paintBounds()) { acc, f -> acc.union(f.paintBounds()) }
             dirty = dirty?.union(b) ?: b
             page.items.removeAt(i)
@@ -1610,8 +1623,24 @@ class InteractionController(
         return dirty
     }
 
+    /** Take the fill alone off the filled shapes the eraser touches inside but not on their outline; the repaint region, or null. */
+    private fun unfillOnPage(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
+        var dirty: Rect? = null
+        for (item in page.items) {
+            if (!EraseRule.takesFill(item, cx, cy, radius)) continue
+            val shape = item as ShapeItem
+            eraseUnfilled += RefillShapes.Entry(shape, shape.fillRgba, null)
+            shape.fillRgba = null
+            val b = shape.paintBounds()
+            dirty = dirty?.union(b) ?: b
+        }
+        return dirty
+    }
+
     private fun endErase() {
         val cmds = ArrayList<Command>()
+        // A fill came off before any cut or removal of its shape, so it goes back after them.
+        if (eraseUnfilled.isNotEmpty()) cmds += RefillShapes(eraseUnfilled.toList())
         if (areaErase()) {
             // One drag may split/trim many strokes across pages; commit each touched page's
             // net before/after as one undo step.
@@ -1631,6 +1660,7 @@ class InteractionController(
         eraseRemovals.clear()
         eraseSnapshots.clear()
         eraseMarkups.clear()
+        eraseUnfilled.clear()
         eraserCursor = null
         mode = PointerMode.IDLE
         requestRender()
@@ -1679,6 +1709,8 @@ class InteractionController(
         val endpoint = singleEndpointShape()
         if (endpoint != null) return endpointHandles(endpoint)
         val all = selectionChromeBox()?.let { ResizeMath.obbHandles(it) } ?: return emptyList()
+        // A pill scales by its corners and lengthens by its sides; nothing stretches it upright.
+        if (selection.all { it.item is AudioItem }) return all.filter { it.id != HandleId.T && it.id != HandleId.B }
         val square = (selection.singleOrNull()?.item as? ShapeItem)?.shape?.keepsAspect == true
         return if (square) all.filter { it.id in CORNER_HANDLES } else all
     }
@@ -2685,6 +2717,8 @@ class InteractionController(
             if (state.pageRects.getOrNull(sel.pageIndex) == null) continue
             sel.item.applyTransform(state.affineToPageSpace(sel.pageIndex, world))
         }
+        // A pill stops at its smallest by itself, so its box is read back from it.
+        if (txItems.isNotEmpty() && txItems.all { it.item is AudioItem }) selObb = selectionBox()
         for ((pi, f) in follows) {
             if (state.pageRects.getOrNull(pi) == null) continue
             f.follow(state.affineToPageSpace(pi, world))
@@ -3942,6 +3976,12 @@ class InteractionController(
         return true
     }
 
+    /** Select [items] just placed on page [pageIndex], as a paste leaves its clones, so they can be dragged at once. */
+    fun selectPlaced(pageIndex: Int, items: List<CanvasItem>) {
+        setSelection(items.map { Selected(pageIndex, it) })
+        refreshSelectionMenu()
+    }
+
     fun clearSelection() {
         // Restore the tool a long-press grab temporarily switched away from.
         longPressPrevTool?.let {
@@ -4299,6 +4339,7 @@ class InteractionController(
         val dx = if (offsetFromBoundsTopLeft) targetLocal.x - b.left + nudge else nudge
         val dy = if (offsetFromBoundsTopLeft) targetLocal.y - b.top + nudge else nudge
         for (c in clones) c.translate(dx, dy)
+        com.xnotes.core.audio.RecordingIds.adopt(clones, state.document.pages.flatMap { it.items }, moves = clipboardFromCut)
         page.items.addAll(clones)
         history.push(AddItems(page, clones))
         // A cut's clipboard is spent by the paste that lands it: the items were taken from the
@@ -4358,6 +4399,7 @@ class InteractionController(
 
     private fun extendPan(vx: Double, vy: Double) {
         trackVelocity(vx, vy)
+        onUserMovedView?.invoke()
         val dx = -(vx - lastPan.x)
         var dy = -(vy - lastPan.y)
         if (!state.verticalScroll) {
@@ -4759,6 +4801,7 @@ class InteractionController(
 
     private fun updatePinch(e: MotionEvent) {
         if (e.pointerCount < 2) return
+        onUserMovedView?.invoke()
         val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
         val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
         val dist = a.distanceTo(b)
@@ -4898,10 +4941,11 @@ class InteractionController(
             for (sel in selection) {
                 if (sel.item in followed) continue
                 val pr = state.pageRects.getOrNull(sel.pageIndex) ?: continue
+                if (state.isUnderText(state.document.pages[sel.pageIndex], sel.item)) continue // painted under the ink
                 r.withSave {
                     r.translate(pr.left + moveOffset.x, pr.top + moveOffset.y)
                     state.applyPageTransform(r, state.document.pages[sel.pageIndex])
-                    sel.item.paint(r)
+                    state.paintItem(sel.item, r)
                 }
             }
 
@@ -4911,7 +4955,7 @@ class InteractionController(
                 r.withSave {
                     r.translate(pr.left, pr.top)
                     state.applyPageTransform(r, state.document.pages[pi])
-                    for (item in f.items) item.paint(r)
+                    for (item in f.items) state.paintItem(item, r)
                 }
             }
 

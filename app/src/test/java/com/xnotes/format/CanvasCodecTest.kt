@@ -9,6 +9,8 @@ import com.xnotes.core.geometry.Rect
 import com.xnotes.core.infinite.CanvasBackground
 import com.xnotes.core.infinite.InfiniteDocument
 import com.xnotes.core.infinite.Waypoint
+import com.xnotes.core.model.AudioData
+import com.xnotes.core.model.AudioItem
 import com.xnotes.core.model.ConnectorEnd
 import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.ImageData
@@ -21,6 +23,7 @@ import com.xnotes.core.pal.FontFace
 import com.xnotes.core.model.TextStyle
 import com.xnotes.core.model.ShapeLabel
 import com.xnotes.core.model.Stroke
+import com.xnotes.core.model.SyncMark
 import com.xnotes.core.stroke.Sample
 import com.xnotes.core.shapes.Axis
 import com.xnotes.core.shapes.Elbow
@@ -232,6 +235,25 @@ class CanvasCodecTest {
         val got = back.paths().flatMap { it.contours }.flatMap { FreePath.vertices(it) }
         assertEquals(want.size, got.size)
         for ((w, g) in want.zip(got)) assertEquals(0.0, w.distanceTo(g), 1e-3)
+    }
+
+    @Test fun aFillRoundTripsUnderAKindOlderReadersSkip() {
+        val doc = InfiniteDocument()
+        val outer = listOf(Pt(-5000.0, 10.0), Pt(-4800.0, 10.0), Pt(-4800.0, 110.0), Pt(-5000.0, 110.0))
+        val hole = listOf(Pt(-4950.0, 40.0), Pt(-4900.0, 40.0), Pt(-4900.0, 80.0), Pt(-4950.0, 80.0))
+        val fill = ShapeItem.fill(listOf(outer, hole), Rgba(30, 140, 220, 255))
+        doc.add(fill)
+        val manifest = manifestText(doc)
+        assertTrue(manifest.contains("\"kind\":\"fill\""))
+        assertFalse("no point list for an older reader", manifest.contains("\"points\""))
+        val back = roundTrip(doc).items.single() as ShapeItem
+        assertEquals(ShapeKind.FILL, back.shape)
+        assertEquals(Rgba(30, 140, 220, 255), back.fillRgba)
+        val want = fill.paths().flatMap { it.contours }.flatMap { FreePath.vertices(it) }
+        val got = back.paths().flatMap { it.contours }.flatMap { FreePath.vertices(it) }
+        assertEquals(want.size, got.size)
+        for ((w, g) in want.zip(got)) assertEquals(0.0, w.distanceTo(g), 1e-3)
+        assertFalse("the hole stays open", back.contains(Pt(-4925.0, 60.0)))
     }
 
     @Test fun loadedItemsAreIndexedAndOrdered() {
@@ -798,8 +820,8 @@ class CanvasCodecTest {
     }
 
     @Test fun everyBasicKindRoundTripsBehindAStandIn() {
-        // Drawn text goes under a kind of its own, which older readers skip (its own test).
-        val kinds = ShapeKind.all.filter { !it.isLegacy && it != ShapeKind.GLYPHS }
+        // Drawn text and fills go under kinds of their own, which older readers skip (their own tests).
+        val kinds = ShapeKind.all.filter { !it.isLegacy && it != ShapeKind.GLYPHS && it != ShapeKind.FILL }
         val doc = InfiniteDocument()
         for (k in kinds) {
             val s = ShapeItem(k, Pt(0.0, 0.0), Pt(120.0, 80.0), ink, 2.0, n = if (k.nRange != null) 7 else k.defaultN)
@@ -967,6 +989,32 @@ class CanvasCodecTest {
         val back = roundTrip(doc).items.single() as ShapeItem
         assertEquals("mid", back.label!!.text)
         assertEquals(0.2, back.labelAt, 0.0)
+    }
+
+    @Test fun aRecordingAndTheInkTiedToItRoundTripOnTheCanvas() {
+        val doc = InfiniteDocument(dpi = 150)
+        doc.add(Stroke(Tool.PEN, ToolConfig(), mutableListOf(Sample(1.0, 1.0, 1.0))).apply { sync = SyncMark(2, 61_000) })
+        doc.add(
+            AudioItem(
+                AudioData(imageFile(byteArrayOf(5, 5, 5)), "ogg", 90_000, byteArrayOf(1, 2, 3)),
+                Rect(-500.0, 9000.0, 120.0, 26.0), "Kickoff", 2, FakeTextMeasurer(),
+            ),
+        )
+        doc.add(ShapeItem(ShapeKind.RECTANGLE, Pt(0.0, 0.0), Pt(5.0, 5.0), Rgba(1, 2, 3, 255)))
+
+        val back = roundTrip(doc)
+        assertEquals(3, back.itemCount)
+        assertEquals(SyncMark(2, 61_000), back.items[0].sync)
+        val audio = back.items[1] as AudioItem
+        assertEquals("ogg", audio.audio.ext)
+        assertEquals(90_000, audio.audio.durationMs)
+        assertArrayEquals(byteArrayOf(5, 5, 5), audio.audio.file.readBytes())
+        assertArrayEquals(byteArrayOf(1, 2, 3), audio.audio.peaks)
+        assertEquals(Rect(-500.0, 9000.0, 120.0, 26.0), audio.rect)
+        assertEquals("Kickoff", audio.name)
+        assertEquals(2, audio.rid)
+        assertNull(back.items[2].sync)
+        assertTrue(manifestText(back).contains("\"rec\":2,\"rec_ms\":61000"))
     }
 }
 

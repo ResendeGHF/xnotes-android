@@ -88,6 +88,7 @@ import androidx.core.content.IntentCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.xnotes.R
+import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.platform.PdfOpenError
 import com.xnotes.ui.CanvasToastPill
 import com.xnotes.ui.Editor
@@ -160,6 +161,8 @@ class MainActivity : ComponentActivity() {
         }
         com.xnotes.platform.FontCatalog.init(this)
         com.xnotes.platform.TemplateLibrary.init(this)
+        com.xnotes.ui.AudioPlayback.init(this)
+        com.xnotes.ui.AudioRecording.init(this)
         setTheme(com.xnotes.R.style.Theme_Xnotes) // leave the dark launch/splash theme behind
         applyFullscreen(!deviceHasDisplayCutout(this)) // provisional; reconciled once the editor loads prefs
         // The intent that started the task comes back whenever Android rebuilds it, from a saved state
@@ -276,12 +279,12 @@ class MainActivity : ComponentActivity() {
         pdfImportUri(intent)?.let { pendingPdfImport = it }
     }
 
-    // The PDF uri carried by an inbound VIEW ("Open with") or SEND ("Share") intent, else null.
+    // The PDF or markdown uri carried by an inbound VIEW ("Open with") or SEND ("Share") intent, else null.
     private fun pdfImportUri(intent: Intent?): Uri? = when (intent?.action) {
-        // Only the PDF filter takes VIEW, but a task started by another build's filters keeps its intent.
-        Intent.ACTION_VIEW -> intent.data?.takeIf { (intent.type ?: runCatching { contentResolver.getType(it) }.getOrNull()) == "application/pdf" }
+        // Only the import filters take VIEW, but a task started by another build's filters keeps its intent.
+        Intent.ACTION_VIEW -> intent.data?.takeIf { (intent.type ?: runCatching { contentResolver.getType(it) }.getOrNull()) in IMPORT_TYPES }
         Intent.ACTION_SEND ->
-            if (intent.type == "application/pdf")
+            if (intent.type in IMPORT_TYPES)
                 IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
             else null
         else -> null
@@ -296,12 +299,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) StylusButtonLatch.releaseKey() // a held pen key's key-up may not come back to this window
         if (hasFocus && editor?.fullscreen == true) applyFullscreen(true) // re-hide transient bars after they swipe in
     }
 
     override fun onPause() {
         super.onPause()
         if (openTabs.isEmpty()) editor?.persist() else openTabs.forEach { it.persist(includeUiState = it === editor) }
+    }
+
+    // Playback never goes on with xnotes off screen; a split window that only lost focus is still on it.
+    override fun onStop() {
+        super.onStop()
+        com.xnotes.ui.AudioPlayback.pause()
     }
 
     @Suppress("DEPRECATION") // RUNNING_* still arrive below Android 14
@@ -647,6 +657,58 @@ private fun EditorScreen(
             }
         }
 
+        // Recording asks for the microphone the first time, and on Android 13 and later for notifications
+        // too, since the recording shows one while xnotes is off screen. Refusing notifications still records.
+        var pendingRecordPane by remember { mutableStateOf<Editor?>(null) }
+        // Notifications are asked for once a run when only they are missing; the system stops asking after two refusals anyway.
+        var askedNotifications by remember { mutableStateOf(false) }
+        val activity = context as? android.app.Activity
+        val recordPermissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            val pane = pendingRecordPane
+            pendingRecordPane = null
+            if (pane == null) return@rememberLauncherForActivityResult
+            if (grants[android.Manifest.permission.RECORD_AUDIO] == true) {
+                pane.startRecording()
+            } else {
+                // Once Android stops asking, only Settings can grant it, so the message offers the way there.
+                val asks = activity?.let { androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(it, android.Manifest.permission.RECORD_AUDIO) } == true
+                val settings = context.getString(R.string.mic_settings) to {
+                    runCatching {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                    Unit
+                }
+                pane.say(context.getString(R.string.err_mic_needed), if (asks) null else settings)
+            }
+        }
+
+        // A recording saved out of the note: its file copied as it is, off the main thread.
+        var pendingSaveAudio by remember { mutableStateOf<Pair<Editor, com.xnotes.core.model.AudioItem>?>(null) }
+        val saveAudioLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+            val pending = pendingSaveAudio
+            pendingSaveAudio = null
+            if (uri == null || pending == null) return@rememberLauncherForActivityResult
+            val (pane, item) = pending
+            val file = item.audio.file
+            scope.launch {
+                val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } } != null }.getOrDefault(false)
+                }
+                pane.say(context.getString(if (ok) R.string.audio_saved else R.string.err_save_audio))
+            }
+        }
+
+        // An audio file to attach, for the pane that asked; the editor copies it off the main thread.
+        var pendingAudioPane by remember { mutableStateOf<Editor?>(null) }
+        val attachAudioLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            val pane = pendingAudioPane
+            pendingAudioPane = null
+            if (uri != null && pane != null) pane.attachAudio(uri)
+        }
+
         // Images picked for the sticker library (multi-select), stored on disk by the editor.
         val addStickersLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             uris.forEach { uri ->
@@ -955,16 +1017,25 @@ private fun EditorScreen(
             }
         }
 
-        // A PDF opened from another app ("Open with"/Share): set up a pending import and land on the
-        // backstage so its name dialog appears, exactly like the in-app "Import PDF" button. With no
-        // folder chosen yet, fall back to App storage so the explorer renders and the note autosaves.
+        // A PDF or markdown file opened from another app ("Open with"/Share): set up a pending import
+        // and land on the backstage so its name dialog appears, exactly like the in-app import button.
+        // With no folder chosen yet, fall back to App storage so the explorer renders and the note autosaves.
+        // A markdown file becomes a new note whose text it is.
         LaunchedEffect(importPdfUri) {
             val src = importPdfUri ?: return@LaunchedEffect
             onImportConsumed() // consume once; the body has no suspend point so it runs to completion
-            val stem = com.xnotes.core.util.Paths.stem(displayNameOf(resolver, src) ?: "Document")
+            val name = displayNameOf(resolver, src)
+            val markdown = runCatching { resolver.getType(src) }.getOrNull() in MARKDOWN_TYPES ||
+                name?.substringAfterLast('.', "")?.lowercase() in MARKDOWN_EXTENSIONS
+            val stem = com.xnotes.core.util.Paths.stem(name ?: "Document")
             guardedAll {
                 if (editor.browseRoot == null) editor.useInternalStorage()
-                editor.requestImport(com.xnotes.ui.ImportKind.PDF, stem, src.toString())
+                editor.requestImport(
+                    if (markdown) com.xnotes.ui.ImportKind.TEXT else com.xnotes.ui.ImportKind.PDF,
+                    stem,
+                    src.toString(),
+                    markdown = markdown,
+                )
                 backstageView = com.xnotes.ui.BackstageView.HOME
                 editor.goHomeAll()
             }
@@ -1074,6 +1145,49 @@ private fun EditorScreen(
                             insertCanvasImageLauncher.launch(arrayOf("image/*"))
                         },
                         onAddStickers = { addStickersLauncher.launch(arrayOf("image/*")) },
+                        onInsertAudio = { pane ->
+                            pendingAudioPane = pane
+                            attachAudioLauncher.launch(arrayOf("audio/*", "application/ogg"))
+                        },
+                        onSaveAudio = { pane, item ->
+                            pendingSaveAudio = pane to item
+                            saveAudioLauncher.launch(audioFileName(item))
+                        },
+                        onShareAudio = { pane, item ->
+                            scope.launch {
+                                val shared = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    runCatching {
+                                        val dir = java.io.File(context.cacheDir, "share").apply { mkdirs() }
+                                        java.io.File(dir, audioFileName(item)).also { item.audio.file.copyTo(it, overwrite = true) }
+                                    }.getOrNull()
+                                }
+                                if (shared == null) pane.say(context.getString(R.string.err_share_audio))
+                                else runCatching { launchShare(shared, item.name, audioMime(item.audio.ext)) }.onFailure { pane.say(context.getString(R.string.err_share_audio)) }
+                            }
+                        },
+                        onRecordAudio = { pane ->
+                            val mic = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
+                                android.content.pm.PackageManager.PERMISSION_GRANTED
+                            val wanted = buildList {
+                                if (!mic) add(android.Manifest.permission.RECORD_AUDIO)
+                                if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                                    androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+                                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                                ) add(android.Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            if (mic && wanted.isEmpty()) {
+                                pane.startRecording()
+                            } else if (mic && !askedNotifications) {
+                                askedNotifications = true
+                                pendingRecordPane = pane
+                                recordPermissions.launch(arrayOf(android.Manifest.permission.RECORD_AUDIO) + wanted)
+                            } else if (mic) {
+                                pane.startRecording()
+                            } else {
+                                pendingRecordPane = pane
+                                recordPermissions.launch(wanted.toTypedArray())
+                            }
+                        },
                         onImportTemplate = { importTemplateLauncher.launch(arrayOf("*/*")) },
                         onTemplateFromImage = { kind ->
                             pendingTemplateKind = kind
@@ -1297,6 +1411,10 @@ private class PaneActions(
     val onInsertImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     val onInsertCanvasImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     val onAddStickers: () -> Unit,
+    val onInsertAudio: (Editor) -> Unit,
+    val onRecordAudio: (Editor) -> Unit,
+    val onSaveAudio: (Editor, com.xnotes.core.model.AudioItem) -> Unit,
+    val onShareAudio: (Editor, com.xnotes.core.model.AudioItem) -> Unit,
     val onImportTemplate: () -> Unit,
     val onTemplateFromImage: (com.xnotes.core.template.TemplateKind) -> Unit,
     val onSharePages: (Editor, List<Int>, Boolean) -> Unit,
@@ -1471,6 +1589,8 @@ private fun EditorPane(
                     onTakePhoto = { actions.onTakePhoto(editor, null) },
                     onClosePane = onClose,
                     onOpenMathStudio = actions.onOpenMathStudio,
+                    onInsertAudio = { actions.onInsertAudio(editor) },
+                    onRecordAudio = { actions.onRecordAudio(editor) },
                 )
             }
             ToolbarAround(bar, onCover = canvas::setToolbarCover) { floatingBar ->
@@ -1484,7 +1604,11 @@ private fun EditorPane(
                         com.xnotes.ui.TextEditorOverlay(canvas, field)
                     }
                     floatingBar()
-                    com.xnotes.ui.SelectionMenu(canvas)
+                    com.xnotes.ui.SelectionMenu(
+                        canvas,
+                        onSaveAudio = { actions.onSaveAudio(editor, it) },
+                        onShareAudio = { actions.onShareAudio(editor, it) },
+                    )
                     com.xnotes.ui.TextStyleBar(canvas)
                     com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) })
                     com.xnotes.ui.CanvasDebugOverlay(canvas)
@@ -1504,6 +1628,8 @@ private fun EditorPane(
                     onTakePhoto = { actions.onTakePhoto(editor, null) },
                     onImagePage = { actions.onImagePage(editor) },
                     onOpenMathStudio = actions.onOpenMathStudio,
+                    onInsertAudio = { actions.onInsertAudio(editor) },
+                    onRecordAudio = { actions.onRecordAudio(editor) },
                 )
             }
             ToolbarAround(bar, onCover = editor::setToolbarCover) { floatingBar ->
@@ -1530,7 +1656,11 @@ private fun EditorPane(
                             com.xnotes.ui.TextEditorOverlay(editor, field)
                         }
                         floatingBar()
-                        com.xnotes.ui.SelectionMenu(editor)
+                        com.xnotes.ui.SelectionMenu(
+                            editor,
+                            onSaveAudio = { actions.onSaveAudio(editor, it) },
+                            onShareAudio = { actions.onShareAudio(editor, it) },
+                        )
                         com.xnotes.ui.ScreenshotMenu(editor)
                         com.xnotes.ui.CropMenu(editor)
                         com.xnotes.ui.TextStyleBar(editor)
@@ -1553,6 +1683,7 @@ private fun EditorPane(
             com.xnotes.ui.MathKeyboardPanel(editor)
             com.xnotes.ui.TextBoxFormatBar(editor)
         }
+        com.xnotes.ui.ColorDropOverlay(if (editor.canvasOpen) editor.infinite else editor)
     }
 }
 
@@ -1949,6 +2080,34 @@ private fun BoxScope.ZoomLockHint(editor: Editor) {
         }
     }
 }
+
+/** A recording's file name when it leaves the app: its name, made safe for any folder, and its format. */
+private fun audioFileName(item: com.xnotes.core.model.AudioItem): String {
+    val stem = item.name.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), " ").trim().ifEmpty { "recording" }.take(96)
+    return "$stem.${item.audio.ext}"
+}
+
+/** The type another app is told a recording's file is. */
+private fun audioMime(ext: String): String = when (ext.lowercase()) {
+    "m4a", "mp4" -> "audio/mp4"
+    "aac" -> "audio/aac"
+    "mp3" -> "audio/mpeg"
+    "ogg" -> "audio/ogg"
+    "opus" -> "audio/opus"
+    "flac" -> "audio/flac"
+    "wav" -> "audio/wav"
+    "amr" -> "audio/amr"
+    "3gp" -> "audio/3gpp"
+    "webm" -> "audio/webm"
+    else -> "audio/*"
+}
+
+/** The types "Open with" and Share hand over for markdown, and its usual extensions. */
+private val MARKDOWN_TYPES = setOf("text/markdown", "text/x-markdown")
+private val MARKDOWN_EXTENSIONS = setOf("md", "markdown")
+
+/** What the import filters take: a PDF becomes a note on its pages, markdown a note of its text. */
+private val IMPORT_TYPES = MARKDOWN_TYPES + "application/pdf"
 
 /** Queries the storage provider for a document's user-visible file name, if available. */
 private fun displayNameOf(resolver: android.content.ContentResolver, uri: Uri): String? = runCatching {

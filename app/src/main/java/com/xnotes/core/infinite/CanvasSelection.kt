@@ -11,6 +11,7 @@ import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.TransformItems
+import com.xnotes.core.model.AudioItem
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.FunctionSpec
@@ -114,13 +115,15 @@ class CanvasSelection(private val doc: InfiniteDocument) {
     /** The resize handles, in content space; a shape that keeps its aspect gets corners only. */
     fun handles(screenMargin: Double = 0.0): List<ResizeHandle> {
         val all = chromeBox(screenMargin)?.let { ResizeMath.obbHandles(it) } ?: return emptyList()
+        // A pill scales by its corners and lengthens by its sides; nothing stretches it upright.
+        if (items.all { it is AudioItem }) return all.filter { it.id != HandleId.T && it.id != HandleId.B }
         val square = (items.singleOrNull() as? ShapeItem)?.shape?.keepsAspect == true
         return if (square) all.filter { it.id in CORNERS } else all
     }
 
     /** The rotate grip's centre, [arm] content pixels past the box's top edge. */
     fun rotateGrip(arm: Double, screenMargin: Double = 0.0): Pt? =
-        chromeBox(screenMargin)?.let { ResizeMath.obbRotateGrip(it, arm) }
+        if (items.any { it is AudioItem }) null else chromeBox(screenMargin)?.let { ResizeMath.obbRotateGrip(it, arm) }
 
     /** The move grip under a selection too small to grab by its body, seen at [zoom], or null. */
     fun moveGrip(zoom: Double, arm: Double, screenMargin: Double = 0.0): Pt? =
@@ -249,6 +252,8 @@ class CanvasSelection(private val doc: InfiniteDocument) {
         val result = ResizeMath.obbResize(from, handle, pointer, margin)
         box = result.obb
         applyLive(result.transform)
+        // A pill stops at its smallest by itself, so its box is read back from it.
+        if (items.all { it is AudioItem }) box = boxOf(items)
     }
 
     /**

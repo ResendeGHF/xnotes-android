@@ -78,6 +78,12 @@ class FlowTextController(
     /** Whether "/" opens the command menu (the text tool's Slash commands toggle). */
     var slashCommands = true
 
+    /** The colour typed ==text== highlights in: the one selected on the toolbar. */
+    var highlight: () -> Rgba = { CharStyle.DEFAULT_HIGHLIGHT }
+
+    /** Claims Enter while the emoji completion is open, so the host puts in its top emoji. */
+    var onEmojiEnter: () -> Boolean = { false }
+
     /** Claims Enter while the slash menu is open, so the host commits its top entry. */
     var onSlashEnter: () -> Boolean = { false }
 
@@ -433,6 +439,7 @@ class FlowTextController(
         val para = flow().paragraphs.getOrNull(r.start.para)
         if (text == "\n" && r.collapsed) {
             if (slashCommands && onSlashEnter()) return selection.end
+            if (markdownInput && onEmojiEnter()) return selection.end
             InputRules.forEnter(flow(), r.start, markdownInput)?.let { return applyRule(it, r.start) }
         }
         // The armed style is only spent on text that actually lands; a deletion keeps it.
@@ -497,7 +504,7 @@ class FlowTextController(
      */
     private fun applyRule(rule: InputRules.Rule, at: FlowPos): FlowPos {
         flushBurst()
-        val result = InputRules.apply(flow(), at, rule)
+        val result = InputRules.apply(flow(), at, rule, highlight())
         mirrorStale = true
         commitEdit(result.command, result.caret)
         pendingStyle = result.pending

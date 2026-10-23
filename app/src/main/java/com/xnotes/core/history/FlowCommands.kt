@@ -2,6 +2,7 @@ package com.xnotes.core.history
 
 import com.xnotes.core.model.Document
 import com.xnotes.core.model.Page
+import com.xnotes.core.text.FlowQuote
 import com.xnotes.core.text.FlowTable
 import com.xnotes.core.text.ListKind
 import com.xnotes.core.text.ParaAlign
@@ -25,6 +26,10 @@ class ParaSnapshot private constructor(
     private val table: FlowTable?,
     private val cellStart: Boolean,
     private val headingLevel: Int,
+    private val rule: Boolean,
+    private val breakBefore: Boolean,
+    private val listStart: Int?,
+    private val quote: FlowQuote?,
 ) {
     fun applyTo(para: Paragraph) {
         para.runs.clear()
@@ -38,6 +43,10 @@ class ParaSnapshot private constructor(
         para.table = table
         para.cellStart = cellStart
         para.headingLevel = headingLevel
+        para.rule = rule
+        para.breakBefore = breakBefore
+        para.listStart = listStart
+        para.quote = quote
         para.touch()
     }
 
@@ -46,7 +55,8 @@ class ParaSnapshot private constructor(
         align == para.align && indent == para.indent && list == para.list &&
             checked == para.checked && codeLang == para.codeLang &&
             table === para.table && cellStart == para.cellStart &&
-            headingLevel == para.headingLevel &&
+            headingLevel == para.headingLevel && rule == para.rule && breakBefore == para.breakBefore &&
+            listStart == para.listStart && quote === para.quote &&
             runs.size == para.runs.size &&
             runs.indices.all { runs[it].text == para.runs[it].text && runs[it].style == para.runs[it].style }
 
@@ -54,7 +64,7 @@ class ParaSnapshot private constructor(
         fun of(para: Paragraph): ParaSnapshot = ParaSnapshot(
             para.runs.map { it.deepCopy() },
             para.align, para.indent, para.list, para.checked, para.codeLang, para.table, para.cellStart,
-            para.headingLevel,
+            para.headingLevel, para.rule, para.breakBefore, para.listStart, para.quote,
         )
     }
 }
