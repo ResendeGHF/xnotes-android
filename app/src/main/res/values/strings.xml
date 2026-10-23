@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name" translatable="false">xnotes</string>
+    <string name="app_name" translatable="false">Notes</string>
 
     <!-- Tools and toolbar items -->
     <string name="tool_pen">Pen</string>
@@ -20,6 +20,8 @@
     <string name="tool_text">Text</string>
     <string name="tool_text_box">Text box</string>
     <string name="tool_markup">PDF text markup</string>
+    <string name="tool_reader">Reader</string>
+    <string name="reader_exit">Exit reader</string>
     <string name="markup_highlight">Highlight</string>
     <string name="markup_squiggly">Squiggly</string>
     <string name="markup_colour">Colour</string>
@@ -68,6 +70,8 @@
     <string name="caption_tip_width">Tip width percentage</string>
     <string name="caption_width">Width</string>
     <string name="caption_scale">Scale</string>
+    <string name="caption_snap_to_shapes">Snap to shapes</string>
+    <string name="caption_select_whole_items">Only fully enclosed items</string>
     <string name="caption_dash">Dash</string>
     <string name="caption_gap">Gap</string>
     <string name="caption_intensity">Intensity</string>
@@ -133,6 +137,7 @@
     <string name="title_shape">Shape</string>
     <string name="shape_line">Line</string>
     <string name="shape_arrow">Arrow</string>
+    <string name="shape_spline">Smooth curve</string>
     <string name="shape_rectangle">Rectangle</string>
     <string name="shape_ellipse">Ellipse</string>
     <string name="shape_circle">Circle</string>
@@ -209,6 +214,7 @@
     <string name="shape_callout_line">Line callout</string>
     <string name="shape_burst">Burst</string>
     <string name="shape_page_solids_math">3D &amp; math</string>
+    <string name="shape_page_functions">Functions</string>
     <string name="shape_solid_cube">Cube</string>
     <string name="shape_solid_cylinder">Cylinder</string>
     <string name="shape_solid_cone">Cone</string>
@@ -271,6 +277,9 @@
     <string name="caption_cells">Cells</string>
     <string name="count_fewer">Fewer</string>
     <string name="count_more">More</string>
+    <string name="title_table">Table</string>
+    <string name="caption_columns">Columns</string>
+    <string name="caption_rows">Rows</string>
     <string name="caption_fill">Fill</string>
     <string name="caption_perfect">Perfect</string>
     <string name="caption_opacity">Opacity</string>
@@ -382,12 +391,16 @@
     <string name="pref_next_note_named">The next note would be named %1$s</string>
     <string name="pref_side_margin_px">"Side margin  %1$d px"</string>
     <string name="pref_max_cache_px">"Max cache resolution  %1$d px"</string>
+    <string name="pref_hidden_shapes">Shapes and connectors in the shape tool</string>
+    <string name="pref_hidden_shapes_help">Untick a page to hide all of its chips, or tap a chip to hide just that one.</string>
     <string name="pref_toolbar_colours_n">"Colours on the toolbar  %1$d"</string>
 
     <!-- Home screen and explorer -->
     <string name="collapse_sidebar">Collapse sidebar</string>
     <string name="home">Home</string>
     <string name="new_note">New note</string>
+    <string name="new_tab">New tab</string>
+    <string name="close_tab">Close tab</string>
     <string name="new_note_in">New note in %1$s</string>
     <string name="close_new_note">Close without creating</string>
     <string name="cover">Cover</string>
@@ -400,7 +413,7 @@
     <string name="templates_built_in">Built-in</string>
     <string name="templates_examples">Examples</string>
     <string name="templates_imported">Imported</string>
-    <string name="templates_imported_help">Kept in your notes folder, so they sync with your notes.</string>
+    <string name="templates_imported_help">Kept in your notes folder, so they stay with your notes.</string>
     <string name="cover_designs">Designs</string>
     <string name="import_template_file">Import template</string>
     <string name="page_from_image">Page template from image</string>
@@ -465,6 +478,46 @@
     <string name="folder_name">Folder name</string>
     <string name="delete_confirm_title">Delete?</string>
     <string name="search_notes">Search notes</string>
+    <string name="search_settings">Search settings</string>
+    <string name="search_keywords_port">Port old notes shapes axes number line curve function graph upgrade check</string>
+    <string name="pref_port">Port old notes</string>
+    <string name="pref_port_help">Earlier notes versions drew the X-Y axes, the number line, the smooth curve and function graphs as shapes of their own. Notes open with these turned into today\'s shapes, but the files keep the old ones until they are saved again. Scan finds them and Port rewrites them. Each file is checked after it is written, and its old copy is kept first. A file that does not check out, or that changes meanwhile, is left as it was. Notes open in an editor are skipped.</string>
+    <string name="port_scan">Scan</string>
+    <string name="port_run">Port</string>
+    <string name="port_scanning">Scanning...</string>
+    <string name="port_no_root">Pick a notes folder first.</string>
+    <string name="port_none">No notes need porting.</string>
+    <string name="port_found">%1$d notes hold %2$d old shapes.</string>
+    <string name="port_progress">Porting %1$d of %2$d...</string>
+    <string name="port_done">Ported %1$d, failed %2$d, skipped %3$d open.</string>
+    <string name="port_failed_list">Not ported, left as they were: %1$s</string>
+    <string name="port_skipped_list">Open in an editor, close and scan again: %1$s</string>
+    <string name="port_backups">Old copies are kept in %1$s</string>
+    <string name="pref_backup">Backup</string>
+    <string name="pref_backup_help">Save all settings, pens, toolbars, fonts, templates and stickers to one file, or load them from one.</string>
+    <string name="export_settings">Export settings</string>
+    <string name="import_settings">Import settings</string>
+    <string name="import_settings_confirm">Replace the current settings with the ones in this file?</string>
+    <string name="replace">Replace</string>
+    <string name="settings_exported">Settings exported</string>
+    <string name="settings_imported">Settings imported</string>
+    <string name="err_export_settings">Could not export the settings.</string>
+    <string name="err_import_settings">That file does not hold notes settings.</string>
+    <string name="insert_from_file">Insert from file...</string>
+    <string name="add_image_page">Add image page...</string>
+    <string name="add_photo_page">Photo as new page</string>
+    <string name="take_photo">Take photo</string>
+    <string name="image_as_page">Image as new page...</string>
+    <string name="import_into_note">Import into this note...</string>
+    <string name="imported_into_note">Added to the note</string>
+    <string name="err_no_camera">No camera app is available.</string>
+    <string name="merge_notes">Merge notes</string>
+    <string name="merge">Merge</string>
+    <string name="merged_name">%1$s merged</string>
+    <string name="merge_trash_originals">Move the originals to trash</string>
+    <string name="err_merge_notes">Could not merge the notes.</string>
+    <string name="find_in_page">Find in page</string>
+    <string name="find_close">Close search</string>
     <string name="clear_search">Clear search</string>
     <string name="search">Search</string>
     <string name="find_in_note">Find in note</string>
@@ -658,6 +711,9 @@
     <string name="back_save_as">"‹  Save as"</string>
     <string name="add_page">Add page</string>
     <string name="insert_pdf">Insert PDF</string>
+    <string name="add_landscape_page">Add landscape page</string>
+    <string name="add_portrait_page">Add portrait page</string>
+    <string name="add_ellipsis">Add...</string>
     <string name="erase_page">Erase page</string>
     <string name="share_ellipsis">Share…</string>
     <string name="save_as_ellipsis">Save as…</string>
@@ -727,7 +783,6 @@
     <string name="markdown_shortcuts">Markdown shortcuts</string>
     <string name="slash_commands">Slash commands</string>
     <string name="equation">Equation</string>
-    <string name="select_latex_first">Select the LaTeX to set as an equation</string>
     <string name="insert_date">Date</string>
     <string name="insert_time">Time</string>
     <string name="done">Done</string>
@@ -773,6 +828,8 @@
     <!-- Colour picker -->
     <string name="swatches">Swatches</string>
     <string name="spectrum">Spectrum</string>
+    <string name="eyedropper">Pick a colour from the screen</string>
+    <string name="eyedropper_hint">Touch a colour to pick it</string>
     <string name="caption_recent">Recent</string>
 
     <!-- Canvas and storage -->
@@ -973,6 +1030,7 @@
     <string name="pref_default_layout">Default layout</string>
     <string name="pref_switcher_layouts">Layouts in the switcher</string>
     <string name="pref_sidebar_sections">Sidebar sections</string>
+    <string name="sidebar_files">Files</string>
     <string name="pref_home_opens_to">Home opens to</string>
     <string name="last_folder">Last folder</string>
     <string name="recent_and_pinned">Recent &amp; pinned</string>
@@ -1024,6 +1082,32 @@
     <string name="material_style_clean_description">Colourful accents with untinted neutral backgrounds.</string>
     <string name="material_style_muted_description">Subtle colour with neutral surfaces.</string>
     <string name="material_style_grayscale_description">No colour tint. Your chosen colour is kept for other styles.</string>
+
+    <!-- notes fork additions -->
+    <string name="tool_table">Table</string>
+    <string name="import_file">Import file</string>
+    <string name="kind_read_only_file">Read-only file</string>
+    <string name="kind_read_only_files">Read-only files</string>
+    <string name="kind_no_read_only_files">No read-only files here.</string>
+    <string name="pref_hide_dot_items">Hide dot files and folders (.obsidian, .git)</string>
+    <string name="view_hide_dot_items">Hide dot files and folders</string>
+    <string name="view_hide_dot_items_hint">Names starting with a dot, like .obsidian. Applies to every folder.</string>
+    <string name="reader_read_only">Read only</string>
+    <string name="reader_open_failed">Couldn\'t open this file.</string>
+    <string name="reader_link_missing">Couldn\'t find \"%1$s\" in this folder.</string>
+    <string name="reader_slide">Slide %1$d of %2$d</string>
+    <string name="reader_notes">Notes</string>
+    <string name="reader_rows_truncated">Showing the first %1$d rows.</string>
+    <string name="reader_image">image</string>
+    <string name="reader_empty">This file is empty.</string>
+    <string name="reader_close">Close reader</string>
+    <string name="reader_switch_to_light">Switch to light</string>
+    <string name="reader_switch_to_dark">Switch to dark</string>
+    <string name="reader_zoom_reset">Reset zoom</string>
+    <string name="convert_to_note">Convert to note</string>
+    <string name="converting_to_note">Converting to note...</string>
+    <string name="err_convert_to_note">Couldn\'t convert that file.</string>
+    <string name="reader_truncated_cells">Showing the first %1$d rows and %2$d columns of this sheet.</string>
     <string name="material_contrast">"Contrast  %1$s"</string>
     <string name="pref_corners">Corners</string>
     <string name="corners_sharp">Sharp</string>
@@ -1037,4 +1121,145 @@
     <string name="toolbar_size_compact">Compact</string>
     <string name="toolbar_size_regular">Regular</string>
     <string name="toolbar_size_comfortable">Comfortable</string>
+
+    <!-- math studio -->
+    <string name="math_studio">Math Studio</string>
+    <string name="math_subtitle">Calculator, plots, fields, calculus and reference</string>
+    <string name="math_close">Close Math Studio</string>
+    <string name="math_reference_count">%1$d functions · %2$d constants</string>
+    <string name="math_toolbar">Math Studio</string>
+
+    <string name="math_tab_calculator">Calculator</string>
+    <string name="math_tab_graph2d">2D plot</string>
+    <string name="math_tab_graph3d">3D plot</string>
+    <string name="math_tab_fields">Fields</string>
+    <string name="math_tab_calculus">Calculus</string>
+    <string name="math_tab_symbolic">Symbolic</string>
+    <string name="math_tab_units">Units</string>
+    <string name="math_tab_catalog">Reference</string>
+
+    <string name="math_expression">Expression</string>
+    <string name="math_evaluate">Evaluate</string>
+    <string name="math_clear">Clear</string>
+    <string name="math_clear_history">Clear history</string>
+    <string name="math_history">History</string>
+    <string name="math_no_history">Nothing yet. Evaluations, assignments and answers appear here.</string>
+    <string name="math_calculator_hint">Assign with x = 3, reuse the last answer as ans, and switch DEG/RAD for trigonometric functions. Complex values use i, for example exp(i*pi).</string>
+    <string name="math_angle_deg">DEG</string>
+    <string name="math_angle_rad">RAD</string>
+
+    <string name="math_reset_view">Reset view</string>
+    <string name="math_toggle_grid">Toggle grid</string>
+    <string name="math_insert_graph">Insert graph</string>
+    <string name="math_inserted">Graph inserted</string>
+    <string name="math_insert_failed">Could not build the graph image</string>
+    <string name="math_remove">Remove</string>
+    <string name="math_compute">Compute</string>
+    <string name="math_error">Error</string>
+    <string name="math_variable">Variable</string>
+    <string name="math_at">At</string>
+    <string name="math_order">Order</string>
+    <string name="math_from">From</string>
+    <string name="math_to">To</string>
+    <string name="math_left">Left</string>
+    <string name="math_right">Right</string>
+    <string name="math_guess">Guess</string>
+    <string name="math_no_convergence">did not converge</string>
+
+    <string name="math_2d_cartesian">Cartesian</string>
+    <string name="math_2d_polar">Polar</string>
+    <string name="math_2d_parametric">Parametric</string>
+    <string name="math_2d_implicit">Implicit</string>
+    <string name="math_2d_complex">Complex</string>
+    <string name="math_2d_hint_cartesian">Drag to pan and pinch to zoom. Real values are plotted; points with a significant imaginary part are left as gaps.</string>
+    <string name="math_2d_hint_polar">r = f(θ). Each turn spans 2π; raise the turn count for spirals and multi-lobed curves.</string>
+    <string name="math_2d_hint_parametric">x(t) and y(t) are sampled together over the visible parameter window. Use trig for circles, Lissajous figures and epitrochoids.</string>
+    <string name="math_2d_hint_implicit">Enter f(x, y) = 0. Marching squares traces every zero contour in the current view.</string>
+    <string name="math_2d_hint_complex">Domain colouring: hue is the argument and brightness is the magnitude of f(z). Real and imaginary parts share the same grid.</string>
+    <string name="math_2d_r_theta">r%1$d(θ)</string>
+    <string name="math_2d_f_x">f%1$d(x)</string>
+    <string name="math_2d_add">Add curve</string>
+    <string name="math_2d_turns">Turns</string>
+    <string name="math_2d_x_t">x(t)</string>
+    <string name="math_2d_y_t">y(t)</string>
+    <string name="math_2d_implicit_equation">f(x, y) = 0</string>
+    <string name="math_2d_complex_function">f(z)</string>
+    <string name="math_2d_phase_legend">hue = arg f, brightness = |f|</string>
+    <string name="math_ramp_magnitude">colour = magnitude</string>
+    <string name="math_ramp_height">colour = value</string>
+
+    <string name="math_3d_real_surface">Real surface</string>
+    <string name="math_3d_complex_surface">Complex surface</string>
+    <string name="math_3d_function_xy">z = f(x, y)</string>
+    <string name="math_3d_complex_function">f(z), z = x + iy</string>
+    <string name="math_3d_range">Range ±</string>
+    <string name="math_3d_resolution">Resolution</string>
+    <string name="math_3d_computing">Computing…</string>
+    <string name="math_3d_hint_real">Orbit with one finger, pinch to zoom. Height is mapped to colour so ridges and wells stay readable.</string>
+    <string name="math_3d_hint_complex">Choose the real part, imaginary part, magnitude or argument of f(x + iy) to build the surface.</string>
+    <string name="math_component_real">Re</string>
+    <string name="math_component_imag">Im</string>
+    <string name="math_component_magnitude">|f|</string>
+    <string name="math_component_argument">arg f</string>
+
+    <string name="math_field_scalar_2d">Scalar 2D</string>
+    <string name="math_field_vector_2d">Vector 2D</string>
+    <string name="math_field_scalar_3d">Scalar 3D</string>
+    <string name="math_field_vector_3d">Vector 3D</string>
+    <string name="math_field_scalar_function">f(x, y)</string>
+    <string name="math_field_scalar_function_xyz">f(x, y, z)</string>
+    <string name="math_field_grid">Grid</string>
+    <string name="math_field_density">Density</string>
+    <string name="math_field_level">Level</string>
+    <string name="math_field_probe">Probe</string>
+
+    <string name="math_tool_derivative">Derivative</string>
+    <string name="math_tool_integral">Integral</string>
+    <string name="math_tool_ode">ODE</string>
+    <string name="math_tool_root">Root</string>
+    <string name="math_tool_limit">Limit</string>
+    <string name="math_tool_series">Series</string>
+    <string name="math_tool_graph">Plot</string>
+    <string name="math_integral_adaptive">Adaptive Simpson</string>
+    <string name="math_integral_gauss">Gauss–Legendre</string>
+    <string name="math_integral_romberg">Romberg</string>
+    <string name="math_root_bisection">Bisection</string>
+    <string name="math_root_newton">Newton</string>
+    <string name="math_root_secant">Secant</string>
+    <string name="math_root_result">Root</string>
+    <string name="math_hint_derivative">Uses a high-order central difference. Set the order to 0 to sample f itself.</string>
+    <string name="math_hint_integral">Adaptive Simpson and Romberg report an estimated error; Gauss–Legendre is fixed-order and fast for smooth integrands.</string>
+    <string name="math_hint_ode">Write dy/dx = f(x, y). RK45 adapts its step; Euler and RK4 use a fixed step count.</string>
+    <string name="math_hint_root">Bisection needs a sign change on [left, right]; Newton and secant start from the guess and bracket values.</string>
+    <string name="math_hint_limit">Samples both sides of the target and reports a stable two-sided limit when one exists.</string>
+    <string name="math_hint_series">Sums a(n) over the integer range and plots the running partial sum. Large ranges are sampled for the plot.</string>
+
+    <string name="math_symbolic_expression">Expression</string>
+    <string name="math_symbolic_derivative">d/dx</string>
+    <string name="math_symbolic_second">d²/dx²</string>
+    <string name="math_symbolic_integral">∫ dx</string>
+    <string name="math_symbolic_simplify">Simplify</string>
+    <string name="math_symbolic_expand">Expand</string>
+    <string name="math_symbolic_taylor">Taylor</string>
+    <string name="math_symbolic_solve">Solve</string>
+    <string name="math_symbolic_limit">Limit</string>
+    <string name="math_symbolic_result">Result</string>
+    <string name="math_hint_symbolic">Taylor expands about the value in At using the given order. Solve finds polynomial roots in the complex plane; the LaTeX line can be pasted into notes.</string>
+
+    <string name="math_units_category">Category</string>
+    <string name="math_units_value">Value</string>
+    <string name="math_units_from">From</string>
+    <string name="math_units_to">To</string>
+    <string name="math_units_swap">Swap units</string>
+    <string name="math_units_result">Converted</string>
+    <string name="math_units_equivalents">Equivalents</string>
+    <string name="math_units_bad_value">Enter a numeric value to convert.</string>
+    <string name="math_hint_units">Conversions are exact where the definitions are exact, including SI prefixes, imperial lengths and astronomical distances.</string>
+
+    <string name="math_catalog_search">Search functions and constants</string>
+    <string name="math_catalog_all">All</string>
+    <string name="math_catalog_count">%1$d entries</string>
+    <string name="math_catalog_constants">Constants</string>
+    <string name="math_catalog_functions">Functions</string>
+    <string name="math_catalog_empty">No function or constant matches that search.</string>
 </resources>

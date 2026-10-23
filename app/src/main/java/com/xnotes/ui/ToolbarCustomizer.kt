@@ -18,6 +18,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoStories
+import androidx.compose.material.icons.outlined.Functions
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -444,6 +447,7 @@ private fun itemIcon(item: ToolbarItem): ImageVector = when (item) {
     ToolbarItem.HIGHLIGHTER -> ImageVector.vectorResource(R.drawable.ic_stroke_highlighter)
     ToolbarItem.ERASER -> XnotesIcons.eraser
     ToolbarItem.PAN -> XnotesIcons.pan
+    ToolbarItem.READER -> Icons.Outlined.AutoStories
     ToolbarItem.SELECT -> XnotesIcons.select
     ToolbarItem.LASSO -> XnotesIcons.lasso
     ToolbarItem.SCREENSHOT -> XnotesIcons.scissors
@@ -454,9 +458,11 @@ private fun itemIcon(item: ToolbarItem): ImageVector = when (item) {
     ToolbarItem.TEXT_BOX -> XnotesIcons.textBox
     ToolbarItem.MARKUP -> XnotesIcons.markup
     ToolbarItem.IMAGE -> XnotesIcons.image
+    ToolbarItem.TABLE -> XnotesIcons.table
     ToolbarItem.UNDO -> XnotesIcons.undo
     ToolbarItem.REDO -> XnotesIcons.redo
     ToolbarItem.PAGE_NAV -> XnotesIcons.prev
+    ToolbarItem.SEARCH -> XnotesIcons.search
     ToolbarItem.STYLES -> XnotesIcons.sliders
     ToolbarItem.MARGINS -> XnotesIcons.margins
     ToolbarItem.VIEW -> XnotesIcons.view
@@ -467,4 +473,5 @@ private fun itemIcon(item: ToolbarItem): ImageVector = when (item) {
     ToolbarItem.COLORS -> XnotesIcons.more
     ToolbarItem.WAYPOINTS -> XnotesIcons.bookmark
     ToolbarItem.MINIMAP -> XnotesIcons.map
+    ToolbarItem.MATH -> Icons.Outlined.Functions
 }

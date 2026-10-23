@@ -21,6 +21,9 @@ enum class ToolbarItem(val id: String) {
     HIGHLIGHTER("highlighter"),
     ERASER("eraser"),
     PAN("pan"),
+
+    /** Switches a paged note to reading: the bar shrinks to reading controls and nothing edits. */
+    READER("reader"),
     SELECT("select"),
     LASSO("lasso"),
     SCREENSHOT("screenshot"),
@@ -33,9 +36,11 @@ enum class ToolbarItem(val id: String) {
     /** The text markup tool; only notes with a PDF show it. */
     MARKUP("markup"),
     IMAGE("image"),
+    TABLE("table"),
     UNDO("undo"),
     REDO("redo"),
     PAGE_NAV("page_nav"),
+    SEARCH("search"),
     STYLES("styles"),
     MARGINS("margins"),
     VIEW("view"),
@@ -49,7 +54,10 @@ enum class ToolbarItem(val id: String) {
     WAYPOINTS("waypoints"),
 
     /** Canvas only: the overview map in the corner. */
-    MINIMAP("minimap");
+    MINIMAP("minimap"),
+
+    /** The full maths workspace, on both the note bar and the canvas bar. */
+    MATH("math");
 
     companion object {
         fun fromId(id: String?): ToolbarItem? = entries.firstOrNull { it.id == id }
@@ -152,7 +160,11 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
             ToolbarItem.VIEW to ToolbarItem.STYLES,
             ToolbarItem.MARGINS to ToolbarItem.STYLES,
             ToolbarItem.WAND to ToolbarItem.LASSO,
+            ToolbarItem.TABLE to ToolbarItem.IMAGE,
+            ToolbarItem.SEARCH to ToolbarItem.PAGE_NAV,
             ToolbarItem.MARKUP to ToolbarItem.TEXT_BOX,
+            ToolbarItem.READER to ToolbarItem.PAN,
+            ToolbarItem.MATH to ToolbarItem.SHAPE,
         )
 
         /**
@@ -170,9 +182,10 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
             ToolbarItem.IMAGE, ToolbarItem.COLORS, ToolbarItem.UNDO, ToolbarItem.REDO,
             ToolbarItem.STYLES, ToolbarItem.WAYPOINTS, ToolbarItem.MINIMAP,
             ToolbarItem.ZOOM, ToolbarItem.FIT, ToolbarItem.ZOOM_LOCK,
+            ToolbarItem.MATH,
         )
 
-        /** Everything the paged bar can hold: the whole enum bar the two canvas-only additions. */
+        /** Everything the paged bar can hold: the whole enum bar the canvas-only additions. */
         val NOTE_ITEMS: Set<ToolbarItem> =
             ToolbarItem.entries.toSet() - setOf(ToolbarItem.WAYPOINTS, ToolbarItem.MINIMAP)
 
@@ -184,12 +197,12 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
                 ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
             ),
-            listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
-            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
-            listOf(ToolbarItem.IMAGE),
+            listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
+            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE, ToolbarItem.MATH, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
+            listOf(ToolbarItem.IMAGE, ToolbarItem.TABLE),
             listOf(ToolbarItem.COLORS),
             listOf(ToolbarItem.UNDO, ToolbarItem.REDO),
-            listOf(ToolbarItem.PAGE_NAV, ToolbarItem.STYLES, ToolbarItem.MARGINS, ToolbarItem.VIEW),
+            listOf(ToolbarItem.PAGE_NAV, ToolbarItem.SEARCH, ToolbarItem.STYLES, ToolbarItem.MARGINS, ToolbarItem.VIEW),
             listOf(ToolbarItem.ZOOM, ToolbarItem.FIT, ToolbarItem.ZOOM_LOCK),
             listOf(ToolbarItem.FULLSCREEN),
         )
@@ -202,7 +215,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
             ),
             listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO),
-            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE),
+            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE, ToolbarItem.MATH),
             listOf(ToolbarItem.IMAGE),
             listOf(ToolbarItem.COLORS),
             listOf(ToolbarItem.UNDO, ToolbarItem.REDO),

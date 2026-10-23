@@ -24,11 +24,11 @@ class ToolbarLayoutTest {
             d.sections[2].entries.map { it.item },
         )
         assertEquals(
-            listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
+            listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
             d.sections[3].entries.map { it.item },
         )
         assertEquals(
-            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
+            listOf(ToolbarItem.WAND, ToolbarItem.SHAPE, ToolbarItem.MATH, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
             d.sections[4].entries.map { it.item },
         )
         assertEquals(listOf(ToolbarItem.FULLSCREEN), d.sections[10].entries.map { it.item })
@@ -198,8 +198,20 @@ class ToolbarLayoutTest {
     @Test fun theTwoBarsDoNotShareTheirOwnItems() {
         assertTrue(ToolbarItem.WAYPOINTS !in ToolbarLayout.NOTE_ITEMS)
         assertTrue(ToolbarItem.MINIMAP !in ToolbarLayout.NOTE_ITEMS)
+        assertTrue(ToolbarItem.MATH !in ToolbarLayout.NOTE_ITEMS)
+        assertTrue(ToolbarItem.MATH in ToolbarLayout.CANVAS_ITEMS)
         assertTrue(ToolbarItem.PAGE_NAV !in ToolbarLayout.CANVAS_ITEMS)
         assertTrue(ToolbarItem.TEXT !in ToolbarLayout.CANVAS_ITEMS)
+    }
+
+    @Test fun missingMathSlotsInAfterShape() {
+        // A canvas layout stored before the maths workspace appeared gains it beside Shape.
+        val raw = ToolbarLayout.CANVAS_DEFAULT.toRaw()
+            .map { s -> s.filterNot { it.first == ToolbarItem.MATH.id } }
+        val back = ToolbarLayout.fromRaw(raw, ToolbarLayout.CANVAS_ITEMS, ToolbarLayout.CANVAS_DEFAULT)
+        val sec = back.sections.first { s -> s.entries.any { it.item == ToolbarItem.SHAPE } }
+        val items = sec.entries.map { it.item }
+        assertEquals(items.indexOf(ToolbarItem.SHAPE) + 1, items.indexOf(ToolbarItem.MATH))
     }
 
     @Test fun theCanvasDefaultRoundTripsThroughRaw() {

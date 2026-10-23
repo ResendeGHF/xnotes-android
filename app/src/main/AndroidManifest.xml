@@ -5,6 +5,8 @@
          it, so a device without it keeps the rest of the app. -->
     <uses-feature android:glEsVersion="0x00030000" android:required="false" />
 
+    <!-- The optional handwritten-maths add-on is downloaded on demand. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- The apps that act on selected text ("Translate", "Search"), listed in a PDF text
          selection's menu; Android 11 and later hide them from apps that do not ask. -->
     <queries>

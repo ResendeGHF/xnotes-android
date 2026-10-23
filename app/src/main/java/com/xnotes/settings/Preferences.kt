@@ -40,6 +40,10 @@ data class Preferences(
     val zoomLockPan: String = "single",
     /** Whether holding a freehand ink stroke still snaps it to a recognized shape. */
     val detectShapes: Boolean = true,
+    /** Whether rotating a selection snaps to the nearest 90 degrees. */
+    val snapRotation90: Boolean = false,
+    /** Language for handwriting-to-text (Convert to text): BCP-47 tag, "pt-BR" (Brazilian Portuguese) | "en" (English). */
+    val ocrLanguage: String = "pt-BR",
     /** Tool the stylus side button activates while held; "none" disables it. */
     val penButtonTool: String = "eraser",
     /** Whether the side-button tool also activates during hover (no contact needed); eraser/pan only. */
@@ -55,10 +59,6 @@ data class Preferences(
      *  key press rather than a held state, e.g. HONOR Magic-Pencil whose click arrives as keycode
      *  333); "none" (default) disables it. */
     val stylusButtonTap: String = "none",
-    /** Action mapped to the first page-key side button (keycode 92); "none" disables it. */
-    val stylusButton1Tap: String = "none",
-    /** Action mapped to the second page-key side button (keycode 93); "none" disables it. */
-    val stylusButton2Tap: String = "none",
     /** Horizontal margin (px) on each side of the page column; 0 ⇒ fit-width fills the screen. */
     val sideMargin: Double = 16.0,
     /** Whether the hairline outline around every page is left undrawn. */
@@ -97,6 +97,8 @@ data class Preferences(
     val sidebarPinned: Boolean = true,
     val sidebarColours: Boolean = true,
     val sidebarTrash: Boolean = true,
+    val sidebarFiles: Boolean = true,
+    val sidebarAbout: Boolean = true,
     /** Where Home opens: "top" (the notes folder), "last" (the folder last shown) or "shelves" (the notes folder under Recent and Pinned). */
     val homeOpensTo: String = "top",
     /** How the explorer writes dates: "relative" (2 days ago), "day" (Wed 17:30) or "date" (16 Sep 2026). */
@@ -109,15 +111,22 @@ data class Preferences(
     val perFolderViews: Boolean = false,
     val showFolderCounts: Boolean = true,
     val showExtensions: Boolean = false,
+    /** Hides files and folders whose name starts with a dot (.obsidian, .git) from the explorer. */
+    val hideDotItems: Boolean = true,
+    /** The reader's light/dark choice; null follows the app theme. Never written to the file. */
+    val readerDark: Boolean? = null,
     /** Whether an exported PDF gets a bookmark for each heading of the note's text. */
     val pdfHeadingBookmarks: Boolean = true,
+    /** Shape chips and picker pages, by key, left out of the shape popup. */
+    val hiddenShapes: Set<String> = emptySet(),
 ) {
     /**
      * A new note's page size in document pixels. A named size is laid out under
-     * [defaultPageOrientation]; a custom one is taken as typed, since the two fields already say
+     * [orientation]; a custom one is taken as typed, since the two fields already say
      * which way round the page goes.
      */
-    fun newPagePixels(dpi: Int = PageSize.DEFAULT_DPI): Pair<Double, Double> = defaultPageChoice.pixels(dpi)
+    fun newPagePixels(dpi: Int = PageSize.DEFAULT_DPI, orientation: Orientation = defaultPageOrientation): Pair<Double, Double> =
+        defaultPageChoice.copy(orientation = orientation).pixels(dpi)
 
     /** The default page size, orientation and custom sides as one choice. */
     val defaultPageChoice: PageSizeChoice
@@ -137,14 +146,14 @@ data class Preferences(
         .put("finger_draws", fingerDraws)
         .put("zoom_lock_pan", zoomLockPan)
         .put("detect_shapes", detectShapes)
+        .put("snap_rotation_90", snapRotation90)
+        .put("ocr_language", ocrLanguage)
         .put("pen_button_tool", penButtonTool)
         .put("pen_button_hover", penButtonHover)
         .put("two_finger_tap", twoFingerTap)
         .put("three_finger_tap", threeFingerTap)
         .put("stylus_double_tap", stylusDoubleTap)
         .put("stylus_button_tap", stylusButtonTap)
-        .put("stylus_button_1_tap", stylusButton1Tap)
-        .put("stylus_button_2_tap", stylusButton2Tap)
         .put("side_margin", sideMargin)
         .put("hide_page_borders", hidePageBorders)
         .put("min_zoom_enabled", minZoomEnabled)
@@ -187,6 +196,8 @@ data class Preferences(
         .put("sidebar_pinned", sidebarPinned)
         .put("sidebar_colours", sidebarColours)
         .put("sidebar_trash", sidebarTrash)
+        .put("sidebar_files", sidebarFiles)
+        .put("sidebar_about", sidebarAbout)
         .put("home_opens_to", homeOpensTo)
         .put("date_style", dateStyle)
         .put("tap_previews", tapPreviews)
@@ -194,7 +205,10 @@ data class Preferences(
         .put("per_folder_views", perFolderViews)
         .put("show_folder_counts", showFolderCounts)
         .put("show_extensions", showExtensions)
+        .put("hide_dot_items", hideDotItems)
+        .apply { readerDark?.let { put("reader_dark", it) } }
         .put("pdf_heading_bookmarks", pdfHeadingBookmarks)
+        .apply { if (hiddenShapes.isNotEmpty()) put("hidden_shapes", org.json.JSONArray(hiddenShapes.sorted())) }
 
     companion object {
         val DEFAULT_ACCENT = Rgba(0, 230, 118, 255)
@@ -257,14 +271,14 @@ data class Preferences(
                 fingerDraws = o.optBoolean("finger_draws", false),
                 zoomLockPan = zoomLockPan,
                 detectShapes = o.optBoolean("detect_shapes", true),
+                snapRotation90 = o.optBoolean("snap_rotation_90", false),
+                ocrLanguage = o.optString("ocr_language", "pt-BR").takeIf { it == "en" || it == "pt-BR" } ?: "pt-BR",
                 penButtonTool = o.optString("pen_button_tool", "eraser").ifEmpty { "eraser" },
                 penButtonHover = o.optBoolean("pen_button_hover", false),
                 twoFingerTap = tapAction("two_finger_tap"),
                 threeFingerTap = tapAction("three_finger_tap"),
                 stylusDoubleTap = tapAction("stylus_double_tap"),
                 stylusButtonTap = tapAction("stylus_button_tap"),
-                stylusButton1Tap = tapAction("stylus_button_1_tap"),
-                stylusButton2Tap = tapAction("stylus_button_2_tap"),
                 sideMargin = o.optDouble("side_margin", 16.0).coerceIn(0.0, 80.0),
                 hidePageBorders = o.optBoolean("hide_page_borders", false),
                 minZoomEnabled = o.optBoolean("min_zoom_enabled", false),
@@ -290,6 +304,8 @@ data class Preferences(
                 sidebarPinned = o.optBoolean("sidebar_pinned", true),
                 sidebarColours = o.optBoolean("sidebar_colours", true),
                 sidebarTrash = o.optBoolean("sidebar_trash", true),
+                sidebarFiles = o.optBoolean("sidebar_files", true),
+                sidebarAbout = o.optBoolean("sidebar_about", true),
                 homeOpensTo = o.optString("home_opens_to", "top").let { if (it == "last" || it == "shelves") it else "top" },
                 dateStyle = o.optString("date_style", "day").let { if (it == "relative" || it == "date") it else "day" },
                 tapPreviews = o.optBoolean("tap_previews", false),
@@ -297,7 +313,10 @@ data class Preferences(
                 perFolderViews = o.optBoolean("per_folder_views", false),
                 showFolderCounts = o.optBoolean("show_folder_counts", true),
                 showExtensions = o.optBoolean("show_extensions", false),
+                hideDotItems = o.optBoolean("hide_dot_items", true),
+                readerDark = if (o.has("reader_dark")) o.optBoolean("reader_dark") else null,
                 pdfHeadingBookmarks = o.optBoolean("pdf_heading_bookmarks", true),
+                hiddenShapes = o.optJSONArray("hidden_shapes")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).ifEmpty { null } }.toSet() }.orEmpty(),
             )
         }
     }

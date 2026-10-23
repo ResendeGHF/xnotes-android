@@ -22,13 +22,14 @@ android {
     ndkVersion = "27.0.12077973"
 
     defaultConfig {
-        applicationId = "com.xnotes"
+        applicationId = "com.notes"
         minSdk = 26
         targetSdk = 36
-        versionCode = 65
-        versionName = "0.9.4"
+        versionCode = 99
+        // <upstream xnotes version>-<notes fork version>
+        versionName = "0.9.4-0.46"
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
@@ -49,6 +50,9 @@ android {
             // The tree-sitter parser tables gzip ~6x: compressed packaging keeps the
             // APK at ~12MB instead of ~30MB, at the cost of extract-on-install.
             useLegacyPackaging = true
+            // ONNX Runtime's core library is downloaded with the handwritten-maths add-on (see
+            // MathOcr); only its small JNI bridge ships in the APK.
+            excludes += "**/libonnxruntime.so"
         }
     }
 
@@ -132,11 +136,20 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.pdfbox.android)
     implementation(libs.androidsvg)
+    implementation(libs.mlkit.digital.ink)
+    implementation(libs.commonmark)
+    implementation(libs.commonmark.gfm.tables)
+    implementation(libs.commonmark.gfm.strikethrough)
+    implementation(libs.commonmark.task.list.items)
+    implementation(libs.commonmark.autolink)
     implementation(libs.latex.base)
     implementation(libs.latex.parser)
     implementation(libs.latex.renderer)
+    implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.ui.tooling)
+    implementation(libs.lottie.compose)
 
     testImplementation(libs.junit)
     testImplementation(libs.json)
+    testImplementation(libs.kxml2)
 }
