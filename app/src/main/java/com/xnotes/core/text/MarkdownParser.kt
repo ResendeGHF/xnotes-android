@@ -620,4 +620,28 @@ object MarkdownParser {
             return ParsedInline.of(MathInline(s, display), sc.position())
         }
     }
+
+    /** A line that is only a `$$` display-math fence, as the reader rewrites before CommonMark. */
+    internal val MATH_FENCE = Regex("^\\s{0,3}\\\$\\\$\\s*$")
+
+    /**
+     * The "$" span opening at [at], as its closing offset and whether it is the
+     * doubled display form, or null. Mirrors what typing the same text converts,
+     * so pasting and typing land the same paragraph.
+     */
+    internal fun mathSpan(text: String, at: Int): Pair<Int, Boolean>? {
+        val display = text.startsWith("$$", at)
+        val marker = if (display) "$$" else "$"
+        val from = at + marker.length
+        if (from >= text.length) return null
+        val close = text.indexOf(marker, from)
+        if (close < from + 1) return null
+        // Padded the same on both sides, or not padded at all: "$x$" and "$ x $"
+        // are maths, while "$5 and $10" pads only where it closes and is money.
+        if (text[from].isWhitespace() != text[close - 1].isWhitespace()) return null
+        if (text.substring(from, close).isBlank()) return null
+        // A single "$" must not close on the first half of a doubled one.
+        if (!display && close + 1 < text.length && text[close + 1] == '$') return null
+        return close to display
+    }
 }

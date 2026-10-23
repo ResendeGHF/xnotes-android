@@ -399,7 +399,7 @@ private suspend fun rasterSurface(
         alpha = 150
     }
     val labelPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-        color = theme.dim
+        this.color = theme.dim
         textSize = (min(w, h) * 0.04f).coerceIn(16f, 36f)
         typeface = android.graphics.Typeface.MONOSPACE
     }

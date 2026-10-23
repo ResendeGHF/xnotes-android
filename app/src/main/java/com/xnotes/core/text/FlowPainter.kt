@@ -367,9 +367,6 @@ object FlowPainter {
     val CODE_BG = Rgba(128, 128, 128, 42)
     val CHIP_BG = Rgba(128, 128, 128, 56)
 
-    /** Hyperlink ink: an azure that reads on both light and dark paper. */
-    val LINK_COLOR = Rgba(90, 156, 255, 255)
-
     /**
      * Chips behind a formula showing its source. Both are translucent tints so
      * they sit on light and dark paper alike, and the cool one is deliberately
