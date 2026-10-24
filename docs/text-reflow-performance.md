@@ -220,3 +220,30 @@ modified by the benchmarks. These timings isolate the chrome CPU and texture
 GPU costs; physical stylus movement at 50% zoom in landscape remains the next
 necessary validation. An 8 pt document font may still be physically tiny at
 50% zoom, which resolution improvements alone cannot remedy.
+
+### 2026-10-24: zoom-adaptive text raster, first stage
+
+- The native editable-text bitmap can now request more than 1 raster pixel per
+  document pixel, in camera-detail tiers 1x/2x/4x. The 2-million-pixel final
+  allocation limit, GL texture limit and 8192-pixel-side safety ceiling remain.
+- A viewport change schedules visible text refinement after 190 ms of inactivity.
+  Pinching and panning keep the existing uploaded quad instead of re-rasterizing
+  text per frame. Rigid moves/rotation preserve the highest available raster
+  scale; a cancelled zoom refinement is retried after the gesture.
+- The text's canonical StaticLayout and document font size are independent of
+  zoom; only the output bitmap pixel density changes. A single current raster is
+  cached by the scene and reused on zoom-out/repeated pan. A multi-tier LRU cache
+  and rendering in visible line/region tiles are **not** part of this first stage.
+- Zoom refinements only target visible text-only shapes and are queued on the
+  existing serial background raster worker, with a 25% minimum resolution gain
+  to avoid marginal replacement work.
+
+| Device-side GLES3 1x/2x/4x smoke test | 1x | 2x | 4x |
+| --- | ---: | ---: | ---: |
+| Synthetic 6-line canonical text output | 420x191 | 840x381 | 1680x761 |
+
+Nine Android instrumentation tests passed, including the zoom-detail GPU
+smoke test, plus JVM unit tests and debug APK compilation. Updated debug APK
+was reinstalled on Redmi Pad 2 (data preserved). Physical stylus pinch and
+pan tests at high zoom remain necessary; the isolated smoke test cannot
+establish actual end-to-end frame pacing.

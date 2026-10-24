@@ -62,15 +62,27 @@ internal fun isRigidTextQuadMotion(previous: DoubleArray, next: DoubleArray): Bo
         before.indices.all { near(before[it], after[it]) }
 }
 
-/** Keep narrow or tall text legible: its texture can be skinny *and* thousands of pixels long.
- *  The previous hard 1024/2048-height limits squashed a 5324px label to 19%/38% resolution.
- *  Bound total bytes, respect the device's actual GL texture limit, and give unusually narrow
- *  previews a larger (still bounded) allowance so they are not upscaled fivefold. */
+/** Text detail is view state, not font-size or line-break state. Bucket levels so a pinch
+ * does not start a new raster for every fractional zoom increment. */
+internal fun textRasterZoomTier(zoom: Double): Double = when {
+    !zoom.isFinite() || zoom <= 1.25 -> 1.0
+    zoom <= 2.5 -> 2.0
+    else -> 4.0
+}
+
+/** A little hysteresis avoids replacing an expensive GL bitmap for marginal detail gains. */
+internal fun shouldRefineTextBitmap(currentScale: Double, wantedScale: Double): Boolean =
+    currentScale.isFinite() && currentScale > 0.0 && wantedScale.isFinite() &&
+        wantedScale > currentScale * 1.25
+
+/** Keep narrow or tall text legible, bounded by a pixel budget and the actual GPU limit.
+ * High zoom may request more pixels than the document unit size, without changing layout. */
 internal fun textBitmapScale(
     width: Double,
     height: Double,
     glMaxSide: Double,
     preview: Boolean,
+    targetScale: Double = 1.0,
 ): Double {
     if (!width.isFinite() || !height.isFinite() || width <= 0 || height <= 0) return 1.0
     val longSide = max(width, height)
@@ -79,6 +91,7 @@ internal fun textBitmapScale(
     val budgetPixels = if (!preview) 2_000_000.0
         else if (extremeAspect) 1_000_000.0 else 350_000.0
     val edge = min(8192.0, glMaxSide.coerceAtLeast(2048.0))
-    return minOf(1.0, edge / width, edge / height,
+    val desired = if (targetScale.isFinite() && targetScale > 0.0) targetScale.coerceAtMost(4.0) else 1.0
+    return minOf(desired, edge / width, edge / height,
         sqrt(budgetPixels / (width * height)))
 }

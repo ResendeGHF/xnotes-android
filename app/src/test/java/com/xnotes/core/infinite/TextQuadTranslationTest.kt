@@ -91,6 +91,37 @@ class TextQuadTranslationTest {
         assertEquals(1.0, textBitmapScale(1000.0, 1000.0, 16383.0, preview = false), 1e-9)
     }
 
+    @Test fun zoomLevelsChooseStableDetailTiers() {
+        assertEquals(1.0, textRasterZoomTier(0.5), 0.0)
+        assertEquals(1.0, textRasterZoomTier(1.25), 0.0)
+        assertEquals(2.0, textRasterZoomTier(1.5), 0.0)
+        assertEquals(2.0, textRasterZoomTier(2.5), 0.0)
+        assertEquals(4.0, textRasterZoomTier(3.0), 0.0)
+        assertEquals(4.0, textRasterZoomTier(8.0), 0.0)
+        assertEquals(1.0, textRasterZoomTier(Double.NaN), 0.0)
+    }
+
+    @Test fun higherZoomRendersMorePixelsWithoutChangingDocumentGeometry() {
+        assertEquals(1.0, textBitmapScale(100.0, 50.0, 16383.0,
+            preview = false), 1e-9)
+        assertEquals(2.0, textBitmapScale(100.0, 50.0, 16383.0,
+            preview = false, targetScale = 2.0), 1e-9)
+        assertEquals(4.0, textBitmapScale(100.0, 50.0, 16383.0,
+            preview = false, targetScale = 4.0), 1e-9)
+        assertEquals(kotlin.math.sqrt(2.0), textBitmapScale(1000.0, 1000.0,
+            16383.0, preview = false, targetScale = 4.0), 1e-9)
+        assertEquals(4096.0 / 5323.5, textBitmapScale(158.69140625, 5323.5,
+            4096.0, preview = false, targetScale = 4.0), 1e-9)
+    }
+
+    @Test fun refinementsNeedMeaningfulGainAndNeverAcceptInvalidScale() {
+        assertFalse(shouldRefineTextBitmap(2.0, 2.0))
+        assertFalse(shouldRefineTextBitmap(2.0, 2.4))
+        assertTrue(shouldRefineTextBitmap(1.0, 2.0))
+        assertFalse(shouldRefineTextBitmap(0.0, 2.0))
+        assertFalse(shouldRefineTextBitmap(1.0, Double.NaN))
+    }
+
     @Test fun rotationAndInvalidCoordinatesMustRequestNewLayout() {
         assertFalse(isRigidTextQuadTranslation(original, doubleArrayOf(
             110.0, 20.0, 110.0, 120.0, 50.0, 20.0, 50.0, 120.0)))

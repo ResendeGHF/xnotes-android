@@ -128,6 +128,37 @@ class TextPreviewGpuTest : InstrumentationTestCase() {
                 "bytes=${narrowBitmap.allocationByteCount} " +
                 "median=%.2fms p95=%.2fms uploadFrame=%.2fms".format(
                     java.util.Locale.US, narrowSorted[12], narrowSorted[21], narrowTimes[0]))
+
+            // The same canonical line layout, progressively rasterized at 1×, 2×, and 4×.
+            // Only texture pixels change; no text or document geometry is modified.
+            val zoomText = text.take(140)
+            val zoomWidth = 420.0
+            val zoomLayout = AndroidText.drawLayout(zoomText,
+                label.normalizedWidth(zoomWidth), label.normalizedFont,
+                android.graphics.Color.BLACK, ShapeLabel.FLAGS)
+            val zoomHeight = zoomLayout.height * glyphScale
+            val produced = ArrayList<String>()
+            for (target in listOf(1.0, 2.0, 4.0)) {
+                val lod = com.xnotes.core.infinite.textBitmapScale(zoomWidth, zoomHeight,
+                    scene.maxTextTextureSide, preview = false, targetScale = target)
+                val bitmap = Bitmap.createBitmap(
+                    ceil(zoomWidth * lod).toInt(), ceil(zoomHeight * lod).toInt(),
+                    Bitmap.Config.ARGB_8888)
+                Canvas(bitmap).apply {
+                    scale((lod * glyphScale).toFloat(), (lod * glyphScale).toFloat())
+                    zoomLayout.draw(this)
+                }
+                produced += "$target:${bitmap.width}x${bitmap.height}"
+                val quad = doubleArrayOf(10.0, 20.0, 10.0 + zoomWidth, 20.0,
+                    10.0, 20.0 + zoomHeight, 10.0 + zoomWidth, 20.0 + zoomHeight)
+                scene.upsertText(item, bitmap, quad, Rect(10.0, 20.0, zoomWidth, zoomHeight))
+                scene.setLift(emptyList(), LiftTransform.NONE)
+                scene.drawContent(frame.copy(zoom = target))
+                GLES30.glFinish()
+                assertEquals(GLES30.GL_NO_ERROR, GLES30.glGetError())
+                assertTrue(bitmap.allocationByteCount <= 8_400_000)
+            }
+            Log.i("XnotesZoomGPU", "tiers=${produced.joinToString()} lines=${zoomLayout.lineCount}")
         } finally {
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE,
                 EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
