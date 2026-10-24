@@ -2,21 +2,80 @@ package com.xnotes.platform
 
 import android.graphics.Path
 import android.graphics.PathMeasure
+import android.graphics.PathIterator
+import android.os.Build
+import android.annotation.TargetApi
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.vector.PathFlattener
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 
-/**
- * Glyph outlines read back out of a platform `Path`, which below API 34 cannot be read verb by
- * verb. So it is walked with a `PathMeasure` at a fine step and then decimated: the walk gives
- * exact contour boundaries, which triangulation needs to tell a counter from a bowl, and the
- * decimation puts the straight parts back to two points each.
- */
+/** Glyph contours flattened adaptively in native code, with contour breaks preserved. */
 internal object GlyphPaths {
 
     /** Every contour of [source], text [size] px tall, as a closed polyline. */
     fun contours(source: Path, size: Double): List<VectorContour> {
+        if (Build.VERSION.SDK_INT >= 34) nativeContours(source)?.let { return it }
+        return approximateContours(source, size)
+    }
+
+    @TargetApi(34)
+    private fun nativeContours(source: Path): List<VectorContour>? {
+        val iterator = source.pathIterator
+        val points = FloatArray(8)
+        val out = ArrayList<VectorContour>()
+        var start: Pt? = null
+        var segments = ArrayList<VectorSeg>()
+        fun point(i: Int) = Pt(points[i].toDouble(), points[i + 1].toDouble())
+        fun finish(closed: Boolean) {
+            start?.let { if (segments.isNotEmpty()) out += VectorContour(it, segments, closed) }
+            start = null
+            segments = ArrayList()
+        }
+        fun quadratic() {
+            val a = point(0)
+            val control = point(2)
+            val end = point(4)
+            segments += VectorSeg.Cubic(a + (control - a) * (2.0 / 3.0),
+                end + (control - end) * (2.0 / 3.0), end)
+        }
+        while (iterator.hasNext()) {
+            when (iterator.next(points, 0)) {
+                PathIterator.VERB_MOVE -> { finish(false); start = point(0) }
+                PathIterator.VERB_LINE -> segments += VectorSeg.Line(point(2))
+                PathIterator.VERB_QUAD -> quadratic()
+                PathIterator.VERB_CUBIC -> segments += VectorSeg.Cubic(point(2), point(4), point(6))
+                PathIterator.VERB_CONIC -> if (points[6] == 1f) quadratic() else return null
+                PathIterator.VERB_CLOSE -> finish(true)
+                PathIterator.VERB_DONE -> break
+                else -> return null
+            }
+        }
+        finish(false)
+        return out
+    }
+
+    internal fun approximateContours(source: Path, size: Double): List<VectorContour> {
+        // Native adaptive flattening avoids PathMeasure calls and Kotlin RDP per sample.
+        val approximation = source.approximate((size / DECIMATE_DENOMINATOR).toFloat().coerceAtLeast(0.001f))
+        val out = ArrayList<VectorContour>()
+        var ring = ArrayList<Pt>()
+        var previousFraction = -1f
+        for (i in approximation.indices step 3) {
+            val fraction = approximation[i]
+            val p = Pt(approximation[i + 1].toDouble(), approximation[i + 2].toDouble())
+            if (fraction == previousFraction && ring.isNotEmpty() && !near(ring.last(), p)) {
+                if (ring.size >= 3) out += contourOf(ring)
+                ring = ArrayList()
+            }
+            if (ring.isEmpty() || !near(ring.last(), p)) ring += p
+            previousFraction = fraction
+        }
+        if (ring.size >= 3) out += contourOf(ring)
+        return out
+    }
+
+    internal fun sampledContours(source: Path, size: Double): List<VectorContour> {
         val step = size / SAMPLES_PER_EM
         val tolerance = size / DECIMATE_DENOMINATOR
         val measure = PathMeasure(source, false)
