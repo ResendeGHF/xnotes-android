@@ -221,15 +221,15 @@ class CanvasSelectionTest {
         sel.select(listOf(item))
         sel.beginTransform()
         val preview = sel.previewResize(HandleId.BR, Pt(1.0, 1.0))!!
-        assertEquals(100.0 * (8.0 / 12.0), sel.box!!.halfW * 2.0, 1e-6)
-        assertEquals(100.0 * (8.0 / 12.0), preview.apply(Pt(100.0, 0.0)).x, 1e-6)
+        assertEquals(100.0 * (3.0 / 12.0), sel.box!!.halfW * 2.0, 1e-6)
+        assertEquals(100.0 * (3.0 / 12.0), preview.apply(Pt(100.0, 0.0)).x, 1e-6)
         sel.resizeLive(HandleId.BR, Pt(1.0, 1.0))
-        assertEquals(8.0, item.label!!.style.pointSize, 1e-6)
+        assertEquals(3.0, item.label!!.style.pointSize, 1e-6)
     }
 
     @Test fun aTextSideCannotCollapseIntoAnUnreadableColumn() {
         val item = importedText()
-        val minWidth = item.label!!.lineHeight * 5.0
+        val minWidth = item.label!!.lineHeight * 2.0
         val sel = CanvasSelection(docOf(item))
         sel.select(listOf(item))
         sel.beginTransform()

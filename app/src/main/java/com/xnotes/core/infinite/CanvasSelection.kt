@@ -18,6 +18,11 @@ import com.xnotes.core.model.GeometrySnapshot
 import com.xnotes.core.model.GlueFollow
 import com.xnotes.core.model.ShapeItem
 
+/** Allow smaller text via corner handles; this is deliberately below the toolbar's 6 pt floor. */
+private const val MIN_TEXT_CORNER_PT = 3.0
+/** Keep a small nonzero text-column width while allowing tighter reflow. */
+private const val MIN_TEXT_SIDE_LINE_HEIGHTS = 2.0
+
 /**
  * What is selected on the canvas, and the arithmetic of moving, scaling and rotating it.
  *
@@ -231,11 +236,11 @@ class CanvasSelection(private val doc: InfiniteDocument) {
             ?: return raw
         val label = text.label ?: return raw
         if (from.halfW <= 1e-6 || from.halfH <= 1e-6 || label.style.pointSize <= 0.0) return raw
-        // Editable text must not collapse into sub-readable glyphs or a two-character column.
+        // Editable text has a small font/column floor; zoom can improve sharpness, not physical size.
         // Only text-only hosts get these limits; other shapes preserve their resize behavior.
         val minScale = when (handle) {
-            in CORNERS -> (8.0 / label.style.pointSize).coerceAtMost(1.0)
-            HandleId.L, HandleId.R -> (label.lineHeight * 5.0 / (from.halfW * 2.0)).coerceAtMost(1.0)
+            in CORNERS -> (MIN_TEXT_CORNER_PT / label.style.pointSize).coerceAtMost(1.0)
+            HandleId.L, HandleId.R -> (label.lineHeight * MIN_TEXT_SIDE_LINE_HEIGHTS / (from.halfW * 2.0)).coerceAtMost(1.0)
             HandleId.T, HandleId.B -> (label.lineHeight / (from.halfH * 2.0)).coerceAtMost(1.0)
             else -> return raw
         }
