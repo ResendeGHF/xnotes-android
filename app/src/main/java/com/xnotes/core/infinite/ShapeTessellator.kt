@@ -186,26 +186,6 @@ object ShapeTessellator {
     private const val CONTOUR_PRECISION = 1024.0
 
     /** Glyph outlines as filled triangles in [color], each point put in place by [place]; null for none. */
-    private fun windingTextPart(glyphs: List<VectorContour>, color: Rgba, place: (Pt) -> Pt): MeshPart? {
-        val b = MeshBuilder()
-        for (contour in glyphs) {
-            val ring = PathFlattener.flatten(contour, GLYPH_FLATTEN)
-            if (ring.size < 3) continue
-            val firstPoint = place(ring[0])
-            val first = b.vertex(firstPoint.x, firstPoint.y)
-            var previous = first
-            for (i in 1 until ring.size) {
-                val p = place(ring[i])
-                val next = b.vertex(p.x, p.y)
-                if (i > 1) b.triangle(first, previous, next)
-                previous = next
-            }
-        }
-        // Concave fans overlap with opposite signs; the GPU's winding mask resolves them.
-        return if (b.isEmpty) null else MeshPart(b.build(), color, InkPass.NONZERO)
-    }
-
-    /** Glyph outlines as filled triangles in [color], each point put in place by [place]; null for none. */
     fun textPart(glyphs: List<VectorContour>, color: Rgba, place: (Pt) -> Pt): MeshPart? {
         if (glyphs.isEmpty()) return null
         val rings = glyphs.map { c -> PathFlattener.flatten(c, GLYPH_FLATTEN).map(place) }.filter { it.size >= 3 }

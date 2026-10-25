@@ -2,6 +2,7 @@ package com.xnotes.platform
 
 import android.opengl.EGL14
 import android.graphics.Path
+import android.graphics.PathMeasure
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -19,6 +20,7 @@ import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.TextFlags
 import com.xnotes.core.shapes.ShapeKind
 import com.xnotes.core.vector.VectorContour
+import com.xnotes.core.vector.PathFlattener
 
 /** Runs on Android: the JVM fake cannot validate native layout or glyph paths. */
 @Suppress("DEPRECATION")
@@ -34,9 +36,43 @@ class TextReflowTest : InstrumentationTestCase() {
                 if (end <= start) continue
                 val path = Path()
                 paint.getTextPath(text, start, end, layout.getLineLeft(line), layout.getLineBaseline(line).toFloat(), path)
-                addAll(GlyphPaths.sampledContours(path, paint.textSize.toDouble()))
+                addAll(sampledContours(path, paint.textSize.toDouble()))
             }
         }
+    }
+
+    /** Historical PathMeasure baseline for compatibility assertions; never shipped in main code. */
+    private fun sampledContours(source: Path, size: Double): List<VectorContour> {
+        val step = size / 64.0
+        val tolerance = size / 2000.0
+        val measure = PathMeasure(source, false)
+        val out = ArrayList<VectorContour>()
+        val at = FloatArray(2)
+        var guard = 4096
+        do {
+            val length = measure.length
+            if (length > 1e-4) {
+                val count = kotlin.math.ceil(length / step).toInt().coerceIn(2, 4096)
+                val points = ArrayList<Pt>(count + 1)
+                for (i in 0..count) {
+                    val distance = length * i / count
+                    if (measure.getPosTan(distance, at, null)) {
+                        points += Pt(at[0].toDouble(), at[1].toDouble())
+                    }
+                }
+                val thinned = PathFlattener.decimate(points, tolerance)
+                if (thinned.size >= 3) {
+                    val last = thinned.last()
+                    val first = thinned.first()
+                    val near = kotlin.math.abs(first.x - last.x) < 1e-4 &&
+                        kotlin.math.abs(first.y - last.y) < 1e-4
+                    val ring = if (near) thinned.dropLast(1) else thinned
+                    out += VectorContour(ring[0],
+                        ring.drop(1).map { VectorSeg.Line(it) }, closed = true)
+                }
+            }
+        } while (measure.nextContour() && guard-- > 0)
+        return out
     }
 
     private fun nativePath(text: String, font: FontSpec, width: Double, flags: TextFlags): Path {

@@ -1,25 +1,23 @@
 package com.xnotes.platform
 
 import android.graphics.Path
-import android.graphics.PathMeasure
 import android.graphics.PathIterator
 import android.os.Build
-import android.annotation.TargetApi
+import androidx.annotation.RequiresApi
 import com.xnotes.core.geometry.Pt
-import com.xnotes.core.vector.PathFlattener
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 
-/** Glyph contours flattened adaptively in native code, with contour breaks preserved. */
+/** Read native glyph path verbs where available, or approximate older Android paths. */
 internal object GlyphPaths {
 
-    /** Every contour of [source], text [size] px tall, as a closed polyline. */
+    /** Preserve each contour in [source]; [size] controls approximation on older Android. */
     fun contours(source: Path, size: Double): List<VectorContour> {
         if (Build.VERSION.SDK_INT >= 34) nativeContours(source)?.let { return it }
         return approximateContours(source, size)
     }
 
-    @TargetApi(34)
+    @RequiresApi(34)
     private fun nativeContours(source: Path): List<VectorContour>? {
         val iterator = source.pathIterator
         val points = FloatArray(8)
@@ -75,29 +73,6 @@ internal object GlyphPaths {
         return out
     }
 
-    internal fun sampledContours(source: Path, size: Double): List<VectorContour> {
-        val step = size / SAMPLES_PER_EM
-        val tolerance = size / DECIMATE_DENOMINATOR
-        val measure = PathMeasure(source, false)
-        val out = ArrayList<VectorContour>()
-        val at = FloatArray(2)
-        var guard = MAX_CONTOURS
-        do {
-            val length = measure.length
-            if (length > 1e-4) {
-                val count = kotlin.math.ceil(length / step).toInt().coerceIn(2, MAX_SAMPLES)
-                val pts = ArrayList<Pt>(count + 1)
-                for (i in 0..count) {
-                    val d = length * i / count
-                    if (measure.getPosTan(d, at, null)) pts.add(Pt(at[0].toDouble(), at[1].toDouble()))
-                }
-                val thinned = PathFlattener.decimate(pts, tolerance)
-                if (thinned.size >= 3) out.add(contourOf(thinned))
-            }
-        } while (measure.nextContour() && guard-- > 0)
-        return out
-    }
-
     private fun contourOf(points: List<Pt>): VectorContour {
         // A closed glyph contour comes back with its last point on its first; drop the repeat.
         val last = points.size - 1
@@ -107,12 +82,6 @@ internal object GlyphPaths {
 
     private fun near(a: Pt, b: Pt) = kotlin.math.abs(a.x - b.x) < 1e-4 && kotlin.math.abs(a.y - b.y) < 1e-4
 
-    /** How finely a contour is walked, in samples per em of arc length. */
-    private const val SAMPLES_PER_EM = 64.0
-
-    /** Decimation tolerance as a fraction of the em: well under a pixel at any real zoom. */
+    /** Approximation tolerance as a fraction of the em: well under a pixel at any real zoom. */
     private const val DECIMATE_DENOMINATOR = 2000.0
-
-    private const val MAX_SAMPLES = 4096
-    private const val MAX_CONTOURS = 4096
 }

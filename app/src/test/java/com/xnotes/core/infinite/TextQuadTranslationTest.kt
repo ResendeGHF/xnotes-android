@@ -14,8 +14,8 @@ class TextQuadTranslationTest {
     @Test fun movingAnExistingTextQuadDoesNotRequireRerasterization() {
         val moved = doubleArrayOf(17.5, -4.0, 117.5, -4.0,
             17.5, 56.0, 117.5, 56.0)
-        assertTrue(isRigidTextQuadTranslation(original, moved))
-        assertTrue(isRigidTextQuadTranslation(original, original))
+        assertTrue(isRigidTextQuadMotion(original, moved))
+        assertTrue(isRigidTextQuadMotion(original, original))
     }
 
     @Test fun sideResizeCanMoveTheTextWithoutScalingItsLetters() {
@@ -43,9 +43,9 @@ class TextQuadTranslationTest {
     }
 
     @Test fun widthOrHeightChangeMustRequestNewLayout() {
-        assertFalse(isRigidTextQuadTranslation(original, doubleArrayOf(
+        assertFalse(isRigidTextQuadMotion(original, doubleArrayOf(
             10.0, 20.0, 130.0, 20.0, 10.0, 80.0, 130.0, 80.0)))
-        assertFalse(isRigidTextQuadTranslation(original, doubleArrayOf(
+        assertFalse(isRigidTextQuadMotion(original, doubleArrayOf(
             10.0, 20.0, 110.0, 20.0, 10.0, 100.0, 110.0, 100.0)))
     }
 
@@ -58,7 +58,6 @@ class TextQuadTranslationTest {
             rotated[i + 1] = point.y
         }
         assertTrue(isRigidTextQuadMotion(original, rotated))
-        assertFalse(isRigidTextQuadTranslation(original, rotated))
         assertTrue(isRigidTextQuadMotion(original, original))
     }
 
@@ -122,9 +121,9 @@ class TextQuadTranslationTest {
         assertFalse(shouldRefineTextBitmap(1.0, Double.NaN))
     }
 
-    @Test fun rotationAndInvalidCoordinatesMustRequestNewLayout() {
-        assertFalse(isRigidTextQuadTranslation(original, doubleArrayOf(
+    @Test fun rotationCanReuseTextureButInvalidCoordinatesCannot() {
+        assertTrue(isRigidTextQuadMotion(original, doubleArrayOf(
             110.0, 20.0, 110.0, 120.0, 50.0, 20.0, 50.0, 120.0)))
-        assertFalse(isRigidTextQuadTranslation(original, doubleArrayOf(Double.NaN)))
+        assertFalse(isRigidTextQuadMotion(original, doubleArrayOf(Double.NaN)))
     }
 }

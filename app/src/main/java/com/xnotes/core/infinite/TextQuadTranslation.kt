@@ -23,22 +23,6 @@ internal fun fixedSizeTextLift(origin: Pt, boxTransform: Affine): LiftTransform 
 internal fun textWrapChanged(previousEnds: IntArray?, nextEnds: IntArray): Boolean =
     previousEnds == null || !previousEnds.contentEquals(nextEnds)
 
-/**
- * A native text bitmap can be reused only if the layout quad was translated rigidly.
- * Resizing, turning or shearing changes the glyph mapping and must request a new raster.
- */
-internal fun isRigidTextQuadTranslation(previous: DoubleArray, next: DoubleArray): Boolean {
-    if (previous.size != 8 || next.size != 8) return false
-    val dx = next[0] - previous[0]
-    val dy = next[1] - previous[1]
-    if (!dx.isFinite() || !dy.isFinite()) return false
-    for (i in 0 until 8 step 2) {
-        if (abs((next[i] - previous[i]) - dx) > 1e-6 ||
-            abs((next[i + 1] - previous[i + 1]) - dy) > 1e-6) return false
-    }
-    return true
-}
-
 /** A rotation or translation changes only the placement of a text quad, never its glyph layout.
  *  Compare its two edge lengths and their mutual angle; scaling/shearing must rerasterize. */
 internal fun isRigidTextQuadMotion(previous: DoubleArray, next: DoubleArray): Boolean {
