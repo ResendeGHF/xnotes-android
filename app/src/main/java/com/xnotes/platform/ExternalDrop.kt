@@ -25,7 +25,7 @@ import kotlinx.coroutines.withContext
 
 /** Receives global Android drags without changing the clipboard or the active drawing tool. */
 object ExternalDrop {
-    class Target(val imageDir: File, val insert: (List<DroppedContent>) -> Boolean)
+    class Target(val imageDir: File, val insert: suspend (List<DroppedContent>) -> Boolean)
 
     class Receiver(val handle: (Int, DragEvent, Pt) -> Boolean)
 

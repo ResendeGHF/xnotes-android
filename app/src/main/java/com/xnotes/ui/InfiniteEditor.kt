@@ -1547,10 +1547,18 @@ class InfiniteEditor(context: Context) : ToolPopupHost, SelectionMenuHost, LongP
         return com.xnotes.platform.ExternalDrop.Target(dir) { content ->
             if (document !== doc || !surfaces.isAttachedToWindow) false else {
                 commitText()
-                val items = com.xnotes.core.importing.DropPlacement.items(
-                    content, at, area, false, inkColor, textPointSize, textFace, textMeasurer, textAsLabel = true,
-                )
-                if (items.isEmpty()) false else {
+                val color = inkColor
+                val size = textPointSize
+                val face = textFace
+                // Placement measures the full imported paragraph. Keep its initial StaticLayout
+                // off the input thread, just like subsequent text rasterization.
+                val items = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    com.xnotes.core.importing.DropPlacement.items(
+                        content, at, area, false, color, size, face,
+                        com.xnotes.platform.AndroidTextMeasurer(), textAsLabel = true,
+                    )
+                }
+                if (document !== doc || !surfaces.isAttachedToWindow || items.isEmpty()) false else {
                     document.addAll(items)
                     history.push(AddCanvasItems(document, items))
                     selection.select(items)
