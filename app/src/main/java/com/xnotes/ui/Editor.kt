@@ -696,6 +696,7 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
                 it.surfaces, autosaveScope, viewContext,
                 prepare = { point -> if (noteOpen && canvasOpen) it.prepareExternalDrop(point, imageDir) else null },
                 onFailure = { message = appContext.getString(R.string.err_drop_content) },
+                indicatorColor = { palette.accent.toArgb() },
             )
             it.onMessage = { m, action -> say(m, action) }
             for (t in ToolDefaults.persistedTools) it.setToolConfig(t, settings.configFor(t))
@@ -1581,6 +1582,7 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
         externalDrop = com.xnotes.platform.ExternalDrop.create(
             surfaces, autosaveScope, viewContext, ::prepareExternalDrop,
             onFailure = { message = appContext.getString(R.string.err_drop_content) },
+            indicatorColor = { palette.accent.toArgb() },
         )
         com.xnotes.platform.MathRendering.addListener(mathLanded)
         if (pane == Pane.PRIMARY) reloadTemplateLibrary()

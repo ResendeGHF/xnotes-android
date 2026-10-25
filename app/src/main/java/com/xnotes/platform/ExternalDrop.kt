@@ -6,7 +6,6 @@ import android.content.ClipDescription
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.PixelFormat
@@ -33,9 +32,10 @@ object ExternalDrop {
     fun create(
         view: View, scope: CoroutineScope, permissionContext: Context,
         prepare: (Pt) -> Target?, onFailure: () -> Unit,
+        indicatorColor: () -> Int,
     ): Receiver {
         val debug = view.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
-        val marker = DropMarker(view.resources.displayMetrics.density)
+        val marker = DropMarker(view.resources.displayMetrics.density, indicatorColor)
         var showing = false
         fun hide() {
             if (showing) view.overlay.remove(marker)
@@ -169,15 +169,15 @@ object ExternalDrop {
     private const val MAX_IMAGE_BYTES = 32L * 1024 * 1024
     private const val MAX_TEXT_CHARS = 1_000_000
 
-    private class DropMarker(density: Float) : Drawable() {
+    internal class DropMarker(density: Float, private val indicatorColor: () -> Int) : Drawable() {
         var at = Pt.ZERO
         private val radius = 14f * density
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(45, 125, 220)
             style = Paint.Style.STROKE
             strokeWidth = 2f * density
         }
         override fun draw(canvas: Canvas) {
+            paint.color = indicatorColor()
             val x = at.x.toFloat()
             val y = at.y.toFloat()
             canvas.drawCircle(x, y, radius, paint)
