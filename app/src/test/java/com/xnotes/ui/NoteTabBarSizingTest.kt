@@ -16,4 +16,12 @@ class NoteTabBarSizingTest {
         assertEquals(1, visibleTabSlots(280f, 1))
         assertEquals(1, visibleTabSlots(120f, 4))
     }
+
+    @Test fun closingThirdOfFourMovesIndicatorToTheSurvivingTab() {
+        val fourTabs = tabHighlightBounds(200f, 2)
+        val afterClose = tabHighlightBounds(800f / 3f, 1)
+        assertEquals(402f, fourTabs.first, 0.01f)
+        assertEquals(800f / 3f + 2f, afterClose.first, 0.01f)
+        assertEquals(800f / 3f - 4f, afterClose.second, 0.01f)
+    }
 }

@@ -23,7 +23,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -32,8 +31,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextOverflow
@@ -54,25 +52,28 @@ fun NoteTabBar(
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalPalette.current
-    // The highlight belongs to the tab strip, not the individual buttons, so it can
-    // travel between tabs (including tabs with different title lengths).
-    val bounds = remember { mutableStateMapOf<String, Pair<Float, Float>>() }
-    val selected = activeUri?.let(bounds::get)
-    // Spring animations track targets that move every frame while sibling tabs resize.
-    val highlightMotion = spring<Float>(dampingRatio = 1f, stiffness = Spring.StiffnessHigh)
-    val highlightX by animateFloatAsState(selected?.first ?: 0f, highlightMotion, label = "tabHighlightX")
-    val highlightWidth by animateFloatAsState(selected?.second ?: 0f, highlightMotion, label = "tabHighlightWidth")
+    // All tabs are equal-width, so the indicator can be positioned arithmetically.
+    // Avoid feeding onGloballyPositioned measurements into Compose state each animation frame.
     val highlight = palette.selectionBackground.toComposeColor()
     BoxWithConstraints(modifier.fillMaxWidth()) {
         val visibleSlots = visibleTabSlots(maxWidth.value, tabs.tabs.size)
         val tabWidth = maxWidth / visibleSlots
+        val animatedWidth by animateDpAsState(tabWidth, tween(240), label = "tabWidth")
+        val activeIndex = tabs.tabs.indexOfFirst { it.uri == activeUri }
+        val density = LocalDensity.current
+        val (highlightXDp, highlightWidthDp) = tabHighlightBounds(animatedWidth.value, activeIndex)
+        val targetX = with(density) { highlightXDp.dp.toPx() }
+        val targetWidth = with(density) { highlightWidthDp.dp.toPx() }
+        val highlightMotion = spring<Float>(dampingRatio = 1f, stiffness = Spring.StiffnessHigh)
+        val highlightX by animateFloatAsState(targetX, highlightMotion, label = "tabHighlightX")
+        val highlightWidth by animateFloatAsState(targetWidth, highlightMotion, label = "tabHighlightWidth")
     Row(
         Modifier.fillMaxWidth()
             .background(palette.bg.toComposeColor())
             .horizontalScroll(rememberScrollState())
             .height(42.dp)
             .drawBehind {
-                if (selected != null && highlightWidth > 0f) {
+                if (activeIndex >= 0 && highlightWidth > 0f) {
                     val inset = 2.dp.toPx()
                     drawRoundRect(
                         highlight,
@@ -86,7 +87,6 @@ fun NoteTabBar(
     ) {
         tabs.tabs.forEach { tab ->
             key(tab.uri) {
-            val animatedWidth by animateDpAsState(tabWidth, tween(240), label = "tabWidth")
             val tabTint by animateColorAsState(
                 targetValue = if (tab.uri == activeUri) palette.selectionForeground.toComposeColor()
                     else palette.textDim.toComposeColor(),
@@ -96,9 +96,6 @@ fun NoteTabBar(
             Row(
                 Modifier.width(animatedWidth)
                     .padding(horizontal = 2.dp)
-                    .onGloballyPositioned { coordinates ->
-                        bounds[tab.uri] = coordinates.positionInParent().x to coordinates.size.width.toFloat()
-                    }
                     .clip(RoundedCornerShape(8.dp)), 
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -142,3 +139,7 @@ fun NoteTabBar(
 /** Equal-width tabs until five fit, but never below 144 dp per visible tab. */
 internal fun visibleTabSlots(widthDp: Float, tabCount: Int): Int =
     minOf(tabCount.coerceAtLeast(1), 5, (widthDp / 144f).toInt().coerceAtLeast(1))
+
+/** Stable indicator geometry independent of animation frames and removed-tab measurements. */
+internal fun tabHighlightBounds(tabWidthDp: Float, activeIndex: Int): Pair<Float, Float> =
+    (activeIndex.coerceAtLeast(0) * tabWidthDp + 2f) to (tabWidthDp - 4f).coerceAtLeast(0f)
