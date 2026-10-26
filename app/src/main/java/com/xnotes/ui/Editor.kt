@@ -457,6 +457,25 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
     private val session = com.xnotes.platform.SessionStore(sessionDir, codec, pdfDir, imageDir)
     private val canvasSession = com.xnotes.platform.CanvasSessionStore(sessionDir, canvasCodec, imageDir)
     private val viewStates = com.xnotes.platform.ViewStateStore(com.xnotes.platform.JsonStore.viewStates(appContext))
+    /**
+     * Parsed documents for recently switched-away tabs. This stores only model objects, never
+     * render surfaces, page bitmaps or GL contexts. Limit both count and document complexity;
+     * PDF-backed notes are excluded because their extracted PDF is released on document swap.
+     */
+    private val inactiveDocuments = object : LinkedHashMap<String, Document>(3, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Document>?) = size > 2
+    }
+
+    fun forgetInactiveDocument(uri: String) { inactiveDocuments.remove(uri) }
+    fun clearInactiveDocuments() { inactiveDocuments.clear() }
+
+    private fun rememberInactiveDocument() {
+        val doc = state.document
+        val uri = doc.path ?: return
+        if (autosaveUri != uri || doc.pdfFile != null || doc.pages.size > 12) return
+        if (doc.pages.sumOf { it.items.size } > 1_500) return
+        inactiveDocuments[uri] = doc
+    }
     private var lastSessionContentVersion = -1
     private var sessionLoaded = false
 
@@ -3574,6 +3593,19 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
      */
     suspend fun openAsync(uri: String, name: String? = null) {
         if (opening) return
+        // A tab switch commonly returns to a document decoded moments ago. Reuse its model
+        // instead of re-reading and parsing the ZIP; replaceDocument still resets render caches,
+        // history, gestures and applies the remembered viewport as for any normal open.
+        val cached = inactiveDocuments.remove(uri)
+        if (cached != null) {
+            replaceDocument(cached)
+            maybeBindAutosave(uri)
+            noteOpen = true
+            rememberOpened(uri, name)
+            state.lastOpenReadMs = 0L
+            state.lastOpenTotalMs = 0L
+            return
+        }
         openCancelled.set(false)
         opening = true
         val t0 = System.nanoTime()
@@ -6195,6 +6227,7 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
         saveViewState() // remember the outgoing folder note's view before switching away
         flowText.endSession() // flushes the typing burst so the autosave below carries it
         flushAutosave() // save the outgoing note if it was autosaving to the folder
+        if (state.document.path != doc.path) rememberInactiveDocument()
         autosaveUri = null
         // File readouts belong to the outgoing note; a file-backed open re-sets them after the swap.
         state.lastOpenCompacted = doc.compactedOnLoad
