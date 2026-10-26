@@ -1761,7 +1761,7 @@ private fun ExplorerSection(
 
     val pendingImport = editor.pendingImport
     // Clear any stale error when a fresh name dialog opens for a new operation.
-    LaunchedEffect(createMode, pendingImport) { fieldError = null }
+    LaunchedEffect(createMode, pendingImport, renaming) { fieldError = null }
     // A new note gets the full-screen New note; it opens once it is made.
     if (createMode == CreateMode.FILE && pendingImport == null && !editor.importing) {
         var busy by remember { mutableStateOf(false) }
@@ -1854,13 +1854,13 @@ private fun ExplorerSection(
             initial = entryLabel(entry),
             confirmLabel = stringResource(R.string.rename),
             allowEmpty = false,
+            error = fieldError,
             onConfirm = { raw ->
                 val kind = DocumentKind.ofName(entry.name)
                 val newName = if (entry.isDir || kind == null) raw else DocumentKind.withSuffix(DocumentKind.stripSuffix(raw), kind)
                 // Renames touch the open-note binding (Compose state) so run on the main thread.
-                val ok = editor.renameDocument(entry.documentUri, newName)
-                renaming = null
-                if (ok) {
+                if (editor.renameDocument(entry.documentUri, newName)) {
+                    renaming = null
                     // Carry the colour code to the new name (sidecar is keyed by name), then re-list.
                     if (entry.color != null) {
                         scope.launch {
@@ -1870,6 +1870,8 @@ private fun ExplorerSection(
                     } else {
                         refreshKey++
                     }
+                } else {
+                    fieldError = context.getString(if (entry.isDir) R.string.err_rename_folder else R.string.err_rename_note)
                 }
             },
             onDismiss = { renaming = null },
