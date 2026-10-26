@@ -1,8 +1,11 @@
 package com.xnotes.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -18,6 +21,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
@@ -54,8 +58,10 @@ fun NoteTabBar(
     // travel between tabs (including tabs with different title lengths).
     val bounds = remember { mutableStateMapOf<String, Pair<Float, Float>>() }
     val selected = activeUri?.let(bounds::get)
-    val highlightX by animateFloatAsState(selected?.first ?: 0f, tween(220), label = "tabHighlightX")
-    val highlightWidth by animateFloatAsState(selected?.second ?: 0f, tween(220), label = "tabHighlightWidth")
+    // Spring animations track targets that move every frame while sibling tabs resize.
+    val highlightMotion = spring<Float>(dampingRatio = 1f, stiffness = Spring.StiffnessHigh)
+    val highlightX by animateFloatAsState(selected?.first ?: 0f, highlightMotion, label = "tabHighlightX")
+    val highlightWidth by animateFloatAsState(selected?.second ?: 0f, highlightMotion, label = "tabHighlightWidth")
     val highlight = palette.selectionBackground.toComposeColor()
     BoxWithConstraints(modifier.fillMaxWidth()) {
         val visibleSlots = visibleTabSlots(maxWidth.value, tabs.tabs.size)
@@ -79,6 +85,8 @@ fun NoteTabBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         tabs.tabs.forEach { tab ->
+            key(tab.uri) {
+            val animatedWidth by animateDpAsState(tabWidth, tween(240), label = "tabWidth")
             val tabTint by animateColorAsState(
                 targetValue = if (tab.uri == activeUri) palette.selectionForeground.toComposeColor()
                     else palette.textDim.toComposeColor(),
@@ -86,7 +94,7 @@ fun NoteTabBar(
                 label = "tabTint",
             )
             Row(
-                Modifier.width(tabWidth)
+                Modifier.width(animatedWidth)
                     .padding(horizontal = 2.dp)
                     .onGloballyPositioned { coordinates ->
                         bounds[tab.uri] = coordinates.positionInParent().x to coordinates.size.width.toFloat()
@@ -124,6 +132,7 @@ fun NoteTabBar(
                 TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
                     Text("×", fontSize = 16.sp, color = tabTint)
                 }
+            }
             }
         }
     }
