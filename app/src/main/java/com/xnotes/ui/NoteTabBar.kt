@@ -1,5 +1,6 @@
 package com.xnotes.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -73,6 +74,12 @@ fun NoteTabBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         tabs.tabs.forEach { tab ->
+            val tabTint by animateColorAsState(
+                targetValue = if (tab.uri == activeUri) palette.selectionForeground.toComposeColor()
+                    else palette.textDim.toComposeColor(),
+                animationSpec = tween(300),
+                label = "tabTint",
+            )
             Row(
                 Modifier.padding(horizontal = 2.dp)
                     .onGloballyPositioned { coordinates ->
@@ -96,17 +103,19 @@ fun NoteTabBar(
                     Icon(
                         imageVector = if (isCanvas) Icons.Outlined.Gesture else Icons.AutoMirrored.Outlined.Article,
                         contentDescription = if (isCanvas) "Canvas" else "Note",
+                        tint = tabTint,
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
                         tab.title.replace(Regex("(?i)\\.(xnote|xcanvas)$"), ""),
                         maxLines = 1,
                         fontSize = 12.sp,
+                        color = tabTint,
                         modifier = Modifier.padding(start = 6.dp),
                     )
                 }
                 TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
-                    Text("×", fontSize = 16.sp)
+                    Text("×", fontSize = 16.sp, color = tabTint)
                 }
             }
         }
