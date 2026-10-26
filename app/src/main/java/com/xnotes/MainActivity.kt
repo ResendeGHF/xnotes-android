@@ -700,7 +700,7 @@ private fun EditorScreen(
         }
         // An unsuccessful or cancelled read must not create a ghost tab.
         val openedUri = if (target.canvasOpen) target.infinite.document.path else target.currentUri
-        if (target.noteOpen && !target.canvasOpen && openedUri == uriStr) {
+        if (target.noteOpen && openedUri == uriStr) {
             noteTabs = noteTabs.open(uriStr, name ?: "Note", target.pane == com.xnotes.ui.Pane.SECONDARY)
         }
     }
@@ -708,13 +708,10 @@ private fun EditorScreen(
     fun activateTab(uri: String, secondary: Boolean = false) {
         val target = if (secondary) editor.secondaryPane() else editor
         val other = if (target === editor) editor.secondary else editor
-        if (other?.noteOpen == true && !other.canvasOpen && other.currentUri == uri) {
+        if (other?.noteOpen == true && (if (other.canvasOpen) other.infinite.document.path else other.currentUri) == uri) {
             editor.focusPane(other.pane)
             return
         }
-        // An infinite canvas is a separate editor surface. It must finish detaching before a
-        // paged document can replace it; that transition is not part of tab switching yet.
-        if (target.canvasOpen) return
         val activeUri = if (target.canvasOpen) target.infinite.document.path else target.currentUri
         if (target.noteOpen && activeUri == uri) {
             noteTabs = noteTabs.open(uri, noteTabs.tabs.first { it.uri == uri }.title, secondary)
@@ -730,10 +727,19 @@ private fun EditorScreen(
             pane.noteOpen && (if (pane.canvasOpen) pane.infinite.document.path else pane.currentUri) == uri
         }
         val finish = {
-            noteTabs = noteTabs.close(uri)
+            val updated = noteTabs.close(uri)
+            val replacement = when (matching?.pane) {
+                com.xnotes.ui.Pane.PRIMARY -> updated.primaryUri
+                com.xnotes.ui.Pane.SECONDARY -> updated.secondaryUri
+                else -> null
+            }
+            noteTabs = updated
             editor.forgetInactiveDocument(uri)
             editor.secondary?.forgetInactiveDocument(uri)
-            matching?.goHome()
+            if (matching != null) {
+                if (replacement != null) scope.launch { openInto(matching, replacement) }
+                else matching.goHome()
+            }
             Unit
         }
         if (matching != null) guarded(matching, finish) else finish()
@@ -992,7 +998,7 @@ private fun EditorScreen(
         contentWindowInsets = contentInsets,
     ) { inner ->
         Column(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
-            if (noteTabs.tabs.isNotEmpty() && editor.openPanes.isNotEmpty() && !editor.active.canvasOpen) {
+            if (noteTabs.tabs.isNotEmpty() && editor.openPanes.isNotEmpty()) {
                 NoteTabBar(
                     tabs = noteTabs,
                     activeUri = editor.active.takeIf { it.noteOpen }?.let { pane ->

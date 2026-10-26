@@ -465,9 +465,35 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
     private val inactiveDocuments = object : LinkedHashMap<String, Document>(3, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Document>?) = size > 2
     }
+    private val inactiveCanvases = object : LinkedHashMap<String, com.xnotes.core.infinite.InfiniteDocument>(3, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, com.xnotes.core.infinite.InfiniteDocument>?) = size > 2
+    }
 
-    fun forgetInactiveDocument(uri: String) { inactiveDocuments.remove(uri) }
-    fun clearInactiveDocuments() { inactiveDocuments.clear() }
+    fun forgetInactiveDocument(uri: String) {
+        inactiveDocuments.remove(uri)
+        inactiveCanvases.remove(uri)
+    }
+    fun clearInactiveDocuments() {
+        inactiveDocuments.clear()
+        inactiveCanvases.clear()
+    }
+
+    private fun rememberInactiveCanvas() {
+        if (!canvasOpen) return
+        val doc = infinite.document
+        val uri = doc.path ?: return
+        if (canvasAutosaveUri == uri && doc.items.size <= 1_500) inactiveCanvases[uri] = doc
+    }
+
+    /** Finish the canvas's edits before switching the pane to a paged note. */
+    private fun leaveCanvasForPagedNote() {
+        if (!canvasOpen) return
+        infinite.commitText()
+        flushCanvasAutosave()
+        rememberInactiveCanvas()
+        canvasAutosaveUri = null
+        canvasOpen = false
+    }
 
     private fun rememberInactiveDocument() {
         val doc = state.document
@@ -796,6 +822,12 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
      * main thread; the model swap itself hops back to the main thread.
      */
     suspend fun openCanvasAsync(uri: String, name: String?): Boolean {
+        val cached = inactiveCanvases.remove(uri)
+        if (cached != null) {
+            openCanvasDocument(cached, uri, name)
+            rememberOpened(uri, name)
+            return true
+        }
         val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             runCatching {
                 appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use {
@@ -814,7 +846,14 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
         displayName: String?,
         fromSession: Boolean = false,
     ) {
-        flushAutosave() // a paged note may be open underneath; do not leave its edits unwritten
+        if (canvasOpen) {
+            infinite.commitText()
+            flushCanvasAutosave()
+            if (infinite.document.path != uri) rememberInactiveCanvas()
+        } else {
+            flushAutosave() // a paged note may be open underneath; do not leave its edits unwritten
+            rememberInactiveDocument()
+        }
         doc.path = uri
         doc.displayName = displayName
         val canvas = infinite
@@ -3598,6 +3637,7 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
         // history, gestures and applies the remembered viewport as for any normal open.
         val cached = inactiveDocuments.remove(uri)
         if (cached != null) {
+            leaveCanvasForPagedNote()
             replaceDocument(cached)
             maybeBindAutosave(uri)
             noteOpen = true
@@ -3635,6 +3675,7 @@ class Editor(context: Context, val pane: Pane = Pane.PRIMARY) : ToolPopupHost, S
             doc.path = uri
             doc.displayName = name
             doc.dirty = false
+            leaveCanvasForPagedNote()
             replaceDocument(doc)
             state.openFileBytes = fileBytes
             state.lastSaveBytes = fileBytes // the on-disk size, until the first autosave rewrites it
