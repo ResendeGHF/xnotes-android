@@ -13,7 +13,7 @@ class NoteTabsStore(context: Context) {
     fun load(): NoteTabs = runCatching {
         val json = JSONObject(prefs.getString("workspace", "{}") ?: "{}")
         val array = json.optJSONArray("tabs") ?: JSONArray()
-        val tabs = buildList {
+        val tabs = buildList<NoteTab> {
             for (i in 0 until array.length()) {
                 val entry = array.optJSONObject(i) ?: continue
                 val uri = entry.optString("uri")
