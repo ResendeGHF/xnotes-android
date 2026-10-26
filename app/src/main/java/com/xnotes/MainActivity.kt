@@ -732,6 +732,7 @@ private fun EditorScreen(
         val finish = {
             noteTabs = noteTabs.close(uri)
             matching?.goHome()
+            Unit
         }
         if (matching != null) guarded(matching, finish) else finish()
     }
