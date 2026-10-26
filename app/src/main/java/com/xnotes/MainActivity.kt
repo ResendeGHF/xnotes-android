@@ -1375,6 +1375,7 @@ private fun EditorPane(
                         )
                         com.xnotes.ui.TextStyleBar(canvas)
                         com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) })
+                        com.xnotes.ui.PenMenu(canvas)
                         com.xnotes.ui.CanvasDebugOverlay(canvas)
                     }
                 }
@@ -1423,6 +1424,7 @@ private fun EditorPane(
                             com.xnotes.ui.ScreenshotMenu(editor)
                             com.xnotes.ui.TextStyleBar(editor)
                             com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) })
+                            com.xnotes.ui.PenMenu(editor)
                             com.xnotes.ui.FlowEditMenu(editor)
                             com.xnotes.ui.PdfSelectionMenu(editor)
                             com.xnotes.ui.MarkupNotePeek(editor)
