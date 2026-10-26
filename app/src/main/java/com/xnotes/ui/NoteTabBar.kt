@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -31,6 +32,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextOverflow
 import com.xnotes.core.workspace.NoteTabs
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
@@ -55,8 +57,11 @@ fun NoteTabBar(
     val highlightX by animateFloatAsState(selected?.first ?: 0f, tween(220), label = "tabHighlightX")
     val highlightWidth by animateFloatAsState(selected?.second ?: 0f, tween(220), label = "tabHighlightWidth")
     val highlight = palette.selectionBackground.toComposeColor()
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val visibleSlots = visibleTabSlots(maxWidth.value, tabs.tabs.size)
+        val tabWidth = maxWidth / visibleSlots
     Row(
-        modifier.fillMaxWidth()
+        Modifier.fillMaxWidth()
             .background(palette.bg.toComposeColor())
             .horizontalScroll(rememberScrollState())
             .height(42.dp)
@@ -64,7 +69,7 @@ fun NoteTabBar(
                 if (selected != null && highlightWidth > 0f) {
                     val inset = 2.dp.toPx()
                     drawRoundRect(
-                        highlight.copy(alpha = 0.32f),
+                        highlight,
                         topLeft = Offset(highlightX, inset),
                         size = Size(highlightWidth, size.height - inset * 2),
                         cornerRadius = CornerRadius((size.height - inset * 2) / 2),
@@ -81,7 +86,8 @@ fun NoteTabBar(
                 label = "tabTint",
             )
             Row(
-                Modifier.padding(horizontal = 2.dp)
+                Modifier.width(tabWidth)
+                    .padding(horizontal = 2.dp)
                     .onGloballyPositioned { coordinates ->
                         bounds[tab.uri] = coordinates.positionInParent().x to coordinates.size.width.toFloat()
                     }
@@ -89,7 +95,7 @@ fun NoteTabBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
-                    Modifier.height(40.dp)
+                    Modifier.weight(1f).height(40.dp)
                         .clickable(
                             interactionSource = remember(tab.uri) { MutableInteractionSource() },
                             indication = null,
@@ -109,9 +115,10 @@ fun NoteTabBar(
                     Text(
                         tab.title.replace(Regex("(?i)\\.(xnote|xcanvas)$"), ""),
                         maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         fontSize = 12.sp,
                         color = tabTint,
-                        modifier = Modifier.padding(start = 6.dp),
+                        modifier = Modifier.weight(1f).padding(start = 6.dp),
                     )
                 }
                 TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
@@ -120,4 +127,9 @@ fun NoteTabBar(
             }
         }
     }
+    }
 }
+
+/** Equal-width tabs until five fit, but never below 144 dp per visible tab. */
+internal fun visibleTabSlots(widthDp: Float, tabCount: Int): Int =
+    minOf(tabCount.coerceAtLeast(1), 5, (widthDp / 144f).toInt().coerceAtLeast(1))
