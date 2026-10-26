@@ -22,8 +22,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -56,7 +54,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -98,6 +95,7 @@ import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.ui.Editor
 import com.xnotes.ui.Toolbar
 import com.xnotes.ui.ToolbarAround
+import com.xnotes.ui.NoteTabBar
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.XnotesTheme
@@ -282,6 +280,8 @@ class MainActivity : ComponentActivity() {
         // UI is hidden; they load again when something new is drawn.
         if (level >= TRIM_MEMORY_UI_HIDDEN || level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_RUNNING_CRITICAL) {
             com.xnotes.platform.PdfiumDocument.trimAll()
+            editor?.clearInactiveDocuments()
+            editor?.secondary?.clearInactiveDocuments()
         }
     }
 
@@ -731,6 +731,8 @@ private fun EditorScreen(
         }
         val finish = {
             noteTabs = noteTabs.close(uri)
+            editor.forgetInactiveDocument(uri)
+            editor.secondary?.forgetInactiveDocument(uri)
             matching?.goHome()
             Unit
         }
@@ -990,8 +992,8 @@ private fun EditorScreen(
         contentWindowInsets = contentInsets,
     ) { inner ->
         Column(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
-            if (noteTabs.tabs.isNotEmpty() && !editor.active.canvasOpen) {
-                NoteTabStrip(
+            if (noteTabs.tabs.isNotEmpty() && editor.openPanes.isNotEmpty() && !editor.active.canvasOpen) {
+                NoteTabBar(
                     tabs = noteTabs,
                     activeUri = editor.active.takeIf { it.noteOpen }?.let { pane ->
                         if (pane.canvasOpen) pane.infinite.document.path else pane.currentUri
@@ -1362,40 +1364,6 @@ private fun audioMime(ext: String): String = when (ext.lowercase()) {
     "3gp" -> "audio/3gpp"
     "webm" -> "audio/webm"
     else -> "audio/*"
-}
-
-/** Tabs contain no editor views. Switching attaches the selected file to an existing pane only. */
-@Composable
-private fun NoteTabStrip(
-    tabs: NoteTabs,
-    activeUri: String?,
-    onSelect: (String) -> Unit,
-    onClose: (String) -> Unit,
-) {
-    val palette = LocalPalette.current
-    Row(
-        Modifier.fillMaxWidth()
-            .background(palette.bg.toComposeColor())
-            .horizontalScroll(rememberScrollState())
-            .height(42.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        tabs.tabs.forEach { tab ->
-            Row(
-                Modifier.padding(horizontal = 2.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background((if (tab.uri == activeUri) palette.accent else palette.border).toComposeColor().copy(alpha = 0.18f)),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TextButton(onClick = { onSelect(tab.uri) }) {
-                    Text(tab.title, maxLines = 1, fontSize = 12.sp)
-                }
-                TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
-                    Text("×", fontSize = 16.sp)
-                }
-            }
-        }
-    }
 }
 
 /** Neither pane of a split may be squeezed below this share of the split axis. */
