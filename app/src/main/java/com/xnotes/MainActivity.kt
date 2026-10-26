@@ -1001,9 +1001,9 @@ private fun EditorScreen(
             if (noteTabs.tabs.isNotEmpty() && editor.openPanes.isNotEmpty()) {
                 NoteTabBar(
                     tabs = noteTabs,
-                    activeUri = editor.active.takeIf { it.noteOpen }?.let { pane ->
-                        if (pane.canvasOpen) pane.infinite.document.path else pane.currentUri
-                    },
+                    // Selection follows workspace state immediately on close, even while
+                    // the replacement document is still loading into its editor pane.
+                    activeUri = noteTabs.selectedUri(editor.active.pane == com.xnotes.ui.Pane.SECONDARY),
                     onSelect = { uri -> activateTab(uri) },
                     onClose = ::closeTab,
                 )

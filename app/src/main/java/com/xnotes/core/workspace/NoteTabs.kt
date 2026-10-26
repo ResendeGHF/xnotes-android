@@ -58,6 +58,10 @@ data class NoteTabs(
         )
     }
 
+    /** Workspace selection remains valid while the focused editor swaps documents asynchronously. */
+    fun selectedUri(secondaryFocused: Boolean): String? =
+        if (secondaryFocused) secondaryUri ?: primaryUri else primaryUri ?: secondaryUri
+
     fun move(fromIndex: Int, toIndex: Int): NoteTabs {
         if (fromIndex !in tabs.indices || toIndex !in tabs.indices || fromIndex == toIndex) return this
         val reordered = tabs.toMutableList()

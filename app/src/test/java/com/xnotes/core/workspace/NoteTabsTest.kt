@@ -51,6 +51,16 @@ class NoteTabsTest {
         assertEquals(emptyList<NoteTab>(), afterLast.tabs)
     }
 
+    @Test fun activeHighlightFollowsReplacementImmediatelyAfterClosingSelectedTab() {
+        val workspace = NoteTabs().open("a", "A").open("b", "B")
+            .open("c", "C").open("d", "D").open("c", "C")
+        val closed = workspace.close("c")
+        assertEquals("b", closed.selectedUri(secondaryFocused = false))
+        assertEquals("b", closed.selectedUri(secondaryFocused = true))
+        val closeSelected = closed.close("b")
+        assertEquals("a", closeSelected.selectedUri(secondaryFocused = false))
+    }
+
     @Test fun canvasAndPagedNotesCoexistAsTabs() {
         val workspace = NoteTabs().open("content://notes/math.xnote", "Math")
             .open("content://notes/diagram.xcanvas", "Diagram")
