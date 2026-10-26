@@ -34,4 +34,31 @@ class NoteTabsTest {
         assertEquals(listOf("b", "a"), workspace.tabs.map { it.uri })
         assertEquals("b", workspace.primaryUri)
     }
+
+    @Test fun closingActiveTabSelectsPreviousTabWithoutClosingOtherTabs() {
+        val workspace = NoteTabs().open("a", "A").open("b", "B").open("c", "C")
+        val closed = workspace.close("c")
+        assertEquals("b", closed.primaryUri)
+        assertEquals(listOf("a", "b"), closed.tabs.map { it.uri })
+    }
+
+    @Test fun closingFirstTabSelectsNextAndClosingLastReturnsToExplorer() {
+        val workspace = NoteTabs().open("a", "A").open("b", "B").open("a", "A")
+        val afterFirst = workspace.close("a")
+        assertEquals("b", afterFirst.primaryUri)
+        val afterLast = afterFirst.close("b")
+        assertNull(afterLast.primaryUri)
+        assertEquals(emptyList<NoteTab>(), afterLast.tabs)
+    }
+
+    @Test fun canvasAndPagedNotesCoexistAsTabs() {
+        val workspace = NoteTabs().open("content://notes/math.xnote", "Math")
+            .open("content://notes/diagram.xcanvas", "Diagram")
+            .open("content://notes/math.xnote", "Math")
+        assertEquals("content://notes/math.xnote", workspace.primaryUri)
+        assertEquals(2, workspace.tabs.size)
+        val backToCanvas = workspace.open("content://notes/diagram.xcanvas", "Diagram")
+        assertEquals("content://notes/diagram.xcanvas", backToCanvas.primaryUri)
+        assertEquals("content://notes/math.xnote", backToCanvas.close("content://notes/diagram.xcanvas").primaryUri)
+    }
 }

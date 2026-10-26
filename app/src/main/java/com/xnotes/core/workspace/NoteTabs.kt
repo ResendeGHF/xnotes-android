@@ -45,8 +45,10 @@ data class NoteTabs(
         val remaining = tabs.filterNot { it.uri == uri }
         fun replacement(excluding: String?): String? {
             if (remaining.isEmpty()) return null
-            val next = index.coerceAtMost(remaining.lastIndex)
-            return (next until remaining.size).asSequence().plus((next - 1 downTo 0).asSequence())
+            // Browser-style close: prefer the tab immediately to the left, then the right.
+            val left = (index - 1).coerceAtMost(remaining.lastIndex)
+            return (left downTo 0).asSequence().filter { it >= 0 }
+                .plus((index until remaining.size).asSequence())
                 .map { remaining[it].uri }.firstOrNull { it != excluding }
         }
         return copy(
