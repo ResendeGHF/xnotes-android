@@ -3,6 +3,8 @@ package com.xnotes.ui
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -79,8 +81,29 @@ fun NoteTabBar(
                     .clip(RoundedCornerShape(8.dp)), 
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextButton(onClick = { onSelect(tab.uri) }) {
-                    Text(tab.title, maxLines = 1, fontSize = 12.sp)
+                Row(
+                    Modifier.height(40.dp)
+                        .clickable(
+                            interactionSource = remember(tab.uri) { MutableInteractionSource() },
+                            indication = null,
+                            onClick = { onSelect(tab.uri) },
+                        )
+                        .padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val isCanvas = tab.uri.substringBefore('?').endsWith(".xcanvas", ignoreCase = true) ||
+                        tab.title.endsWith(".xcanvas", ignoreCase = true)
+                    Icon(
+                        imageVector = if (isCanvas) Icons.Outlined.Gesture else Icons.AutoMirrored.Outlined.Article,
+                        contentDescription = if (isCanvas) "Canvas" else "Note",
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        tab.title.replace(Regex("(?i)\\.(xnote|xcanvas)$"), ""),
+                        maxLines = 1,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(start = 6.dp),
+                    )
                 }
                 TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
                     Text("×", fontSize = 16.sp)
