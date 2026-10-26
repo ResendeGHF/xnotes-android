@@ -22,6 +22,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -54,6 +56,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -99,6 +102,8 @@ import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.XnotesTheme
 import com.xnotes.ui.theme.toComposeColor
+import com.xnotes.core.workspace.NoteTabs
+import com.xnotes.platform.NoteTabsStore
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -302,6 +307,9 @@ private fun EditorScreen(
 ) {
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
+    val tabsStore = remember(context) { NoteTabsStore(context) }
+    var noteTabs by remember { mutableStateOf(tabsStore.load()) }
+    LaunchedEffect(noteTabs) { tabsStore.save(noteTabs) }
     // The LaTeX renderer resolves its fonts through the composition, so this is the
     // only place it can be built; the flow reaches it through MathRendering after.
     val mathDensity = LocalDensity.current
@@ -690,6 +698,42 @@ private fun EditorScreen(
         } else {
             target.openAsync(uriStr, name)
         }
+        // An unsuccessful or cancelled read must not create a ghost tab.
+        val openedUri = if (target.canvasOpen) target.infinite.document.path else target.currentUri
+        if (target.noteOpen && !target.canvasOpen && openedUri == uriStr) {
+            noteTabs = noteTabs.open(uriStr, name ?: "Note", target.pane == com.xnotes.ui.Pane.SECONDARY)
+        }
+    }
+
+    fun activateTab(uri: String, secondary: Boolean = false) {
+        val target = if (secondary) editor.secondaryPane() else editor
+        val other = if (target === editor) editor.secondary else editor
+        if (other?.noteOpen == true && !other.canvasOpen && other.currentUri == uri) {
+            editor.focusPane(other.pane)
+            return
+        }
+        // An infinite canvas is a separate editor surface. It must finish detaching before a
+        // paged document can replace it; that transition is not part of tab switching yet.
+        if (target.canvasOpen) return
+        val activeUri = if (target.canvasOpen) target.infinite.document.path else target.currentUri
+        if (target.noteOpen && activeUri == uri) {
+            noteTabs = noteTabs.open(uri, noteTabs.tabs.first { it.uri == uri }.title, secondary)
+            return
+        }
+        guarded(target) {
+            scope.launch { openInto(target, uri) }
+        }
+    }
+
+    fun closeTab(uri: String) {
+        val matching = listOfNotNull(editor, editor.secondary).firstOrNull { pane ->
+            pane.noteOpen && (if (pane.canvasOpen) pane.infinite.document.path else pane.currentUri) == uri
+        }
+        val finish = {
+            noteTabs = noteTabs.close(uri)
+            matching?.goHome()
+        }
+        if (matching != null) guarded(matching, finish) else finish()
     }
 
     fun openTreeFile(uriStr: String) {
@@ -944,7 +988,18 @@ private fun EditorScreen(
         snackbarHost = { SnackbarHost(snackbar, Modifier.windowInsetsPadding(WindowInsets.ime.exclude(contentInsets))) },
         contentWindowInsets = contentInsets,
     ) { inner ->
-        Box(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
+        Column(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
+            if (noteTabs.tabs.isNotEmpty() && !editor.active.canvasOpen) {
+                NoteTabStrip(
+                    tabs = noteTabs,
+                    activeUri = editor.active.takeIf { it.noteOpen }?.let { pane ->
+                        if (pane.canvasOpen) pane.infinite.document.path else pane.currentUri
+                    },
+                    onSelect = { uri -> activateTab(uri) },
+                    onClose = ::closeTab,
+                )
+            }
+            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             // BASE LAYER: backstage is the root of the stack — always present underneath.
             com.xnotes.ui.Backstage(
                 editor = editor,
@@ -1079,6 +1134,7 @@ private fun EditorScreen(
                 },
             )
             SplitHost(editor, actions)
+            }
         }
     }
     if (showShareChooser) {
@@ -1305,6 +1361,40 @@ private fun audioMime(ext: String): String = when (ext.lowercase()) {
     "3gp" -> "audio/3gpp"
     "webm" -> "audio/webm"
     else -> "audio/*"
+}
+
+/** Tabs contain no editor views. Switching attaches the selected file to an existing pane only. */
+@Composable
+private fun NoteTabStrip(
+    tabs: NoteTabs,
+    activeUri: String?,
+    onSelect: (String) -> Unit,
+    onClose: (String) -> Unit,
+) {
+    val palette = LocalPalette.current
+    Row(
+        Modifier.fillMaxWidth()
+            .background(palette.bg.toComposeColor())
+            .horizontalScroll(rememberScrollState())
+            .height(42.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        tabs.tabs.forEach { tab ->
+            Row(
+                Modifier.padding(horizontal = 2.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background((if (tab.uri == activeUri) palette.accent else palette.border).toComposeColor().copy(alpha = 0.18f)),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = { onSelect(tab.uri) }) {
+                    Text(tab.title, maxLines = 1, fontSize = 12.sp)
+                }
+                TextButton(onClick = { onClose(tab.uri) }, modifier = Modifier.width(36.dp)) {
+                    Text("×", fontSize = 16.sp)
+                }
+            }
+        }
+    }
 }
 
 /** Neither pane of a split may be squeezed below this share of the split axis. */
