@@ -43,11 +43,16 @@ data class NoteTabs(
         val index = tabs.indexOfFirst { it.uri == uri }
         if (index < 0) return this
         val remaining = tabs.filterNot { it.uri == uri }
-        val fallback = remaining.getOrNull(index.coerceAtMost(remaining.lastIndex))?.uri
+        fun replacement(excluding: String?): String? {
+            if (remaining.isEmpty()) return null
+            val next = index.coerceAtMost(remaining.lastIndex)
+            return (next until remaining.size).asSequence().plus((next - 1 downTo 0).asSequence())
+                .map { remaining[it].uri }.firstOrNull { it != excluding }
+        }
         return copy(
             tabs = remaining,
-            primaryUri = if (primaryUri == uri) fallback?.takeUnless { it == secondaryUri } else primaryUri,
-            secondaryUri = if (secondaryUri == uri) fallback?.takeUnless { it == primaryUri } else secondaryUri,
+            primaryUri = if (primaryUri == uri) replacement(secondaryUri) else primaryUri,
+            secondaryUri = if (secondaryUri == uri) replacement(primaryUri) else secondaryUri,
         )
     }
 
