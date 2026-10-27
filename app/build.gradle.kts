@@ -154,6 +154,18 @@ dependencies {
     implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.ui.tooling)
     implementation(libs.lottie.compose)
+    // Bouncy Castle ships two artifact lines: jdk15to18 (Java 8+) and jdk18on (Java 8+,
+    // multi-release). PDFBox pulls the former transitively while OpenPGP needs the latter.
+    // Both contain the same classes, so keep exactly one line: the OpenPGP artifacts and
+    // bcpkix (PDFBox's signature support) all resolve to jdk18on.
+    implementation(libs.bouncycastle.prov)
+    implementation(libs.bouncycastle.bcpg)
+    implementation(libs.bouncycastle.bcpkix)
+    configurations.configureEach {
+        exclude(group = "org.bouncycastle", module = "bcprov-jdk15to18")
+        exclude(group = "org.bouncycastle", module = "bcutil-jdk15to18")
+        exclude(group = "org.bouncycastle", module = "bcpkix-jdk15to18")
+    }
 
     testImplementation(libs.junit)
     testImplementation(libs.json)

@@ -70,12 +70,21 @@ class SessionStore(private val dir: File, private val codec: DocumentCodec, priv
         }
     }
 
-    /** Discard any saved session (document + sidecar), so the next launch restores nothing.
-     *  Used when the app is left with no note open, so a closed note isn't kept on disk. */
-    fun clear() {
+    /**
+     * Discard any saved session (document + sidecar), so the next launch restores nothing.
+     * [secure] overwrites the document bytes first: a session that held a note from an encrypted
+     * folder must not leave its plaintext recoverable on disk.
+     */
+    fun clear(secure: Boolean = false) {
         runCatching {
-            docFile.delete()
-            File(dir, "session.json").delete()
+            val sidecar = File(dir, "session.json")
+            if (secure) {
+                com.xnotes.crypto.VaultCrypto.secureDelete(docFile)
+                com.xnotes.crypto.VaultCrypto.secureDelete(sidecar)
+            } else {
+                docFile.delete()
+                sidecar.delete()
+            }
         }
     }
 

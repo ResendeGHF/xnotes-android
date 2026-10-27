@@ -15,6 +15,8 @@
 -dontwarn java.awt.**
 -dontwarn javax.**
 -dontwarn org.apache.**
+# OpenPGP and Argon2id. PGP walks these classes by name.
+-keep class org.bouncycastle.** { *; }
 -dontwarn org.bouncycastle.**
 
 # --- Persisted model enums ----------------------------------------------------------------------

@@ -57,9 +57,10 @@ class CanvasSessionStore(private val dir: File, private val codec: CanvasCodec, 
         document
     }.getOrNull()
 
-    fun clear() {
+    /** Discard the saved canvas. [secure] overwrites it first when it came from an encrypted folder. */
+    fun clear(secure: Boolean = false) {
         runCatching {
-            docFile.delete()
+            if (secure) com.xnotes.crypto.VaultCrypto.secureDelete(docFile) else docFile.delete()
             meta.write(JSONObject())
         }
     }

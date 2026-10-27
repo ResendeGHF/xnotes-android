@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Unlocked-note working files and passphrase-encrypted PGP keys stay off backups. -->
+    <exclude domain="file" path="vaultwork" />
+    <exclude domain="file" path="pgp" />
+    <!-- Thumbnails and working sessions can hold pixels/plaintext of an unlocked note. -->
+    <exclude domain="file" path="note_thumbs" />
+    <exclude domain="file" path="session" />
+    <exclude domain="file" path="session-b" />
+</full-backup-content>

@@ -241,6 +241,12 @@ data class ImportProgress(val done: Int, val total: Int)
 /** Per-folder colour sidecar: a hidden ".xnote" dir holding "colors.json" (item name -> hex). */
 private const val SIDECAR_DIR = ".xnote"
 private const val SIDECAR_FILE = "colors.json"
+
+/** Result of creating an encrypted folder. */
+enum class VaultCreateResult { CREATED, FAILED, NESTED }
+
+/** Folder document id → whether it is an encrypted-folder root. Shared by every pane. */
+private val vaultRootCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 /** In the root folder's sidecar only: the names given to colour codes, so they sync with the notes. */
 private const val COLOR_NAMES_FILE = "color-names.json"
 
@@ -379,12 +385,60 @@ class Editor(
     /** Encoded inserted images, streamed to disk so a note full of large images never loads all their
      *  bytes into the heap; the renderer decodes from these files on demand. Under filesDir (not the
      *  reclaimable cacheDir). */
-    private val imageDir = tempDir("noteimg")
+    private val noteImageDir = tempDir("noteimg")
+
+    /**
+     * The dir used for newly inserted images, audio and page templates. A note inside an encrypted
+     * folder keeps them in that folder's private work dir, which locking overwrites; an ordinary
+     * note (or the backstage) uses the shared temp dir.
+     */
+    private val imageDir: java.io.File
+        get() = openVaultId?.let { vaultWorkFor(it) } ?: noteImageDir
 
     /** Scratch dir for [writeNoteSafely]: a note is encoded here in full before any SAF file is
      *  touched, so a failed encode can never truncate a good note. Lives under filesDir (not the
      *  reclaimable cacheDir). */
     private val saveTmpDir = tempDir("savetmp")
+
+    /** Working files for an unlocked folder. Wiped on lock. Excluded from backup. */
+    private val vaultWorkRoot = java.io.File(appContext.filesDir, "vaultwork").apply {
+        if (pane == Pane.PRIMARY && tabId == "default") com.xnotes.crypto.VaultCrypto.secureDeleteTree(this)
+        mkdirs()
+    }
+
+    /** OpenPGP keys for import and export. Secret keys are passphrase-wrapped on disk. */
+    val pgp = com.xnotes.crypto.PgpKeyStore(java.io.File(appContext.filesDir, "pgp"))
+
+    /** The encrypted folder holding the open document, or null. Drives session/asset handling. */
+    private var openVaultId: String? = null
+
+    /** Set when a locked folder blocks an open, so the explorer can ask for the password. */
+    var vaultPrompt by mutableStateOf<String?>(null)
+
+    /** The note or canvas an unlock will reopen, and the folder that held it. */
+    private class PendingVaultOpen(
+        val uri: String,
+        val name: String?,
+        val canvas: Boolean,
+        val vaultId: String,
+    )
+
+    private var pendingVaultOpen: PendingVaultOpen? = null
+
+    fun clearVaultPrompt() {
+        vaultPrompt = null
+        pendingVaultOpen = null
+    }
+
+    /** Unlock succeeded for [vaultId]: reopen the note that was blocked by it, if any. */
+    suspend fun reopenPendingVault(vaultId: String) {
+        val pending = pendingVaultOpen
+        pendingVaultOpen = null
+        vaultPrompt = null
+        if (pending == null || pending.vaultId != vaultId) return
+        if (pending.canvas) openCanvasAsync(pending.uri, pending.name)
+        else openAsync(pending.uri, pending.name)
+    }
 
     /** Where a batch export renders each document before it joins the zip; one file at a time. */
     private val batchDir = tempDir("batchpdf")
@@ -1020,14 +1074,21 @@ class Editor(
      * main thread; the model swap itself hops back to the main thread.
      */
     suspend fun openCanvasAsync(uri: String, name: String?): Boolean {
+        val vaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
+        if (vaultId != null && !com.xnotes.crypto.VaultSession.isUnlocked(vaultId)) {
+            vaultPrompt = vaultId
+            pendingVaultOpen = PendingVaultOpen(uri, name, canvas = true, vaultId)
+            message = appContext.getString(R.string.err_vault_locked)
+            return false
+        }
+        pendingVaultOpen = null
+        vaultPrompt = null
         val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             runCatching {
-                appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use {
-                    canvasCodec.read(it, imageDir)
-                }?.also { it.created = settleCreated(uri, it.created) }
+                readXcanvas(uri)?.also { it.created = settleCreated(uri, it.created) }
             }.getOrNull()
         } ?: return false
-        openCanvasDocument(doc, uri, name)
+        openCanvasDocument(doc, uri, name, vaultId = vaultId)
         rememberOpened(uri, name)
         return true
     }
@@ -1037,11 +1098,18 @@ class Editor(
         uri: String?,
         displayName: String?,
         fromSession: Boolean = false,
+        vaultId: String? = null,
     ) {
         flushAutosave() // a paged note may be open underneath; do not leave its edits unwritten
         doc.path = uri
         doc.displayName = displayName
+        vaultPrompt = null
+        pendingVaultOpen = null
+        openVaultId = vaultId
         val canvas = infinite
+        // A canvas in an encrypted folder keeps its inserted images and recordings in the folder's
+        // private work dir, which locking overwrites. [recordingDir] follows imageDir.
+        canvas.imageDir = if (vaultId != null) vaultWorkFor(vaultId) else imageDir
         canvas.replaceDocument(doc)
         canvas.applyPalette(palette)
         canvas.applyInputPrefs(settings.prefs.fingerDraws, controller.penButtonTool, settings.prefs.zoomLockPan, settings.prefs.detectShapes, settings.prefs.snapRotation90)
@@ -1060,6 +1128,11 @@ class Editor(
     /** Write [doc] to [uri] through a private temp, so a failed encode never truncates a good file. */
     private fun writeCanvasSafely(uri: String, doc: com.xnotes.core.infinite.InfiniteDocument): Boolean =
         synchronized(saveLock) {
+            when (writeSealed(uri) { canvasCodec.write(doc, it) }) {
+                SealedWrite.DONE -> { rememberStamp(uri); return true }
+                SealedWrite.FAILED -> return false
+                SealedWrite.NOT_VAULT -> Unit
+            }
             runCatching {
                 val tmp = java.io.File.createTempFile("save", ".xcanvas", saveTmpDir)
                 try {
@@ -2301,7 +2374,7 @@ class Editor(
         // that write out rather than pulling the source out from under it.
         val pending = noteWriteJob
         openPdfTemp?.let { old ->
-            if (old != keep) autosaveScope.launch { pending?.join(); old.delete() }
+            if (old != keep) autosaveScope.launch { pending?.join(); discardWorkFile(old) }
         }
         openPdfTemp = keep
     }
@@ -3149,11 +3222,14 @@ class Editor(
         secondary?.persist() // the other pane's note has to be flushed on pause too
     }
 
-    /** Persist the open canvas, or clear the stored one when a canvas is not what is open. */
+    /** Persist the open canvas, or clear the stored one when a canvas is not what is open.
+     *  A canvas from an encrypted folder is never written out: its plaintext must not reach the
+     *  session file, so any previous session is overwritten and removed instead. */
     private fun saveCanvasSession() {
         val canvas = infiniteOrNull
-        if (!canvasOpen || canvas == null) {
-            canvasSession.clear()
+        if (!canvasOpen || canvas == null || openVaultId != null) {
+            // Only a vault session can hold a copy that needs overwriting; ordinary ones unlink.
+            canvasSession.clear(secure = openVaultId != null)
             return
         }
         canvasSession.save(canvas.document, writeDocument = true)
@@ -3163,7 +3239,12 @@ class Editor(
      *  reopens this note where the user left off, unsaved edits included. */
     private fun saveSession() {
         if (!sessionLoaded) return // don't overwrite the saved note before restore has applied
-        if (!noteOpen || canvasOpen) { session.clear(); return } // nothing paged on top: wipe any stale session
+        // Nothing paged on top, or a note sealed in an encrypted folder: wipe rather than persist.
+        if (!noteOpen || canvasOpen || openVaultId != null) {
+            // Only a vault session can hold a copy that needs overwriting; ordinary ones unlink.
+            session.clear(secure = openVaultId != null)
+            return
+        }
         val contentChanged = contentVersion != lastSessionContentVersion
         lastSessionContentVersion = contentVersion
         // Snapshot on the main thread, then write the session off-thread, so saving a big note's
@@ -3188,16 +3269,31 @@ class Editor(
      *  there is no saved session. Drives the launch loader, so it's safe to await. */
     suspend fun restoreSession() {
         // A canvas was open last time: it takes precedence, since only one document is ever on top.
-        val canvasDoc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            if (canvasSession.exists()) canvasSession.load() else null
+        val canvasPair = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            if (!canvasSession.exists()) null
+            else canvasSession.load()?.let { doc -> doc to doc.path?.let { vaultOf(it) } }
         }
-        if (canvasDoc != null) {
+        val canvasDoc = canvasPair?.first
+        val canvasVault = canvasPair?.second
+        if (canvasDoc != null && canvasVault != null) {
+            // The folder is locked at launch (keys live only in memory), so this plaintext snapshot
+            // can never be opened. Overwrite it instead of restoring it.
+            canvasSession.clear(secure = true)
+        } else if (canvasDoc != null) {
             openCanvasDocument(canvasDoc, canvasDoc.path, canvasDoc.displayName, fromSession = true)
             sessionLoaded = true
             return
         }
-        val snap = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { session.load() }
-        if (snap != null) {
+        val snapPair = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            session.load()?.let { snap -> snap to snap.document.path?.let { vaultOf(it) } }
+        }
+        val snap = snapPair?.first
+        val snapVault = snapPair?.second
+        if (snap != null && snapVault != null) {
+            // A file left by an older build (or a crash before locking) must not be shown after
+            // restart, when the vault key is gone.
+            session.clear(secure = true)
+        } else if (snap != null) {
             state.document = snap.document
             rebuildPdfSource()
             adoptOpenPdf(snap.document) // track the restored note's temp PDF for later cleanup
@@ -3815,14 +3911,21 @@ class Editor(
         val t0 = System.nanoTime()
         var readMs = -1L
         try {
+            val vaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
+            if (vaultId != null && !com.xnotes.crypto.VaultSession.isUnlocked(vaultId)) {
+                vaultPrompt = vaultId
+                pendingVaultOpen = PendingVaultOpen(uri, name, canvas = false, vaultId)
+                message = appContext.getString(R.string.err_vault_locked)
+                return
+            }
+            pendingVaultOpen = null
+            vaultPrompt = null
             val readStart = System.nanoTime()
             var fileBytes = -1L
             val timing = com.xnotes.format.DocumentCodec.ReadTiming()
             val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 fileBytes = fileSizeOf(uri)
-                appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))
-                    ?.use { codec.read(it, pdfDir, imageDir, timing) }
-                    ?.also { it.created = settleCreated(uri, it.created) }
+                readXnote(uri, timing)?.also { it.created = settleCreated(uri, it.created) }
             }
             readMs = (System.nanoTime() - readStart) / 1_000_000
             state.lastOpenInflateMs = timing.inflateMs
@@ -3835,10 +3938,11 @@ class Editor(
                     " + assets ${timing.assetsMs} + compact ${timing.compactMs}, $fileBytes bytes",
             )
             if (doc == null) { message = appContext.getString(R.string.err_open_that_note); return }
-            if (openCancelled.get()) { doc.pdfFile?.delete(); deleteImageTemps(doc); return } // tapped Cancel mid-read; stay put
+            if (openCancelled.get()) { discardWorkFile(doc.pdfFile); deleteImageTemps(doc); return } // tapped Cancel mid-read; stay put
             doc.path = uri
             doc.displayName = name
             doc.dirty = false
+            openVaultId = vaultId
             replaceDocument(doc)
             state.openFileBytes = fileBytes
             state.lastSaveBytes = fileBytes // the on-disk size, until the first autosave rewrites it
@@ -3865,6 +3969,7 @@ class Editor(
         try {
             synchronized(saveLock) { codec.write(state.document, output) }
             state.document.path = uri
+            openVaultId = vaultOf(uri)
             if (name != null) state.document.displayName = name
             state.document.dirty = false
             maybeBindAutosave(uri) // saving into the folder makes it autosave thereafter
@@ -3909,6 +4014,8 @@ class Editor(
                 // this save belongs to may have its path and autosave binding touched.
                 if (state.document === doc) {
                     doc.path = uri
+                    // Save As can move a note into or out of a vault; keep session sealing in step.
+                    openVaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
                     maybeBindAutosave(uri)
                     refreshContent()
                 }
@@ -4071,15 +4178,12 @@ class Editor(
             delay(150)
             if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return@withContext it } }
-            val bmp = thumbCache.load(uri, generation) ?: run {
-                val doc = runCatching {
-                    appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use {
-                        canvasCodec.read(it, imageDir)
-                    }
-                }.getOrNull() ?: return@withContext null
+            val disk = sealDiskThumb(uri)
+            val bmp = (if (disk) thumbCache.load(uri, generation) else null) ?: run {
+                val doc = runCatching { readXcanvas(uri) }.getOrNull() ?: return@withContext null
                 doc.created?.let { createdStore.put(documentKey(uri), it) }
                 try {
-                    renderCanvasThumbnailSquare(doc, tilePx)?.also { thumbCache.store(uri, it, generation) }
+                    renderCanvasThumbnailSquare(doc, tilePx)?.also { if (disk) thumbCache.store(uri, it, generation) }
                         ?: return@withContext null
                 } finally {
                     deleteCanvasImageTemps(doc)
@@ -4150,16 +4254,15 @@ class Editor(
             delay(150) // let a quick scroll-past cancel this before any heavy work begins
             if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return@withContext it } }
-            val bmp = thumbCache.load(uri, generation) ?: run {
-                val doc = runCatching {
-                    appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { codec.read(it, pdfDir, imageDir) }
-                }.getOrNull() ?: return@withContext null
+            val disk = sealDiskThumb(uri)
+            val bmp = (if (disk) thumbCache.load(uri, generation) else null) ?: run {
+                val doc = runCatching { readXnote(uri) }.getOrNull() ?: return@withContext null
                 doc.created?.let { createdStore.put(documentKey(uri), it) }
                 try {
                     val vs = viewSettingsFor(uri)
-                    renderDocThumbnailSquare(doc, tilePx, pdfPageFilterFor(vs), vs.rotation)?.also { thumbCache.store(uri, it, generation) } ?: return@withContext null
+                    renderDocThumbnailSquare(doc, tilePx, pdfPageFilterFor(vs), vs.rotation)?.also { if (disk) thumbCache.store(uri, it, generation) } ?: return@withContext null
                 } finally {
-                    doc.pdfFile?.delete() // transient doc loaded just for a thumbnail; drop its extracts
+                    discardWorkFile(doc.pdfFile) // transient doc loaded just for a thumbnail; drop its extracts
                     deleteImageTemps(doc)
                 }
             }
@@ -4187,10 +4290,10 @@ class Editor(
             delay(150)
             if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(key)?.let { return@withContext it } }
-            val bmp = thumbCache.load(key, generation) ?: run {
-                val u = android.net.Uri.parse(uri)
+            val disk = sealDiskThumb(uri)
+            val bmp = (if (disk) thumbCache.load(key, generation) else null) ?: run {
                 val rendered = if (DocumentKind.ofName(name) == DocumentKind.CANVAS) {
-                    val doc = runCatching { appContext.contentResolver.openInputStream(u)?.use { canvasCodec.read(it, imageDir) } }.getOrNull()
+                    val doc = runCatching { readXcanvas(uri) }.getOrNull()
                         ?: return@withContext null
                     try {
                         renderCanvasThumbnail(doc, (pageThumbPx * 1.414).roundToInt(), pageThumbPx)
@@ -4198,17 +4301,17 @@ class Editor(
                         deleteCanvasImageTemps(doc)
                     }
                 } else {
-                    val doc = runCatching { appContext.contentResolver.openInputStream(u)?.use { codec.read(it, pdfDir, imageDir) } }.getOrNull()
+                    val doc = runCatching { readXnote(uri) }.getOrNull()
                         ?: return@withContext null
                     try {
                         val vs = viewSettingsFor(uri)
                         renderDocPage(doc, 0, pageThumbPx, pdfPageFilterFor(vs), vs.rotation)
                     } finally {
-                        doc.pdfFile?.delete()
+                        discardWorkFile(doc.pdfFile)
                         deleteImageTemps(doc)
                     }
                 } ?: return@withContext null
-                rendered.also { thumbCache.store(key, it, generation) }
+                if (disk) rendered.also { thumbCache.store(key, it, generation) } else rendered
             }
             publishThumbnail(key, bmp, generation)
         }
@@ -4219,9 +4322,7 @@ class Editor(
         val generation = thumbnailGeneration
         if (DocumentKind.ofName(name) == DocumentKind.CANVAS) return emptyList()
         return withContext(thumbDispatcher) {
-            val doc = runCatching {
-                appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { codec.read(it, pdfDir, imageDir) }
-            }.getOrNull() ?: return@withContext emptyList()
+            val doc = runCatching { readXnote(uri) }.getOrNull() ?: return@withContext emptyList()
             try {
                 val vs = viewSettingsFor(uri)
                 val filter = pdfPageFilterFor(vs)
@@ -4230,7 +4331,7 @@ class Editor(
                     runCatching { renderDocPage(doc, i, heightPx, filter, vs.rotation) }.getOrNull()?.asImageBitmap()
                 }.takeIf { isActive && isCurrentThumbnail(generation) } ?: emptyList()
             } finally {
-                doc.pdfFile?.delete()
+                discardWorkFile(doc.pdfFile)
                 deleteImageTemps(doc)
             }
         }
@@ -4240,17 +4341,17 @@ class Editor(
      *  they don't pile up in [imageDir] until the next launch purge. Never called on the open note. */
     private fun deleteImageTemps(doc: Document) {
         for (page in doc.pages) for (item in page.items) {
-            if (item is ImageItem) runCatching { item.image.file.delete() }
-            if (item is com.xnotes.core.model.AudioItem) runCatching { item.audio.file.delete() }
+            if (item is ImageItem) runCatching { discardWorkFile(item.image.file) }
+            if (item is com.xnotes.core.model.AudioItem) runCatching { discardWorkFile(item.audio.file) }
         }
-        for (file in doc.templatePackages.values) runCatching { file.delete() }
+        for (file in doc.templatePackages.values) runCatching { discardWorkFile(file) }
     }
 
     /** [deleteImageTemps] for a canvas, whose items are one flat list rather than per page. */
     private fun deleteCanvasImageTemps(doc: com.xnotes.core.infinite.InfiniteDocument) {
         for (item in doc.items) {
-            if (item is ImageItem) runCatching { item.image.file.delete() }
-            if (item is com.xnotes.core.model.AudioItem) runCatching { item.audio.file.delete() }
+            if (item is ImageItem) runCatching { discardWorkFile(item.image.file) }
+            if (item is com.xnotes.core.model.AudioItem) runCatching { discardWorkFile(item.audio.file) }
         }
     }
 
@@ -4276,7 +4377,8 @@ class Editor(
         withContext(thumbDispatcher) {
             if (state.document !== doc) return@withContext // a new note was opened; don't cache stale pixels
             val bmp = runCatching { renderDocThumbnailSquare(doc, tilePx, filter, rotation) }.getOrNull() ?: return@withContext
-            thumbCache.store(uri, bmp, generation)
+            // A sealed note's pixels may live only in memory; the disk cache stays ciphertext-free.
+            if (sealDiskThumb(uri)) thumbCache.store(uri, bmp, generation)
             // The whole-page tile is drawn again the next time it's shown.
             synchronized(noteThumbs) { noteThumbs.remove(pageThumbKey(uri)) }
             thumbCache.remove(pageThumbKey(uri))
@@ -4506,6 +4608,130 @@ class Editor(
     }.getOrDefault(false)
 
     /**
+     * Creates an encrypted folder and unlocks it. The header holds Argon2id parameters and a wrapped
+     * data key. IO — call off the main thread. The password is wiped here.
+     */
+    fun createEncryptedFolder(
+        treeUri: String,
+        parentDocId: String,
+        name: String,
+        password: CharArray,
+        params: com.xnotes.crypto.VaultCrypto.Params,
+    ): VaultCreateResult {
+        var folder: android.net.Uri? = null
+        var dataKey: ByteArray? = null
+        var header: ByteArray? = null
+        var created = false
+        try {
+            if (vaultCovering(treeUri, parentDocId) != null) return VaultCreateResult.NESTED
+            val tree = android.net.Uri.parse(treeUri)
+            val parent = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, parentDocId)
+            val folderUri = android.provider.DocumentsContract.createDocument(
+                appContext.contentResolver, parent, android.provider.DocumentsContract.Document.MIME_TYPE_DIR, name,
+            ) ?: return VaultCreateResult.FAILED
+            folder = folderUri
+            val folderId = android.provider.DocumentsContract.getDocumentId(folderUri)
+            val marker = android.provider.DocumentsContract.createDocument(
+                appContext.contentResolver, folderUri, "application/octet-stream", com.xnotes.crypto.VaultCrypto.MARKER_NAME,
+            ) ?: return VaultCreateResult.FAILED
+            val vault = com.xnotes.crypto.VaultCrypto.create(password, params)
+            dataKey = vault.dataKey
+            val headerBytes = vault.header
+            header = headerBytes
+            val wrote = runCatching {
+                appContext.contentResolver.openOutputStream(marker, "wt")?.use { it.write(headerBytes) } != null
+            }.getOrDefault(false)
+            if (!wrote) return VaultCreateResult.FAILED
+            com.xnotes.crypto.VaultSession.unlock(folderId, vault.dataKey)
+            vaultRootCache[folderId] = true
+            created = true
+            return VaultCreateResult.CREATED
+        } catch (_: Throwable) {
+            // A provider may fail in many ways (disk full, revoked grant, encode error). Leaving a
+            // half-created folder behind would look like a vault without a usable header.
+            return VaultCreateResult.FAILED
+        } finally {
+            dataKey?.fill(0)
+            header?.fill(0)
+            password.fill('\u0000')
+            if (!created) {
+                folder?.let { runCatching { android.provider.DocumentsContract.deleteDocument(appContext.contentResolver, it) } }
+            }
+        }
+    }
+
+    /** The encrypted folder covering [folderDocId], if this folder or an ancestor is one. IO. */
+    fun vaultHere(treeUri: String, folderDocId: String): String? = vaultCovering(treeUri, folderDocId)
+
+    fun vaultUnlocked(folderId: String): Boolean = com.xnotes.crypto.VaultSession.isUnlocked(folderId)
+
+    /** Checks the password and keeps the data key in memory. IO. Wipes [password]. */
+    fun unlockVault(treeUri: String, folderDocId: String, password: CharArray): Boolean {
+        var header: ByteArray? = null
+        var key: ByteArray? = null
+        try {
+            val id = vaultCovering(treeUri, folderDocId) ?: return false
+            header = vaultHeader(treeUri, id) ?: return false
+            key = com.xnotes.crypto.VaultCrypto.open(header, password)
+            com.xnotes.crypto.VaultSession.unlock(id, key)
+            return true
+        } catch (_: Exception) {
+            return false
+        } finally {
+            key?.fill(0)
+            header?.fill(0)
+            password.fill('\u0000')
+        }
+    }
+
+    /**
+     * Drops the data key. If the open note lives in this folder, it is saved (still encrypted) and
+     * closed first, then the in-memory working files are overwritten.
+     */
+    fun lockVault(folderId: String) {
+        // Both panes can show a note from the same folder; close all of them before dropping the key.
+        val panes = listOfNotNull(this, secondary)
+        val affected = panes.filter { it.noteOpen && it.openVaultId == folderId }
+        fun finish() {
+            com.xnotes.crypto.VaultSession.lock(folderId)
+            com.xnotes.crypto.VaultCrypto.secureDeleteTree(vaultWorkFor(folderId))
+            for (ed in panes) {
+                // A session snapshot holds the note's plaintext. Overwrite it rather than merely
+                // unlinking it, then drop decoded thumbnails that the explorer could still show.
+                ed.clearSessionsSecure()
+                ed.openVaultId = null
+                synchronized(ed.noteThumbs) { ed.noteThumbs.evictAll() }
+            }
+            vaultPrompt = null
+            pendingVaultOpen = null
+        }
+        if (affected.isEmpty()) { finish(); return }
+        var remaining = affected.size
+        for (ed in affected) {
+            ed.goHome {
+                remaining--
+                if (remaining == 0) finish()
+            }
+        }
+    }
+
+    /** Folder id when [uri] is inside a locked encrypted folder; null when it can be read. */
+    fun lockedVaultId(uri: String): String? =
+        vaultOf(uri)?.takeIf { !com.xnotes.crypto.VaultSession.isUnlocked(it) }
+
+    /** The encrypted folder holding [uri], or null. Does provider I/O; call off the main thread. */
+    private fun vaultOf(uri: String): String? {
+        val root = browseRoot ?: return null
+        return protectingVault(root, uri)
+    }
+
+    /** Overwrite both session files: they may have held plaintext from an encrypted folder. */
+    private fun clearSessionsSecure() {
+        session.clear(secure = true)
+        canvasSession.clear(secure = true)
+    }
+
+    /**
      * The stem a new note gets from the filename template, expanded against the current moment.
      * A template carrying `#` advances its number past every name in [takenLower] (lowercased,
      * with extension); one that doesn't is returned as-is, for the caller to de-duplicate.
@@ -4561,8 +4787,14 @@ class Editor(
             android.provider.DocumentsContract.createDocument(appContext.contentResolver, parent, "application/octet-stream", name)
         }.getOrNull() ?: return null
         return runCatching {
-            appContext.contentResolver.openOutputStream(uri, "wt")?.use { write(it) }
-            uri.toString()
+            when (writeSealed(uri.toString(), write)) {
+                SealedWrite.FAILED -> error("sealed")
+                SealedWrite.DONE -> uri.toString()
+                SealedWrite.NOT_VAULT -> {
+                    appContext.contentResolver.openOutputStream(uri, "wt")?.use { write(it) }
+                    uri.toString()
+                }
+            }
         }.getOrElse {
             runCatching { android.provider.DocumentsContract.deleteDocument(appContext.contentResolver, uri) }
             null
@@ -4932,12 +5164,15 @@ class Editor(
         return shown != null && isSameDocument(shown, uri)
     }
 
-    private fun readNote(uri: String): Document? = runCatching {
-        appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { codec.read(it, pdfDir, imageDir) }
-    }.getOrNull()
+    private fun readNote(uri: String): Document? = runCatching { readXnote(uri) }.getOrNull()
 
     /** Encode [doc] in full first, then replace the file at [uri], so a failed encode never truncates it. IO. */
     private fun writeDocument(uri: String, doc: Document): Boolean = runCatching {
+        when (writeSealed(uri) { codec.write(doc, it) }) {
+            SealedWrite.DONE -> return@runCatching true
+            SealedWrite.FAILED -> return@runCatching false
+            SealedWrite.NOT_VAULT -> Unit
+        }
         val tmp = java.io.File.createTempFile("merge", ".xnote", saveTmpDir)
         try {
             java.io.FileOutputStream(tmp).use { codec.write(doc, it) }
@@ -5269,6 +5504,7 @@ class Editor(
         val resultUri = result.getOrNull()?.toString() ?: docUri
         if (state.document.path == docUri) {
             state.document.path = resultUri
+            openVaultId = vaultOf(resultUri)
             state.document.displayName = newName
             if (autosaveUri == docUri) autosaveUri = resultUri
             title = state.document.title
@@ -5422,6 +5658,9 @@ class Editor(
 
     /** [copyDocumentInto], returning the copy's name, or null when it failed. */
     private fun copyDocumentAs(treeUri: String, sourceUri: String, targetParentDocId: String): String? = runCatching {
+        val srcVault = protectingVault(treeUri, sourceUri)
+        val dstVault = vaultCovering(treeUri, targetParentDocId)
+        if (srcVault != dstVault) return@runCatching transcodeDocument(treeUri, sourceUri, targetParentDocId)
         val tree = android.net.Uri.parse(treeUri)
         val target = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, targetParentDocId)
         val src = android.net.Uri.parse(sourceUri)
@@ -5453,6 +5692,48 @@ class Editor(
             queryDisplayName(newUri) ?: newName
         }
     }.getOrNull()
+
+    /**
+     * Copies [sourceUri] into [targetParentDocId], decrypting and encrypting when the two sides sit
+     * in different encrypted folders. Plaintext exists only in the copy buffer. IO.
+     */
+    private fun transcodeDocument(treeUri: String, sourceUri: String, targetParentDocId: String): String? {
+        val src = android.net.Uri.parse(sourceUri)
+        val name = queryDisplayName(src) ?: return null
+        val isDir = appContext.contentResolver.getType(src) == android.provider.DocumentsContract.Document.MIME_TYPE_DIR
+        val tree = android.net.Uri.parse(treeUri)
+        val parent = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, targetParentDocId)
+        val taken = browseChildren(treeUri, targetParentDocId).mapTo(HashSet()) { it.name.lowercase() }
+        val newName = uniqueCopyName(name, taken, splitExtension = !isDir)
+        if (isDir) {
+            val folder = android.provider.DocumentsContract.createDocument(
+                appContext.contentResolver, parent, android.provider.DocumentsContract.Document.MIME_TYPE_DIR, newName,
+            ) ?: return null
+            val newId = android.provider.DocumentsContract.getDocumentId(folder)
+            val children = browseChildren(treeUri, browseDocId(sourceUri))
+            for (child in children) {
+                if (transcodeDocument(treeUri, child.documentUri, newId) == null) return null
+            }
+            return newName
+        }
+        val newUri = android.provider.DocumentsContract.createDocument(
+            appContext.contentResolver, parent, "application/octet-stream", newName,
+        ) ?: return null
+        val copied = runCatching {
+            openDocumentStream(sourceUri)?.use { input ->
+                when (writeSealed(newUri.toString()) { out -> input.copyTo(out) }) {
+                    SealedWrite.FAILED -> false
+                    SealedWrite.DONE -> true
+                    SealedWrite.NOT_VAULT -> appContext.contentResolver.openOutputStream(newUri, "wt")?.use { out -> input.copyTo(out); true } ?: false
+                }
+            } ?: false
+        }.getOrDefault(false)
+        if (!copied) {
+            runCatching { android.provider.DocumentsContract.deleteDocument(appContext.contentResolver, newUri) }
+            return null
+        }
+        return queryDisplayName(newUri) ?: newName
+    }
 
     /** Copies [entries] into [targetParentDocId], colour codes included; returns how many were copied. IO. */
     fun copyEntriesInto(treeUri: String, entries: List<BrowseEntry>, targetParentDocId: String): Int {
@@ -5545,12 +5826,20 @@ class Editor(
         // Pasting a cut into the folder the items already live in is a no-op (and SAF would reject the
         // same-parent move), so report success without touching anything.
         if (sourceParentDocId == targetParentDocId) return@runCatching true
+        val srcVault = protectingVault(treeUri, sourceUri)
+        val dstVault = vaultCovering(treeUri, targetParentDocId)
+        if (srcVault != dstVault) {
+            val copied = transcodeDocument(treeUri, sourceUri, targetParentDocId) != null
+            if (!copied) return@runCatching false
+            return@runCatching deleteDocument(sourceUri)
+        }
         val tree = android.net.Uri.parse(treeUri)
         val sourceParent = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, sourceParentDocId)
         val target = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, targetParentDocId)
         val newUri = android.provider.DocumentsContract.moveDocument(appContext.contentResolver, android.net.Uri.parse(sourceUri), sourceParent, target)
         if (newUri != null && state.document.path == sourceUri) {
             state.document.path = newUri.toString()
+            openVaultId = vaultOf(newUri.toString())
             if (autosaveUri == sourceUri) autosaveUri = newUri.toString()
         }
         newUri?.let { onDocumentMoved(sourceUri, it.toString()) }
@@ -5690,6 +5979,7 @@ class Editor(
     /** Point the open note at the copy it just forked into, and say so. Main thread. */
     private fun adoptNoteFork(fork: Fork) {
         state.document.path = fork.uri
+        openVaultId = vaultOf(fork.uri)
         state.document.displayName = fork.name
         autosaveUri = fork.uri
         refreshContent()
@@ -5700,6 +5990,8 @@ class Editor(
     private fun adoptCanvasFork(fork: Fork) {
         val canvas = infiniteOrNull ?: return
         canvas.document.path = fork.uri
+        openVaultId = vaultOf(fork.uri)
+        canvas.imageDir = openVaultId?.let { vaultWorkFor(it) } ?: imageDir
         canvas.document.displayName = fork.name
         canvasAutosaveUri = fork.uri
         refreshContent()
@@ -5719,6 +6011,15 @@ class Editor(
      * throw mid-encode left the note as 0 bytes. Returns true only when [uri] now holds the note.
      */
     private fun writeNoteSafely(uri: String, doc: Document): Boolean = synchronized(saveLock) {
+        when (writeSealed(uri) { codec.write(doc, it) }) {
+            SealedWrite.DONE -> {
+                rememberStamp(uri)
+                state.lastSaveBytes = fileSizeOf(uri)
+                return true
+            }
+            SealedWrite.FAILED -> return false
+            SealedWrite.NOT_VAULT -> Unit
+        }
         // Replace only the manifest when everything ahead of it is already right. A splice that
         // fails part way leaves a file that is not a valid zip, and falling through to the full
         // rewrite below is what puts it right, so this must stay ordered this way.
@@ -6092,6 +6393,127 @@ class Editor(
     fun browseRootDocId(treeUri: String): String =
         android.provider.DocumentsContract.getTreeDocumentId(android.net.Uri.parse(treeUri))
 
+    /** This folder, or an ancestor up to the tree root, when it is an encrypted folder. */
+    private fun vaultCovering(treeUri: String, folderDocId: String): String? {
+        val rootId = browseRootDocId(treeUri)
+        var id = folderDocId
+        while (id.isNotEmpty()) {
+            if (isVaultRoot(treeUri, id)) return id
+            if (id == rootId) break
+            val parent = id.substringBeforeLast('/', "")
+            if (parent.isEmpty() || parent == id) break
+            id = parent
+        }
+        return null
+    }
+
+    /** The encrypted folder that seals the file at [fileUri], or null. */
+    private fun protectingVault(treeUri: String, fileUri: String): String? {
+        val docId = runCatching {
+            android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(fileUri))
+        }.getOrNull() ?: return null
+        val parent = docId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return null
+        return vaultCovering(treeUri, parent)
+    }
+
+    private fun isVaultRoot(treeUri: String, folderId: String): Boolean {
+        vaultRootCache[folderId]?.let { return it }
+        val yes = vaultHeader(treeUri, folderId) != null
+        vaultRootCache[folderId] = yes
+        return yes
+    }
+
+    private fun vaultHeader(treeUri: String, folderId: String): ByteArray? {
+        val tree = android.net.Uri.parse(treeUri)
+        val fileId = findChildDocId(tree, folderId, com.xnotes.crypto.VaultCrypto.MARKER_NAME, dir = false) ?: return null
+        val uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, fileId)
+        return runCatching { appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+    }
+
+    private fun vaultWorkFor(folderId: String): java.io.File =
+        java.io.File(vaultWorkRoot, folderId.hashCode().toUInt().toString(16)).apply { mkdirs() }
+
+    /** Asset dirs for a read. Vault notes use a private dir that lock overwrites. */
+    private fun workDirs(uri: String): Pair<java.io.File, java.io.File> {
+        val id = browseRoot?.let { protectingVault(it, uri) }
+        if (id == null) return pdfDir to imageDir
+        val dir = vaultWorkFor(id)
+        return dir to dir
+    }
+
+    private fun discardWorkFile(file: java.io.File?) {
+        if (file == null) return
+        val root = vaultWorkRoot.absolutePath + java.io.File.separator
+        if (file.absolutePath.startsWith(root)) com.xnotes.crypto.VaultCrypto.secureDelete(file) else file.delete()
+    }
+
+    /**
+     * Opens a note. Inside an unlocked folder the ciphertext is authenticated and decrypted in
+     * memory before the stream is returned. A locked folder yields null and never touches plaintext.
+     */
+    private fun openDocumentStream(uri: String): java.io.InputStream? {
+        val raw = appContext.contentResolver.openInputStream(android.net.Uri.parse(uri)) ?: return null
+        val root = browseRoot ?: return raw
+        val id = protectingVault(root, uri) ?: return raw
+        val key = com.xnotes.crypto.VaultSession.key(id) ?: run { raw.close(); return null }
+        return try {
+            com.xnotes.crypto.VaultCrypto.decryptFile(key, raw)
+        } catch (_: Exception) {
+            raw.close()
+            null
+        }
+    }
+
+    private enum class SealedWrite { NOT_VAULT, DONE, FAILED }
+
+    /**
+     * Encrypts [produce]'s plaintext in memory and writes only ciphertext when [uri] is inside an
+     * unlocked folder. [SealedWrite.NOT_VAULT] means the caller writes the normal way.
+     */
+    private fun writeSealed(uri: String, produce: (java.io.OutputStream) -> Unit): SealedWrite {
+        val root = browseRoot ?: return SealedWrite.NOT_VAULT
+        val id = protectingVault(root, uri) ?: return SealedWrite.NOT_VAULT
+        val key = com.xnotes.crypto.VaultSession.key(id) ?: return SealedWrite.FAILED
+        val tmp = java.io.File.createTempFile("enc", ".bin", saveTmpDir)
+        return try {
+            java.io.FileOutputStream(tmp).use { out -> com.xnotes.crypto.VaultCrypto.encryptFile(key, out, produce) }
+            val dest = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt") ?: return SealedWrite.FAILED
+            dest.use { java.io.FileInputStream(tmp).use { input -> input.copyTo(it) } }
+            SealedWrite.DONE
+        } catch (_: Exception) {
+            SealedWrite.FAILED
+        } finally {
+            com.xnotes.crypto.VaultCrypto.secureDelete(tmp)
+        }
+    }
+
+    private fun readXnote(uri: String, timing: com.xnotes.format.DocumentCodec.ReadTiming? = null): com.xnotes.core.model.Document? {
+        val (pdf, img) = workDirs(uri)
+        return openDocumentStream(uri)?.use { codec.read(it, pdf, img, timing) }
+    }
+
+    private fun readXcanvas(uri: String): com.xnotes.core.infinite.InfiniteDocument? {
+        val (_, img) = workDirs(uri)
+        return openDocumentStream(uri)?.use { canvasCodec.read(it, img) }
+    }
+
+    /** Plaintext thumbnails of a sealed note are not written to the disk cache. */
+    private fun sealDiskThumb(uri: String): Boolean =
+        browseRoot?.let { protectingVault(it, uri) } == null
+
+    /** Plaintext bytes of a note, decrypted in memory when it lives in an unlocked folder. */
+    fun plainDocumentBytes(uri: String): ByteArray? = openDocumentStream(uri)?.use { it.readBytes() }
+
+    /**
+     * Saves an already-decrypted note into [parentDocId], sealing it again when that folder is encrypted.
+     * [plain] is wiped by the caller.
+     */
+    fun importPlainNote(plain: ByteArray, treeUri: String, parentDocId: String, rawName: String): String? {
+        val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.NOTE)
+        return createNoteFile(treeUri, parentDocId, name) { it.write(plain) }
+    }
+
     /** The document id of a folder entry, for descending into it. */
     fun browseDocId(documentUri: String): String =
         android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(documentUri))
@@ -6133,6 +6555,9 @@ class Editor(
                         // The colour sidecar is captured (read below) but never listed, whatever the dot setting.
                         if (name == SIDECAR_DIR) { sidecarDocId = id; continue }
                         if (hiddenByDot(name)) continue
+                    } else if (name == com.xnotes.crypto.VaultCrypto.MARKER_NAME) {
+                        vaultRootCache[parentDocId] = true
+                        continue
                     } else if (!com.xnotes.core.util.ReaderKind.isListed(name) || hiddenByDot(name)) {
                         continue
                     }
@@ -6714,7 +7139,7 @@ class Editor(
             exportCanvasFileToPdf(srcUri, out, onProgress, isCancelled, title)
             return
         }
-        val doc = appContext.contentResolver.openInputStream(android.net.Uri.parse(srcUri))?.use { codec.read(it, pdfDir, imageDir) } ?: return
+        val doc = readXnote(srcUri) ?: return
         val src = doc.pdfFile?.let { com.xnotes.platform.PdfSource.create(it) }
         try {
             com.xnotes.platform.PdfExporter.export(
@@ -6728,7 +7153,7 @@ class Editor(
             )
         } finally {
             src?.close()
-            doc.pdfFile?.delete() // transient doc loaded just for export; drop its extracts
+            discardWorkFile(doc.pdfFile) // transient doc loaded just for export; drop its extracts
             deleteImageTemps(doc)
         }
     }
@@ -6745,8 +7170,7 @@ class Editor(
         isCancelled: () -> Boolean,
         title: String,
     ) {
-        val doc = appContext.contentResolver.openInputStream(android.net.Uri.parse(srcUri))
-            ?.use { canvasCodec.read(it, imageDir) } ?: return
+        val doc = readXcanvas(srcUri) ?: return
         try {
             com.xnotes.platform.CanvasPdfExporter.export(
                 appContext, doc, out,
@@ -9303,7 +9727,12 @@ class Editor(
         AudioPlayback.closeFor(this)
         saveViewState()
         flushAutosave()
+        val wasSealed = openVaultId != null
         autosaveUri = null
+        openVaultId = null
+        vaultPrompt = null
+        pendingVaultOpen = null
+        if (wasSealed) clearSessionsSecure()
         state.document = blankDocument().also { stampNewNoteDefaults(it) }
         rebuildPdfSource() // close the outgoing note's PDF source (a blank note has none)
         adoptOpenPdf(state.document) // and reclaim its temp PDF file now it's released
@@ -9409,8 +9838,10 @@ class Editor(
 
     /** Pop back to backstage: detach the current note (flush autosave, drop the binding) and clear
      *  [noteOpen] so the editor is removed from the stack. The document stays as an inert buffer. */
-    fun goHome() {
-        if (!noteOpen) return
+    fun goHome(onLeft: (() -> Unit)? = null) {
+        if (!noteOpen) { onLeft?.invoke(); return }
+        val sealed = openVaultId != null
+        vaultPrompt = null
         penMenu.close()
         infiniteOrNull?.penMenu?.close()
         // Closing the note places a recording still going, before the note is saved.
@@ -9426,6 +9857,9 @@ class Editor(
                 canvasAutosaveUri = null
                 canvasOpen = false
                 noteOpen = false
+                openVaultId = null
+                if (sealed) clearSessionsSecure()
+                onLeft?.invoke()
             }
             return
         }
@@ -9439,6 +9873,9 @@ class Editor(
             autosaveUri?.let { uri -> autosaveScope.launch { regenerateClosedNoteThumb(uri) } }
             autosaveUri = null
             noteOpen = false
+            openVaultId = null
+            if (sealed) clearSessionsSecure()
+            onLeft?.invoke()
         }
     }
 }

@@ -1,6 +1,8 @@
 package com.xnotes.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExitTransition
@@ -175,7 +177,7 @@ import kotlin.math.roundToInt
 enum class BackstageView { HOME, PREFERENCES, ABOUT, TRASH }
 
 /** Whether the Home explorer is awaiting a new file/folder name. */
-private enum class CreateMode { NONE, FILE, CANVAS, FOLDER }
+private enum class CreateMode { NONE, FILE, CANVAS, FOLDER, ENCRYPTED_FOLDER }
 
 /** Entries copied or cut in the explorer; each remembers the folder it was listed in. */
 private data class ClipItem(val entries: List<BrowseEntry>, val isCut: Boolean)
@@ -823,6 +825,7 @@ private fun NewItemMenuItems(
     onClose: () -> Unit,
     onCreateMode: (CreateMode) -> Unit,
     onImportPdf: () -> Unit,
+    onImportEncrypted: () -> Unit,
 ) {
     val tint = LocalPalette.current.text.toComposeColor()
     // Taller than a default menu row (the explorer's primary create affordance), but only as wide
@@ -842,6 +845,8 @@ private fun NewItemMenuItems(
     item(XnotesIcons.canvas, stringResource(R.string.new_canvas_menu)) { onCreateMode(CreateMode.CANVAS) }
     item(XnotesIcons.importDoc, stringResource(R.string.import_file)) { onImportPdf() }
     item(XnotesIcons.newFolder, stringResource(R.string.new_folder_menu)) { onCreateMode(CreateMode.FOLDER) }
+    item(XnotesIcons.lock, stringResource(R.string.new_encrypted_folder_menu)) { onCreateMode(CreateMode.ENCRYPTED_FOLDER) }
+    item(XnotesIcons.lock, stringResource(R.string.import_encrypted_menu)) { onImportEncrypted() }
 }
 
 /** What the explorer hands back to the activity: opening, sharing and exporting files it can't do itself. */
@@ -922,6 +927,7 @@ private fun CreateButton(
     exporting: Boolean,
     onCreateMode: (CreateMode) -> Unit,
     onImportPdf: () -> Unit,
+    onImportEncrypted: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -944,7 +950,7 @@ private fun CreateButton(
             )
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-            NewItemMenuItems({ menuOpen = false }, onCreateMode, onImportPdf)
+            NewItemMenuItems({ menuOpen = false }, onCreateMode, onImportPdf, onImportEncrypted)
         }
     }
 }
@@ -1016,6 +1022,37 @@ private fun ExplorerSection(
     var moving by remember(root) { mutableStateOf<List<BrowseEntry>?>(null) }
     var merging by remember(root) { mutableStateOf<List<BrowseEntry>?>(null) }
     var previewing by remember(root) { mutableStateOf<BrowseEntry?>(null) }
+    var pgpExport by remember(root) { mutableStateOf<BrowseEntry?>(null) }
+    var pgpImport by remember(root) { mutableStateOf<ByteArray?>(null) }
+    var pgpBusy by remember(root) { mutableStateOf(false) }
+    var askUnlock by remember(root) { mutableStateOf(false) }
+    var vaultBusy by remember(root) { mutableStateOf(false) }
+    val vaultEpoch = com.xnotes.crypto.VaultSession.epoch
+    var vaultFolderId by remember(root) { mutableStateOf<String?>(null) }
+    LaunchedEffect(root, currentDocId, vaultEpoch, refreshKey) {
+        vaultFolderId = withContext(Dispatchers.IO) { editor.vaultHere(root, currentDocId) }
+    }
+    val importEncrypted = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            pgpImport = withContext(Dispatchers.IO) {
+                runCatching { context.contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+            }
+        }
+    }
+    var pendingPgp by remember(root) { mutableStateOf<ByteArray?>(null) }
+    val savePgp = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pgp-encrypted")) { uri ->
+        val bytes = pendingPgp
+        pendingPgp = null
+        if (uri != null && bytes != null) {
+            scope.launch(Dispatchers.IO) {
+                runCatching { context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) } }
+                bytes.fill(0)
+            }
+        } else {
+            bytes?.fill(0)
+        }
+    }
     var opError by remember(root) { mutableStateOf<String?>(null) }
     var query by remember(root) { mutableStateOf("") }
     // Set from the sidebar: the whole tree's items carrying this colour, shown in place of the folder.
@@ -1348,6 +1385,7 @@ private fun ExplorerSection(
                 share = { callsNow.value.shareFile(it.documentUri) },
                 saveCopy = { callsNow.value.saveCopyFile(it.documentUri) },
                 exportPdf = { callsNow.value.exportFilePdf(it.documentUri) },
+                exportPgp = { pgpExport = it },
                 preview = { previewing = it },
                 convertToNote = { convertToNote(it) },
                 importInto = { callsNow.value.importInto(it.documentUri) },
@@ -1770,6 +1808,17 @@ private fun ExplorerSection(
                         }
                     }
                     Spacer(Modifier.width(8.dp))
+                    if (vaultFolderId != null) {
+                        val unlocked = editor.vaultUnlocked(vaultFolderId!!)
+                        ExplorerIcon(
+                            if (unlocked) XnotesIcons.unlock else XnotesIcons.lock,
+                            stringResource(if (unlocked) R.string.lock_folder else R.string.unlock_folder),
+                        ) {
+                            val id = vaultFolderId ?: return@ExplorerIcon
+                            if (unlocked) editor.lockVault(id) else askUnlock = true
+                        }
+                        Spacer(Modifier.width(4.dp))
+                    }
                     ExplorerSearchField(query, { query = it }, expandedWidth = if (wide) 320.dp else (headerWidth - 144.dp).coerceAtLeast(160.dp), lift = liftNow)
                     if (wide && switcherLayouts.size > 1) {
                         Spacer(Modifier.width(8.dp))
@@ -1844,6 +1893,7 @@ private fun ExplorerSection(
             exporting = selection.isNotEmpty(),
             onCreateMode = onCreateMode,
             onImportPdf = calls.importPdf,
+            onImportEncrypted = { importEncrypted.launch(arrayOf("*/*")) },
             onExport = {
                 val picked = selection.toList()
                 // A lone folder zips under its own name, anything else under the folder it was picked in.
@@ -1945,6 +1995,143 @@ private fun ExplorerSection(
                 }
             },
             onDismiss = { fieldError = null; if (pendingImport != null) editor.cancelImport() else onCreateMode(CreateMode.NONE) },
+        )
+    }
+    if (createMode == CreateMode.ENCRYPTED_FOLDER) {
+        EncryptedFolderDialog(
+            error = fieldError,
+            busy = vaultBusy,
+            onConfirm = { name, password, params ->
+                vaultBusy = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        editor.createEncryptedFolder(root, currentDocId, name, password, params)
+                    }
+                    vaultBusy = false
+                    when (result) {
+                        VaultCreateResult.CREATED -> { fieldError = null; onCreateMode(CreateMode.NONE); refreshKey++ }
+                        VaultCreateResult.NESTED -> fieldError = context.getString(R.string.err_nested_vault)
+                        VaultCreateResult.FAILED -> fieldError = context.getString(R.string.err_create_folder)
+                    }
+                }
+            },
+            onDismiss = { if (!vaultBusy) { fieldError = null; onCreateMode(CreateMode.NONE) } },
+        )
+    }
+    // Either pane can be the one whose open hit the locked folder; the prompt must act on that pane.
+    val promptEditor = editor.vaultPrompt?.let { editor }
+        ?: editor.secondary?.takeIf { it.vaultPrompt != null }
+    val unlockId = promptEditor?.vaultPrompt ?: vaultFolderId.takeIf { askUnlock }
+    if (unlockId != null) {
+        val promptPane = promptEditor ?: editor
+        UnlockVaultDialog(
+            error = fieldError,
+            busy = vaultBusy,
+            onConfirm = { password ->
+                vaultBusy = true
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) { editor.unlockVault(root, unlockId, password) }
+                    vaultBusy = false
+                    if (ok) {
+                        fieldError = null
+                        askUnlock = false
+                        // The open that hit the locked folder was remembered; carry it through now.
+                        promptPane.reopenPendingVault(unlockId)
+                        refreshKey++
+                    } else fieldError = context.getString(R.string.err_unlock_folder)
+                }
+            },
+            onDismiss = {
+                if (!vaultBusy) {
+                    fieldError = null
+                    askUnlock = false
+                    (promptEditor ?: editor).clearVaultPrompt()
+                }
+            },
+        )
+    }
+    pgpExport?.let { entry ->
+        PgpExportDialog(
+            editor = editor,
+            fileName = entry.name,
+            busy = pgpBusy,
+            error = fieldError,
+            onConfirm = { recipient, signer, pass ->
+                pgpBusy = true
+                scope.launch {
+                    val message = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val plain = editor.plainDocumentBytes(entry.documentUri)
+                            if (plain == null) {
+                                error(
+                                    if (editor.lockedVaultId(entry.documentUri) != null) context.getString(R.string.err_vault_locked)
+                                    else context.getString(R.string.err_import_pgp),
+                                )
+                            }
+                            try {
+                                editor.pgp.encryptAndSign(plain, entry.name, recipient, signer, pass)
+                            } finally {
+                                plain.fill(0)
+                                pass.fill('\u0000')
+                            }
+                        }
+                    }
+                    pgpBusy = false
+                    message.onSuccess { bytes ->
+                        fieldError = null
+                        pgpExport = null
+                        pendingPgp = bytes
+                        val stem = entry.name.substringBeforeLast('.')
+                        savePgp.launch("$stem.pgp")
+                    }.onFailure {
+                        fieldError = it.message ?: context.getString(R.string.err_import_pgp)
+                    }
+                }
+            },
+            onDismiss = { if (!pgpBusy) { fieldError = null; pgpExport = null } },
+        )
+    }
+    pgpImport?.let { packet ->
+        PgpImportDialog(
+            editor = editor,
+            busy = pgpBusy,
+            error = fieldError,
+            onConfirm = { secret, pass ->
+                pgpBusy = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            try {
+                                val opened = editor.pgp.decryptAndVerify(packet, secret, pass)
+                                try {
+                                    val uri = editor.importPlainNote(
+                                        opened.plain, root, currentDocId, safeImportedStem(opened.fileName),
+                                    )
+                                    if (uri == null) error("save")
+                                    opened.signerUserId
+                                } finally {
+                                    // The decrypted note may be large; wipe it whichever path we leave by.
+                                    opened.plain.fill(0)
+                                }
+                            } finally {
+                                pass.fill('\u0000')
+                            }
+                        }
+                    }
+                    pgpBusy = false
+                    packet.fill(0)
+                    pgpImport = null
+                    result.onSuccess { who ->
+                        fieldError = null
+                        refreshKey++
+                        editor.message = context.getString(R.string.imported_verified, who)
+                    }.onFailure {
+                        fieldError = null
+                        editor.message = it.message ?: context.getString(R.string.err_import_pgp)
+                    }
+                }
+            },
+            onDismiss = { if (!pgpBusy) { packet.fill(0); pgpImport = null; fieldError = null } },
         )
     }
 
@@ -2182,6 +2369,7 @@ internal fun EntryMenu(
     onShare: (() -> Unit)? = null,
     onSaveCopy: (() -> Unit)? = null,
     onExportPdf: (() -> Unit)? = null,
+    onExportPgp: (() -> Unit)? = null,
     onColor: ((Rgba?) -> Unit)? = null,
     pinned: Boolean = false,
     onTogglePin: (() -> Unit)? = null,
@@ -2219,6 +2407,7 @@ internal fun EntryMenu(
                 DropdownMenuItem(text = { Text(stringResource(R.string.share)) }, onClick = { onDismiss(); onShare() })
                 DropdownMenuItem(text = { Text(stringResource(R.string.save_copy_ellipsis)) }, onClick = { onDismiss(); onSaveCopy?.invoke() })
                 DropdownMenuItem(text = { Text(stringResource(R.string.export_pdf)) }, onClick = { onDismiss(); onExportPdf?.invoke() })
+                if (onExportPgp != null) DropdownMenuItem(text = { Text(stringResource(R.string.export_pgp)) }, onClick = { onDismiss(); onExportPgp() })
             }
         }
     }
@@ -2495,6 +2684,18 @@ internal fun EmptyPane(text: String, art: EmptyArt? = null, actions: (@Composabl
         }
     }
 }
+
+/**
+ * A PGP message's file name comes from the sender, so treat it as a label rather than a path:
+ * drop directory components and control characters, cap its length, and leave a useful default.
+ */
+private fun safeImportedStem(raw: String): String =
+    raw.substringAfterLast('/').substringAfterLast('\\')
+        .substringBeforeLast('.')
+        .filterNot { it.isISOControl() }
+        .trim()
+        .take(120)
+        .ifBlank { "Imported" }
 
 /** Names the note that selected notes merge into, and whether the originals go to trash after. */
 @Composable

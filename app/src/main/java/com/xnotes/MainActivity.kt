@@ -1560,8 +1560,12 @@ private fun EditorPane(
             }
         }
     }
+    // The colour drag is drawn over the pane, not as another column child: a full-height child
+    // measured before the weighted canvas takes the whole pane and the surfaces collapse to black.
+    Box(modifier) {
     Column(
-        modifier = modifier
+        Modifier
+            .fillMaxSize()
             .background(palette.bg.toComposeColor())
             .then(takeFocus)
             .focusRequester(focusRequester)
@@ -1686,6 +1690,7 @@ private fun EditorPane(
             com.xnotes.ui.MathKeyboardPanel(editor)
             com.xnotes.ui.TextBoxFormatBar(editor)
         }
+    }
         com.xnotes.ui.ColorDropOverlay(if (editor.canvasOpen) editor.infinite else editor)
     }
 }
