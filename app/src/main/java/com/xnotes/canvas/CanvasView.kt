@@ -77,6 +77,9 @@ class CanvasView @JvmOverloads constructor(
     /** Stylus side-button presses (generic-motion stream), for pens that don't put it in the touch buttonState. */
     var genericMotion: ((MotionEvent) -> Unit)? = null
 
+    /** Side-button clicks with the pen over the page, and the touch that closes the pen menu. */
+    val sideButton = SideButtonClicks()
+
     /** The inline flow text input surface (IME mirror), installed by the Editor. */
     var flowInput: FlowInput? = null
 
@@ -157,6 +160,7 @@ class CanvasView @JvmOverloads constructor(
 
     @Suppress("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (sideButton.onTouch(event)) return true
         if (trackScrollbar(event)) return true
         if (trackFourFingerTap(event)) return true
         if (trackMultiFingerTap(event)) return true
@@ -354,10 +358,13 @@ class CanvasView @JvmOverloads constructor(
         return true
     }
 
-    override fun onHoverEvent(event: MotionEvent): Boolean =
-        hover?.invoke(event) ?: super.onHoverEvent(event)
+    override fun onHoverEvent(event: MotionEvent): Boolean {
+        sideButton.onHover(event)
+        return hover?.invoke(event) ?: super.onHoverEvent(event)
+    }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        sideButton.onGenericMotion(event)
         genericMotion?.invoke(event)
         return super.onGenericMotionEvent(event)
     }

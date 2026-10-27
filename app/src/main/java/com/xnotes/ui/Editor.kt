@@ -322,7 +322,7 @@ class Editor(
     val pane: Pane = Pane.PRIMARY,
     /** Which browser-style tab this editor belongs to; each tab keeps its own session and temp dirs. */
     val tabId: String = "default",
-) : ToolPopupHost, SelectionMenuHost, LongPressMenuHost, TextEditHost, ToastHost, SwatchStore, ColorDropHost, AudioHost {
+) : ToolPopupHost, PenMenuHost, SelectionMenuHost, LongPressMenuHost, TextEditHost, ToastHost, SwatchStore, ColorDropHost, AudioHost {
 
     private val appContext = context.applicationContext
 
@@ -921,6 +921,12 @@ class Editor(
     /** Long-press paste context menu target, or null when hidden. */
     override var contextMenu by mutableStateOf<ContextMenuTarget?>(null)
         private set
+
+    /** The armed tool's settings, opened at the pen by the side button (see [PenMenuState]). */
+    override val penMenu = PenMenuState()
+
+    override val penMenuTool: Tool? get() = tool.takeIf { it.hasSettings }
+
     var title by mutableStateOf(state.document.title)
         private set
     var dirty by mutableStateOf(false)
@@ -981,6 +987,8 @@ class Editor(
             it.onSay = { text -> say(text) }
             it.view.onTwoFingerTap = { dispatchTapGesture(preferences.twoFingerTap) }
             it.view.onThreeFingerTap = { dispatchTapGesture(preferences.threeFingerTap) }
+            it.view.sideButton.onClick = { at -> dispatchTapGesture(preferences.stylusButtonTap, at) }
+            it.view.sideButton.touchClosesMenu = { it.penMenu.takesTouch() }
         }
 
     /** Take on a swatch the canvas recoloured, so both bars show it and the next save keeps it. */
@@ -1871,6 +1879,8 @@ class Editor(
         }
         view.onTwoFingerTap = { dispatchTapGesture(preferences.twoFingerTap) }
         view.onThreeFingerTap = { dispatchTapGesture(preferences.threeFingerTap) }
+        view.sideButton.onClick = { at -> dispatchTapGesture(preferences.stylusButtonTap, at) }
+        view.sideButton.touchClosesMenu = { penMenu.takesTouch() }
         view.hover = { controller.onHover(it) }
         view.genericMotion = { controller.onGenericMotion(it) }
         view.drawOverlay = { renderer, _ -> controller.drawOverlay(renderer) }
@@ -6884,16 +6894,23 @@ class Editor(
 
 
     /** Run the action a two/three-finger tap or stylus double-tap is mapped to; "none" does nothing. */
-    private fun dispatchTapGesture(action: String) = when {
+    private fun dispatchTapGesture(action: String, at: Pt? = null) = when {
         // The pen's taps arrive here whichever surface is up; a canvas on top must not edit the note under it.
-        canvasOpen -> infinite.dispatchTapGesture(action)
+        canvasOpen -> infinite.dispatchTapGesture(action, at)
         readerMode -> Unit
+        action == "tool_settings" -> togglePenMenu(at)
         action == "undo" -> undo()
         action == "redo" -> redo()
         action == "toggle_pan" -> toggleTool(Tool.PAN)
         action == "toggle_eraser" -> toggleTool(Tool.ERASER)
         action == "toggle_previous" -> toggleToPreviousTool()
         else -> Unit
+    }
+
+    /** Open the armed tool's settings at [at] (the pen, or mid-page for a gesture with no place), or close them. */
+    private fun togglePenMenu(at: Pt?) {
+        if (penMenu.at == null && penMenuTool == null) return
+        penMenu.toggle(at ?: Pt(view.width / 2.0, view.height / 2.0))
     }
 
     /** Arm [target], or if it is already armed, return to the previous tool (no-op if none yet). */
@@ -9233,9 +9250,10 @@ class Editor(
             else -> return false
         }
         // A canvas is on top: the same key stream drives its pen, so a Bluetooth or USI side
-        // button behaves there exactly as it does on a note.
-        if (canvasOpen) return infinite.onStylusButtonKey(e.keyCode, down)
-        return controller.onStylusButtonKey(e.keyCode, down)
+        // button behaves there exactly as it does on a note. A press and release with the pen
+        // over the page is also a click (see [SideButtonClicks]).
+        if (canvasOpen) return infinite.onStylusButtonKey(e.keyCode, down).also { if (it) infinite.view.sideButton.onKey(e.eventTime) }
+        return controller.onStylusButtonKey(e.keyCode, down).also { if (it) view.sideButton.onKey(e.eventTime) }
     }
 
     // Pens with no side button (e.g. Huawei M-Pencil) report a barrel double-tap as a vendor key
@@ -9393,6 +9411,8 @@ class Editor(
      *  [noteOpen] so the editor is removed from the stack. The document stays as an inert buffer. */
     fun goHome() {
         if (!noteOpen) return
+        penMenu.close()
+        infiniteOrNull?.penMenu?.close()
         // Closing the note places a recording still going, before the note is saved.
         AudioRecording.stopFor(this)
         infiniteOrNull?.let { AudioRecording.stopFor(it) }
