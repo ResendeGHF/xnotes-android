@@ -16,6 +16,8 @@ val keystoreProperties = Properties().apply {
 }
 
 android {
+    useLibrary("android.test.runner", false)
+    useLibrary("android.test.base", false)
     namespace = "com.xnotes"
     compileSdk = 36
     // Pinned toolchain for the vendored native builds (F-Droid reproducibility).
@@ -25,6 +27,7 @@ android {
         applicationId = "com.notes"
         minSdk = 26
         targetSdk = 36
+        testInstrumentationRunner = "android.test.InstrumentationTestRunner"
         versionCode = 99
         // <upstream xnotes version>-<notes fork version>
         versionName = "0.9.5-0.46"

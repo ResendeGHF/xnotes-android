@@ -218,7 +218,8 @@ class ToolbarLayoutTest {
     @Test fun theTwoBarsDoNotShareTheirOwnItems() {
         assertTrue(ToolbarItem.WAYPOINTS !in ToolbarLayout.NOTE_ITEMS)
         assertTrue(ToolbarItem.MINIMAP !in ToolbarLayout.NOTE_ITEMS)
-        assertTrue(ToolbarItem.MATH !in ToolbarLayout.NOTE_ITEMS)
+        // Maths is on the paged bar as well as the canvas, unlike waypoints and the minimap.
+        assertTrue(ToolbarItem.MATH in ToolbarLayout.NOTE_ITEMS)
         assertTrue(ToolbarItem.MATH in ToolbarLayout.CANVAS_ITEMS)
         assertTrue(ToolbarItem.PAGE_NAV !in ToolbarLayout.CANVAS_ITEMS)
         assertTrue(ToolbarItem.TEXT !in ToolbarLayout.CANVAS_ITEMS)
