@@ -16,8 +16,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Article
+import androidx.compose.material.icons.outlined.Gesture
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -96,7 +101,7 @@ fun NoteTabBar(
             Row(
                 Modifier.width(animatedWidth)
                     .padding(horizontal = 2.dp)
-                    .clip(RoundedCornerShape(8.dp)), 
+                    .clip(RoundedCornerShape(8.dp)),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
