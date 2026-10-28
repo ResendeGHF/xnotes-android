@@ -138,6 +138,7 @@ fun PreferencesPane(
     onBackToHome: () -> Unit,
     onImportCodeTheme: () -> Unit = {},
     onImportFont: () -> Unit = {},
+    onBackup: (export: Boolean) -> Unit = {},
 ) {
     val palette = LocalPalette.current
     val focusManager = LocalFocusManager.current
@@ -381,6 +382,7 @@ fun PreferencesPane(
                 Chip("Portuguese (Brazil)", prefs.ocrLanguage == "pt-BR") { update(prefs.copy(ocrLanguage = "pt-BR")) }
                 Chip("English", prefs.ocrLanguage == "en") { update(prefs.copy(ocrLanguage = "en")) }
             }
+            CheckRow(stringResource(R.string.pref_volume_keys_turn_pages), prefs.volumeKeysTurnPages) { update(prefs.copy(volumeKeysTurnPages = it)) }
             FieldLabel("Handwritten math (Convert to math)")
             MathAddonControls()
 

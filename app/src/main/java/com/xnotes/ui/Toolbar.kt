@@ -123,6 +123,7 @@ fun Toolbar(
         Tool.TEXT_BOX to XnotesIcons.textBox,
         Tool.TABLE to XnotesIcons.table,
         Tool.MARKUP to XnotesIcons.markup,
+        Tool.TAPE to XnotesIcons.tape,
     )
     var configForTool by remember { mutableStateOf<Tool?>(null) }
     var switcherIndex by remember { mutableStateOf<Int?>(null) }
@@ -245,7 +246,7 @@ private fun ToolbarItemView(
         ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
         ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER, ToolbarItem.PAN,
         ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT, ToolbarItem.SHAPE,
-        ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE -> {
+        ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE, ToolbarItem.TAPE -> {
             val tool = Tool.fromId(item.id)
             if (tool != null) ToolButton(editor, tool, toolIcons[tool], configForTool, setConfigForTool)
         }
@@ -342,7 +343,7 @@ private fun ToolButton(
 ) {
     if (icon == null) return
     val armed = editor.tool == tool
-    val configurable = tool.isStroke || tool == Tool.SHAPE || tool == Tool.ERASER || tool == Tool.SELECT || tool == Tool.LASSO || tool == Tool.TEXT || tool == Tool.TABLE || tool == Tool.MARKUP
+    val configurable = tool.isStroke || tool == Tool.SHAPE || tool == Tool.ERASER || tool == Tool.SELECT || tool == Tool.LASSO || tool == Tool.TEXT || tool == Tool.TABLE || tool == Tool.MARKUP || tool == Tool.TAPE
     Box {
         ToolbarIcon(
             icon,
@@ -367,6 +368,7 @@ private fun ToolButton(
                 tool == Tool.SELECT || tool == Tool.LASSO -> SelectConfigPopup(editor, tool) { setConfigForTool(null) }
                 tool == Tool.TEXT -> TextToolConfigPopup(editor) { setConfigForTool(null) }
                 tool == Tool.MARKUP -> MarkupToolPopup(editor) { setConfigForTool(null) }
+                tool == Tool.TAPE -> TapeConfigPopup(editor) { setConfigForTool(null) }
                 else -> ToolConfigPopup(editor, tool) { setConfigForTool(null) }
             }
         }
@@ -683,8 +685,8 @@ private fun NoteInsertMenu(
         owner = editor,
         imageRows = listOf(
             InsertRow(XnotesIcons.image, stringResource(R.string.insert_image_ellipsis)) { onInsertImage() },
-            InsertRow(XnotesIcons.paste, stringResource(R.string.paste_image)) { editor.pasteImage() },
             InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
+            InsertRow(XnotesIcons.paste, stringResource(R.string.paste_image)) { editor.pasteImage() },
             InsertRow(XnotesIcons.page, stringResource(R.string.image_as_page)) { onImagePage() },
             InsertRow(XnotesIcons.sticker, stringResource(R.string.stickers), more = true) { stickersOpen = true },
         ),

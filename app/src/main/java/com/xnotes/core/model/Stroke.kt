@@ -56,6 +56,7 @@ class Stroke(
     override val resizable = false
     override var locked = false
     override var link: String? = null
+    override var group: Int? = null
     override var sync: SyncMark? = null
 
     /**

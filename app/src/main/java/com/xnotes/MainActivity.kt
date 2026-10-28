@@ -23,6 +23,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -56,6 +58,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -79,6 +82,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -252,6 +256,7 @@ class MainActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // The pen writes in whichever pane has the focus, so its button belongs to that pane too.
         if (editor?.active?.onStylusButtonKey(event) == true) return true
+        if (editor?.active?.onVolumeKey(event) == true) return true
         return super.dispatchKeyEvent(event)
     }
 
@@ -260,6 +265,7 @@ class MainActivity : ComponentActivity() {
     // so the view tree never opens a touch target and the whole stroke is dropped. Rewrite them
     // here, the last point they are intact, and dispatch normally. A no-op on every other device.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        StylusButtonLatch.clicks.onTouch(ev) // a side-button press with the pen tip down is a hold, never a click
         val standard = standardPenAction(ev.actionMasked)
         if (standard < 0 || ev.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) {
             return super.dispatchTouchEvent(ev)
@@ -783,6 +789,27 @@ private fun EditorScreen(
             }
         }
 
+        // A settings backup written where the user picks, or read and held for the go-ahead to apply it.
+        val exportSettingsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { resolver.openOutputStream(uri, "wt")?.use { editor.exportSettings(it) } != null }.getOrDefault(false)
+                }
+                editor.message = context.getString(if (ok) R.string.settings_exported else R.string.err_export_settings)
+            }
+        }
+        var pendingBackup by remember { mutableStateOf<Editor.SettingsBackup?>(null) }
+        val importSettingsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                val backup = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { resolver.openInputStream(uri)?.use { editor.readSettingsBackup(it) } }.getOrNull()
+                }
+                if (backup == null) editor.message = context.getString(R.string.err_import_settings) else pendingBackup = backup
+            }
+        }
+
         /** Run [action] once every open pane has settled its unsaved changes, prompting one at a time. */
         fun guardedAll(action: () -> Unit) {
             val panes = editor.openPanes
@@ -1074,6 +1101,10 @@ private fun EditorScreen(
                         onExitApp = { (context as? android.app.Activity)?.finish() },
                         onImportCodeTheme = { importCodeThemeLauncher.launch(arrayOf("*/*")) },
                         onImportFont = { importFontLauncher.launch(arrayOf("*/*")) },
+                        onBackup = { export ->
+                            if (export) exportSettingsLauncher.launch("xnotes-settings-${java.time.LocalDate.now()}.zip")
+                            else importSettingsLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
+                        },
                         onImportPdf = { importPdfLauncher.launch(importMimeTypes) },
                         onOpenFile = { uri ->
                             val name = displayNameOf(resolver, Uri.parse(uri)).orEmpty()
@@ -1215,6 +1246,13 @@ private fun EditorScreen(
                             }
                         },
                         onTakePhoto = { pane, at -> takePhoto(pane, at, null) },
+                        onShareImage = { file ->
+                            runCatching { launchShare(file, file.nameWithoutExtension, "image/png") }
+                                .onFailure { editor.message = context.getString(R.string.err_share_image) }
+                        },
+                        onOpenFile = { pane, uri ->
+                            scope.launch { openInto(context, pane, uri) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) } }
+                        },
                         onImagePage = { pane ->
                             pendingImagePage = PendingPageInsert(pane, pane.pageIndex + 1)
                             imagePageLauncher.launch(arrayOf("image/*"))
@@ -1290,6 +1328,23 @@ private fun EditorScreen(
                 },
             )
         }
+        pendingBackup?.let { backup ->
+            com.xnotes.ui.AlertDialog(
+                onDismissRequest = { pendingBackup = null },
+                title = { androidx.compose.material3.Text(stringResource(R.string.import_settings_title)) },
+                text = { androidx.compose.material3.Text(stringResource(R.string.import_settings_confirm)) },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = { pendingBackup = null; editor.applySettingsBackup(backup) }) {
+                        androidx.compose.material3.Text(stringResource(R.string.replace))
+                    }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { pendingBackup = null }) {
+                        androidx.compose.material3.Text(stringResource(R.string.cancel))
+                    }
+                },
+            )
+        }
         guardAction?.let { request ->
             val guarded = request.editor
             val action = request.action
@@ -1335,7 +1390,10 @@ private fun EditorScreen(
             // A batch counts files, so it gets a determinate ring; a single import has nothing to count.
             val batch = importer.importProgress
             if (batch != null) PdfImportBatchDialog(batch.done, batch.total) { importer.cancelImportInProgress() }
-            else PdfImportDialog(isPdf = importer.pendingImport?.kind != com.xnotes.ui.ImportKind.OPEN, onCancel = { importer.cancelImportInProgress() }) // the stream-copy stops at its next buffer
+            else PdfImportDialog(
+                label = importer.busyWith ?: if (importer.pendingImport?.markdown == true) R.string.importing_markdown else R.string.importing_pdf,
+                onCancel = { importer.cancelImportInProgress() }, // the stream-copy stops at its next buffer
+            )
         }
         // Tapping a note reads it off-thread (editor.opening). Only show the spinner once the read has run
         // long enough to matter, so opening a small note never flashes a dialog; a big PDF gets the loader.
@@ -1399,6 +1457,31 @@ private class ExportProgress(val done: Int, val total: Int, val counting: String
 }
 
 /**
+ * A tap here, or any pen stroke, lets the side panel's page selection go; a finger that scrolls or
+ * pinches keeps it. Watched on the way in and never consumed, so whatever is under it still acts.
+ */
+private fun Modifier.endsPageSelection(editor: Editor): Modifier = pointerInput(editor) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+        if (!editor.inPageSelectionMode) return@awaitEachGesture
+        if (down.type == PointerType.Stylus || down.type == PointerType.Eraser) {
+            editor.clearPageSelection()
+            return@awaitEachGesture
+        }
+        while (true) {
+            val e = awaitPointerEvent(PointerEventPass.Initial)
+            if (e.changes.any { it.id != down.id && it.pressed }) return@awaitEachGesture
+            val c = e.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+            if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) return@awaitEachGesture
+            if (!c.pressed) {
+                editor.clearPageSelection()
+                return@awaitEachGesture
+            }
+        }
+    }
+}
+
+/**
  * What a pane can ask the screen around it to do: open a SAF picker, run an export, or change the
  * window. Each callback takes the pane it is acting for, because in a split there are two of them
  * and a picker's result has to come back to the one that opened it.
@@ -1411,11 +1494,17 @@ private class PaneActions(
     val onClosePane: (Editor) -> Unit,
     val onInsertImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     val onInsertCanvasImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
+    /** Take a photo with the camera app and place it like an inserted picture, on the canvas when [Editor.canvasOpen]. */
+    val onTakePhoto: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     val onAddStickers: () -> Unit,
     val onInsertAudio: (Editor) -> Unit,
     val onRecordAudio: (Editor) -> Unit,
     val onSaveAudio: (Editor, com.xnotes.core.model.AudioItem) -> Unit,
     val onShareAudio: (Editor, com.xnotes.core.model.AudioItem) -> Unit,
+    /** Hand a PNG the pane rendered (a selection or a capture) to the share sheet. */
+    val onShareImage: (java.io.File) -> Unit,
+    /** Open a stored note in [Editor]'s pane, as a tap on it in the explorer would. */
+    val onOpenFile: (Editor, String) -> Unit,
     val onImportTemplate: () -> Unit,
     val onTemplateFromImage: (com.xnotes.core.template.TemplateKind) -> Unit,
     val onSharePages: (Editor, List<Int>, Boolean) -> Unit,
@@ -1423,8 +1512,6 @@ private class PaneActions(
     val onSavePagesAsImages: (Editor, List<Int>) -> Unit,
     val onInsertPdf: (Editor, Int) -> Unit,
     val onInsertPages: (Editor, com.xnotes.ui.PageInsert, Int) -> Unit,
-    /** Take a photo and place it at the content point, or the page centre when null. */
-    val onTakePhoto: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     /** Pick an image and add it as a page after the current one. */
     val onImagePage: (Editor) -> Unit,
     /** Open the maths workspace over the current note or canvas. */
@@ -1547,6 +1634,7 @@ private fun EditorPane(
     val palette = LocalPalette.current
     val focusRequester = remember { FocusRequester() }
     val focused = app.active === editor
+    SideEffect { editor.openInPane = { uri -> actions.onOpenFile(editor, uri) } }
     // This pane owns the keyboard while it is the focused one; (re)grab it as that changes.
     LaunchedEffect(focused, editor.noteOpen) {
         if (focused && editor.noteOpen) runCatching { focusRequester.requestFocus() }
@@ -1613,7 +1701,9 @@ private fun EditorPane(
                         canvas,
                         onSaveAudio = { actions.onSaveAudio(editor, it) },
                         onShareAudio = { actions.onShareAudio(editor, it) },
+                        onShareImage = actions.onShareImage,
                     )
+                    com.xnotes.ui.CropOverlay(canvas)
                     com.xnotes.ui.TextStyleBar(canvas)
                     com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) })
                     com.xnotes.ui.PenMenu(canvas)
@@ -1623,20 +1713,22 @@ private fun EditorPane(
             }
         } else {
             val bar: @Composable () -> Unit = {
-                Toolbar(
-                    editor,
-                    onToggleFullscreen = actions.onToggleFullscreen,
-                    onOpenBackstage = actions.onOpenBackstage,
-                    onInsertImage = { actions.onInsertImage(editor, null) },
-                    onAddStickers = actions.onAddStickers,
-                    onClosePane = onClose,
-                    onImportTemplate = actions.onImportTemplate,
-                    onTakePhoto = { actions.onTakePhoto(editor, null) },
-                    onImagePage = { actions.onImagePage(editor) },
-                    onOpenMathStudio = actions.onOpenMathStudio,
-                    onInsertAudio = { actions.onInsertAudio(editor) },
-                    onRecordAudio = { actions.onRecordAudio(editor) },
-                )
+                Box(Modifier.endsPageSelection(editor)) {
+                    Toolbar(
+                        editor,
+                        onToggleFullscreen = actions.onToggleFullscreen,
+                        onOpenBackstage = actions.onOpenBackstage,
+                        onInsertImage = { actions.onInsertImage(editor, null) },
+                        onAddStickers = actions.onAddStickers,
+                        onClosePane = onClose,
+                        onImportTemplate = actions.onImportTemplate,
+                        onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onImagePage = { actions.onImagePage(editor) },
+                        onOpenMathStudio = actions.onOpenMathStudio,
+                        onInsertAudio = { actions.onInsertAudio(editor) },
+                        onRecordAudio = { actions.onRecordAudio(editor) },
+                    )
+                }
             }
             ToolbarAround(bar, onCover = editor::setToolbarCover) { floatingBar ->
                 Row(modifier = Modifier.fillMaxSize()) {
@@ -1652,7 +1744,7 @@ private fun EditorPane(
                             onTemplateFromImage = actions.onTemplateFromImage,
                         )
                     }
-                    Box(modifier = Modifier.weight(1f).fillMaxHeight().clipToBounds()) {
+                    Box(modifier = Modifier.weight(1f).fillMaxHeight().clipToBounds().endsPageSelection(editor)) {
                         AndroidView(
                             factory = { detached(editor.surfaces) },
                             modifier = Modifier.fillMaxSize().externalDropTarget(editor.externalDrop),
@@ -1666,8 +1758,10 @@ private fun EditorPane(
                             editor,
                             onSaveAudio = { actions.onSaveAudio(editor, it) },
                             onShareAudio = { actions.onShareAudio(editor, it) },
+                            onShareImage = actions.onShareImage,
                         )
-                        com.xnotes.ui.ScreenshotMenu(editor)
+                        com.xnotes.ui.CropOverlay(editor)
+                        com.xnotes.ui.ScreenshotMenu(editor, onShare = actions.onShareImage)
                         com.xnotes.ui.CropMenu(editor)
                         com.xnotes.ui.TextStyleBar(editor)
                         com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) })
@@ -1906,8 +2000,7 @@ private fun SavingDialog() {
  * cost is copying the (possibly large) source bytes — so it shows an animated spinner.
  */
 @Composable
-private fun PdfImportDialog(isPdf: Boolean, onCancel: () -> Unit) =
-    SpinnerDialog(if (isPdf) "Importing…" else "Importing note…", onCancel)
+private fun PdfImportDialog(label: Int, onCancel: () -> Unit) = SpinnerDialog(stringResource(label), onCancel)
 
 /**
  * Determinate "Importing PDFs…" dialog for a multi-file import: a ring filled by files finished plus

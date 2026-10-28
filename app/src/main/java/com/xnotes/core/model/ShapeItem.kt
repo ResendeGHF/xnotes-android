@@ -76,6 +76,7 @@ class ShapeItem(
     override val resizable = true
     override var locked = false
     override var link: String? = null
+    override var group: Int? = null
     override var sync: SyncMark? = null
 
     /** What a [ShapeKind.FUNCTION] plots; its sampled curve lives in [path]. */

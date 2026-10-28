@@ -30,7 +30,7 @@ android {
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
         versionCode = 99
         // <upstream xnotes version>-<notes fork version>
-        versionName = "0.9.5-0.46"
+        versionName = "0.9.6-0.46"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

@@ -39,6 +39,11 @@ data class DrawStyle(val color: Rgba, val width: Double) {
                 item.strokeRgba = color
                 item.strokeWidth = width
             }
+            is TapeItem -> {
+                item.rgba = color
+                // A rectangle's width is its height, which the box's handles set, not a pen width.
+                if (item.mode != TapeMode.RECTANGLE) item.shape = item.shape.copy(width = width.coerceIn(TapeItem.MIN_WIDTH, TapeItem.MAX_WIDTH))
+            }
             is ConnectorItem -> {
                 item.label = item.label?.let { l ->
                     val c = l.style.rgba
@@ -66,6 +71,7 @@ data class DrawStyle(val color: Rgba, val width: Double) {
             }
             is ConnectorItem -> DrawStyle(item.strokeRgba, item.strokeWidth)
             is TableItem -> DrawStyle(item.strokeRgba, item.strokeWidth)
+            is TapeItem -> DrawStyle(item.rgba, item.shape.width)
             else -> null
         }
 
