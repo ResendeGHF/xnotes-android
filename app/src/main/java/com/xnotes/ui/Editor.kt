@@ -345,8 +345,6 @@ enum class Pane { PRIMARY, SECONDARY }
 class Editor(
     context: Context,
     val pane: Pane = Pane.PRIMARY,
-    /** Which browser-style tab this editor belongs to; each tab keeps its own session and temp dirs. */
-    val tabId: String = "default",
 ) : ToolPopupHost, PenMenuHost, SelectionMenuHost, LongPressMenuHost, TextEditHost, ToastHost, SwatchStore, ColorDropHost, AudioHost, CropHost {
 
     private val appContext = context.applicationContext
@@ -390,7 +388,7 @@ class Editor(
      *  pane is built mid-session, with the primary's note already live in these dirs, so it only
      *  takes the handle. */
     private fun tempDir(name: String): java.io.File =
-        java.io.File(appContext.filesDir, if (tabId == "default") name else "${name}_$tabId").apply {
+        java.io.File(appContext.filesDir, name).apply {
             mkdirs()
             if (pane == Pane.PRIMARY) listFiles()?.forEach { it.delete() }
         }
@@ -421,7 +419,7 @@ class Editor(
 
     /** Working files for an unlocked folder. Wiped on lock. Excluded from backup. */
     private val vaultWorkRoot = java.io.File(appContext.filesDir, "vaultwork").apply {
-        if (pane == Pane.PRIMARY && tabId == "default") com.xnotes.crypto.VaultCrypto.secureDeleteTree(this)
+        if (pane == Pane.PRIMARY) com.xnotes.crypto.VaultCrypto.secureDeleteTree(this)
         mkdirs()
     }
 
@@ -564,12 +562,82 @@ class Editor(
      *  each other's saved document. */
     private val sessionDir = java.io.File(
         appContext.filesDir,
-        if (tabId == "default") (if (pane == Pane.PRIMARY) "session" else "session-b")
-        else ("session_$tabId" + if (pane == Pane.PRIMARY) "" else "-b")
+        if (pane == Pane.PRIMARY) "session" else "session-b",
     )
     private val session = com.xnotes.platform.SessionStore(sessionDir, codec, pdfDir, imageDir)
     private val canvasSession = com.xnotes.platform.CanvasSessionStore(sessionDir, canvasCodec, imageDir)
     private val viewStates = com.xnotes.platform.ViewStateStore(com.xnotes.platform.JsonStore.viewStates(appContext))
+    /**
+     * Parsed documents for recently switched-away tabs. This stores only model objects, never
+     * render surfaces, page bitmaps or GL contexts. Limit both count and document complexity;
+     * PDF-backed notes are excluded because their extracted PDF is released on document swap.
+     */
+    private val inactiveDocuments = object : LinkedHashMap<String, Document>(3, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Document>?) = size > 2
+    }
+    private val inactiveCanvases = object : LinkedHashMap<String, com.xnotes.core.infinite.InfiniteDocument>(3, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, com.xnotes.core.infinite.InfiniteDocument>?) = size > 2
+    }
+    /**
+     * The last viewport of every document that has a tab. The old tab model kept one Editor (and
+     * therefore one CanvasState/CanvasView) per tab; a single Editor now swaps documents, so the
+     * view must live beside the tab rather than in the rendered document. This is intentionally
+     * in-memory: folder notes also mirror it to [viewStates], while documents opened from outside
+     * the granted folder still come back to the same place for the life of the process.
+     */
+    private val tabViews = HashMap<String, com.xnotes.platform.ViewStateStore.View>()
+    /** Canvas views use a centre + zoom waypoint, which survives a pane-size change. */
+    private val tabCanvasViews = HashMap<String, com.xnotes.core.infinite.Waypoint>()
+
+    fun forgetInactiveDocument(uri: String) {
+        inactiveDocuments.remove(uri)
+        inactiveCanvases.remove(uri)
+        val key = documentKey(uri)
+        tabViews.remove(key)
+        tabCanvasViews.remove(key)
+    }
+    fun clearInactiveDocuments() {
+        inactiveDocuments.clear()
+        inactiveCanvases.clear()
+        tabViews.clear()
+        tabCanvasViews.clear()
+    }
+
+    private fun rememberCanvasView() {
+        if (!canvasOpen) return
+        val uri = infinite.document.path ?: return
+        tabCanvasViews[documentKey(uri)] = infinite.viewport.toWaypoint()
+    }
+
+    private fun rememberInactiveCanvas() {
+        if (!canvasOpen) return
+        val doc = infinite.document
+        val uri = doc.path ?: return
+        rememberCanvasView()
+        if (canvasAutosaveUri == uri && doc.items.size <= 1_500) inactiveCanvases[uri] = doc
+    }
+
+    /** Finish the canvas's edits before switching the pane to a paged note. */
+    private fun leaveCanvasForPagedNote() {
+        if (!canvasOpen) return
+        infinite.commitText()
+        flushCanvasAutosave()
+        rememberInactiveCanvas()
+        // The view goes away with this swap. Android may cancel its in-flight touch as the
+        // AndroidView detaches; reset first so that cancellation cannot rewind the viewport to
+        // the start of the gesture and overwrite the view just remembered.
+        infinite.interaction.resetGestureState()
+        canvasAutosaveUri = null
+        canvasOpen = false
+    }
+
+    private fun rememberInactiveDocument() {
+        val doc = state.document
+        val uri = doc.path ?: return
+        if (autosaveUri != uri || doc.pdfFile != null || doc.pages.size > 12) return
+        if (doc.pages.sumOf { it.items.size } > 1_500) return
+        inactiveDocuments[uri] = doc
+    }
     private var lastSessionContentVersion = -1
     private var sessionLoaded = false
 
@@ -729,8 +797,15 @@ class Editor(
      *  "Saving your notes…" dialog so quitting a large note never freezes the UI (ANR). */
     var savingNote by mutableStateOf(false)
         private set
-    /** Flipped by the open dialog's Cancel so a slow open is discarded instead of swapped in. */
-    private val openCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+    /**
+     * The last document open requested by this pane. A newer request (usually a tab tap) makes
+     * every older read stale, so a slow PDF copy can never swap its document in over the tab the
+     * user has since selected. The request id is also the open dialog's cancel token.
+     */
+    private val openGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+    /** The URI the current open request is trying to show, or null when none is in flight. */
+    var pendingOpenUri: String? = null
+        private set
     var zoomLocked by mutableStateOf(false)
         private set
 
@@ -1091,6 +1166,7 @@ class Editor(
 
     /** Open a fresh, unsaved infinite canvas on top of backstage. */
     fun newCanvas() {
+        cancelOpenInProgress() // a blank canvas replaces whatever a slower tab open was loading
         val doc = com.xnotes.core.infinite.InfiniteDocument(created = System.currentTimeMillis())
         settings.newCanvasBackground?.let { doc.background = it }
         openCanvasDocument(doc, uri = null, displayName = null)
@@ -1101,23 +1177,41 @@ class Editor(
      * main thread; the model swap itself hops back to the main thread.
      */
     suspend fun openCanvasAsync(uri: String, name: String?): Boolean {
-        val vaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
-        if (vaultId != null && !com.xnotes.crypto.VaultSession.isUnlocked(vaultId)) {
-            vaultPrompt = vaultId
-            pendingVaultOpen = PendingVaultOpen(uri, name, canvas = true, vaultId)
-            message = appContext.getString(R.string.err_vault_locked)
-            return false
+        val request = beginOpen(uri)
+        try {
+            vaultPrompt = null
+            pendingVaultOpen = null
+            val vaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
+            if (!isCurrentOpen(request)) return false
+            if (vaultId != null && !com.xnotes.crypto.VaultSession.isUnlocked(vaultId)) {
+                vaultPrompt = vaultId
+                pendingVaultOpen = PendingVaultOpen(uri, name, canvas = true, vaultId)
+                message = appContext.getString(R.string.err_vault_locked)
+                return false
+            }
+            val cached = inactiveCanvases.remove(uri)
+            if (cached != null) {
+                if (!isCurrentOpen(request)) {
+                    inactiveCanvases[uri] = cached
+                    return false
+                }
+                openCanvasDocument(cached, uri, name, vaultId = vaultId)
+                rememberOpened(uri, name)
+                return true
+            }
+            val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    readXcanvas(uri)?.also { it.created = settleCreated(uri, it.created) }
+                }.getOrNull()
+            }
+            if (!isCurrentOpen(request)) return false
+            if (doc == null) return false
+            openCanvasDocument(doc, uri, name, vaultId = vaultId)
+            rememberOpened(uri, name)
+            return true
+        } finally {
+            finishOpen(request)
         }
-        pendingVaultOpen = null
-        vaultPrompt = null
-        val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching {
-                readXcanvas(uri)?.also { it.created = settleCreated(uri, it.created) }
-            }.getOrNull()
-        } ?: return false
-        openCanvasDocument(doc, uri, name, vaultId = vaultId)
-        rememberOpened(uri, name)
-        return true
     }
 
     private fun openCanvasDocument(
@@ -1127,9 +1221,27 @@ class Editor(
         fromSession: Boolean = false,
         vaultId: String? = null,
     ) {
-        flushAutosave() // a paged note may be open underneath; do not leave its edits unwritten
+        if (canvasOpen) {
+            infinite.commitText()
+            flushCanvasAutosave()
+            rememberCanvasView() // keep this canvas's view even when its model is not cached
+            if (infinite.document.path != uri) rememberInactiveCanvas()
+            // The canvas AndroidView may be detached by the swap and receive a cancellation;
+            // drop the gesture first so it cannot rewind the viewport.
+            infinite.interaction.resetGestureState()
+        } else {
+            // A paged note may be open underneath; remember its view before the canvas hides it,
+            // then do not leave its edits unwritten.
+            saveViewState()
+            flushAutosave()
+            rememberInactiveDocument()
+            // The paged view is about to detach. It must not treat that ordinary cancellation as
+            // palm rejection and rewind itself after its view was saved.
+            controller.resetGestureState()
+        }
         doc.path = uri
         doc.displayName = displayName
+        uri?.let { u -> tabCanvasViews[documentKey(u)]?.let { doc.lastView = it } }
         vaultPrompt = null
         pendingVaultOpen = null
         openVaultId = vaultId
@@ -1279,6 +1391,12 @@ class Editor(
 
     /** The current document's storage location (a SAF content URI string), or null. */
     val currentUri: String? get() = state.document.path
+
+    /** The file this pane is showing, whether it is a paged note or a canvas. */
+    val openDocumentUri: String? get() = if (canvasOpen) infiniteOrNull?.document?.path else currentUri
+
+    /** The tab title for what this pane is showing; canvases keep their own document title. */
+    val openDocumentTitle: String get() = if (canvasOpen) infiniteOrNull?.document?.title ?: "Untitled" else title
 
     /** The bookmarks in page order; ones on the same page keep the order they were made in. */
     val bookmarks: List<Bookmark> get() = state.document.bookmarks.sortedBy { it.page }
@@ -4041,26 +4159,47 @@ class Editor(
      * [DocumentCodec.read] streaming a (possibly large) embedded PDF out to a temp file; on the main
      * thread that would freeze the UI and stall the spinner, so only the read runs on IO and the
      * document swap ([replaceDocument], which only invalidates caches and requests an off-thread
-     * render) stays on the caller's main thread. A mid-read Cancel ([cancelOpenInProgress]) discards
-     * the loaded note and leaves the explorer as it was. A second tap while one open is in flight is
-     * ignored, so two reads never race to swap in a document.
+     * render) stays on the caller's main thread. A newer request makes an older one stale instead
+     * of ignoring it: a tab tap must always win over a slower read started earlier, or the pane
+     * would swap to that older document (and its viewport) while the user is already working.
+     * [cancelOpenInProgress] invalidates the current request outright.
      */
     suspend fun openAsync(uri: String, name: String? = null) {
-        if (opening) return
-        openCancelled.set(false)
-        opening = true
+        val request = beginOpen(uri)
         val t0 = System.nanoTime()
         var readMs = -1L
         try {
+            vaultPrompt = null
+            pendingVaultOpen = null
+            // A tab switch commonly returns to a document decoded moments ago. Reuse its model
+            // instead of re-reading and parsing the ZIP; replaceDocument still resets render caches,
+            // history, gestures and applies the remembered viewport as for any normal open.
+            // A locked folder must still prompt even when its document is cached in memory.
             val vaultId = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { vaultOf(uri) }
+            if (!isCurrentOpen(request)) return
             if (vaultId != null && !com.xnotes.crypto.VaultSession.isUnlocked(vaultId)) {
                 vaultPrompt = vaultId
                 pendingVaultOpen = PendingVaultOpen(uri, name, canvas = false, vaultId)
                 message = appContext.getString(R.string.err_vault_locked)
                 return
             }
-            pendingVaultOpen = null
-            vaultPrompt = null
+            val cached = inactiveDocuments.remove(uri)
+            if (cached != null) {
+                // No suspension follows, so the check cannot become stale before the swap.
+                if (!isCurrentOpen(request)) {
+                    inactiveDocuments[uri] = cached
+                    return
+                }
+                leaveCanvasForPagedNote()
+                openVaultId = vaultId
+                replaceDocument(cached)
+                maybeBindAutosave(uri)
+                noteOpen = true
+                rememberOpened(uri, name)
+                state.lastOpenReadMs = 0L
+                state.lastOpenTotalMs = 0L
+                return
+            }
             val readStart = System.nanoTime()
             var fileBytes = -1L
             val timing = com.xnotes.format.DocumentCodec.ReadTiming()
@@ -4069,6 +4208,12 @@ class Editor(
                 readXnote(uri, timing)?.also { it.created = settleCreated(uri, it.created) }
             }
             readMs = (System.nanoTime() - readStart) / 1_000_000
+            if (!isCurrentOpen(request)) {
+                // A newer tab/document has already been chosen. Release the temporaries this
+                // stale read produced and leave the pane alone.
+                doc?.let { discardWorkFile(it.pdfFile); deleteImageTemps(it) }
+                return
+            }
             state.lastOpenInflateMs = timing.inflateMs
             state.lastOpenParseMs = timing.parseMs
             state.lastOpenAssetsMs = timing.assetsMs
@@ -4079,11 +4224,11 @@ class Editor(
                     " + assets ${timing.assetsMs} + compact ${timing.compactMs}, $fileBytes bytes",
             )
             if (doc == null) { message = appContext.getString(R.string.err_open_that_note); return }
-            if (openCancelled.get()) { discardWorkFile(doc.pdfFile); deleteImageTemps(doc); return } // tapped Cancel mid-read; stay put
             doc.path = uri
             doc.displayName = name
             doc.dirty = false
             openVaultId = vaultId
+            leaveCanvasForPagedNote()
             replaceDocument(doc)
             state.openFileBytes = fileBytes
             state.lastSaveBytes = fileBytes // the on-disk size, until the first autosave rewrites it
@@ -4091,20 +4236,40 @@ class Editor(
             noteOpen = true // push the editor on top of backstage (only on a successful open)
             rememberOpened(uri, name)
         } catch (e: XNoteFormatException) {
-            message = appContext.getString(R.string.err_not_xnotes)
+            if (isCurrentOpen(request)) message = appContext.getString(R.string.err_not_xnotes)
         } catch (e: Exception) {
-            message = appContext.getString(R.string.err_open_note)
+            if (isCurrentOpen(request)) message = appContext.getString(R.string.err_open_note)
         } finally {
-            // Record the timings for the debug overlay, so a genuinely fast open (read < 160ms, no
-            // spinner) can be told apart from a bug where the spinner is wrongly skipped.
-            state.lastOpenReadMs = readMs
-            state.lastOpenTotalMs = (System.nanoTime() - t0) / 1_000_000
-            opening = false
+            if (isCurrentOpen(request)) {
+                // Record the timings for the debug overlay, so a genuinely fast open (read < 160ms,
+                // no spinner) can be told apart from a bug where the spinner is wrongly skipped.
+                state.lastOpenReadMs = readMs
+                state.lastOpenTotalMs = (System.nanoTime() - t0) / 1_000_000
+                finishOpen(request)
+            }
         }
     }
 
-    /** Aborts an in-flight open (the dialog's Cancel) so the loaded note is discarded, not shown. */
-    fun cancelOpenInProgress() { openCancelled.set(true) }
+    private fun beginOpen(uri: String): Int {
+        pendingOpenUri = uri
+        opening = true
+        return openGeneration.incrementAndGet()
+    }
+
+    private fun isCurrentOpen(request: Int): Boolean = request == openGeneration.get()
+
+    private fun finishOpen(request: Int) {
+        if (!isCurrentOpen(request)) return
+        opening = false
+        pendingOpenUri = null
+    }
+
+    /** Aborts an in-flight open (the dialog's Cancel or a tab selection) so its note is discarded. */
+    fun cancelOpenInProgress() {
+        openGeneration.incrementAndGet()
+        opening = false
+        pendingOpenUri = null
+    }
 
     fun save(output: OutputStream, uri: String, name: String? = null) {
         try {
@@ -4840,6 +5005,7 @@ class Editor(
                 // A session snapshot holds the note's plaintext. Overwrite it rather than merely
                 // unlinking it, then drop decoded thumbnails that the explorer could still show.
                 ed.clearSessionsSecure()
+                ed.clearInactiveDocuments()
                 ed.openVaultId = null
                 synchronized(ed.noteThumbs) { ed.noteThumbs.evictAll() }
             }
@@ -6400,11 +6566,18 @@ class Editor(
         return if (isUnderTree(u, root)) documentKey(u) else null
     }
 
-    /** Remember the current note's view (zoom + scroll); a no-op unless it's a laid-out folder note. */
+    /**
+     * Remember the current note's view (zoom + scroll). Every tab-owned document keeps it in
+     * [tabViews] for the life of the process; folder notes additionally mirror it to [viewStates]
+     * so they reopen in place after a relaunch.
+     */
     private fun saveViewState() {
         if (!state.didInitialFit || state.viewportW <= 0) return // nothing meaningful established yet
-        val key = viewKey(currentUri) ?: return
-        viewStates.put(key, state.zoom, state.scrollX, state.scrollY, viewOverrides)
+        val uri = currentUri ?: return
+        tabViews[documentKey(uri)] = com.xnotes.platform.ViewStateStore.View(
+            state.zoom, state.scrollX, state.scrollY, viewOverrides,
+        )
+        viewKey(uri)?.let { viewStates.put(it, state.zoom, state.scrollX, state.scrollY, viewOverrides) }
     }
 
     /** Update the global View-menu defaults (the menu's "Default for all notes" checkbox),
@@ -6501,12 +6674,15 @@ class Editor(
             keepImages = vs.keepImages,
         )
 
-    /** A note's resolved View-menu settings by URI: the open note's live value, a folder note's
-     *  remembered overrides over the global defaults, else the defaults themselves. */
+    /** A note's resolved View-menu settings by URI: the open note's live value, a tab's remembered
+     *  overrides, a folder note's persisted overrides, else the defaults themselves. */
     private fun viewSettingsFor(uri: String?): com.xnotes.canvas.ViewSettings = when {
         uri != null && uri == currentUri -> viewSettings
-        else -> (viewKey(uri)?.let { viewStates.get(it)?.overrides } ?: com.xnotes.canvas.ViewOverrides())
-            .resolve(viewDefaults)
+        else -> (
+            uri?.let { tabViews[documentKey(it)]?.overrides }
+                ?: viewKey(uri)?.let { viewStates.get(it)?.overrides }
+                ?: com.xnotes.canvas.ViewOverrides()
+            ).resolve(viewDefaults)
     }
 
     /** Drop every cached side-panel thumbnail backed by a PDF page (the filter changed). */
@@ -6517,13 +6693,14 @@ class Editor(
     }
 
     /**
-     * Choose a just-installed document's initial view — its remembered view for a folder note,
-     * else fit-width — and apply it now if the viewport is sized, else on the next layout. Setting
-     * it explicitly is what stops the previous document's zoom/scroll from carrying over. The
-     * note's View-menu settings ride along (folder notes remember them; anything else resets).
+     * Choose a just-installed document's initial view — the one remembered for its tab, a folder
+     * note's persisted view, else fit-width — and apply it now if the viewport is sized, else on
+     * the next layout. Setting it explicitly is what stops the previous document's zoom/scroll
+     * from carrying over. The note's View-menu settings ride along.
      */
     private fun installInitialView(path: String?) {
-        val saved = viewKey(path)?.let { viewStates.get(it) }
+        val saved = path?.let { tabViews[documentKey(it)] }
+            ?: viewKey(path)?.let { viewStates.get(it) }
         installViewOverrides(saved?.overrides ?: com.xnotes.canvas.ViewOverrides())
         state.pendingInitialView =
             if (saved != null) InitialView.Restore(saved.zoom, saved.scrollX, saved.scrollY) else InitialView.FitWidth
@@ -7510,6 +7687,7 @@ class Editor(
         saveViewState() // remember the outgoing folder note's view before switching away
         flowText.endSession() // flushes the typing burst so the autosave below carries it
         flushAutosave() // save the outgoing note if it was autosaving to the folder
+        if (state.document.path != doc.path) rememberInactiveDocument()
         autosaveUri = null
         // File readouts belong to the outgoing note; a file-backed open re-sets them after the swap.
         state.lastOpenCompacted = doc.compactedOnLoad
@@ -10500,6 +10678,7 @@ class Editor(
     }
 
     fun newNote() {
+        cancelOpenInProgress() // a blank note replaces whatever a slower tab open was loading
         AudioRecording.stopFor(this) // closing the note places its recording
         AudioPlayback.closeFor(this)
         saveViewState()
@@ -10566,7 +10745,7 @@ class Editor(
 
     /** Build the second pane on first use. It shares the temp dirs and the live settings with this
      *  one, and keeps its own document, history, canvas and session slot. */
-    fun secondaryPane(): Editor = secondary ?: Editor(viewContext, Pane.SECONDARY, tabId).also {
+    fun secondaryPane(): Editor = secondary ?: Editor(viewContext, Pane.SECONDARY).also {
         it.keyActions = keyActions // the shortcuts already resolve their target pane themselves
         it.sibling = this
         sibling = it
@@ -10616,6 +10795,7 @@ class Editor(
     /** Pop back to backstage: detach the current note (flush autosave, drop the binding) and clear
      *  [noteOpen] so the editor is removed from the stack. The document stays as an inert buffer. */
     fun goHome(onLeft: (() -> Unit)? = null) {
+        cancelOpenInProgress()
         if (!noteOpen) { onLeft?.invoke(); return }
         val sealed = openVaultId != null
         vaultPrompt = null
@@ -10630,6 +10810,8 @@ class Editor(
         // so leaving one is just popping the layer.
         if (canvasOpen) {
             infinite.commitText() // an open label goes down with what was typed
+            rememberCanvasView() // the tab stays open; reopening it should return here
+            infinite.interaction.resetGestureState()
             flushCanvasThen(showOverlay = true) {
                 canvasAutosaveUri = null
                 canvasOpen = false
@@ -10643,7 +10825,8 @@ class Editor(
         exitReader()
         commitText() // commit an open text box before leaving (also hides its keyboard)
         flowText.endSession() // end any live flow caret (flushes typing, hides the keyboard)
-        saveViewState() // remember this folder note's view before leaving
+        saveViewState() // remember this note's view before leaving
+        controller.resetGestureState() // the view detaches below; do not rewind on its cancellation
         flushThen(showOverlay = true) {
             // Regenerate this folder note's grid tile now that editing is done (off-thread, low priority);
             // a non-folder note (no autosave binding) isn't in the explorer, so there's nothing to do.

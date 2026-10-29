@@ -163,6 +163,17 @@ class CanvasViewportTest {
         assertEquals(2.0, v.zoom, 1e-12)
     }
 
+    @Test fun resizingKeepsTheCentreOfTheVisibleCanvasStill() {
+        val v = viewport(1000, 800)
+        v.zoom = 2.5
+        v.centerOn(1234.0, -5678.0)
+        val before = v.centerContent
+        v.resize(600, 1200) // the new tab bar, a split, or the keyboard changing the pane
+        assertEquals(before.x, v.centerContent.x, 1e-6)
+        assertEquals(before.y, v.centerContent.y, 1e-6)
+        assertEquals(2.5, v.zoom, 1e-12)
+    }
+
     @Test fun waypointRoundTripsAcrossAScreenSizeChange() {
         val v = viewport(1000, 800)
         v.zoom = 5.5

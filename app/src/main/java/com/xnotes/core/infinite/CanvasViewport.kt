@@ -46,6 +46,18 @@ class CanvasViewport {
         zoom = zoom
     }
 
+    /**
+     * Adopt a new viewport size while keeping the content at the middle of the clear area in the
+     * middle. The tab bar, a split and the keyboard all resize the view; without this the centre
+     * would slide by half the size change and look like the canvas jumped on its own.
+     */
+    fun resize(width: Int, height: Int) {
+        val centre = if (widthPx > 0 && heightPx > 0) centerContent else null
+        widthPx = width
+        heightPx = height
+        centre?.let { centerOn(it.x, it.y) }
+    }
+
     // --- transforms ---
 
     fun contentToViewport(p: Pt): Pt = Pt((p.x - scrollX) * zoom, (p.y - scrollY) * zoom)

@@ -99,10 +99,13 @@ import com.xnotes.ui.externalDropTarget
 import com.xnotes.ui.Editor
 import com.xnotes.ui.Toolbar
 import com.xnotes.ui.ToolbarAround
+import com.xnotes.ui.NoteTabBar
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.XnotesTheme
 import com.xnotes.ui.theme.toComposeColor
+import com.xnotes.core.workspace.NoteTabs
+import com.xnotes.platform.NoteTabsStore
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -152,8 +155,6 @@ class MainActivity : ComponentActivity() {
     // cutout); this activity just applies it to the window. Fullscreen draws edge to edge and lets
     // the swipe-in transient bars overlay (no resize), non-fullscreen insets under the bars.
     private var editor: Editor? = null
-    // Every browser-style tab currently open, so pausing flushes background tabs too.
-    private var openTabs: List<Editor> = emptyList()
     // A PDF handed to us by another app ("Open with" / Share); consumed once the editor is ready.
     private var pendingPdfImport by mutableStateOf<Uri?>(null)
 
@@ -176,34 +177,23 @@ class MainActivity : ComponentActivity() {
         if (!rebuilt) pendingPdfImport = pdfImportUri(intent)
         setContent {
             val context = LocalContext.current
-            val appScope = rememberCoroutineScope()
-            val tabs = remember { androidx.compose.runtime.mutableStateListOf(Editor(context, tabId = "default")) }
-            var activeTabIndex by remember { mutableStateOf(0) }
-
-            if (activeTabIndex >= tabs.size) activeTabIndex = tabs.lastIndex
-            val ed = tabs[activeTabIndex]
-            // DispatchKeyEvent and the lifecycle hooks live outside the composition; they follow the
-            // tab on screen. Every tab is flushed on pause, not just the visible one.
-            androidx.compose.runtime.SideEffect {
-                editor = ed
-                openTabs = tabs.toList()
-            }
+            // One editor now hosts every tab; switching a tab swaps the document in its active pane.
+            val ed = remember { Editor(context).also { editor = it } }
 
             LaunchedEffect(ed.fullscreen) { applyFullscreen(ed.fullscreen) }
             var ready by remember { mutableStateOf(false) }
 
             LaunchedEffect(Unit) {
                 val start = android.os.SystemClock.uptimeMillis()
-                tabs[0].restoreSession()
+                ed.restoreSession()
                 val elapsed = android.os.SystemClock.uptimeMillis() - start
                 if (elapsed < MIN_LOADER_MS) kotlinx.coroutines.delay(MIN_LOADER_MS - elapsed)
                 ready = true
-                tabs[0].prewarmBackstage()
+                ed.prewarmBackstage()
             }
 
-            // Import every new PDF found in the notes tree, silently, once the first tab has loaded.
-            // The same runs again when the folder root changes (a new folder may hold PDFs). The tab
-            // that changed it runs the scan, so its own explorer refreshes with the new notes.
+            // Import every new PDF found in the notes tree, silently, once the editor has loaded.
+            // The same runs again when the folder root changes (a new folder may hold PDFs).
             val autoImportRoot = ed.browseRoot
             LaunchedEffect(ready, autoImportRoot) {
                 if (ready && autoImportRoot != null) ed.autoImportPdfs()
@@ -214,22 +204,7 @@ class MainActivity : ComponentActivity() {
                     Box(modifier = Modifier.fillMaxSize()) {
                         if (ready) {
                             EditorScreen(
-                                tabs = tabs,
-                                activeTabIndex = activeTabIndex,
-                                onTabSelected = { activeTabIndex = it },
-                                onTabClosed = { indexToClose ->
-                                    val editorToClose = tabs[indexToClose]
-                                    editorToClose.persist(includeUiState = editorToClose === editor)
-                                    tabs.removeAt(indexToClose)
-                                    if (activeTabIndex >= indexToClose && activeTabIndex > 0) activeTabIndex--
-                                },
-                                onNewTab = {
-                                    val newEditor = Editor(context, tabId = java.util.UUID.randomUUID().toString())
-                                    newEditor.prewarmBackstage()
-                                    tabs.add(newEditor)
-                                    activeTabIndex = tabs.lastIndex
-                                    appScope.launch { newEditor.restoreSession() }
-                                },
+                                editor = ed,
                                 fullscreen = ed.fullscreen,
                                 onToggleFullscreen = ed::toggleFullscreen,
                                 importPdfUri = pendingPdfImport,
@@ -312,7 +287,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (openTabs.isEmpty()) editor?.persist() else openTabs.forEach { it.persist(includeUiState = it === editor) }
+        editor?.persist()
     }
 
     // Playback never goes on with xnotes off screen; a split window that only lost focus is still on it.
@@ -328,6 +303,8 @@ class MainActivity : ComponentActivity() {
         // UI is hidden; they load again when something new is drawn.
         if (level >= TRIM_MEMORY_UI_HIDDEN || level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_RUNNING_CRITICAL) {
             com.xnotes.platform.PdfiumDocument.trimAll()
+            editor?.clearInactiveDocuments()
+            editor?.secondary?.clearInactiveDocuments()
         }
     }
 
@@ -361,19 +338,34 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun EditorScreen(
-    tabs: MutableList<Editor>,
-    activeTabIndex: Int,
-    onTabSelected: (Int) -> Unit,
-    onTabClosed: (Int) -> Unit,
-    onNewTab: () -> Unit,
+    editor: Editor,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     importPdfUri: Uri? = null,
     onImportConsumed: () -> Unit = {},
-    ) {
-        val editor = tabs[activeTabIndex]
+) {
         val context = LocalContext.current
         val snackbar = remember { SnackbarHostState() }
+        // The workspace remembers which documents were open, not their editors. Only the visible
+        // pane holds a decoded document; switching tabs reopens one on demand.
+        val tabsStore = remember(context) { NoteTabsStore(context) }
+        var noteTabs by remember { mutableStateOf(tabsStore.load()) }
+        LaunchedEffect(noteTabs) { tabsStore.save(noteTabs) }
+        // Documents can also arrive here without going through the explorer (session restore, a new
+        // note's first save, an import). Add them once they have a file, without resurrecting a tab
+        // that closeTab just removed: noteTabs is deliberately not a key of this effect.
+        LaunchedEffect(
+            editor.noteOpen, editor.canvasOpen, editor.openDocumentUri,
+            editor.secondary?.noteOpen, editor.secondary?.canvasOpen, editor.secondary?.openDocumentUri,
+        ) {
+            for (pane in listOfNotNull(editor, editor.secondary)) {
+                if (!pane.noteOpen) continue
+                val uri = pane.openDocumentUri ?: continue
+                if (noteTabs.tabs.none { it.uri == uri }) {
+                    noteTabs = noteTabs.open(uri, pane.openDocumentTitle, pane.pane == com.xnotes.ui.Pane.SECONDARY)
+                }
+            }
+        }
         // The LaTeX renderer resolves its fonts through the composition, so this is the
         // only place it can be built; the flow reaches it through MathRendering after.
         val mathDensity = LocalDensity.current
@@ -833,10 +825,64 @@ private fun EditorScreen(
             }
         }
 
+        /** Read [uriStr] into [target] and remember it as a tab only if that document is now open. */
+        suspend fun openTab(target: Editor, uriStr: String) {
+            val opened = openInto(context, target, uriStr) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) }
+                ?: return
+            noteTabs = noteTabs.open(opened, target.openDocumentTitle, target.pane == com.xnotes.ui.Pane.SECONDARY)
+        }
+
         fun openTreeFile(uriStr: String) {
-            scope.launch {
-                openInto(context, editor, uriStr) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) }
+            scope.launch { openTab(editor, uriStr) }
+        }
+
+        /** Switch the pane that owns [uri] to it, or load it there when it is not open yet. */
+        fun activateTab(uri: String, secondary: Boolean = false) {
+            val target = if (secondary) editor.secondaryPane() else editor
+            val other = if (target === editor) editor.secondary else editor
+            if (other?.noteOpen == true && other.openDocumentUri == uri) {
+                // Returning to a tab that is already on screen cancels a slower open that was
+                // heading for the other pane; otherwise it would swap in later, under the user.
+                target.cancelOpenInProgress()
+                editor.focusPane(other.pane)
+                return
             }
+            if (target.noteOpen && target.openDocumentUri == uri) {
+                target.cancelOpenInProgress()
+                editor.focusPane(target.pane)
+                noteTabs = noteTabs.open(uri, target.openDocumentTitle, secondary)
+                return
+            }
+            guarded(target) { scope.launch { openTab(target, uri) } }
+        }
+
+        /** Close [uri]'s tab and swap its pane to the nearest surviving tab, or back to the explorer. */
+        fun closeTab(uri: String) {
+            // Closing the tab that is still being read must stop the disk work from swapping it
+            // into the pane after its tab has gone.
+            listOfNotNull(editor, editor.secondary).forEach { pane ->
+                if (pane.pendingOpenUri == uri) pane.cancelOpenInProgress()
+            }
+            val matching = listOfNotNull(editor, editor.secondary).firstOrNull { pane ->
+                pane.noteOpen && pane.openDocumentUri == uri
+            }
+            val finish = {
+                val updated = noteTabs.close(uri)
+                val replacement = when (matching?.pane) {
+                    com.xnotes.ui.Pane.PRIMARY -> updated.primaryUri
+                    com.xnotes.ui.Pane.SECONDARY -> updated.secondaryUri
+                    else -> null
+                }
+                noteTabs = updated
+                editor.forgetInactiveDocument(uri)
+                editor.secondary?.forgetInactiveDocument(uri)
+                if (matching != null) {
+                    if (replacement != null) scope.launch { openTab(matching, replacement) }
+                    else matching.goHome()
+                }
+                Unit
+            }
+            if (matching != null) guarded(matching, finish) else finish()
         }
 
         /** Open two picked files together, one per pane, and start the split focused on the first. */
@@ -845,8 +891,8 @@ private fun EditorScreen(
             editor.focusPane(com.xnotes.ui.Pane.PRIMARY)
             val second = editor.secondaryPane()
             scope.launch {
-                openInto(context, editor, firstUri) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) }
-                openInto(context, second, secondUri) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) }
+                openTab(editor, firstUri)
+                openTab(second, secondUri)
                 // A file that would not open leaves no half-built pane behind; the other stays as it is.
                 if (!second.noteOpen) {
                     editor.abandonSecondary()
@@ -1077,22 +1123,28 @@ private fun EditorScreen(
         // inset. Insets are consumed below so inner imePadding only adds what the bars don't cover.
         val contentInsets = if (fullscreen) WindowInsets(0, 0, 0, 0) else WindowInsets.systemBars
         Scaffold(
-            topBar = {
-                Box(if (fullscreen) Modifier else Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
-                    com.xnotes.ui.BrowserTabBar(
-                        editors = tabs,
-                        selectedIndex = activeTabIndex,
-                        onTabSelected = onTabSelected,
-                        onTabClosed = onTabClosed,
-                        onNewTab = onNewTab
-                    )
-                }
-            },
             snackbarHost = { SnackbarHost(snackbar, Modifier.windowInsetsPadding(WindowInsets.ime.exclude(contentInsets))) },
             contentWindowInsets = contentInsets,
         ) { inner ->
-            Box(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
-                androidx.compose.runtime.key(editor) {
+            Column(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
+                // Keep the bar mounted for as long as a pane is open, even before the first tab
+                // metadata lands. Adding or removing it later would resize the editor under the
+                // pointer and shift the page/canvas viewport mid-gesture.
+                if (editor.openPanes.isNotEmpty()) {
+                    com.xnotes.ui.NoteTabBar(
+                        tabs = noteTabs,
+                        // Selection follows workspace state immediately on close, even while
+                        // the replacement document is still loading into its editor pane.
+                        activeUri = noteTabs.selectedUri(editor.active.pane == com.xnotes.ui.Pane.SECONDARY),
+                        onSelect = { uri ->
+                            // A tab already assigned to the second pane must reopen there, not in
+                            // the primary pane.
+                            activateTab(uri, secondary = noteTabs.secondaryUri == uri && noteTabs.primaryUri != uri)
+                        },
+                        onClose = ::closeTab,
+                    )
+                }
+                Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                     // BASE LAYER: backstage is the root of the stack — always present underneath.
                     com.xnotes.ui.Backstage(
                         editor = editor,
@@ -1251,7 +1303,7 @@ private fun EditorScreen(
                                 .onFailure { editor.message = context.getString(R.string.err_share_image) }
                         },
                         onOpenFile = { pane, uri ->
-                            scope.launch { openInto(context, pane, uri) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) } }
+                            scope.launch { openTab(pane, uri) }
                         },
                         onImagePage = { pane ->
                             pendingImagePage = PendingPageInsert(pane, pane.pageIndex + 1)
@@ -2225,24 +2277,33 @@ private suspend fun openInto(
     target: Editor,
     uriStr: String,
     onOpenReader: (String, String) -> Unit
-) {
+): String? {
     val resolver = context.contentResolver
     val name = displayNameOf(resolver, Uri.parse(uriStr)) ?: ""
 
-    if (name.endsWith(".pdf", ignoreCase = true)) {
+    val expected = if (name.endsWith(".pdf", ignoreCase = true)) {
         val newUri = target.importPdfDirectly(uriStr, name)
         if (newUri != null) {
             target.openAsync(newUri, "${com.xnotes.core.util.Paths.stem(name)}.xnote")
         } else {
             target.message = context.getString(R.string.err_insert_pdf)
         }
+        newUri
     } else if (com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.CANVAS) {
         target.openCanvasAsync(uriStr, name)
+        uriStr
     } else if (com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.NOTE) {
         target.openAsync(uriStr, name)
+        uriStr
     } else if (com.xnotes.core.util.ReaderKind.isReadable(name)) {
         onOpenReader(uriStr, name)
+        return null
     } else {
         target.openAsync(uriStr, name)
+        uriStr
     }
+    // A failed, cancelled or vault-locked read leaves the pane on its previous document, so it
+    // must not become a tab.
+    val opened = target.openDocumentUri
+    return opened?.takeIf { target.noteOpen && it == expected }
 }

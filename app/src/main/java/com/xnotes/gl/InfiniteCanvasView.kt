@@ -233,8 +233,7 @@ class InfiniteCanvasView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        viewport.widthPx = w
-        viewport.heightPx = h
+        viewport.resize(w, h)
         afterLayout?.invoke()
         publish()
     }
