@@ -39,6 +39,15 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         strokeCap = Paint.Cap.ROUND
     }
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isDither = true }
+    private val animBadgeFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; color = android.graphics.Color.argb(210, 20, 22, 28)
+    }
+    private val animBadgeRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 3f; color = android.graphics.Color.argb(230, 255, 255, 255)
+    }
+    private val animBadgeGlyph = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; color = android.graphics.Color.argb(255, 255, 255, 255)
+    }
     private val rasterBlendPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isDither = true }
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val layerPaint = Paint()
@@ -347,6 +356,24 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         if (o != 0) canvas.rotate(o.toFloat())
         canvas.drawBitmap(bmp, null, RectF(-uw / 2f, -uh / 2f, uw / 2f, uh / 2f), bitmapPaint)
         canvas.restore()
+        // Math Studio animation filmstrips carry their setup in the PNG itself: badge them so a
+        // tap on the badge can reopen the animation. Page-space coords still apply here.
+        if (MathAnimPng.hasSpec(image.file.path)) {
+            val pxPerUnit = minOf(scaleX, scaleY).toDouble().coerceAtLeast(1e-9)
+            val (bx, by, br) = MathAnimPng.badge(dest.w, dest.h, pxPerUnit)
+            val cx = (dest.left + bx).toFloat()
+            val cy = (dest.top + by).toFloat()
+            val r = br.toFloat()
+            canvas.drawCircle(cx, cy, r, animBadgeFill)
+            canvas.drawCircle(cx, cy, r, animBadgeRing)
+            val tri = Path().apply {
+                moveTo(cx - r * 0.28f, cy - r * 0.42f)
+                lineTo(cx + r * 0.48f, cy)
+                lineTo(cx - r * 0.28f, cy + r * 0.42f)
+                close()
+            }
+            canvas.drawPath(tri, animBadgeGlyph)
+        }
     }
 
     /**

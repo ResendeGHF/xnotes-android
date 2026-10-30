@@ -22,7 +22,13 @@ enum class ReaderKind(val label: String, vararg val extensions: String) {
 
         fun isReadable(name: String): Boolean = ofName(name) != null
 
-        /** Whether the explorer lists [name] as a file at all: an editable document or a readable one. */
-        fun isListed(name: String): Boolean = DocumentKind.isDocument(name) || isReadable(name)
+        /** Samsung Notes files: not rendered, but recognized so they can be imported. */
+        fun isSdocx(name: String): Boolean =
+            name.substringAfterLast('.', "").lowercase() == "sdocx"
+
+        /** Whether the explorer lists [name] as a file at all: an editable document,
+         *  a readable one, or an importable Samsung note. */
+        fun isListed(name: String): Boolean =
+            DocumentKind.isDocument(name) || isReadable(name) || isSdocx(name)
     }
 }

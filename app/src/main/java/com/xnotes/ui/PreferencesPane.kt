@@ -75,12 +75,16 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xnotes.R
+import com.xnotes.canvas.StylusCalibrator
+import com.xnotes.core.geometry.Pt
 import com.xnotes.core.model.Orientation
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.Rgba
@@ -371,6 +375,12 @@ fun PreferencesPane(
             OptionDropdown(tapOptions, prefs.stylusDoubleTap) { update(prefs.copy(stylusDoubleTap = it)) }
             FieldLabel(stringResource(R.string.pref_stylus_button_tap))
             OptionDropdown(tapOptions, prefs.stylusButtonTap) { update(prefs.copy(stylusButtonTap = it)) }
+            Column(
+                Modifier.searchAnchor(stringResource(R.string.search_keywords_calibrate)),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                StylusCalibrationSettings(prefs, ::update)
+            }
 
             HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle("OCR")
@@ -385,6 +395,13 @@ fun PreferencesPane(
             CheckRow(stringResource(R.string.pref_volume_keys_turn_pages), prefs.volumeKeysTurnPages) { update(prefs.copy(volumeKeysTurnPages = it)) }
             FieldLabel("Handwritten math (Convert to math)")
             MathAddonControls()
+            FieldLabel(stringResource(R.string.latex_ai_section))
+            Text(
+                stringResource(R.string.latex_ai_help),
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+            )
+            LatexAiControls(prefs, ::update)
 
             HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_new_notes))
@@ -827,9 +844,92 @@ fun PreferencesPane(
     }
 }
 
+/** Stylus parallax correction: guided calibration plus manual fine-tune, applied live to pen input. */
+@Composable
+private fun StylusCalibrationSettings(prefs: Preferences, update: (Preferences) -> Unit) {
+    val palette = LocalPalette.current
+    var calibrating by remember { mutableStateOf(false) }
+    var testStrokes by remember { mutableStateOf(listOf<List<Offset>>()) }
+    fun round1(v: Float): Double =
+        (v * 10f).roundToInt() / 10.0
+    FieldLabel(stringResource(R.string.pref_stylus_calibrate))
+    Text(
+        stringResource(R.string.pref_stylus_calibrate_help),
+        color = palette.textDim.toComposeColor(),
+        fontSize = 12.sp,
+    )
+    Text(
+        stringResource(
+            R.string.pref_stylus_offset,
+            String.format(java.util.Locale.US, "%+.1f", prefs.stylusOffsetXDp),
+            String.format(java.util.Locale.US, "%+.1f", prefs.stylusOffsetYDp),
+        ),
+        color = palette.text.toComposeColor(),
+        fontSize = 13.sp,
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(onClick = { calibrating = true }) { Text(stringResource(R.string.stylus_calibrate_now), fontSize = 13.sp) }
+        TextButton(
+            enabled = prefs.stylusOffsetXDp != 0.0 || prefs.stylusOffsetYDp != 0.0,
+            onClick = { update(prefs.copy(stylusOffsetXDp = 0.0, stylusOffsetYDp = 0.0)) },
+        ) { Text(stringResource(R.string.stylus_calibrate_reset), fontSize = 13.sp) }
+    }
+    FieldLabel(
+        stringResource(
+            R.string.pref_stylus_offset_x,
+            String.format(java.util.Locale.US, "%+.1f", prefs.stylusOffsetXDp),
+        ),
+    )
+    Slider(
+        value = prefs.stylusOffsetXDp.toFloat().coerceIn(-StylusCalibrator.TUNE_RANGE_DP.toFloat(), StylusCalibrator.TUNE_RANGE_DP.toFloat()),
+        onValueChange = {
+            update(prefs.copy(stylusOffsetXDp = round1(it).coerceIn(-StylusCalibrator.MAX_OFFSET_DP, StylusCalibrator.MAX_OFFSET_DP)))
+        },
+        valueRange = -StylusCalibrator.TUNE_RANGE_DP.toFloat()..StylusCalibrator.TUNE_RANGE_DP.toFloat(),
+        modifier = Modifier.width(280.dp),
+    )
+    FieldLabel(
+        stringResource(
+            R.string.pref_stylus_offset_y,
+            String.format(java.util.Locale.US, "%+.1f", prefs.stylusOffsetYDp),
+        ),
+    )
+    Slider(
+        value = prefs.stylusOffsetYDp.toFloat().coerceIn(-StylusCalibrator.TUNE_RANGE_DP.toFloat(), StylusCalibrator.TUNE_RANGE_DP.toFloat()),
+        onValueChange = {
+            update(prefs.copy(stylusOffsetYDp = round1(it).coerceIn(-StylusCalibrator.MAX_OFFSET_DP, StylusCalibrator.MAX_OFFSET_DP)))
+        },
+        valueRange = -StylusCalibrator.TUNE_RANGE_DP.toFloat()..StylusCalibrator.TUNE_RANGE_DP.toFloat(),
+        modifier = Modifier.width(280.dp),
+    )
+    Text(
+        stringResource(R.string.stylus_calibrate_test_help),
+        color = palette.textDim.toComposeColor(),
+        fontSize = 12.sp,
+    )
+    StylusTestPad(
+        offsetDp = Pt(prefs.stylusOffsetXDp, prefs.stylusOffsetYDp),
+        strokes = testStrokes,
+        onStrokes = { testStrokes = it },
+        modifier = Modifier.fillMaxWidth().height(160.dp),
+    )
+    Row {
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = { testStrokes = emptyList() }) { Text(stringResource(R.string.clear), fontSize = 13.sp) }
+    }
+    if (calibrating) {
+        StylusCalibrationDialog(
+            onApply = { x, y -> update(prefs.copy(stylusOffsetXDp = x, stylusOffsetYDp = y)) },
+            onDismiss = { calibrating = false },
+        )
+    }
+}
+
 /**
- * Download or delete the handwritten-maths model. It is too big to bundle, so the selection
- * menu only offers Convert to math once it is here.
+ * Download or delete the handwritten-maths model: a formula recognizer that reads whole
+ * complex expressions (fractions, integrals, derivatives, multi-variable physics notation)
+ * into LaTeX, offline after the one download. Without it Convert to math still works via
+ * the built-in structural pass, which suits simpler formulas.
  */
 @Composable
 private fun MathAddonControls() {
@@ -840,22 +940,20 @@ private fun MathAddonControls() {
     var confirmDelete by remember { mutableStateOf(false) }
     val sizeMb = MathOcr.DOWNLOAD_BYTES / 1_000_000
     Text(
-        "An on-device model that turns selected handwritten formulas into LaTeX. Download it once; it works offline after.",
+        "An on-device formula model that turns selected handwritten mathematics into LaTeX, including complex expressions. Download it once; it works offline after.",
         color = palette.textDim.toComposeColor(),
         fontSize = 12.sp,
     )
-    if (!MathOcr.supported) {
-        Text("Not available for this device's processor.", color = palette.text.toComposeColor(), fontSize = 12.sp)
-        return
-    }
     when (val s = state) {
         MathOcr.State.Missing ->
             TextButton(onClick = { MathOcr.startDownload(context) }) { Text("Download ($sizeMb MB)", fontSize = 13.sp) }
         is MathOcr.State.Downloading -> {
-            LinearProgressIndicator(progress = { s.done.toFloat() / s.total }, modifier = Modifier.width(280.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("${s.done / 1_000_000} of ${s.total / 1_000_000} MB", color = palette.text.toComposeColor(), fontSize = 12.sp)
-                TextButton(onClick = { MathOcr.cancelDownload(context) }) { Text(stringResource(R.string.cancel), fontSize = 13.sp) }
+            Column {
+                LinearProgressIndicator(progress = { s.done.toFloat() / s.total }, modifier = Modifier.fillMaxWidth())
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${s.done / 1_000_000} of ${s.total / 1_000_000} MB", color = palette.text.toComposeColor(), fontSize = 12.sp)
+                    TextButton(onClick = { MathOcr.cancelDownload(context) }) { Text(stringResource(R.string.cancel), fontSize = 13.sp) }
+                }
             }
         }
         MathOcr.State.Installed ->
@@ -872,11 +970,70 @@ private fun MathAddonControls() {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("Delete the math model?") },
-            text = { Text("Convert to math goes away until you download it again ($sizeMb MB).") },
+            text = { Text("Convert to math falls back to the built-in pass until you download it again ($sizeMb MB).") },
             confirmButton = { TextButton(onClick = { MathOcr.delete(context); confirmDelete = false }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(stringResource(R.string.cancel)) } },
         )
     }
+}
+
+/**
+ * The vision-model provider used by "Convert handwritten to LaTeX": Gemini, any
+ * OpenAI-compatible endpoint (ChatGPT, OpenRouter, Pollinations, ...), Claude, or a
+ * custom endpoint speaking the OpenAI chat format (a self-hosted model or another
+ * online service). The API key is kept in private app storage, never in the
+ * exported settings; custom endpoints may leave it empty when the server needs none.
+ */
+@Composable
+private fun LatexAiControls(prefs: com.xnotes.settings.Preferences, update: (com.xnotes.settings.Preferences) -> Unit) {
+    val context = LocalContext.current
+    val palette = LocalPalette.current
+    val provider = com.xnotes.platform.LatexAiProvider.ofId(prefs.latexAiProvider)
+    var apiKey by remember { mutableStateOf(com.xnotes.platform.LatexAiKeys.get(context)) }
+    var showKey by remember { mutableStateOf(false) }
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Chip("Gemini", provider == com.xnotes.platform.LatexAiProvider.GEMINI) { update(prefs.copy(latexAiProvider = "gemini")) }
+        Chip("OpenAI-compatible", provider == com.xnotes.platform.LatexAiProvider.OPENAI) { update(prefs.copy(latexAiProvider = "openai")) }
+        Chip("Claude", provider == com.xnotes.platform.LatexAiProvider.ANTHROPIC) { update(prefs.copy(latexAiProvider = "anthropic")) }
+        Chip(stringResource(R.string.latex_ai_custom), provider == com.xnotes.platform.LatexAiProvider.CUSTOM) { update(prefs.copy(latexAiProvider = "custom")) }
+    }
+    OutlinedTextField(
+        value = prefs.latexAiModel,
+        onValueChange = { update(prefs.copy(latexAiModel = it)) },
+        singleLine = true,
+        placeholder = { Text(com.xnotes.platform.LatexAiConfig.defaultModel(provider)) },
+        label = { Text(stringResource(R.string.latex_ai_model)) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Done),
+        modifier = Modifier.width(280.dp),
+    )
+    if (provider == com.xnotes.platform.LatexAiProvider.OPENAI || provider == com.xnotes.platform.LatexAiProvider.CUSTOM) {
+        OutlinedTextField(
+            value = prefs.latexAiBaseUrl,
+            onValueChange = { update(prefs.copy(latexAiBaseUrl = it)) },
+            singleLine = true,
+            placeholder = { Text(com.xnotes.platform.LatexAiConfig.defaultBaseUrl(provider)) },
+            label = { Text(stringResource(R.string.latex_ai_base_url)) },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+            modifier = Modifier.width(280.dp),
+        )
+    }
+    OutlinedTextField(
+        value = apiKey,
+        onValueChange = { apiKey = it; com.xnotes.platform.LatexAiKeys.put(context, it) },
+        singleLine = true,
+        label = { Text(stringResource(R.string.latex_ai_api_key)) },
+        visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+        trailingIcon = {
+            TextButton(onClick = { showKey = !showKey }) {
+                Text(stringResource(if (showKey) R.string.latex_ai_hide_key else R.string.latex_ai_show_key))
+            }
+        },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+        modifier = Modifier.width(280.dp),
+    )
 }
 
 /** Export every setting to a zip, or adopt one, for a new device or a fresh install. */

@@ -938,10 +938,10 @@ class CanvasState(
         clampScroll()
     }
 
-    /** The scroll, zoom and fit magnets at one moment, for [restoreView]. */
-    class ViewSnapshot(val zoom: Double, val scrollX: Double, val scrollY: Double, val fitWidth: Boolean, val fitHeight: Boolean)
+    /** The scroll, zoom, fit magnets and paginated row at one moment, for [restoreView]. */
+    class ViewSnapshot(val zoom: Double, val scrollX: Double, val scrollY: Double, val fitWidth: Boolean, val fitHeight: Boolean, val row: Int)
 
-    fun snapshotView(): ViewSnapshot = ViewSnapshot(zoom, scrollX, scrollY, fitWidthActive, fitHeightActive)
+    fun snapshotView(): ViewSnapshot = ViewSnapshot(zoom, scrollX, scrollY, fitWidthActive, fitHeightActive, currentRow)
 
     /** Put the view back as [v] found it, rebuilding the page caches if the zoom moved. */
     fun restoreView(v: ViewSnapshot) {
@@ -951,6 +951,10 @@ class CanvasState(
         }
         fitWidthActive = v.fitWidth
         fitHeightActive = v.fitHeight
+        if (!verticalScroll) {
+            currentRow = v.row.coerceIn(0, rowRanges().lastIndex.coerceAtLeast(0))
+            flipOffsetX = 0.0
+        }
         scrollX = v.scrollX
         scrollY = v.scrollY
         clampScroll()
@@ -1505,6 +1509,8 @@ class CanvasState(
         InkFade.paint(page.items.subList(n, page.items.size), r, f, {
             !isLiftedItem(it) && !it.isHighlighterInk() && it.paintBounds().intersects(region)
         }) { it.paint(r) }
+        // Exported linked pages carry their link's color as a frame.
+        if (page.linkBorder != null) com.xnotes.core.links.LinkBorder.paint(page, r)
     }
 
     /**

@@ -49,6 +49,7 @@ import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.EraseRule
 import com.xnotes.core.model.AudioItem
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.NoteLinkItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.RectHandle
 import com.xnotes.core.model.Resizable
@@ -217,6 +218,8 @@ class InteractionController(
 
     /** A finger tap that may land on an audio pill, at [pageLocal] on page [pageIndex]; true when one took it. */
     var onAudioTap: ((pageIndex: Int, pageLocal: Pt) -> Boolean)? = null
+    /** A tap on the play badge of a Math Studio animation frame; opens the saved animation. */
+    var onMathAnimTap: ((pageIndex: Int, pageLocal: Pt) -> Boolean)? = null
 
     /**
      * A tap that may open a markup, at viewport point [at]: a pan tap ([withLink], so a menu can offer
@@ -235,6 +238,9 @@ class InteractionController(
 
     /** Text markups the page layers don't show yet, under everything else in the overlay. */
     var markupOverlay: MarkupOverlay? = null
+
+    /** Boxes around the PDF links on the pages shown, over the background. */
+    var linkOverlay: LinkOverlay? = null
 
     /** The icons over noted markups, above all the page's content. */
     var noteIcons: NoteIcons? = null
@@ -274,6 +280,13 @@ class InteractionController(
     /** When true, the side-button tool also runs off the hover stream (no contact needed); eraser/pan only. */
     var penButtonHover: Boolean = false
 
+    /**
+     * Stylus parallax correction in dp, from Settings → Input → Calibrate. Added to every
+     * stylus/eraser-tip sample (× [CanvasState.devicePxPerDp]) before the viewport→content
+     * transform, so ink lands under the nib at any zoom. Finger input is never shifted.
+     */
+    var stylusOffsetDp: Pt = Pt.ZERO
+
     /** The side-button tool currently running off the hover stream, or null when no hover gesture is live. */
     private var hoverActionTool: Tool? = null
 
@@ -302,6 +315,26 @@ class InteractionController(
     private var strokeStartTimeMs = 0L
     private var drawingPointerId = -1
     private var drawingIsStylus = false
+    /** True while the live gesture's down-pointer was a stylus or stylus-eraser tip, so every
+     *  later sample of the gesture takes the calibration offset. */
+    private var drawingIsCalibrated = false
+
+    /** Viewport-px correction for the live gesture ([stylusOffsetDp] × density), or zero. */
+    private fun offsetPx(): Pt = Pt(stylusOffsetDp.x * state.devicePxPerDp, stylusOffsetDp.y * state.devicePxPerDp)
+
+    /** Shift a down/hover sample when its pointer is a pen tip. */
+    private fun calDown(vx: Double, vy: Double, toolType: Int): Pt =
+        if (toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER) {
+            val o = offsetPx()
+            Pt(vx + o.x, vy + o.y)
+        } else Pt(vx, vy)
+
+    /** Shift a move/up sample of the live gesture when it began with a pen tip. */
+    private fun calLive(vx: Double, vy: Double): Pt =
+        if (drawingIsCalibrated) {
+            val o = offsetPx()
+            Pt(vx + o.x, vy + o.y)
+        } else Pt(vx, vy)
 
     // SHAPE SNAP (hold a freehand stroke still → it becomes a real shape)
     /** Pending "pen held still" timer; non-null only while a stroke is eligible and armed. */
@@ -328,6 +361,9 @@ class InteractionController(
     private var downStoppedFling = false // this touch landed on a moving glide, so its lift isn't a dismiss tap
     private var panMayCommitText = false // pan begun off an open text box: a tap commits it, a drag scrolls
     private var downView: CanvasState.ViewSnapshot? = null // the view as this touch went down, put back if Android takes the touch back
+    /** The view as the current pinch went down (second finger landed). A rejected palm finger
+     *  only undoes the pinch it joined, never the legitimate pan that came before it. */
+    private var pinchStartView: CanvasState.ViewSnapshot? = null
     private var touchTakenBack = false // Android took back a finger of this touch, so the rest of it is ignored
     // Framework singletons, created lazily on first use (always a gesture on the main thread) so
     // the controller's selection/edit logic stays constructible — and unit-testable — off-device.
@@ -701,13 +737,15 @@ class InteractionController(
                 handlePointerDown(e)
             }
             MotionEvent.ACTION_MOVE -> {
-                if (tapCandidate && Pt(e.x.toDouble(), e.y.toDouble()).distanceTo(tapDownViewport) > TAP_SLOP) tapCandidate = false
+                if (tapCandidate) {
+                    val mv = calLive(e.x.toDouble(), e.y.toDouble())
+                    if (Pt(mv.x, mv.y).distanceTo(tapDownViewport) > TAP_SLOP) tapCandidate = false
+                }
                 handleMove(e)
             }
             MotionEvent.ACTION_POINTER_UP ->
-                if (movingView() && isCancelledLift(e)) {
-                    touchTakenBack = true
-                    takeBackTouch()
+                if (isCancelledLift(e) && movingView()) {
+                    handleCancelledPointerUp(e)
                 } else {
                     handlePointerUp(e)
                 }
@@ -729,18 +767,58 @@ class InteractionController(
         val movedView = movingView()
         abortGesture()
         if (movedView) downView?.let { state.restoreView(it); onViewChanged() }
+        pinchStartView = null
+        requestRender()
+    }
+
+    /**
+     * One finger of a pan/pinch was rejected as a palm (ACTION_POINTER_UP with FLAG_CANCELED):
+     * undo only what the pinch did since that finger landed, then carry on with the finger(s)
+     * still down. Rewinding the whole touch to [downView] here would also discard the legitimate
+     * pan from before the palm landed — the "pan jumps back" bug.
+     */
+    private fun handleCancelledPointerUp(e: MotionEvent) {
+        if (mode != PointerMode.PINCH) {
+            handlePointerUp(e)
+            return
+        }
+        pinchStartView?.let { state.restoreView(it); onViewChanged() }
+        pinchStartView = null
+        val remaining = (0 until e.pointerCount).filter { it != e.actionIndex }
+        if (remaining.size >= 2) {
+            // Two or more fingers still down: stay pinching, re-anchored on them so the
+            // rejected finger's position cannot skew the next update.
+            val a = Pt(e.getX(remaining[0]).toDouble(), e.getY(remaining[0]).toDouble())
+            val b = Pt(e.getX(remaining[1]).toDouble(), e.getY(remaining[1]).toDouble())
+            val mid = (a + b) * 0.5
+            pinchInitDist = a.distanceTo(b).coerceAtLeast(1.0)
+            pinchInitZoom = state.zoom
+            pinchAnchorContent = state.viewportToContent(mid)
+            startTrackingVelocity(mid.x, mid.y)
+        } else if (remaining.size == 1) {
+            // One finger left: relax back into a pan from where it is, so the drag does not
+            // jump. Fresh velocity, so the palm's flick cannot fling the page.
+            val rp = calDown(
+                e.getX(remaining[0]).toDouble(), e.getY(remaining[0]).toDouble(),
+                e.getToolType(remaining[0]),
+            )
+            beginPan(rp.x, rp.y)
+        } else {
+            mode = PointerMode.IDLE
+        }
         requestRender()
     }
 
     fun onHover(e: MotionEvent): Boolean {
         if (handleHoverAction(e)) return true
         if (hoverConnect(e)) return true
-        val isEraserPointer = e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+        val toolType = e.getToolType(0)
+        val isEraserPointer = toolType == MotionEvent.TOOL_TYPE_ERASER
         if (tool != Tool.ERASER && !isEraserPointer) return false
         eraserCursor = if (e.actionMasked == MotionEvent.ACTION_HOVER_EXIT) {
             null
         } else {
-            Pt(e.x.toDouble(), e.y.toDouble())
+            calDown(e.x.toDouble(), e.y.toDouble(), toolType)
         }
         requestRender()
         return true
@@ -753,8 +831,9 @@ class InteractionController(
         // A press that may still be a click waits, so a click never erases under the hovering pen.
         val want = penButtonHover && buttonNow && !StylusButtonLatch.clicks.mayStillClick(e.eventTime) &&
             (penButtonTool == Tool.ERASER && !readOnly || penButtonTool == Tool.PAN)
-        val vx = e.x.toDouble()
-        val vy = e.y.toDouble()
+        val cal = calDown(e.x.toDouble(), e.y.toDouble(), e.getToolType(0))
+        val vx = cal.x
+        val vy = cal.y
         return when {
             want && hoverActionTool == null -> { beginHoverAction(vx, vy); true }
             want && hoverActionTool != null -> { extendHoverAction(vx, vy); true }
@@ -820,11 +899,14 @@ class InteractionController(
         dismissPressAt = null
         markupPressAt = null
         val toolType = e.getToolType(0)
-        val vx = e.getX(0).toDouble()
-        val vy = e.getY(0).toDouble()
+        val down = calDown(e.getX(0).toDouble(), e.getY(0).toDouble(), toolType)
+        val vx = down.x
+        val vy = down.y
         val content = state.viewportToContent(Pt(vx, vy))
         drawingPointerId = e.getPointerId(0)
         drawingIsStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS
+        drawingIsCalibrated = toolType == MotionEvent.TOOL_TYPE_STYLUS ||
+            toolType == MotionEvent.TOOL_TYPE_ERASER
 
         // Cropping an image is modal: a press adjusts the crop rect (handle drag or move), never ink.
         if (mode == PointerMode.CROP) { beginCropDrag(content); return }
@@ -1018,8 +1100,9 @@ class InteractionController(
 
     private fun handleMove(e: MotionEvent) {
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
-        val vx = e.getX(idx).toDouble()
-        val vy = e.getY(idx).toDouble()
+        val raw = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+        val vx = raw.x
+        val vy = raw.y
         val content = state.viewportToContent(Pt(vx, vy))
         maybeCancelLongPress(Pt(vx, vy))
         when (mode) {
@@ -1079,12 +1162,13 @@ class InteractionController(
     private fun handleUp(e: MotionEvent) {
         cancelLongPress()
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
-        val content = state.viewportToContent(Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble()))
+        val up = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+        val content = state.viewportToContent(up)
         when (mode) {
             PointerMode.DRAW -> endDraw(e)
             PointerMode.PAN -> {
                 mode = PointerMode.IDLE
-                val upViewport = Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+                val upViewport = up
                 val tap = !downStoppedFling && upViewport.distanceTo(panDownViewport) <= TAP_SLOP
                 if (tap) onTap?.invoke(upViewport)
                 if (panMayCommitText) {
@@ -1134,7 +1218,7 @@ class InteractionController(
             PointerMode.SLIDE -> endSlide()
             PointerMode.FLOW_TEXT -> {
                 mode = PointerMode.IDLE
-                flowText?.release(content, Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble()), e.eventTime)
+                flowText?.release(content, up, e.eventTime)
             }
             PointerMode.TEXT_DRAG -> endTextDrag(content)
             PointerMode.PDF_TEXT -> {
@@ -1143,7 +1227,6 @@ class InteractionController(
                 val pressAt = markupPressAt
                 markupPressAt = null
                 pdfText?.release()
-                val up = Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble())
                 if (pressAt != null && up.distanceTo(pressAt) <= TAP_SLOP) {
                     onTap?.invoke(pressAt)
                     onMarkupTap?.invoke(pressAt, false)
@@ -1152,7 +1235,6 @@ class InteractionController(
             PointerMode.IDLE -> {
                 lockedPressAt?.let { at ->
                     lockedPressAt = null
-                    val up = Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble())
                     if (up.distanceTo(at) <= TAP_SLOP) {
                         onTap?.invoke(up)
                         pdfText?.clear()
@@ -1182,6 +1264,7 @@ class InteractionController(
             if (peelTapeAt(pageIndex, local)) return true
             if (onItemLinkTap?.invoke(pageIndex, local) == true) return true
             if (onAudioTap?.invoke(pageIndex, local) == true) return true
+            if (onMathAnimTap?.invoke(pageIndex, local) == true) return true
             if (tool == Tool.SELECT && fingerTapSelect(content)) return true
         }
         if (onMarkupTap?.invoke(state.contentToViewport(content), true) == true) return true
@@ -1261,16 +1344,21 @@ class InteractionController(
         val idx = e.findPointerIndex(drawingPointerId)
         if (idx < 0) return
         for (h in 0 until e.historySize) {
-            addStrokePoint(
+            val hp = calLive(
                 e.getHistoricalX(idx, h).toDouble(),
                 e.getHistoricalY(idx, h).toDouble(),
+            )
+            addStrokePoint(
+                hp.x,
+                hp.y,
                 if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0,
                 e.getHistoricalEventTime(h),
                 force = false,
             )
         }
+        val cp = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
-            e.getX(idx).toDouble(), e.getY(idx).toDouble(),
+            cp.x, cp.y,
             if (drawingIsStylus) e.getPressure(idx).toDouble() else 1.0, e.eventTime, force = false,
         )
         frontInk?.wet(liveStroke, strokePageIndex)
@@ -1401,8 +1489,9 @@ class InteractionController(
         cancelDwell()
         dwellEligible = false
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
+        val up = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
-            e.getX(idx).toDouble(), e.getY(idx).toDouble(),
+            up.x, up.y,
             if (drawingIsStylus) e.getPressure(idx).toDouble() else 1.0, e.eventTime, force = true,
         )
         // A mid-stroke snap already committed a shape and cleared liveStroke, so this block is
@@ -2180,6 +2269,15 @@ class InteractionController(
         val local = state.toPageSpace(resizePageIndex, content)
         when (item) {
             is ImageItem -> item.setGeometry(RectHandle(ResizeMath.resizeImage(item.rect, handle, local)))
+            is NoteLinkItem -> {
+                var r = ResizeMath.resizeImage(item.rect, handle, local)
+                r = com.xnotes.core.geometry.Rect(
+                    r.x, r.y,
+                    r.w.coerceAtLeast(NoteLinkItem.MIN_WIDTH),
+                    r.h.coerceAtLeast(NoteLinkItem.MIN_HEIGHT),
+                )
+                item.setGeometry(RectHandle(r))
+            }
             is TextItem -> {
                 // Resize against the displayed bounds (grown-to-fit height) so handles track the box.
                 val (pos, w, h) = ResizeMath.resizeText(item.pos, item.width, item.bounds().h, handle, local)
@@ -3856,14 +3954,15 @@ class InteractionController(
 
     private fun tapDown(e: MotionEvent) {
         tapCandidate = true
-        tapDownViewport = Pt(e.x.toDouble(), e.y.toDouble())
+        val toolType = e.getToolType(0)
+        tapDownViewport = calDown(e.x.toDouble(), e.y.toDouble(), toolType)
         tapDownTime = e.eventTime
         tapDownSelected = selection.mapTo(HashSet()) { it.item }
     }
 
     /** A tap that follows another close by and soon after is a double tap. */
     private fun tapUp(e: MotionEvent) {
-        val at = Pt(e.x.toDouble(), e.y.toDouble())
+        val at = calLive(e.x.toDouble(), e.y.toDouble())
         val tap = tapCandidate && e.eventTime - tapDownTime < LONG_PRESS_MS
         tapCandidate = false
         if (!tap) {
@@ -5023,6 +5122,10 @@ class InteractionController(
         clearFading()
         crossedSegments.clear() // they belong to the outgoing document, whose history is gone
         dwellEligible = false
+        drawingIsCalibrated = false
+        downView = null
+        pinchStartView = null
+        touchTakenBack = false
         mode = PointerMode.IDLE
         dismissPressAt = null
         lastPan = Pt.ZERO
@@ -5058,6 +5161,7 @@ class InteractionController(
         if (mode == PointerMode.SHOT) clearScreenshot() // a second finger turns the drag into a zoom
         clearOverscroll() // a second finger ends any bottom-pull; the elastic snaps away
         clearFlipPull() // ...and any paginated edge-pull folds back into the scroll
+        pinchStartView = state.snapshotView()
         mode = PointerMode.PINCH
         val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
         val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
@@ -5133,6 +5237,7 @@ class InteractionController(
 
     private fun endPinch() {
         mode = PointerMode.IDLE
+        pinchStartView = null
         if (state.zoomingInProgress) {
             state.zoomingInProgress = false
             state.invalidateCachesForZoom() // keep stale surfaces to blit until the sharp rebuild lands
@@ -5151,12 +5256,14 @@ class InteractionController(
         cancelLongPress()
         cancelDwell()
         dwellEligible = false
+        drawingIsCalibrated = false
         snappedSelectionPendingMenu = false
         strokeDismissedSelection = false
         panMayCommitText = false
         stopFling()
         clearFlipPull()
         clearOverscroll()
+        pinchStartView = null
         if (mode == PointerMode.ERASE) endErase() // what a cancelled erase took stays one undo step
         if (mode == PointerMode.VERTEX) abandonVertex()
         if (mode == PointerMode.JOINT) jointEdit?.restore()
@@ -5174,6 +5281,7 @@ class InteractionController(
         pushStrokeEdit(null) // a cancelled crossing still left segments on the pages behind it
         liveStroke = null
         strokePageIndex = null
+        drawingIsCalibrated = false
         snapEngaged = false
         snapRunStartEdge = null
         snapCurrentEdge = null
@@ -5206,6 +5314,8 @@ class InteractionController(
             r.scale(state.zoom, state.zoom)
 
             markupOverlay?.draw(r)
+
+            linkOverlay?.draw(r)
 
             // Lifted (selected) items, drawn live at the move offset; one that bends to stay joined is drawn below.
             for (sel in selection) {

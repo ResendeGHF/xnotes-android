@@ -49,6 +49,7 @@ import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.Document
 import com.xnotes.core.model.DrawStyle
 import com.xnotes.core.model.ImageData
+import com.xnotes.math.LatexToExpr
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.MarkupType
 import com.xnotes.core.model.Orientation
@@ -142,6 +143,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
@@ -183,29 +185,54 @@ data class BrowseEntry(
 
 /**
  * How a picked file should be imported: as a PDF-backed note, an image note, a text note (extracted
- * from txt/csv/rtf/html/docx/xlsx/epub), or an existing `.xnote`/`.xcanvas` opened as-is.
+ * from txt/csv/rtf/html/docx/xlsx/epub), a Samsung Notes note (from .sdocx), or an existing
+ * `.xnote`/`.xcanvas` opened as-is.
  */
 enum class ImportKind {
-    PDF, IMAGE, TEXT, OPEN;
+    PDF, IMAGE, TEXT, SDOCX, OPEN;
 
     companion object {
         /** The document extensions the "Import file" action understands (for the picker + UI hint). */
         val IMPORT_EXTENSIONS = listOf("pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg",
-            "txt", "md", "markdown", "csv", "rtf", "html", "htm", "epub", "docx", "xlsx")
+            "txt", "md", "markdown", "csv", "rtf", "html", "htm", "epub", "docx", "xlsx", "sdocx")
 
         private val IMAGE_EXT = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "heic", "heif")
         private val TEXT_EXT = setOf("txt", "md", "markdown", "csv", "rtf", "html", "htm", "epub", "docx", "xlsx")
+
+        /**
+         * Upper bound for one link-graph refresh pass over the listed files
+         * (manifest reads only). On timeout the indexed part so far is kept
+         * with [com.xnotes.core.links.LinkGraph.partial] set, instead of
+         * spinning forever on a huge or slow tree.
+         */
+        const val SCAN_TIMEOUT_MS = 30_000L
 
         /** Classify a picked file by extension (then mime) into the importer that should handle it. */
         fun classify(name: String, mime: String?): ImportKind {
             val ext = name.substringAfterLast('.', "").lowercase()
             return when {
                 ext == "xnote" || ext == "xcanvas" -> OPEN
+                ext == "sdocx" -> SDOCX
                 ext == "pdf" || mime == "application/pdf" -> PDF
                 ext in IMAGE_EXT || mime?.startsWith("image/") == true -> IMAGE
                 ext in TEXT_EXT || mime?.startsWith("text/") == true -> TEXT
                 else -> TEXT // best effort for unknown types
             }
+        }
+
+        /**
+         * Whether an *unprompted* file (an "Open with"/"Share" intent) is worth
+         * importing: a known extension, or a MIME type with a matching
+         * importer. Anything else (a zip shared as octet-stream, say) is
+         * declined instead of becoming a garbage text note.
+         */
+        fun isKnownImport(name: String, mime: String?): Boolean {
+            val ext = name.substringAfterLast('.', "").lowercase()
+            if (ext in IMPORT_EXTENSIONS) return true
+            if (ext == "xnote" || ext == "xcanvas") return true
+            val m = mime.orEmpty()
+            return m == "application/pdf" || m.startsWith("image/") ||
+                m.startsWith("text/") || m == "text/markdown" || m == "text/x-markdown"
         }
     }
 }
@@ -239,6 +266,21 @@ data class PendingImport(
     /** Set when the pick is a markdown file imported through the upstream markdown note builder. */
     val markdown: Boolean = false,
 )
+
+/** A scan/photo/PDF picked for "trace into strokes", awaiting its preview + conversion. */
+data class PendingTrace(
+    val uri: String,
+    /** Original file name (with extension), for the default note name. */
+    val sourceName: String,
+    val mime: String,
+    /** The folder to save the traced note into. */
+    val parentDocId: String? = null,
+    /** A staged file to read instead of [uri] (the camera flow's warped scan). Deleted once staged. */
+    val file: java.io.File? = null,
+)
+
+/** A photo just taken for "trace from camera", awaiting corner adjustment. */
+data class PendingCameraScan(val file: java.io.File, val name: String)
 
 /** How far a multi-file PDF import has got; drives the count in the import dialog. */
 data class ImportProgress(val done: Int, val total: Int)
@@ -290,6 +332,9 @@ private val FIELD_CTRL_KEYS = setOf(
 
 /** How far off an address written in a PDF's text a tap may land and still open it. */
 private const val AUTO_LINK_SLOP_DP = 4.0
+
+/** How many internal PDF link jumps [Editor.pdfLinkBackStack] keeps; a pathological link loop must not grow it without bound. */
+private const val MAX_LINK_BACK_STACK = 50
 
 /** How near ink a finger tap during playback may land to play from it. */
 private const val INK_TAP_DP = 8.0
@@ -516,6 +561,9 @@ class Editor(
     }
     private val canvasCodec = com.xnotes.format.CanvasCodec(imageCodec, textMeasurer)
 
+    /** The note-link index behind the Graph screen: which files link to which, kept on every save. */
+    private val noteLinkIndex = com.xnotes.platform.NoteLinkIndex(appContext)
+
     /** One flow layout + snapshot: repainted from cache threads, so only the published frame is read. */
     private class PublishedFlow(val frame: FlowFrame, val indexOf: Map<Page, Int>)
     private val flowLayout = FlowLayout(textMeasurer, com.xnotes.platform.MathRendering)
@@ -655,11 +703,30 @@ class Editor(
     /** App-tracked creation times for explorer ordering (SAF exposes only last-modified). */
     private val createdStore = com.xnotes.platform.CreationTimeStore(com.xnotes.platform.JsonStore.createdTimes(appContext))
     private val docMeta = com.xnotes.platform.DocMetaStore(com.xnotes.platform.JsonStore.docMeta(appContext))
-    /** A single lowest-priority background thread renders explorer thumbnails one at a time, so a
-     *  folder of many notes fills in gradually without ever competing with the UI/render threads. */
-    private val thumbDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "note-thumbs").apply { priority = Thread.MIN_PRIORITY }
+    /** Explorer thumbnails: parsed and painted concurrently (every task owns its surfaces and
+     *  layout pass), at background priority. Bounded so a folder of many notes fills in fast
+     *  without starving the UI, render or SAF-provider threads. */
+    private val thumbThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+    private val thumbPool = java.util.concurrent.Executors.newFixedThreadPool(thumbThreads) { r ->
+        Thread(r, "note-thumbs").apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
     }.asCoroutineDispatcher()
+    /** How long a tile waits for a scroll-past to cancel it before any pool work is queued. */
+    private val tileSettleMs = 80L
+    /**
+     * Bumped when the shown folder changes so tiles queued for the old folder abort before any
+     * heavy work; already-published tiles stay cached (keyed by URI) for instant back-navigation.
+     * Independent of [thumbnailGeneration], which tracks the disk cache's theme.
+     */
+    @Volatile private var tileEpoch = 0L
+
+    /** Drop tile work queued for the folder just left. Main thread. */
+    fun cancelStaleTiles() {
+        tileEpoch++
+    }
+
+    /** True when a tile task started under [epoch]/[generation] may still publish. */
+    private fun tileAlive(epoch: Long, generation: Long) =
+        epoch == tileEpoch && isCurrentThumbnail(generation)
     /**
      * Side-panel page thumbnails, rendered once and reused so scrolling the panel doesn't re-render.
      * Keyed by [Page] **identity** (not index) so a drag-reorder keeps each page's bitmap instead of
@@ -772,6 +839,12 @@ class Editor(
     /** A picked PDF awaiting a name before it's imported into the explorer; drives the inline name field. */
     var pendingImport by mutableStateOf<PendingImport?>(null)
         private set
+    /** A scan/photo/PDF picked for "trace into strokes"; drives the trace preview dialog. */
+    var pendingTrace by mutableStateOf<PendingTrace?>(null)
+        private set
+    /** A photo just taken for "trace from camera"; drives the scan capture dialog. */
+    var pendingCameraScan by mutableStateOf<PendingCameraScan?>(null)
+        private set
     /** True while a committed import is being written off-thread; drives the "Importing…" dialog. */
     var importing by mutableStateOf(false)
         private set
@@ -832,6 +905,12 @@ class Editor(
     var message by mutableStateOf<String?>(null)
     /** A button the next [message] carries, such as Undo, with what it does. */
     var messageAction by mutableStateOf<Pair<String, () -> Unit>?>(null)
+
+    /**
+     * Host hook for note-link taps: open [uri] in another tab at [page] (0-based).
+     * Set by the activity, which owns tabs; null (e.g. previews) shows a message instead.
+     */
+    var onOpenNoteLink: ((uri: String, page: Int) -> Unit)? = null
 
     /** Show [text], with [action] as a button on it. */
     fun say(text: String, action: Pair<String, () -> Unit>? = null) {
@@ -939,15 +1018,22 @@ class Editor(
         }
     }
 
-    override val canConvertToMath: Boolean get() = com.xnotes.platform.MathOcr.isInstalled(appContext)
+    override val canConvertToMath: Boolean get() = true
 
     override fun convertSelectionToMath() {
         val sel = controller.inkSelection() ?: return
+        val lang = settings.prefs.ocrLanguage
         android.widget.Toast.makeText(appContext, "Recognizing math...", android.widget.Toast.LENGTH_SHORT).show()
         autosaveScope.launch {
+            // The formula model reads whole complex expressions; without it, the built-in
+            // structural pass still reassembles what handwriting recognition spells out.
             val latex = try {
-                withContext(Dispatchers.Default) { com.xnotes.platform.MathOcr.recognize(appContext, sel.strokes, sel.bounds) }
-            } catch (e: Throwable) {
+                if (com.xnotes.platform.MathOcr.isInstalled(appContext)) {
+                    withContext(Dispatchers.Default) { com.xnotes.platform.MathOcr.recognize(appContext, sel.strokes, sel.bounds) }
+                } else {
+                    withContext(Dispatchers.IO) { com.xnotes.platform.InkMathOcr.recognize(sel.strokes, lang) }
+                }
+            } catch (e: Exception) {
                 android.widget.Toast.makeText(appContext, "Math recognition failed: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 return@launch
             }
@@ -958,6 +1044,89 @@ class Editor(
             controller.replaceInkWithMath(sel, latex)
         }
     }
+
+    override val canSendSelectionToMath: Boolean get() =
+        selectionMath != null ||
+            controller.singleSelectedText() != null ||
+            controller.inkSelection() != null ||
+            (flowText.active && !flowText.selection.normalized().collapsed)
+
+    override fun sendSelectionToMathStudio(destination: MathStudioDestination) {
+        // Math boxes first (already LaTeX), then text boxes and flow markdown, OCR for ink last.
+        selectionMath?.let { sendMathTextToStudio(it, destination); return }
+        controller.singleSelectedText()?.text?.let { sendMathTextToStudio(it, destination); return }
+        flowMathSelectionText()?.let { sendMathTextToStudio(it, destination); return }
+        val sel = controller.inkSelection()
+        if (sel == null) {
+            say("Nothing to send: select a formula, text or handwriting first")
+            return
+        }
+        val lang = settings.prefs.ocrLanguage
+        android.widget.Toast.makeText(appContext, "Recognizing math...", android.widget.Toast.LENGTH_SHORT).show()
+        autosaveScope.launch {
+            val latex = try {
+                if (com.xnotes.platform.MathOcr.isInstalled(appContext)) {
+                    withContext(Dispatchers.Default) { com.xnotes.platform.MathOcr.recognize(appContext, sel.strokes, sel.bounds) }
+                } else {
+                    withContext(Dispatchers.IO) { com.xnotes.platform.InkMathOcr.recognize(sel.strokes, lang) }
+                }
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(appContext, "Math recognition failed: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            if (latex.isBlank()) {
+                android.widget.Toast.makeText(appContext, "No math recognized", android.widget.Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            sendMathTextToStudio(latex, destination)
+        }
+    }
+
+    /** The selected flow paragraph range as plain text, or null when there is no flow selection. */
+    private fun flowMathSelectionText(): String? {
+        if (!flowText.active) return null
+        val sel = flowText.selection.normalized()
+        if (sel.collapsed) return null
+        val paras = state.document.flow.paragraphs
+        if (paras.isEmpty()) return null
+        return if (sel.start.para == sel.end.para) {
+            val plain = paras.getOrNull(sel.start.para)?.plainText() ?: return null
+            plain.substring(sel.start.offset.coerceIn(0, plain.length), sel.end.offset.coerceIn(0, plain.length)).takeIf { it.isNotBlank() }
+        } else {
+            (sel.start.para..sel.end.para).mapNotNull { p ->
+                val plain = paras.getOrNull(p)?.plainText() ?: return@mapNotNull null
+                val from = if (p == sel.start.para) sel.start.offset.coerceIn(0, plain.length) else 0
+                val to = if (p == sel.end.para) sel.end.offset.coerceIn(0, plain.length) else plain.length
+                if (to > from) plain.substring(from, to) else null
+            }.joinToString("\n").takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun sendMathTextToStudio(raw: String, destination: MathStudioDestination) {
+        val expr = LatexToExpr.convertOrPass(raw)
+        if (expr.isBlank()) {
+            say("Could not read an expression from the selection")
+            return
+        }
+        onMathStudioRequest?.invoke(MathStudioRequest(destination.tab, expr))
+    }
+
+    /** True when the flow text holds a non-collapsed selection to send to Math Studio. */
+    fun canSendFlowSelectionToMath(): Boolean =
+        flowText.active && !flowText.selection.normalized().collapsed
+
+    /** Sends the flow selection's text to Math Studio at [destination]. */
+    fun sendFlowSelectionToMathStudio(destination: MathStudioDestination) {
+        val text = flowMathSelectionText()
+        if (text.isNullOrBlank()) {
+            say("Select an expression first")
+            return
+        }
+        sendMathTextToStudio(text, destination)
+    }
+
+    /** Opens Math Studio with a canvas selection's expression; set by the host activity. */
+    var onMathStudioRequest: ((MathStudioRequest) -> Unit)? = null
 
     private var cropBaking = false
 
@@ -1107,6 +1276,8 @@ class Editor(
         get() = infiniteOrNull ?: InfiniteEditor(appContext).also {
             infiniteOrNull = it
             it.applyPalette(palette)
+            // Recording positions for a canvas in an encrypted folder stay in RAM only.
+            it.vaultGuard = { openVaultId != null }
             // Both editors write inserted images into the same purged-on-launch temp dir.
             it.imageDir = imageDir
             it.externalDrop = com.xnotes.platform.ExternalDrop.create(
@@ -1116,6 +1287,7 @@ class Editor(
                 indicatorColor = { palette.accent.toArgb() },
             )
             it.onMessage = { m, action -> say(m, action) }
+            it.onMathAnimSpec = onMathAnimSpec
             for (t in ToolDefaults.persistedTools) it.setToolConfig(t, settings.configFor(t))
             it.armShapeConfig(settings.shapeConfig)
             it.onDetectShapesChanged = { v -> snapHeldToShapes = v }
@@ -1201,7 +1373,7 @@ class Editor(
             }
             val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
-                    readXcanvas(uri)?.also { it.created = settleCreated(uri, it.created) }
+                    readXcanvas(uri)?.also { it.created = settleCreated(uri, it.created, vaultId) }
                 }.getOrNull()
             }
             if (!isCurrentOpen(request)) return false
@@ -1252,6 +1424,8 @@ class Editor(
         canvas.replaceDocument(doc)
         canvas.applyPalette(palette)
         canvas.applyInputPrefs(settings.prefs.fingerDraws, controller.penButtonTool, settings.prefs.zoomLockPan, settings.prefs.detectShapes, settings.prefs.snapRotation90)
+        canvas.interaction.stylusOffsetDp =
+            com.xnotes.core.geometry.Pt(settings.prefs.stylusOffsetXDp, settings.prefs.stylusOffsetYDp)
         canvas.applyZoomRange(settings.prefs.canvasMinZoomPercent, settings.prefs.canvasMaxZoomPercent)
         canvas.hiddenShapes = { settings.prefs.hiddenShapes }
         canvas.onContentChanged = { scheduleCanvasAutosave() }
@@ -1397,6 +1571,27 @@ class Editor(
 
     /** The tab title for what this pane is showing; canvases keep their own document title. */
     val openDocumentTitle: String get() = if (canvasOpen) infiniteOrNull?.document?.title ?: "Untitled" else title
+
+    /** This note's Math Studio workspace snapshot, or null when it never opened the studio. */
+    fun mathStudioJson(): String? =
+        if (canvasOpen) infiniteOrNull?.document?.mathStudioJson else state.document.mathStudioJson
+
+    /** Stores this note's Math Studio workspace snapshot and marks the note dirty so it persists. */
+    fun storeMathStudioJson(json: String) {
+        if (canvasOpen) {
+            val doc = infiniteOrNull?.document ?: return
+            if (doc.mathStudioJson != json) {
+                doc.mathStudioJson = json
+                doc.dirty = true
+            }
+        } else {
+            val doc = state.document
+            if (doc.mathStudioJson != json) {
+                doc.mathStudioJson = json
+                doc.dirty = true
+            }
+        }
+    }
 
     /** The bookmarks in page order; ones on the same page keep the order they were made in. */
     val bookmarks: List<Bookmark> get() = state.document.bookmarks.sortedBy { it.page }
@@ -1796,6 +1991,49 @@ class Editor(
 
     private val markupOverlay = com.xnotes.canvas.MarkupOverlay(state) { pdfPageFilter() }.also { controller.markupOverlay = it }
 
+    private val linkOverlay = com.xnotes.canvas.LinkOverlay(state) { notePage -> linkBoxes(notePage) }.also { controller.linkOverlay = it }
+
+    /** Where each internal PDF link jump came from, oldest first: the view before each tap.
+     *  [goBackPdfLink] pops one at a time; [forgetPdfLinkHistory] drops them all. */
+    var pdfLinkBackStack by mutableStateOf<List<com.xnotes.canvas.CanvasState.ViewSnapshot>>(emptyList())
+        private set
+
+    /** A link jump can be undone while anything is on [pdfLinkBackStack]. */
+    val canGoBackPdfLink: Boolean get() = pdfLinkBackStack.isNotEmpty()
+
+    /** Return to the view before the last PDF link jump (one jump per press, back to the start). */
+    fun goBackPdfLink() {
+        if (pdfLinkBackStack.isEmpty()) return
+        val top = pdfLinkBackStack.last()
+        pdfLinkBackStack = pdfLinkBackStack.dropLast(1)
+        state.restoreView(top)
+        afterView()
+    }
+
+    /** Dismiss the link buttons and forget every view saved by PDF link jumps. */
+    fun forgetPdfLinkHistory() {
+        if (pdfLinkBackStack.isNotEmpty()) pdfLinkBackStack = emptyList()
+    }
+
+    /**
+     * Note page [notePage]'s PDF link boxes in page space, or null when its links are not held
+     * yet ([warmVisibleLinks] parses them off-thread, then the view repaints and they draw).
+     */
+    private fun linkBoxes(notePage: Int): List<com.xnotes.core.geometry.Rect>? {
+        val src = pdfSource ?: return null
+        val page = state.document.pages.getOrNull(notePage) ?: return null
+        val pdfIdx = page.pdfKey ?: return null
+        val links = src.cachedLinks(pdfIdx) ?: return null
+        if (links.isEmpty()) return null
+        val s = state.document.dpi / 72.0
+        return links.map { l ->
+            com.xnotes.core.geometry.Rect(
+                l.rect.left * s, l.rect.top * s,
+                (l.rect.right - l.rect.left) * s, (l.rect.bottom - l.rect.top) * s,
+            )
+        }
+    }
+
     private val noteIcons = com.xnotes.canvas.NoteIcons(state).also { controller.noteIcons = it }
 
     /** Viewport bounds the PDF text selection's menu anchors to, or null when it is hidden. */
@@ -2116,6 +2354,9 @@ class Editor(
         controller.onTap = { at -> tapClosesNotePeek(at) }
         controller.onItemLinkTap = onItemLinkTap@{ pageIndex, pageLocal ->
             val page = state.document.pages.getOrNull(pageIndex) ?: return@onItemLinkTap false
+            // A note link wins over everything under the same point: follow it.
+            page.items.lastOrNull { it is com.xnotes.core.model.NoteLinkItem && it.contains(pageLocal) }
+                ?.let { (it as com.xnotes.core.model.NoteLinkItem).also { link -> followNoteLink(link) }; return@onItemLinkTap true }
             // A canvas item with a hyperlink wins over everything under the same point (it sits on top).
             page.items.lastOrNull { it.link != null && it.contains(pageLocal) }
                 ?.link?.let { openUrl(it); return@onItemLinkTap true }
@@ -2126,6 +2367,7 @@ class Editor(
             false
         }
         controller.onAudioTap = { pageIndex, local -> tapAudio(pageIndex, local) }
+        controller.onMathAnimTap = { pageIndex, local -> tapMathAnim(pageIndex, local) }
         controller.onUserMovedView = { AudioPlayback.userMoved(this) }
         // Whatever is added while this note records takes the recording's moment.
         history.onPush = { command -> AudioRecording.stamp(this, command.added()) }
@@ -2183,7 +2425,11 @@ class Editor(
 
     override fun holdsAudio(item: com.xnotes.core.model.AudioItem): Boolean = pageOfAudio(item) != null
 
-    override fun audioPositionKey(rid: Int): String? = state.document.path?.let { "${documentKey(it)}#$rid" }
+    override fun audioPositionKey(rid: Int): String? {
+        // Recording positions for a note in an encrypted folder stay in RAM only, never in audio_positions.
+        if (openVaultId != null) return null
+        return state.document.path?.let { "${documentKey(it)}#$rid" }
+    }
 
     override fun audioFailed() {
         message = appContext.getString(R.string.err_audio_unplayable)
@@ -2238,6 +2484,27 @@ class Editor(
      * A finger tap on a pill plays it (see [AudioPlayback.tap]); during playback a tap on ink written
      * during that recording plays from a little before it. Anything else is left to links and markups.
      */
+    /** Reopens a Math Studio animation when its play badge is tapped. */
+    var onMathAnimSpec: ((MathAnimSpec) -> Unit)? = null
+        set(value) {
+            field = value
+            infiniteOrNull?.onMathAnimSpec = value
+        }
+
+    private fun tapMathAnim(pageIndex: Int, local: com.xnotes.core.geometry.Pt): Boolean {
+        val page = state.document.pages.getOrNull(pageIndex) ?: return false
+        val item = page.items.lastOrNull { it is com.xnotes.core.model.ImageItem && it.contains(local) } as? com.xnotes.core.model.ImageItem
+            ?: return false
+        if (!com.xnotes.platform.MathAnimPng.hasSpec(item.image.file.path)) return false
+        val pxPerUnit = state.devicePxPerDp * state.zoom
+        val lx = local.x - item.rect.left; val ly = local.y - item.rect.top
+        if (!com.xnotes.platform.MathAnimPng.hitsBadge(item.rect.w, item.rect.h, pxPerUnit, lx, ly)) return false
+        val spec = com.xnotes.platform.MathAnimPng.readSpec(item.image.file)
+            ?.let { MathAnimSpec.parse(it) } ?: return false
+        onMathAnimSpec?.invoke(spec)
+        return onMathAnimSpec != null
+    }
+
     private fun tapAudio(pageIndex: Int, local: com.xnotes.core.geometry.Pt): Boolean {
         val page = state.document.pages.getOrNull(pageIndex) ?: return false
         val item = page.items.lastOrNull { it is com.xnotes.core.model.AudioItem && it.contains(local) } as? com.xnotes.core.model.AudioItem
@@ -2540,9 +2807,14 @@ class Editor(
 
     private fun rebuildPdfSource() {
         pdfText.clear()
+        forgetPdfLinkHistory()
         // Opening never waits, and queued first it runs before the old document's close.
         val old = pdfSource
-        pdfSource = state.document.pdfFile?.let { com.xnotes.platform.PdfSource.open(it) }
+        pdfSource = state.document.pdfFile?.let {
+            com.xnotes.platform.PdfSource.open(it).also { src ->
+                src.onLinksChanged = { view.post { view.requestRender() } }
+            }
+        }
         old?.close()
         hasPdf = pdfSource != null
         // Asked for again: it rests on a note without a PDF, and wakes on the next one with a PDF.
@@ -2837,7 +3109,9 @@ class Editor(
     }
 
     /** Act on a tapped PDF link: open a web/mail URL externally, or jump to an internal destination
-     *  page (mapped from the source-PDF page index to whichever document page carries it). */
+     *  page (mapped from the source-PDF page index to whichever document page carries it). An
+     *  internal jump pushes the current view onto [pdfLinkBackStack] first, so [goBackPdfLink]
+     *  walks back one jump at a time and [forgetPdfLinkHistory] drops the whole trail. */
     private fun followLink(link: com.xnotes.platform.PdfLink) {
         val url = link.url
         if (url != null) {
@@ -2846,7 +3120,9 @@ class Editor(
         }
         val dest = link.destPage ?: return
         val docPage = state.document.pages.indexOfFirst { it.pdfPage == dest }
-        if (docPage >= 0) goToPage(docPage)
+        if (docPage < 0) return
+        pdfLinkBackStack = (pdfLinkBackStack + state.snapshotView()).takeLast(MAX_LINK_BACK_STACK)
+        goToPage(docPage)
     }
 
     /**
@@ -3022,6 +3298,206 @@ class Editor(
         return item
     }
 
+    /**
+     * Place a Math Studio result as a formula box centred where the view is, selected
+     * so it can be dragged at once. Returns false when there is nothing to place.
+     */
+    fun placeMathResult(latex: String): Boolean {
+        if (latex.isBlank() || canvasOpen) return false
+        val doc = state.document
+        if (doc.pages.isEmpty()) return false
+        val centre = state.viewportToContent(com.xnotes.core.geometry.Pt(state.viewportW / 2.0, state.viewportH / 2.0))
+        val index = (state.pageIndexAtContent(centre) ?: state.currentPageIndex()).coerceIn(0, doc.pages.lastIndex)
+        val page = doc.pages[index]
+        val cover = state.footprint(page)
+        val local = state.toPageSpace(index, centre)
+        val probe = TextItem(Pt(0.0, 0.0), TextItem.DEFAULT_WIDTH, 0.0, latex, controller.inkColor, controller.textPointSize, controller.textFace, measurer = textMeasurer, math = true)
+        val w = (probe.mathBox()?.takeIf { it.width > 0 }?.width ?: TextItem.DEFAULT_WIDTH).coerceAtMost(cover.right - cover.left)
+        val h = probe.mathBox()?.takeIf { it.height > 0 }?.height ?: TextItem.DEFAULT_WIDTH / 4
+        val x = (local.x - w / 2.0).coerceIn(cover.left, (cover.right - w).coerceAtLeast(cover.left))
+        val y = (local.y - h / 2.0).coerceIn(cover.top, (cover.bottom - h).coerceAtLeast(cover.top))
+        val box = TextItem(Pt(x, y), w, 0.0, latex, controller.inkColor, controller.textPointSize, controller.textFace, measurer = textMeasurer, math = true)
+        page.items.add(box)
+        state.appendToCache(page, box)
+        history.push(AddItem(page, box))
+        state.document.dirty = true
+        refreshContent()
+        controller.selectPlaced(index, listOf(box))
+        view.requestRender()
+        return true
+    }
+
+    /**
+     * Place a note link on the page in view, centred where the view is (or at [atContent] from a
+     * long-press), selected so it can be dragged at once like an image (long-press + drag moves it;
+     * corners resize it).
+     */
+    fun insertNoteLink(
+        displayName: String,
+        targetUri: String,
+        targetName: String,
+        pages: List<Int>,
+        color: com.xnotes.core.model.Rgba,
+        atContent: com.xnotes.core.geometry.Pt? = null,
+        rounded: Boolean = false,
+    ): com.xnotes.core.model.NoteLinkItem? {
+        if (canvasOpen) return null
+        val doc = state.document
+        if (doc.pages.isEmpty()) return null
+        val centre = atContent ?: state.viewportToContent(com.xnotes.core.geometry.Pt(state.viewportW / 2.0, state.viewportH / 2.0))
+        val index = (state.pageIndexAtContent(centre) ?: state.currentPageIndex()).coerceIn(0, doc.pages.lastIndex)
+        val page = doc.pages[index]
+        val cover = state.footprint(page)
+        val local = state.toPageSpace(index, centre)
+        val box0 = com.xnotes.core.model.NoteLinkItem.boxAt(local)
+        val box = if (atContent != null && state.pageRects.getOrNull(index) != null) {
+            val pr = state.pageRects[index]
+            com.xnotes.core.geometry.Rect(
+                (atContent.x - pr.left - box0.w / 2 + cover.left).coerceIn(cover.left, (cover.right - box0.w).coerceAtLeast(cover.left)),
+                (atContent.y - pr.top - box0.h / 2 + cover.top).coerceIn(cover.top, (cover.bottom - box0.h).coerceAtLeast(cover.top)),
+                box0.w, box0.h,
+            )
+        } else {
+            com.xnotes.core.geometry.Rect(
+                box0.x.coerceIn(cover.left, (cover.right - box0.w).coerceAtLeast(cover.left)),
+                box0.y.coerceIn(cover.top, (cover.bottom - box0.h).coerceAtLeast(cover.top)),
+                box0.w, box0.h,
+            )
+        }
+        val item = com.xnotes.core.model.NoteLinkItem(box, displayName, targetUri, targetName, pages, color, rounded)
+        page.items.add(item)
+        // Index at once, not only on the next save, so the Graph screen sees the
+        // link even if the note is closed before an autosave lands.
+        state.document.path?.let { indexLinks(it, doc) }
+        state.appendToCache(page, item)
+        history.push(AddItem(page, item))
+        doc.dirty = true
+        refreshContent()
+        controller.selectPlaced(index, listOf(item))
+        view.requestRender()
+        return item
+    }
+
+    /** Follow a tapped note link: jump within this note, or open the target in another tab. */
+    fun followNoteLink(link: com.xnotes.core.model.NoteLinkItem) {
+        val first = link.firstPage
+        if (link.isSelf) {
+            val idx = (first ?: 0).coerceIn(0, state.document.pages.lastIndex.coerceAtLeast(0))
+            if (state.document.pages.isNotEmpty()) goToPage(idx)
+            return
+        }
+        if (first == null) {
+            say(appContext.getString(com.xnotes.R.string.note_link_no_pages))
+            return
+        }
+        val open = onOpenNoteLink
+        if (open != null) {
+            open(link.targetUri, first)
+        } else {
+            say(appContext.getString(com.xnotes.R.string.note_link_cannot_open))
+        }
+    }
+
+    /**
+     * Load another note for link expansion. Prefers a live open copy (it may hold edits
+     * newer than the last autosave); otherwise reads through the same decrypting stream
+     * a normal open uses. Null when the target cannot be read (deleted file, locked
+     * vault, bad bundle). The [LinkExport.LoadedSource.transient] flag tells the caller
+     * which temp files it owns for cleanup (a live snapshot owns none).
+     */
+    fun loadNoteForExport(uri: String): com.xnotes.core.links.LinkExport.LoadedSource? {
+        if (uri.isBlank()) return null
+        if (!canvasOpen && currentUri == uri) {
+            return com.xnotes.core.links.LinkExport.LoadedSource(state.document.snapshot(), false)
+        }
+        val second = secondary
+        if (second != null && !second.canvasOpen && second.openDocumentUri == uri) {
+            return com.xnotes.core.links.LinkExport.LoadedSource(second.state.document.snapshot(), false)
+        }
+        return runCatching {
+            val (pdf, img) = workDirs(uri)
+            openDocumentStream(uri)?.use { codec.read(it, pdf, img) }
+                ?.let { com.xnotes.core.links.LinkExport.LoadedSource(it, true) }
+        }.getOrNull()
+    }
+
+    /**
+     * Rasterize a PDF-backed page of an *external* note into a plain PNG, so a link
+     * export can carry the background without its source PDF. Null when there is no
+     * PDF background or it cannot be rendered. IO — call off-thread.
+     */
+    fun bakePdfBackground(
+        source: com.xnotes.core.model.Document,
+        page: com.xnotes.core.model.Page,
+    ): com.xnotes.core.links.LinkExport.BakedBackground? {
+        val pdfFile = source.pdfFile ?: return null
+        val key = page.pdfKey ?: return null
+        val scale = 150.0 / source.dpi.coerceAtLeast(1)
+        val pw = (page.width * scale).toInt().coerceIn(1, 2048)
+        val ph = (page.height * scale).toInt().coerceIn(1, 2048)
+        return runCatching {
+            val src = com.xnotes.platform.PdfSource.create(pdfFile) ?: return null
+            try {
+                val bmp = src.renderPage(key, pw, ph, com.xnotes.canvas.PdfPageFilter.NONE, emptyList())?.bitmap ?: return null
+                val turned = if (page.pdfTurn != 0) {
+                    val m = android.graphics.Matrix().apply { postRotate(90f * page.pdfTurn) }
+                    android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                        .also { if (it !== bmp) bmp.recycle() }
+                } else bmp
+                val out = java.io.File.createTempFile("linkpdf", ".png", imageDir)
+                val w = turned.width
+                val h = turned.height
+                try {
+                    java.io.FileOutputStream(out).use {
+                        turned.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                    }
+                } finally {
+                    turned.recycle()
+                }
+                com.xnotes.core.links.LinkExport.BakedBackground(out, w, h)
+            } finally {
+                src.close()
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * The document as a self-contained export sees it: linked pages inlined below their link
+     * ([com.xnotes.core.links.LinkExport]), links rewired to the appended same-file pages and
+     * appended pages carrying the link's color border. Plain export when [withLinks] is false.
+     * Cleans up the expansion's temp files (external extracts, baked backgrounds) behind it.
+     */
+    fun docForExport(withLinks: Boolean): com.xnotes.core.model.Document {
+        if (!withLinks) return state.document
+        return expandWithLinks(state.document).document
+    }
+
+    /**
+     * [doc] expanded with its links inlined (or itself, when expansion fails), with
+     * the expansion's temp files cleaned up. The caller must already be off the main
+     * thread; [codec.write] streams baked images during the write, so clean up only
+     * after it returns.
+     */
+    fun expandWithLinks(doc: com.xnotes.core.model.Document): com.xnotes.core.links.LinkExport.Result {
+        val none = com.xnotes.core.links.LinkExport.Result(doc, doc.pages.size, 0, emptyList())
+        return runCatching {
+            com.xnotes.core.links.LinkExport.expand(
+                doc, ::loadNoteForExport, textMeasurer,
+                bakePdfBackground = ::bakePdfBackground,
+            )
+        }.getOrElse { none }
+    }
+
+    /** Drop an expansion's temp files: external extracts, then baked backgrounds. */
+    fun discardExpansion(result: com.xnotes.core.links.LinkExport.Result) {
+        for (source in result.loadedSources) {
+            if (!source.transient) continue
+            discardWorkFile(source.doc.pdfFile)
+            deleteImageTemps(source.doc)
+        }
+        for (file in result.sidecars) file.delete()
+    }
+
     /** Read [item]'s waveform in the background, then show it and keep it with the note. */
     private fun readPeaks(item: com.xnotes.core.model.AudioItem) {
         val audio = item.audio
@@ -3105,28 +3581,32 @@ class Editor(
         layout.ruleColor = { rule }
         val hl = highlighter ?: return layout
         val spans = HashMap<Paragraph, List<com.xnotes.core.text.CodeSpan>>()
-        var i = 0
-        while (i < flow.paragraphs.size) {
-            val lang = flow.paragraphs[i].codeLang
-            if (lang.isNullOrEmpty() || !hl.supports(lang)) {
-                i++
-                continue
-            }
-            val start = i
-            while (i < flow.paragraphs.size && flow.paragraphs[i].codeLang == lang) i++
-            val paras = flow.paragraphs.subList(start, i)
-            // Contiguous same-language paragraphs parse as ONE text, like [scheduleHighlight].
-            val sorted = hl.highlight(paras.joinToString("\n") { it.plainText() }, lang)
-                ?.sortedBy { it.start } ?: continue
-            var offset = 0
-            for (p in paras) {
-                val len = p.length
-                spans[p] = sorted.mapNotNull { s ->
-                    val a = (s.start - offset).coerceAtLeast(0)
-                    val b = (s.end - offset).coerceAtMost(len)
-                    if (b > a) theme.colorFor(s.capture)?.let { com.xnotes.core.text.CodeSpan(a, b, it) } else null
+        // The native highlighter is shared process-wide; thumbnail renders now run
+        // concurrently, so its calls are serialized here (blocks are small — milliseconds).
+        synchronized(hl) {
+            var i = 0
+            while (i < flow.paragraphs.size) {
+                val lang = flow.paragraphs[i].codeLang
+                if (lang.isNullOrEmpty() || !hl.supports(lang)) {
+                    i++
+                    continue
                 }
-                offset += len + 1
+                val start = i
+                while (i < flow.paragraphs.size && flow.paragraphs[i].codeLang == lang) i++
+                val paras = flow.paragraphs.subList(start, i)
+                // Contiguous same-language paragraphs parse as ONE text, like [scheduleHighlight].
+                val sorted = hl.highlight(paras.joinToString("\n") { it.plainText() }, lang)
+                    ?.sortedBy { it.start } ?: continue
+                var offset = 0
+                for (p in paras) {
+                    val len = p.length
+                    spans[p] = sorted.mapNotNull { s ->
+                        val a = (s.start - offset).coerceAtLeast(0)
+                        val b = (s.end - offset).coerceAtMost(len)
+                        if (b > a) theme.colorFor(s.capture)?.let { com.xnotes.core.text.CodeSpan(a, b, it) } else null
+                    }
+                    offset += len + 1
+                }
             }
         }
         layout.codeSpans = { spans[it] }
@@ -3157,23 +3637,68 @@ class Editor(
         out: OutputStream,
         onProgress: (Int, Int) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
+        withLinks: Boolean = false,
     ) {
         // A private PdfSource, not the live [pdfSource], which a note switch mid-export would
         // close. A plain note has no PDF and renders identically.
-        val src = state.document.pdfFile?.let { com.xnotes.platform.PdfSource.create(it) }
+        val doc = docForExport(withLinks)
+        val src = doc.pdfFile?.let { com.xnotes.platform.PdfSource.create(it) }
         try {
             com.xnotes.platform.PdfExporter.export(
-                appContext, state.document, src, out,
-                { exportPaper(state.document, it) },
-                { page, r -> paintExportRuling(state.document, page, r) },
+                appContext, doc, src, out,
+                { exportPaper(doc, it) },
+                { page, r -> paintExportRuling(doc, page, r) },
                 onProgress, isCancelled,
-                flow = flowExportHooks(state.document),
+                flow = flowExportHooks(doc),
                 title = title,
                 headingBookmarks = settings.prefs.pdfHeadingBookmarks,
             )
         } finally {
             src?.close()
         }
+    }
+
+    /**
+     * Write the open note as a self-contained `.xnote` bundle (linked pages inlined,
+     * links rewired, appended pages color-framed) or a plain copy when [withLinks] is
+     * false. The caller runs this off the main thread; it throws on failure.
+     */
+    fun writeXnoteCopy(
+        out: OutputStream,
+        withLinks: Boolean = false,
+        isCancelled: () -> Boolean = { false },
+    ) {
+        if (!withLinks) {
+            codec.write(state.document, out, isCancelled = isCancelled)
+            return
+        }
+        val expanded = expandWithLinks(state.document)
+        try {
+            codec.write(expanded.document, out, isCancelled = isCancelled)
+        } finally {
+            discardExpansion(expanded)
+        }
+    }
+
+    /**
+     * Write the open note as a Samsung Notes `.sdocx` bundle to [out].
+     * Pages, vector strokes, images and a single embedded PDF survive; shapes,
+     * text, tables, audio and tape are dropped. The caller runs this off the
+     * main thread; it throws on failure so the caller can tell success apart.
+     */
+    fun exportSdocx(
+        out: OutputStream,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ) {
+        val doc = state.document
+        val total = doc.pages.size.coerceAtLeast(1)
+        // Report progress per page; the writer itself is one pass, so the ticks
+        // only bracket it. Cancellation is honored before the write starts.
+        if (isCancelled()) throw com.xnotes.format.DocumentCodec.WriteCancelled()
+        onProgress(0, total)
+        com.xnotes.sdocx.SdocxExport.writeDocument(doc, out)
+        onProgress(total, total)
     }
 
     val preferences: Preferences get() = settings.prefs
@@ -3268,6 +3793,8 @@ class Editor(
             p.detectShapes,
             p.snapRotation90,
         )
+        infiniteOrNull?.interaction?.stylusOffsetDp =
+            com.xnotes.core.geometry.Pt(p.stylusOffsetXDp, p.stylusOffsetYDp)
         infiniteOrNull?.applyZoomRange(p.canvasMinZoomPercent, p.canvasMaxZoomPercent)
         // Both surfaces' pads: the switch is about the device, not about one of them.
         pad.frontBuffering = !p.disableFrontBuffering
@@ -3290,6 +3817,7 @@ class Editor(
         flowText.highlight = { toolbarInk() }
         controller.penButtonTool = if (p.penButtonTool == "none") null else (Tool.fromId(p.penButtonTool) ?: Tool.ERASER)
         controller.penButtonHover = p.penButtonHover
+        controller.stylusOffsetDp = com.xnotes.core.geometry.Pt(p.stylusOffsetXDp, p.stylusOffsetYDp)
         state.sideMargin = p.sideMargin
         state.pageBorders = !p.hidePageBorders
         state.maxCachePx = p.maxCacheResolution.toDouble()
@@ -3558,13 +4086,15 @@ class Editor(
         refreshTextBar()
     }
 
-    /** Proactively parse the current page's PDF links off-thread (coalesce + cancel-stale) so a tap
-     *  lands on a warm cache. Cheap and idempotent; a fast scroll keeps moving the target, so only the
-     *  page it settles on is parsed, never a backlog. The on-tap parse stays as a fallback. */
+    /** Proactively parse the visible pages' PDF links off-thread (coalesced) so a tap lands on
+     *  a warm cache and the link boxes can draw. Cheap and idempotent; the on-tap parse stays
+     *  as a fallback for a page tapped before its warm lands. */
     private fun warmVisibleLinks(pageIndex: Int) {
         val src = pdfSource ?: return
-        val pdfIdx = state.document.pages.getOrNull(pageIndex)?.pdfKey ?: return
-        src.warmLinks(pdfIdx)
+        val visible = state.visiblePageRange() ?: (pageIndex..pageIndex)
+        val keys = ArrayList<Int>(visible.count())
+        for (i in visible) state.document.pages.getOrNull(i)?.pdfKey?.let { keys += it }
+        if (keys.isNotEmpty()) src.warmLinks(keys)
     }
 
     /** Recompute the floating text style bar's anchor + values (it follows pan/zoom/selection). */
@@ -4205,7 +4735,7 @@ class Editor(
             val timing = com.xnotes.format.DocumentCodec.ReadTiming()
             val doc = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 fileBytes = fileSizeOf(uri)
-                readXnote(uri, timing)?.also { it.created = settleCreated(uri, it.created) }
+                readXnote(uri, timing)?.also { it.created = settleCreated(uri, it.created, vaultId) }
             }
             readMs = (System.nanoTime() - readStart) / 1_000_000
             if (!isCurrentOpen(request)) {
@@ -4281,6 +4811,7 @@ class Editor(
             maybeBindAutosave(uri) // saving into the folder makes it autosave thereafter
             refreshContent()
             invalidateThumb(uri) // content changed; re-render its tile next time it's shown
+            indexLinks(uri, state.document)
         } catch (e: Throwable) {
             // Throwable, not Exception: an OutOfMemoryError mid-encode must surface a message, not crash.
             message = appContext.getString(R.string.err_save_note)
@@ -4347,6 +4878,13 @@ class Editor(
         val u = android.net.Uri.parse(uri)
         "${u.authority}|${android.provider.DocumentsContract.getDocumentId(u)}"
     }.getOrDefault(uri)
+
+    /**
+     * Identity of a note file for the link graph: authority + document id, so the
+     * same file picked through different URI forms (tree child vs open-document)
+     * still resolves to one node.
+     */
+    fun graphKey(uri: String): String = documentKey(uri)
 
     /** The storage display name for a document/tree URI (no extension stripped), or null. */
     private fun queryDisplayName(uri: android.net.Uri): String? = runCatching {
@@ -4432,6 +4970,7 @@ class Editor(
                 FlowPainter.paintPage(r, frame, index, Rect(0.0, 0.0, page.width, page.height))
             }
         }) { it.paint(r) }
+        if (page.linkBorder != null) com.xnotes.core.links.LinkBorder.paint(page, r)
         val bmp = surface.bitmap
         if (rotation == 0) return bmp
         val m = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
@@ -4476,35 +5015,41 @@ class Editor(
         return surface.bitmap
     }
 
-    /** The square thumbnail for the canvas at [uri]; null when it is not a readable canvas. */
-    suspend fun canvasTileThumbnail(uri: String): ImageBitmap? {
-        val generation = thumbnailGeneration
-        synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return it } }
-        return withContext(thumbDispatcher) {
-            delay(150)
-            if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
+    /** Canvas tile worker: memory, then disk, then parse + render — every stage rechecks
+     *  the tile's epoch so folder-hopping never spends pool time on a tile nobody shows. */
+    private suspend fun canvasTile(uri: String, epoch: Long, generation: Long): ImageBitmap? =
+        withContext(thumbPool) {
+            ensureActive()
+            if (!tileAlive(epoch, generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return@withContext it } }
             val disk = sealDiskThumb(uri)
             val bmp = (if (disk) thumbCache.load(uri, generation) else null) ?: run {
+                if (!tileAlive(epoch, generation)) return@withContext null
                 val doc = runCatching { readXcanvas(uri) }.getOrNull() ?: return@withContext null
-                doc.created?.let { createdStore.put(documentKey(uri), it) }
+                if (!isVaultUri(uri)) doc.created?.let { createdStore.put(documentKey(uri), it) }
                 try {
+                    ensureActive()
+                    if (!tileAlive(epoch, generation)) return@withContext null
                     renderCanvasThumbnailSquare(doc, tilePx)?.also { if (disk) thumbCache.store(uri, it, generation) }
                         ?: return@withContext null
                 } finally {
                     deleteCanvasImageTemps(doc)
                 }
             }
-            publishThumbnail(uri, bmp, generation)
+            publishThumbnail(uri, bmp, generation, epoch)
         }
-    }
 
     private fun isCurrentThumbnail(generation: Long): Boolean =
         generation == thumbnailGeneration && thumbCache.isCurrent(generation)
 
-    private fun publishThumbnail(key: String, bitmap: android.graphics.Bitmap, generation: Long): ImageBitmap? =
+    private fun publishThumbnail(
+        key: String,
+        bitmap: android.graphics.Bitmap,
+        generation: Long,
+        epoch: Long = tileEpoch,
+    ): ImageBitmap? =
         synchronized(noteThumbs) {
-            if (!isCurrentThumbnail(generation)) {
+            if (!tileAlive(epoch, generation)) {
                 bitmap.recycle()
                 null
             } else {
@@ -4512,30 +5057,46 @@ class Editor(
             }
         }
 
-    /** The square tile for the document at [uri], whichever kind it is. */
-    suspend fun tileThumbnail(uri: String, name: String): ImageBitmap? =
-        if (com.xnotes.core.util.ReaderKind.isReadable(name)) {
-            readerThumbnail(uri, name)
-        } else if (com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.CANVAS) {
-            canvasTileThumbnail(uri)
-        } else {
-            noteTileThumbnail(uri)
+    /** The square tile for the document at [uri], whichever kind it is. Compose entry point:
+     *  memory hits return on the caller; anything heavier settles a scroll-past first, then
+     *  renders on the shared pool. View state is snapshotted here — tab views live on the
+     *  main thread and must never be touched from pool threads. */
+    suspend fun tileThumbnail(uri: String, name: String): ImageBitmap? {
+        val generation = thumbnailGeneration
+        val epoch = tileEpoch
+        val kind = when {
+            com.xnotes.core.util.ReaderKind.isReadable(name) -> TileKind.READER
+            com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.CANVAS -> TileKind.CANVAS
+            else -> TileKind.NOTE
         }
-
-    /** A read-only PDF's first page (memory-cached only); null for the other reader kinds, which tile as text. */
-    private suspend fun readerThumbnail(uri: String, name: String): ImageBitmap? {
-        if (com.xnotes.core.util.ReaderKind.ofName(name) != com.xnotes.core.util.ReaderKind.PDF) return null
-        val key = "reader|$uri"
+        if (kind == TileKind.READER && com.xnotes.core.util.ReaderKind.ofName(name) != com.xnotes.core.util.ReaderKind.PDF) return null
+        val key = if (kind == TileKind.READER) "reader|$uri" else uri
         synchronized(noteThumbs) { noteThumbs.get(key)?.let { return it } }
-        return withContext(thumbDispatcher) {
-            delay(150)
-            if (!isActive) return@withContext null
-            val bmp = com.xnotes.platform.ReaderPdf.renderFirstPage(appContext, android.net.Uri.parse(uri), pageThumbPx)
-                ?.asImageBitmap() ?: return@withContext null
-            synchronized(noteThumbs) { noteThumbs.put(key, bmp) }
-            bmp
+        delay(tileSettleMs) // let a quick scroll-past cancel before any pool work is queued
+        if (!tileAlive(epoch, generation)) return null
+        val vs = if (kind == TileKind.NOTE) viewSettingsFor(uri) else null
+        return when (kind) {
+            TileKind.READER -> readerTile(uri, epoch, generation)
+            TileKind.CANVAS -> canvasTile(uri, epoch, generation)
+            TileKind.NOTE -> noteTile(uri, vs!!, epoch, generation)
         }
     }
+
+    private enum class TileKind { READER, CANVAS, NOTE }
+
+    /** A read-only PDF's first page (memory-cached only); the entry point filters other reader kinds. */
+    private suspend fun readerTile(uri: String, epoch: Long, generation: Long): ImageBitmap? =
+        withContext(thumbPool) {
+            ensureActive()
+            if (epoch != tileEpoch) return@withContext null
+            val key = "reader|$uri"
+            synchronized(noteThumbs) { noteThumbs.get(key)?.let { return@withContext it } }
+            val bmp = com.xnotes.platform.ReaderPdf.renderFirstPage(appContext, android.net.Uri.parse(uri), pageThumbPx)
+                ?.asImageBitmap() ?: return@withContext null
+            synchronized(noteThumbs) {
+                if (epoch != tileEpoch) null else noteThumbs.put(key, bmp).let { bmp }
+            }
+        }
 
     /** The square side (px) explorer tiles render at — fixed so rotation/column changes don't re-render. */
     private val tilePx = 600
@@ -4547,34 +5108,38 @@ class Editor(
     fun cachedNoteTile(uri: String): ImageBitmap? = synchronized(noteThumbs) { noteThumbs.get(uri) }
 
     /**
-     * The square thumbnail for the note at [uri], for the explorer grid. Returns a cached hit
-     * (memory, then disk) as-is; otherwise renders off the main thread on the single low-priority
-     * [thumbDispatcher] (one note at a time) so a folder of many notes fills in gradually without
-     * stalling the UI. The cache is authoritative — a cached tile is shown unconditionally; a content
-     * change drops it ([invalidateThumb]) so it re-renders, and closing a note regenerates it.
+     * Note tile worker: memory, then disk, then parse + render on the pool — every stage
+     * rechecks the tile's epoch. The cache is authoritative: a cached tile is shown
+     * unconditionally; a content change drops it ([invalidateThumb]) so it re-renders, and
+     * closing a note regenerates it.
      */
-    suspend fun noteTileThumbnail(uri: String): ImageBitmap? {
-        val generation = thumbnailGeneration
-        synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return it } }
-        return withContext(thumbDispatcher) {
-            delay(150) // let a quick scroll-past cancel this before any heavy work begins
-            if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
+    private suspend fun noteTile(
+        uri: String,
+        vs: com.xnotes.canvas.ViewSettings,
+        epoch: Long,
+        generation: Long,
+    ): ImageBitmap? =
+        withContext(thumbPool) {
+            ensureActive()
+            if (!tileAlive(epoch, generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(uri)?.let { return@withContext it } }
             val disk = sealDiskThumb(uri)
             val bmp = (if (disk) thumbCache.load(uri, generation) else null) ?: run {
+                if (!tileAlive(epoch, generation)) return@withContext null
                 val doc = runCatching { readXnote(uri) }.getOrNull() ?: return@withContext null
-                doc.created?.let { createdStore.put(documentKey(uri), it) }
+                if (!isVaultUri(uri)) doc.created?.let { createdStore.put(documentKey(uri), it) }
                 try {
-                    val vs = viewSettingsFor(uri)
-                    renderDocThumbnailSquare(doc, tilePx, pdfPageFilterFor(vs), vs.rotation)?.also { if (disk) thumbCache.store(uri, it, generation) } ?: return@withContext null
+                    ensureActive()
+                    if (!tileAlive(epoch, generation)) return@withContext null
+                    renderDocThumbnailSquare(doc, tilePx, pdfPageFilterFor(vs), vs.rotation)
+                        ?.also { if (disk) thumbCache.store(uri, it, generation) } ?: return@withContext null
                 } finally {
                     discardWorkFile(doc.pdfFile) // transient doc loaded just for a thumbnail; drop its extracts
                     deleteImageTemps(doc)
                 }
             }
-            publishThumbnail(uri, bmp, generation)
+            publishThumbnail(uri, bmp, generation, epoch)
         }
-    }
 
     /** The key a document's whole-page thumbnail is cached under, beside its square tile's. */
     private fun pageThumbKey(uri: String): String = "$uri#page"
@@ -4584,24 +5149,41 @@ class Editor(
 
     /**
      * The first page whole, for Gallery and the "Whole page" tiles: [pageThumbPx] tall at the page's own shape,
-     * or for a canvas its content in a landscape frame of the same size. Cached like the square tiles, and dropped
-     * with them when the document changes.
+     * or for a canvas its content in a landscape frame of the same size. Compose entry point with
+     * the same settle/cancel/view-snapshot discipline as [tileThumbnail].
      */
     suspend fun pageThumbnail(uri: String, name: String): ImageBitmap? {
-        if (com.xnotes.core.util.ReaderKind.isReadable(name)) return readerThumbnail(uri, name)
+        if (com.xnotes.core.util.ReaderKind.isReadable(name)) {
+            if (com.xnotes.core.util.ReaderKind.ofName(name) != com.xnotes.core.util.ReaderKind.PDF) return null
+            val generation = thumbnailGeneration
+            val epoch = tileEpoch
+            val key = "reader|$uri"
+            synchronized(noteThumbs) { noteThumbs.get(key)?.let { return it } }
+            delay(tileSettleMs)
+            if (epoch != tileEpoch) return null
+            return readerTile(uri, epoch, generation)
+        }
         val generation = thumbnailGeneration
+        val epoch = tileEpoch
         val key = pageThumbKey(uri)
         synchronized(noteThumbs) { noteThumbs.get(key)?.let { return it } }
-        return withContext(thumbDispatcher) {
-            delay(150)
-            if (!isActive || !isCurrentThumbnail(generation)) return@withContext null
+        delay(tileSettleMs)
+        if (!tileAlive(epoch, generation)) return null
+        val canvas = DocumentKind.ofName(name) == DocumentKind.CANVAS
+        val vs = if (!canvas) viewSettingsFor(uri) else null
+        return withContext(thumbPool) {
+            ensureActive()
+            if (!tileAlive(epoch, generation)) return@withContext null
             synchronized(noteThumbs) { noteThumbs.get(key)?.let { return@withContext it } }
             val disk = sealDiskThumb(uri)
             val bmp = (if (disk) thumbCache.load(key, generation) else null) ?: run {
-                val rendered = if (DocumentKind.ofName(name) == DocumentKind.CANVAS) {
+                if (!tileAlive(epoch, generation)) return@withContext null
+                val rendered = if (canvas) {
                     val doc = runCatching { readXcanvas(uri) }.getOrNull()
                         ?: return@withContext null
                     try {
+                        ensureActive()
+                        if (!tileAlive(epoch, generation)) return@withContext null
                         renderCanvasThumbnail(doc, (pageThumbPx * 1.414).roundToInt(), pageThumbPx)
                     } finally {
                         deleteCanvasImageTemps(doc)
@@ -4610,8 +5192,9 @@ class Editor(
                     val doc = runCatching { readXnote(uri) }.getOrNull()
                         ?: return@withContext null
                     try {
-                        val vs = viewSettingsFor(uri)
-                        renderDocPage(doc, 0, pageThumbPx, pdfPageFilterFor(vs), vs.rotation)
+                        ensureActive()
+                        if (!tileAlive(epoch, generation)) return@withContext null
+                        renderDocPage(doc, 0, pageThumbPx, pdfPageFilterFor(vs!!), vs.rotation)
                     } finally {
                         discardWorkFile(doc.pdfFile)
                         deleteImageTemps(doc)
@@ -4619,7 +5202,7 @@ class Editor(
                 } ?: return@withContext null
                 if (disk) rendered.also { thumbCache.store(key, it, generation) } else rendered
             }
-            publishThumbnail(key, bmp, generation)
+            publishThumbnail(key, bmp, generation, epoch)
         }
     }
 
@@ -4627,14 +5210,15 @@ class Editor(
     suspend fun pageStrip(uri: String, name: String, max: Int, heightPx: Int): List<ImageBitmap> {
         val generation = thumbnailGeneration
         if (DocumentKind.ofName(name) == DocumentKind.CANVAS) return emptyList()
-        return withContext(thumbDispatcher) {
+        val vs = viewSettingsFor(uri)
+        val filter = pdfPageFilterFor(vs)
+        val rotation = vs.rotation
+        return withContext(thumbPool) {
             val doc = runCatching { readXnote(uri) }.getOrNull() ?: return@withContext emptyList()
             try {
-                val vs = viewSettingsFor(uri)
-                val filter = pdfPageFilterFor(vs)
                 (0 until minOf(max, doc.pages.size)).mapNotNull { i ->
                     if (!isActive || !isCurrentThumbnail(generation)) return@withContext emptyList()
-                    runCatching { renderDocPage(doc, i, heightPx, filter, vs.rotation) }.getOrNull()?.asImageBitmap()
+                    runCatching { renderDocPage(doc, i, heightPx, filter, rotation) }.getOrNull()?.asImageBitmap()
                 }.takeIf { isActive && isCurrentThumbnail(generation) } ?: emptyList()
             } finally {
                 discardWorkFile(doc.pdfFile)
@@ -4670,17 +5254,18 @@ class Editor(
 
     /**
      * Render the just-closed note's tile from the in-memory document and cache it (memory + disk), so
-     * the grid shows it instantly and current. Runs on the low-priority [thumbDispatcher]; identity-
+     * the grid shows it instantly and current. Runs on the shared thumbnail pool; identity-
      * guarded so that if the user has already opened another note (state.document changed) it bails
      * rather than caching the wrong pixels. Called from [goHome] — never during editing.
      */
     private suspend fun regenerateClosedNoteThumb(uri: String) {
         val generation = thumbnailGeneration
+        val epoch = tileEpoch
         val doc = state.document
         // The closing note's own filter + rotation, captured before any swap.
         val filter = pdfPageFilter()
         val rotation = viewSettings.rotation
-        withContext(thumbDispatcher) {
+        withContext(thumbPool) {
             if (state.document !== doc) return@withContext // a new note was opened; don't cache stale pixels
             val bmp = runCatching { renderDocThumbnailSquare(doc, tilePx, filter, rotation) }.getOrNull() ?: return@withContext
             // A sealed note's pixels may live only in memory; the disk cache stays ciphertext-free.
@@ -4688,7 +5273,7 @@ class Editor(
             // The whole-page tile is drawn again the next time it's shown.
             synchronized(noteThumbs) { noteThumbs.remove(pageThumbKey(uri)) }
             thumbCache.remove(pageThumbKey(uri))
-            publishThumbnail(uri, bmp, generation)
+            publishThumbnail(uri, bmp, generation, epoch)
         }
     }
 
@@ -4710,6 +5295,7 @@ class Editor(
         settings = settings.copy(browseRoot = treeUri)
         settingsRepo.save(settings)
         browseCache.clear()
+        sidecarFileCache.clear()
         rootNameCache.clear()
         reloadTemplateLibrary()
     }
@@ -4728,8 +5314,15 @@ class Editor(
         return pinnedFolders.any { documentKey(it.uri) == key }
     }
 
-    fun pinFolder(uri: String, name: String) {
-        if (!isPinned(uri)) savePins(pinnedFolders + com.xnotes.settings.PinnedFolder(uri, name))
+    /**
+     * Pin [uri] to the sidebar. Encrypted folders stay unpinnable: persisting their URI and
+     * name to settings.json would leak them to disk. IO.
+     */
+    suspend fun pinFolder(uri: String, name: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        if (isPinned(uri)) return@withContext true
+        if (runCatching { isVaultUri(uri) }.getOrDefault(false)) return@withContext false
+        savePins(pinnedFolders + com.xnotes.settings.PinnedFolder(uri, name))
+        true
     }
 
     fun unpinFolder(uri: String) {
@@ -4740,7 +5333,11 @@ class Editor(
     private fun savePins(pins: List<com.xnotes.settings.PinnedFolder>) {
         if (pins == pinnedFolders) return
         pinnedFolders = pins
-        settings = settings.copy(pinnedFolders = pins)
+        // Best-effort memory-only strip of known vault folders: their URIs must not reach settings.json.
+        val clean = pins.filterNot { pin ->
+            runCatching { vaultRootCache[browseDocId(pin.uri)] }.getOrNull() == true
+        }
+        settings = settings.copy(pinnedFolders = clean)
         settingsRepo.save(settings)
     }
 
@@ -4790,8 +5387,10 @@ class Editor(
         saveSettingsSoon()
     }
 
-    /** Put [uri] at the front of Recent. Main thread. */
+    /** Put [uri] at the front of Recent. Main thread. Vault notes stay out: their URIs and
+     *  names must never reach the disk-backed recent list (in-memory tiles still work). */
     private fun rememberOpened(uri: String, name: String?) {
+        if (openVaultId != null) return
         val key = documentKey(uri)
         val entry = com.xnotes.settings.RecentDoc(uri, name ?: uri.substringAfterLast('/'), System.currentTimeMillis())
         setRecents((listOf(entry) + recentDocs.filterNot { documentKey(it.uri) == key }).take(RECENT_MAX))
@@ -4839,9 +5438,18 @@ class Editor(
     val lastFolder: String? get() = settings.lastFolder
 
     fun setLastFolder(uri: String?) {
+        if (uri == null) {
+            if (settings.lastFolder != null) { settings = settings.copy(lastFolder = null); saveSettingsSoon() }
+            return
+        }
         if (settings.lastFolder == uri) return
-        settings = settings.copy(lastFolder = uri)
-        saveSettingsSoon()
+        // A vault folder's id must never reach settings.json; resolve off-thread (cached after first visit).
+        autosaveScope.launch(Dispatchers.IO) {
+            if (runCatching { isVaultUri(uri) }.getOrDefault(false)) return@launch
+            if (settings.lastFolder == uri) return@launch
+            settings = settings.copy(lastFolder = uri)
+            saveSettingsSoon()
+        }
     }
 
     /** The key a folder's own view is kept under: the same identity [documentKey] gives its document uri. */
@@ -4855,12 +5463,20 @@ class Editor(
     fun setView(key: String?, view: ExplorerView?) {
         if (settings.prefs.perFolderViews && key != null) {
             folderViews = if (view == null) folderViews - key else folderViews + (key to view)
-            settings = settings.copy(folderViews = folderViews)
+            // Folder views persist keyed by document id: strip vault folders so their ids stay in RAM only.
+            settings = settings.copy(folderViews = folderViews.filterKeys { !isVaultFolderKey(it) })
         } else {
             explorerView = view ?: ExplorerView()
             settings = settings.copy(explorerView = explorerView)
         }
         saveSettingsSoon()
+    }
+
+    /** True when the per-folder-view [key] ("authority|docId") names a folder inside an encrypted folder. Main-thread safe (memory cache only). */
+    private fun isVaultFolderKey(key: String): Boolean {
+        val root = browseRoot ?: return false
+        val docId = key.substringAfter('|', "").takeIf { it.isNotEmpty() } ?: return false
+        return cachedVaultId(root, docId).let { (res, id) -> res == VaultResolution.RESOLVED && id != null }
     }
 
     /** Sets the layout every folder without a view of its own opens in (Preferences' default layout). */
@@ -4885,6 +5501,7 @@ class Editor(
         settings = settings.copy(browseRoot = null)
         settingsRepo.save(settings)
         browseCache.clear()
+        sidecarFileCache.clear()
         rootNameCache.clear()
         viewStates.clear() // forget every remembered per-note view for the released folder
         createdStore.clear() // and every tracked creation time — the keys only meant anything for that folder
@@ -4907,6 +5524,9 @@ class Editor(
 
     /** Creates a subfolder [name] under [parentDocId] in tree [treeUri]; IO, call off-thread. */
     fun createFolder(treeUri: String, parentDocId: String, name: String): Boolean = runCatching {
+        // Writing anything (even an empty folder) into a locked vault would leave files that
+        // cannot be sealed until unlock; refuse up front so the UI can explain it.
+        if (isLockedFolder(treeUri, parentDocId)) return@runCatching false
         val parent = android.provider.DocumentsContract.buildDocumentUriUsingTree(android.net.Uri.parse(treeUri), parentDocId)
         android.provider.DocumentsContract.createDocument(
             appContext.contentResolver, parent, android.provider.DocumentsContract.Document.MIME_TYPE_DIR, name,
@@ -4966,10 +5586,38 @@ class Editor(
         }
     }
 
+    /** Memory-only vault lookup. [VaultResolution.RESOLVED] carries the covering folder id
+     *  (null when no vault covers it); [VaultResolution.UNKNOWN] means an ancestor was never
+     *  checked, so the caller must fall back to [vaultHere] (provider IO). Main-thread safe. */
+    enum class VaultResolution { UNKNOWN, RESOLVED }
+
+    fun cachedVaultId(treeUri: String, folderDocId: String): Pair<VaultResolution, String?> {
+        val rootId = runCatching { browseRootDocId(treeUri) }.getOrNull()
+            ?: return VaultResolution.UNKNOWN to null
+        var id = folderDocId
+        while (true) {
+            val cached = vaultRootCache[id] ?: return VaultResolution.UNKNOWN to null
+            if (cached) return VaultResolution.RESOLVED to id
+            if (id == rootId) return VaultResolution.RESOLVED to null
+            val parent = id.substringBeforeLast('/', "")
+            if (parent.isEmpty() || parent == id) return VaultResolution.RESOLVED to null
+            id = parent
+        }
+    }
+
     /** The encrypted folder covering [folderDocId], if this folder or an ancestor is one. IO. */
     fun vaultHere(treeUri: String, folderDocId: String): String? = vaultCovering(treeUri, folderDocId)
 
     fun vaultUnlocked(folderId: String): Boolean = com.xnotes.crypto.VaultSession.isUnlocked(folderId)
+
+    /** True when [folderDocId] sits inside a locked encrypted folder. IO. */
+    fun isLockedFolder(treeUri: String, folderDocId: String): Boolean {
+        val id = vaultCovering(treeUri, folderDocId) ?: return false
+        return !com.xnotes.crypto.VaultSession.isUnlocked(id)
+    }
+
+    /** True when [folderDocId] is itself an encrypted-folder root. IO. */
+    fun isVaultFolder(treeUri: String, folderDocId: String): Boolean = isVaultRoot(treeUri, folderDocId)
 
     /** Checks the password and keeps the data key in memory. IO. Wipes [password]. */
     fun unlockVault(treeUri: String, folderDocId: String, password: CharArray): Boolean {
@@ -4998,9 +5646,13 @@ class Editor(
         // Both panes can show a note from the same folder; close all of them before dropping the key.
         val panes = listOfNotNull(this, secondary)
         val affected = panes.filter { it.noteOpen && it.openVaultId == folderId }
+        browseRoot?.let { root ->
+            autosaveScope.launch(Dispatchers.IO) { purgeVaultLinkRows(root, folderId) }
+        }
         fun finish() {
             com.xnotes.crypto.VaultSession.lock(folderId)
             com.xnotes.crypto.VaultCrypto.secureDeleteTree(vaultWorkFor(folderId))
+            purgeVaultDiskRows(folderId)
             for (ed in panes) {
                 // A session snapshot holds the note's plaintext. Overwrite it rather than merely
                 // unlinking it, then drop decoded thumbnails that the explorer could still show.
@@ -5022,9 +5674,82 @@ class Editor(
         }
     }
 
+    /**
+     * Drop every disk-persisted trace of the vault [folderId] — recents, pins, views, times,
+     * link rows (walked separately), audio positions — so locking leaves no names or ids behind.
+     * Runs on the main thread; the link-index walk goes out on [autosaveScope] from [lockVault].
+     */
+    private fun purgeVaultDiskRows(folderId: String) {
+        val root = browseRoot
+        val auth = root?.let { runCatching { android.net.Uri.parse(it).authority }.getOrNull() }
+        val vkey = if (auth != null) "$auth|$folderId" else null
+        val folderUri = root?.let {
+            runCatching {
+                android.provider.DocumentsContract.buildDocumentUriUsingTree(android.net.Uri.parse(it), folderId).toString()
+            }.getOrNull()
+        }
+        if (folderUri != null) {
+            dropRecentsWithin(folderUri)
+            dropPinsWithin(folderUri)
+        }
+        if (vkey != null) {
+            fun matches(key: String): Boolean = key == vkey || key.startsWith("$vkey/")
+            viewStates.removeMatching(::matches)
+            createdStore.removeMatching(::matches)
+            docMeta.removeMatching(::matches)
+            if (folderViews.keys.any(::matches)) {
+                folderViews = folderViews.filterKeys { !matches(it) }
+                settings = settings.copy(folderViews = folderViews)
+                saveSettingsSoon()
+            }
+            if (settings.lastFolder?.let { runCatching { documentKey(it) }.getOrNull()?.let(::matches) } == true) {
+                settings = settings.copy(lastFolder = null)
+                saveSettingsSoon()
+            }
+            if (folderUri != null) purgeAudioPositions(auth, folderId)
+        } else if (folderUri != null) {
+            purgeAudioPositionsForFolderUri(folderUri)
+        }
+    }
+
+    /** Drop recording positions for anything under the vault (both key forms). */
+    private fun purgeAudioPositionsForFolderUri(folderUri: String) {
+        com.xnotes.platform.AudioPositions.removeMatching { key ->
+            key.substringBeforeLast('#').startsWith(folderUri)
+        }
+    }
+
+    /** Delete link-index rows for every note under the vault [folderId] (sources and targets). IO. */
+    private fun purgeVaultLinkRows(treeUri: String, folderId: String) {
+        val stack = ArrayDeque<String>().apply { add(folderId) }
+        while (stack.isNotEmpty()) {
+            val id = stack.removeLast()
+            val children = runCatching { browseChildren(treeUri, id) }.getOrDefault(emptyList())
+            for (e in children) {
+                if (e.isDir) {
+                    runCatching { browseDocId(e.documentUri) }.getOrNull()?.let { stack.add(it) }
+                } else if (com.xnotes.core.util.DocumentKind.ofName(e.name) == com.xnotes.core.util.DocumentKind.NOTE) {
+                    runCatching { noteLinkIndex.remove(e.documentUri) }
+                }
+            }
+        }
+    }
+
     /** Folder id when [uri] is inside a locked encrypted folder; null when it can be read. */
     fun lockedVaultId(uri: String): String? =
         vaultOf(uri)?.takeIf { !com.xnotes.crypto.VaultSession.isUnlocked(it) }
+
+    /**
+     * True when [uri] is inside an encrypted folder or is one itself: its name, metadata and
+     * bytes must stay encrypted on disk or in RAM only, never in a plaintext store or cache.
+     * Does provider I/O; call off the main thread.
+     */
+    fun isVaultUri(uri: String): Boolean {
+        val root = browseRoot ?: return false
+        val docId = runCatching { browseDocId(uri) }.getOrNull() ?: return false
+        if (isVaultRoot(root, docId)) return true
+        return protectingVault(root, uri) != null
+    }
 
     /** The encrypted folder holding [uri], or null. Does provider I/O; call off the main thread. */
     private fun vaultOf(uri: String): String? {
@@ -5195,6 +5920,71 @@ class Editor(
         return createNoteFile(treeUri, parentDocId, name) { codec.write(doc, it) { importCancelled.get() } }
     }
 
+    /** A scan/photo/PDF picked for "trace into strokes" now awaits its preview + conversion. */
+    fun requestTrace(uri: String, sourceName: String, mime: String, parentDocId: String? = null, file: java.io.File? = null) {
+        pendingTrace = PendingTrace(uri, sourceName, mime, parentDocId, file)
+    }
+
+    /** Drop a pending trace (the picker was dismissed or the dialog closed). */
+    fun clearTrace() {
+        pendingTrace = null
+    }
+
+    /** A photo just taken now awaits corner adjustment in the scan capture dialog. */
+    fun requestCameraScan(file: java.io.File, name: String) {
+        pendingCameraScan = PendingCameraScan(file, name)
+    }
+
+    /** Drop a pending camera scan. */
+    fun clearCameraScan() {
+        pendingCameraScan = null
+    }
+
+    /**
+     * Writes a new `.xnote` holding [pages] traced strokes (no scan background —
+     * the source photo/PDF is discarded) under [parentDocId]; returns its URI, or
+     * null. IO — call off-thread.
+     */
+    fun createTracedNoteFile(
+        treeUri: String,
+        parentDocId: String,
+        rawName: String,
+        pages: List<com.xnotes.scan.TraceDocument.TracedPage>,
+        ink: Rgba = Rgba(35, 35, 45),
+        inkWidthPx: Double = 3.0,
+    ): String? {
+        val (pageW, _) = settings.prefs.newPagePixels()
+        val doc = com.xnotes.scan.TraceDocument.build(pages, state.document.dpi, pageW, ink, inkWidthPx)
+        stampNewNoteDefaults(doc)
+        val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.NOTE)
+        return createNoteFile(treeUri, parentDocId, name) { codec.write(doc, it) { importCancelled.get() } }
+    }
+
+    /**
+     * Writes a new `.xnote` holding the corrected scan image at [imgFile] (a
+     * de-warped camera photo) edge to edge, without tracing it. The file is
+     * copied into this editor's own dir first, so it outlives the staged copy.
+     * Returns its URI, or null. IO — call off-thread.
+     */
+    fun createScanNoteFile(
+        treeUri: String,
+        parentDocId: String,
+        rawName: String,
+        imgFile: java.io.File,
+        suffix: String,
+    ): String? {
+        val kept = runCatching {
+            java.io.File.createTempFile("scan", suffix, imageDir).also { imgFile.copyTo(it, overwrite = true) }
+        }.getOrNull() ?: return null
+        val doc = imageDocument(kept) ?: run {
+            kept.delete()
+            return null
+        }
+        stampNewNoteDefaults(doc)
+        val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.NOTE)
+        return createNoteFile(treeUri, parentDocId, name) { codec.write(doc, it) { importCancelled.get() } }
+    }
+
     fun createMarkdownNoteFile(treeUri: String, parentDocId: String, rawName: String, markdown: String): String? {
         val doc = blankDocument().also { stampNewNoteDefaults(it) }
         doc.flow.paragraphs.addAll(
@@ -5262,6 +6052,18 @@ class Editor(
         return createNoteFile(treeUri, parentDocId, docName) { codec.write(doc, it) { importCancelled.get() } }
     }
 
+    /**
+     * Imports a Samsung Notes `.sdocx` file staged on disk as a new `.xnote`.
+     * Strokes, images, page size/color/template and a single embedded PDF survive;
+     * audio, tables, stickers, shapes and text boxes are dropped. Returns its URI. IO.
+     */
+    fun createSdocxNoteFile(treeUri: String, parentDocId: String, rawName: String, file: java.io.File): String? {
+        val doc = sdocxDocument(file) ?: return null
+        doc.created = System.currentTimeMillis()
+        val docName = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.NOTE)
+        return createNoteFile(treeUri, parentDocId, docName) { codec.write(doc, it) { importCancelled.get() } }
+    }
+
     /** A new note whose flow text holds [file]'s content (named [name] for its type), paginated. IO. */
     private fun textDocument(file: java.io.File, name: String, mime: String): Document {
         val ext = name.substringAfterLast('.', "").lowercase()
@@ -5319,7 +6121,36 @@ class Editor(
             }
             ImportKind.IMAGE -> imageDocument(keep(imageDir, "." + sourceName.substringAfterLast('.', "img")))
             ImportKind.TEXT -> textDocument(staged, sourceName, mime)
+            ImportKind.SDOCX -> sdocxDocument(staged)
             ImportKind.OPEN -> runCatching { java.io.FileInputStream(staged).use { codec.read(it, pdfDir, imageDir) } }.getOrNull()
+        }
+    }
+
+    /**
+     * Build a note from a Samsung Notes `.sdocx` file staged on disk. Parses the ZIP
+     * (pages, strokes, images, PDFs) and converts it to a [Document]; null when it
+     * will not read. IO — call off-thread.
+     */
+    private fun sdocxDocument(staged: java.io.File): Document? {
+        return try {
+            val entries = HashMap<String, ByteArray>()
+            java.util.zip.ZipInputStream(java.io.FileInputStream(staged)).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        entries[entry.name] = zis.readBytes()
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            if (entries.isEmpty()) return null
+            val parsed = com.xnotes.sdocx.SdocxParser.parseArchive(entries)
+            if (parsed.pages.isEmpty()) return null
+            com.xnotes.sdocx.SdocxImport.toDocument(parsed, state.document.dpi, imageDir, pdfDir, imageCodec, textMeasurer)
+                ?.also { stampNewNoteDefaults(it) }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -5739,6 +6570,7 @@ class Editor(
             ImportKind.PDF -> createPdfNoteFile(treeUri, parentDocId, rawName, staged)
             ImportKind.IMAGE -> createImageNoteFile(treeUri, parentDocId, rawName, staged)
             ImportKind.TEXT -> createTextNoteFile(treeUri, parentDocId, rawName, staged, item.sourceName, item.mime)
+            ImportKind.SDOCX -> createSdocxNoteFile(treeUri, parentDocId, rawName, staged)
             ImportKind.OPEN -> createNoteFileFromFile(treeUri, parentDocId, rawName, staged)
         }
 
@@ -5831,6 +6663,7 @@ class Editor(
             docMeta.rekeyTree(from, to)
             knownStamps.remove(oldUri)?.let { knownStamps[newUri] = it }
             invalidateThumb(oldUri)
+            runCatching { noteLinkIndex.remap(oldUri, newUri, newName) }
         }
         val tree = browseRoot?.let { android.net.Uri.parse(it) } ?: return
         fun follow(uri: String): String? {
@@ -5856,10 +6689,11 @@ class Editor(
     }
 
     /** The created time for a file just read: its own when it records one, else the earliest clue; cached either way. IO. */
-    private fun settleCreated(uri: String, own: Long?): Long? {
+    private fun settleCreated(uri: String, own: Long?, vaultId: String? = null): Long? {
         val key = documentKey(uri)
         val created = own ?: com.xnotes.core.util.DocKeys.inferCreated(createdStore.get(key), stampOf(uri)?.modified)
-        created?.let { createdStore.put(key, it) }
+        // Vault contents keep their times in memory only (doc.created); the disk store would leak their ids.
+        if (vaultId == null) created?.let { createdStore.put(key, it) }
         return created
     }
 
@@ -5917,9 +6751,28 @@ class Editor(
         // matched the same way as the view state, and drop its cached tile.
         createdStore.removeMatching { it == keyPrefix || it.startsWith("$keyPrefix/") }
         docMeta.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        if (folderViews.keys.any { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }) {
+            folderViews = folderViews.filterKeys { !com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+            settings = settings.copy(folderViews = folderViews)
+            saveSettingsSoon()
+        }
+        purgeAudioPositions(auth, delId)
         invalidateThumb(docUri)
         dropPinsWithin(docUri)
         dropRecentsWithin(docUri)
+        runCatching { noteLinkIndex.remove(docUri) }
+    }
+
+    /** Drop recording positions for anything at or under the deleted document id. */
+    private fun purgeAudioPositions(auth: String?, docId: String) {
+        com.xnotes.platform.AudioPositions.removeMatching { key ->
+            val base = key.substringBeforeLast('#')
+            if (auth != null && base.startsWith("$auth|")) com.xnotes.core.util.DocKeys.within(base, "$auth|$docId")
+            else {
+                val rawId = runCatching { android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(base)) }.getOrNull()
+                rawId != null && com.xnotes.core.util.DocKeys.within(rawId, docId)
+            }
+        }
     }
 
     /** Drop every pin at or under [docUri], a deleted or trashed folder. */
@@ -5969,6 +6822,11 @@ class Editor(
         val srcVault = protectingVault(treeUri, sourceUri)
         val dstVault = vaultCovering(treeUri, targetParentDocId)
         if (srcVault != dstVault) return@runCatching transcodeDocument(treeUri, sourceUri, targetParentDocId)
+        // Same vault (or no vault): never nest an encrypted folder inside another via copy.
+        val srcDocId = runCatching { android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(sourceUri)) }.getOrNull()
+        if (srcDocId != null && isVaultRoot(treeUri, srcDocId) && vaultCovering(treeUri, targetParentDocId) != null) {
+            return@runCatching null
+        }
         val tree = android.net.Uri.parse(treeUri)
         val target = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, targetParentDocId)
         val src = android.net.Uri.parse(sourceUri)
@@ -6006,6 +6864,11 @@ class Editor(
      * in different encrypted folders. Plaintext exists only in the copy buffer. IO.
      */
     private fun transcodeDocument(treeUri: String, sourceUri: String, targetParentDocId: String): String? {
+        val srcVault = protectingVault(treeUri, sourceUri)
+        val dstVault = vaultCovering(treeUri, targetParentDocId)
+        // Either side locked means no key to decrypt/encrypt with; fail without touching disk.
+        if (srcVault != null && !com.xnotes.crypto.VaultSession.isUnlocked(srcVault)) return null
+        if (dstVault != null && !com.xnotes.crypto.VaultSession.isUnlocked(dstVault)) return null
         val src = android.net.Uri.parse(sourceUri)
         val name = queryDisplayName(src) ?: return null
         val isDir = appContext.contentResolver.getType(src) == android.provider.DocumentsContract.Document.MIME_TYPE_DIR
@@ -6134,9 +6997,19 @@ class Editor(
         // Pasting a cut into the folder the items already live in is a no-op (and SAF would reject the
         // same-parent move), so report success without touching anything.
         if (sourceParentDocId == targetParentDocId) return@runCatching true
+        // Never nest one encrypted folder inside another via move: the inner header would no
+        // longer be reachable under its own key.
+        val srcDocId = runCatching { android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(sourceUri)) }.getOrNull()
+        if (srcDocId != null && isVaultRoot(treeUri, srcDocId) && vaultCovering(treeUri, targetParentDocId) != null) {
+            return@runCatching false
+        }
         val srcVault = protectingVault(treeUri, sourceUri)
         val dstVault = vaultCovering(treeUri, targetParentDocId)
         if (srcVault != dstVault) {
+            // Crossing a vault boundary decrypts and re-encrypts. Either side locked, or a
+            // missing key, fails here without writing plaintext anywhere.
+            if (srcVault != null && !com.xnotes.crypto.VaultSession.isUnlocked(srcVault)) return@runCatching false
+            if (dstVault != null && !com.xnotes.crypto.VaultSession.isUnlocked(dstVault)) return@runCatching false
             val copied = transcodeDocument(treeUri, sourceUri, targetParentDocId) != null
             if (!copied) return@runCatching false
             return@runCatching deleteDocument(sourceUri)
@@ -6323,6 +7196,7 @@ class Editor(
             SealedWrite.DONE -> {
                 rememberStamp(uri)
                 state.lastSaveBytes = fileSizeOf(uri)
+                indexLinks(uri, doc)
                 return true
             }
             SealedWrite.FAILED -> return false
@@ -6331,7 +7205,10 @@ class Editor(
         // Replace only the manifest when everything ahead of it is already right. A splice that
         // fails part way leaves a file that is not a valid zip, and falling through to the full
         // rewrite below is what puts it right, so this must stay ordered this way.
-        if (writeNoteInPlace(uri, doc)) return true
+        if (writeNoteInPlace(uri, doc)) {
+            indexLinks(uri, doc)
+            return true
+        }
         runCatching {
             val tmp = java.io.File.createTempFile("save", ".xnote", saveTmpDir)
             try {
@@ -6350,11 +7227,52 @@ class Editor(
                 state.lastSaveManifestBytes = timing.manifestBytes
                 state.lastSaveBytes = tmp.length() // live file size for the debug overlay
                 rememberStamp(uri) // read back what the provider reports, not what we wrote
+                indexLinks(uri, doc)
                 true
             } finally {
                 tmp.delete()
             }
         }.getOrDefault(false)
+    }
+
+    /**
+     * Refresh the graph index for a note just saved: its outgoing links, in page
+     * order. Best-effort and never throws — a stuck index must not fail a save.
+     */
+    private fun indexLinks(uri: String, doc: Document, nameOverride: String? = null) {
+        // Vault contents stay out of the on-disk link index: names and edges would leak to note_links.db.
+        if (openVaultId != null) return
+        runCatching {
+            val name = nameOverride ?: doc.displayName ?: doc.title
+            val links = com.xnotes.core.links.NoteLinkScan.of(doc).filterNot { isVaultLinkTarget(it.targetUri) }
+            noteLinkIndex.setLinks(uri, name, links)
+            // The bytes just changed: drop the scan mark so the next graph pass
+            // re-reads this one file instead of trusting a stale timestamp.
+            noteLinkIndex.markDirty(uri)
+        }
+    }
+
+    /**
+     * Best-effort memory-only vault check for a link target (safe on any thread): unknown
+     * cache entries stay visible here, and the lock-time purge removes any rows that slipped in.
+     */
+    private fun isVaultLinkTarget(targetUri: String): Boolean {
+        val root = browseRoot ?: return false
+        val parent = runCatching { browseDocId(targetUri) }.getOrNull()
+            ?.substringBeforeLast('/', "")?.takeIf { it.isNotEmpty() } ?: return false
+        return cachedVaultId(root, parent).let { (res, id) -> res == VaultResolution.RESOLVED && id != null }
+    }
+
+    /** The graph as the stored index sees it: files and edges, no folder walk, no reads. IO. */
+    suspend fun cachedLinkGraph(): LinkGraph = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val files = noteLinkIndex.allFiles().filterNot { runCatching { isVaultUri(it.uri) }.getOrDefault(false) }
+        val known = files.map { it.uri }.toSet()
+        // Drop edges touching vault files (pre-existing rows): neither endpoint may name them.
+        val edges = noteLinkIndex.allEdges().mapNotNull { (source, list) ->
+            if (source !in known) null
+            else (source to list.filter { it.targetUri in known }).takeIf { it.second.isNotEmpty() }
+        }.toMap()
+        LinkGraph(files.map { LinkGraphFile(it.uri, it.name) }, edges)
     }
 
     /** Elapsed milliseconds since a [System.nanoTime] mark, for the debug overlay's save timings. */
@@ -6493,6 +7411,8 @@ class Editor(
                 // still counts, but only the document it belongs to may have its flags touched.
                 if (state.document === doc) res.fork?.let { adoptNoteFork(it) }
                 invalidateThumb(res.uri) // file changed on disk; drop the stale tile so the grid re-renders it
+                indexLinks(res.uri, snapshot)
+                res.fork?.let { fork -> indexLinks(fork.uri, snapshot, nameOverride = fork.name) }
             } else if (wasDirty && state.document === doc) {
                 doc.dirty = true; dirty = true // nothing was written; the edits are still unsaved
             }
@@ -6559,8 +7479,10 @@ class Editor(
     /**
      * The view-state key for a note in the granted folder — its document identity, shared with
      * [documentKey] — or null when it isn't a folder document, so only folder notes remember a view.
+     * Vault notes never get a key: their views live in [tabViews] (RAM) only, never in view_states.json.
      */
     private fun viewKey(uri: String?): String? {
+        if (openVaultId != null) return null
         val u = uri ?: return null
         val root = browseRoot ?: return null
         return if (isUnderTree(u, root)) documentKey(u) else null
@@ -6844,6 +7766,7 @@ class Editor(
         if (hide == preferences.hideDotItems) return
         applyHomePreferences(preferences.copy(hideDotItems = hide))
         browseCache.clear()
+        sidecarFileCache.clear()
         folderCounts.clear()
         treeVersion++
     }
@@ -6890,8 +7813,18 @@ class Editor(
         val colors = sidecarDocId?.let { readSidecarColors(tree, it) }.orEmpty()
         // SAF reports no creation time, so an item seen for the first time is stamped with the earlier of
         // now and its modified time: nothing was created after its last edit, and a fresh item gets now.
+        // Vault contents are never stamped: created_times.json would leak their document ids.
         val now = System.currentTimeMillis()
-        createdStore.stampMissing(out.associate { documentKey(it.documentUri) to (com.xnotes.core.util.DocKeys.inferCreated(now, it.modified) ?: now) })
+        val parentSealed = vaultCovering(treeUri, parentDocId) != null
+        if (!parentSealed) {
+            createdStore.stampMissing(
+                out.filterNot { e ->
+                    e.isDir && runCatching {
+                        isVaultRoot(treeUri, android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(e.documentUri)))
+                    }.getOrDefault(false)
+                }.associate { documentKey(it.documentUri) to (com.xnotes.core.util.DocKeys.inferCreated(now, it.modified) ?: now) },
+            )
+        }
         val withCreated = out.map {
             it.copy(created = createdStore.get(documentKey(it.documentUri)) ?: now, color = colors[it.name])
         }
@@ -6922,13 +7855,44 @@ class Editor(
         }
     }.getOrNull()
 
+    /** colors.json file id per sidecar dir id, so relisting a folder skips a provider
+     *  query. Dropped whenever the cached file no longer reads (deleted or replaced). */
+    private val sidecarFileCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     /** Reads the colour map (item name -> colour) from sidecar dir [sidecarDocId]. Forgiving. */
     private fun readSidecarColors(tree: android.net.Uri, sidecarDocId: String): Map<String, Rgba> {
+        val sealed = sidecarSealed(tree, sidecarDocId)
+        sidecarFileCache[sidecarDocId]?.let { fileId ->
+            val hit = readColorsFile(tree, fileId, sealed)
+            if (hit != null) return hit
+            sidecarFileCache.remove(sidecarDocId)
+        }
         val fileId = findChildDocId(tree, sidecarDocId, SIDECAR_FILE, dir = false) ?: return emptyMap()
+        sidecarFileCache[sidecarDocId] = fileId
+        return readColorsFile(tree, fileId, sealed) ?: emptyMap()
+    }
+
+    /**
+     * True when the sidecar [sidecarDocId] lives inside an encrypted folder: its file holds
+     * item names and must be read decrypted (or not at all, when locked) and written sealed.
+     */
+    private fun sidecarSealed(tree: android.net.Uri, sidecarDocId: String): Boolean {
+        val parent = sidecarDocId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return false
+        return runCatching { vaultCovering(tree.toString(), parent) }.getOrNull() != null
+    }
+
+    /** The colour map in the sidecar file [fileId], or null when it cannot be read. */
+    private fun readColorsFile(tree: android.net.Uri, fileId: String, sealed: Boolean): Map<String, Rgba>? {
         val fileUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, fileId)
-        val text = runCatching {
-            appContext.contentResolver.openInputStream(fileUri)?.use { it.readBytes().toString(Charsets.UTF_8) }
-        }.getOrNull() ?: return emptyMap()
+        val text = if (!sealed) {
+            runCatching {
+                appContext.contentResolver.openInputStream(fileUri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+            }.getOrNull() ?: return null
+        } else {
+            // Decrypted in memory; null when the folder is locked.
+            openDocumentStream(fileUri.toString())?.use { it.readBytes().toString(Charsets.UTF_8) } ?: return null
+        }
         return runCatching {
             val obj = org.json.JSONObject(text).optJSONObject("colors") ?: return emptyMap()
             val map = HashMap<String, Rgba>()
@@ -6938,7 +7902,7 @@ class Editor(
                 Rgba.fromHex(obj.optString(k))?.let { map[k] = it }
             }
             map
-        }.getOrDefault(emptyMap())
+        }.getOrNull()
     }
 
     /** Overwrites sidecar dir [sidecarDocId]'s colors.json with [map], creating the file if needed. */
@@ -6955,8 +7919,16 @@ class Editor(
         for ((k, v) in map) colors.put(k, Rgba.toHex(v))
         val obj = org.json.JSONObject().put("version", 1).put("colors", colors)
         val fileUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, fileId)
+        if (sidecarSealed(tree, sidecarDocId)) {
+            // Item names stay encrypted at rest; a locked folder refuses the write.
+            return when (writeSealed(fileUri.toString()) { it.write(obj.toString().toByteArray(Charsets.UTF_8)) }) {
+                SealedWrite.DONE -> { sidecarFileCache[sidecarDocId] = fileId; true }
+                else -> false
+            }
+        }
         return runCatching {
             appContext.contentResolver.openOutputStream(fileUri, "wt")?.use { it.write(obj.toString().toByteArray(Charsets.UTF_8)) }
+            sidecarFileCache[sidecarDocId] = fileId
             true
         }.getOrDefault(false)
     }
@@ -7027,6 +7999,8 @@ class Editor(
     /** Pin the note at [uri] to the top of the top folder, or unpin it. IO. */
     fun setNotePinned(uri: String, pin: Boolean): Boolean {
         val root = browseRoot ?: return false
+        // Note pins live in the root sidecar in plaintext: vault notes stay unpinnable.
+        if (pin && runCatching { isVaultUri(uri) }.getOrDefault(false)) return false
         val path = pinPath(root, uri) ?: return false
         return writeNotePins(root, readNotePins(root).filter { it != path } + listOfNotNull(path.takeIf { pin }))
     }
@@ -7038,14 +8012,28 @@ class Editor(
         val pins = readNotePins(root)
         if (pins.none { it == from || it.startsWith("$from/") }) return
         val to = pinPath(root, toUri)?.takeIf { !it.startsWith("$SIDECAR_DIR/") }
+        val rootId = browseRootDocId(root)
         val next = pins.mapNotNull { p ->
             when {
                 p == from -> to
                 p.startsWith("$from/") -> to?.let { it + p.removePrefix(from) }
                 else -> p
-            }
+            }?.takeIf { !isVaultPinPath(root, rootId, it) }
         }.distinct()
         writeNotePins(root, next)
+    }
+
+    /**
+     * True when the pin path [path] (resolved as [rootId]/[path]) lies in or is an encrypted
+     * folder: persisting or following it would leak vault names to the root sidecar. IO.
+     */
+    private fun isVaultPinPath(treeUri: String, rootId: String, path: String): Boolean {
+        if (path.isEmpty()) return false
+        val fullId = "$rootId/$path"
+        if (isVaultRoot(treeUri, fullId)) return true
+        val parent = fullId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return false
+        return vaultCovering(treeUri, parent) != null
     }
 
     /** The pinned notes and canvases as the explorer lists them, dropping pins whose file is gone. IO. */
@@ -7059,6 +8047,8 @@ class Editor(
         val out = ArrayList<BrowseEntry>()
         for (path in pins) {
             val id = "$rootId/$path"
+            // Vault pins from before the seal stay out of the UI, and are pruned from the sidecar below.
+            if (isVaultPinPath(root, rootId, path)) continue
             val uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, id)
             val entry = runCatching {
                 appContext.contentResolver.query(
@@ -7181,17 +8171,20 @@ class Editor(
         val kind = DocumentKind.ofName(entry.name) ?: return null
         val key = documentKey(entry.documentUri)
         docMeta.get(key, entry.modified)?.let { return it }
+        // Vault contents resolve metadata in RAM for this session only; doc_meta.json and
+        // created_times.json must never learn their ids.
+        val sealed = isVaultUri(entry.documentUri)
         val meta = if (kind == DocumentKind.CANVAS) {
             val peek = peekFile(entry.documentUri, { canvasCodec.peek(it) }, { canvasCodec.peek(it) }) ?: return null
-            peek.created?.let { createdStore.put(key, it) }
+            if (!sealed) peek.created?.let { createdStore.put(key, it) }
             // A canvas has no pages or PDF; the entry just marks it read at this modified time.
             com.xnotes.platform.DocMetaStore.Meta(0, false, entry.modified)
         } else {
             val peek = peekFile(entry.documentUri, { codec.peek(it) }, { codec.peek(it) }) ?: return null
-            peek.created?.let { createdStore.put(key, it) }
+            if (!sealed) peek.created?.let { createdStore.put(key, it) }
             com.xnotes.platform.DocMetaStore.Meta(peek.pages, peek.hasPdf, entry.modified)
         }
-        return meta.also { docMeta.put(key, it) }
+        return meta.also { if (!sealed) docMeta.put(key, it) }
     }
 
     /** [entry]'s created time as known now, which its file's own record, read after the listing, may have replaced. Instant. */
@@ -7319,6 +8312,12 @@ class Editor(
         val failed = ArrayList<BrowseEntry>()
         val cleared = HashMap<String, HashMap<String, Rgba?>>()
         for (e in entries) {
+            // Vault contents are never written to trash.json (names + paths would leak to disk):
+            // report them as failed so the caller offers permanent deletion instead.
+            if (runCatching { isVaultUri(e.documentUri) }.getOrDefault(false)) {
+                failed.add(e)
+                continue
+            }
             val item = runCatching {
                 val now = System.currentTimeMillis()
                 val wrapper = android.provider.DocumentsContract.createDocument(
@@ -7521,6 +8520,18 @@ class Editor(
     /** Whether two uris name the same document, however each was reached. */
     fun isSameDocument(a: String, b: String): Boolean = documentKey(a) == documentKey(b)
 
+    /** Whether [childUri] is [parentUri] itself or a document beneath it (a deleted folder takes its
+     *  whole subtree's tabs with it). Matches by document identity (authority + id), like detachIfOpen,
+     *  not the raw URI string, so every URI form of the same file is covered. */
+    fun isUnderDocument(childUri: String, parentUri: String): Boolean = runCatching {
+        val child = android.net.Uri.parse(childUri)
+        val parent = android.net.Uri.parse(parentUri)
+        if (child.authority != parent.authority) return@runCatching isSameDocument(childUri, parentUri)
+        val childId = android.provider.DocumentsContract.getDocumentId(child) ?: return@runCatching false
+        val parentId = android.provider.DocumentsContract.getDocumentId(parent) ?: return@runCatching false
+        childId == parentId || childId.startsWith("$parentId/")
+    }.getOrDefault(childUri == parentUri)
+
     /** Warm the backstage caches off-thread (after launch) so its first open paints instantly. */
     fun prewarmBackstage() {
         autosaveScope.launch {
@@ -7553,6 +8564,7 @@ class Editor(
         out: OutputStream,
         onProgress: (Int, Int) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
+        withLinks: Boolean = false,
     ) {
         val name = queryDisplayName(android.net.Uri.parse(srcUri)).orEmpty()
         val title = com.xnotes.core.util.Paths.stem(name)
@@ -7560,7 +8572,9 @@ class Editor(
             exportCanvasFileToPdf(srcUri, out, onProgress, isCancelled, title)
             return
         }
-        val doc = readXnote(srcUri) ?: return
+        val loaded = readXnote(srcUri) ?: return
+        val expanded = if (withLinks) expandWithLinks(loaded) else null
+        val doc = expanded?.document ?: loaded
         val src = doc.pdfFile?.let { com.xnotes.platform.PdfSource.create(it) }
         try {
             com.xnotes.platform.PdfExporter.export(
@@ -7574,9 +8588,323 @@ class Editor(
             )
         } finally {
             src?.close()
-            discardWorkFile(doc.pdfFile) // transient doc loaded just for export; drop its extracts
+            if (expanded != null) discardExpansion(expanded)
+            discardWorkFile(loaded.pdfFile) // transient doc loaded just for export; drop its extracts
+            deleteImageTemps(loaded)
+        }
+    }
+
+    /**
+     * Converts the note at [srcUri] to a plain-LaTeX `.tex` document in [out]: every page
+     * is rendered as an image and read by the vision-model provider configured in Settings,
+     * which returns body text, `$...$` inline maths and `\[...\]` display maths (drawings
+     * are left out by the model). Blocks; call off the main thread. Throws with a
+     * user-readable message on failure, so the caller can report it.
+     */
+    /**
+     * User-facing reason whole-note LaTeX cannot run right now, or null when the
+     * provider is configured. Custom endpoints need their URL and model name; the
+     * key may be blank only where the server needs none.
+     */
+    fun aiExportBlocker(): String? {
+        val prefs = settings.prefs
+        val provider = com.xnotes.platform.LatexAiProvider.ofId(prefs.latexAiProvider)
+        if (provider == com.xnotes.platform.LatexAiProvider.CUSTOM) {
+            if (prefs.latexAiBaseUrl.isBlank()) return appContext.getString(R.string.latex_ai_missing_endpoint)
+            if (prefs.latexAiModel.isBlank()) return appContext.getString(R.string.latex_ai_missing_model)
+            return null
+        }
+        if (com.xnotes.platform.LatexAiKeys.get(appContext).isBlank()) return appContext.getString(R.string.latex_ai_missing_key)
+        return null
+    }
+
+    /**
+     * Converts the note at [srcUri] to a plain-LaTeX `.tex` document in [out]: every page
+     * is rendered as an image and read by the vision-model provider configured in Settings,
+     * which returns body text, `$...$` inline maths and `\[...\]` display maths (drawings
+     * are left out by the model). Blocks; call off the main thread. Throws with a user-readable
+     * message on failure, so the caller can report it.
+     */
+    fun exportFileToLatex(
+        srcUri: String,
+        out: OutputStream,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ) = exportStoredNoteToMarkup(
+        srcUri, out, com.xnotes.platform.VlmClient.VlmFormat.LATEX,
+        appContext.getString(R.string.latex_export_empty),
+        com.xnotes.core.text.VlmLatex::assembleDocument, onProgress, isCancelled,
+    )
+
+    /**
+     * Converts the note at [srcUri] to a plain-Markdown `.md` document in [out]: the same
+     * rendered pages and vision-model provider as [exportFileToLatex], but the model
+     * returns headings, lists, tables and `$...$` / `\[...\]` maths instead of LaTeX.
+     * Blocks; call off the main thread. Throws with a user-readable message on failure.
+     */
+    fun exportFileToMarkdown(
+        srcUri: String,
+        out: OutputStream,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ) = exportStoredNoteToMarkup(
+        srcUri, out, com.xnotes.platform.VlmClient.VlmFormat.MARKDOWN,
+        appContext.getString(R.string.latex_export_empty),
+        com.xnotes.core.text.VlmMarkdown::assembleDocument, onProgress, isCancelled,
+    )
+
+    /**
+     * Shared file-to-markup export: reads the stored note, renders its pages, has the
+     * vision model convert each one, and assembles [assemble] into [out]. [emptyMessage]
+     * reports a conversion that read nothing. Throws [com.xnotes.format.DocumentCodec.WriteCancelled]
+     * when [isCancelled] fires, so the caller's progress dialog can tell cancel apart.
+     */
+    private fun exportStoredNoteToMarkup(
+        srcUri: String,
+        out: OutputStream,
+        format: com.xnotes.platform.VlmClient.VlmFormat,
+        emptyMessage: String,
+        assemble: (List<String>) -> String,
+        onProgress: (Int, Int) -> Unit,
+        isCancelled: () -> Boolean,
+    ) {
+        val name = queryDisplayName(android.net.Uri.parse(srcUri)).orEmpty()
+        if (com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.CANVAS) error("a canvas has no pages")
+        val loaded = readXnote(srcUri) ?: error("note could not be read")
+        val blocker = aiExportBlocker()
+        if (blocker != null) error(blocker)
+        val prefs = settings.prefs
+        val provider = com.xnotes.platform.LatexAiProvider.ofId(prefs.latexAiProvider)
+        val config = com.xnotes.platform.LatexAiConfig(provider, com.xnotes.platform.LatexAiKeys.get(appContext), prefs.latexAiModel, prefs.latexAiBaseUrl)
+        val bodies = renderStoredNotePages(loaded, name, config, format, onProgress, isCancelled)
+        val markup = assemble(bodies)
+        if (markup.isBlank()) error(emptyMessage)
+        out.write(markup.toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * Renders every page of the stored [doc] to PNG bytes (long edge 1600 px) and has
+     * the vision model convert each one, in order. Reports PDF-rendering progress, then
+     * per-page conversion progress, through [onProgress]. Blocks; call off the main thread.
+     */
+    private fun renderStoredNotePages(
+        doc: com.xnotes.core.model.Document,
+        name: String,
+        config: com.xnotes.platform.LatexAiConfig,
+        format: com.xnotes.platform.VlmClient.VlmFormat,
+        onProgress: (Int, Int) -> Unit,
+        isCancelled: () -> Boolean,
+    ): List<String> {
+        val pdfTmp = java.io.File.createTempFile("note-vlm", ".pdf", appContext.cacheDir)
+        try {
+            java.io.FileOutputStream(pdfTmp).use { fos ->
+                com.xnotes.platform.PdfExporter.export(
+                    appContext, doc, doc.pdfFile?.let { com.xnotes.platform.PdfSource.create(it) }, fos,
+                    { exportPaper(doc, it) },
+                    { page, r -> paintExportRuling(doc, page, r) },
+                    { done, total -> onProgress(done, (total * 2).coerceAtLeast(1)) },
+                    isCancelled,
+                    flow = flowExportHooks(doc),
+                    title = com.xnotes.core.util.Paths.stem(name).ifEmpty { doc.title },
+                    headingBookmarks = settings.prefs.pdfHeadingBookmarks,
+                )
+            }
+            if (isCancelled()) throw com.xnotes.format.DocumentCodec.WriteCancelled()
+            val src = com.xnotes.platform.PdfSource.create(pdfTmp) ?: error("note could not be read")
+            try {
+                val total = src.pageCount
+                val bodies = ArrayList<String>()
+                for (i in 0 until total) {
+                    if (isCancelled()) throw com.xnotes.format.DocumentCodec.WriteCancelled()
+                    val size = src.pageSizePoints(i)
+                    if (size == null) {
+                        bodies += ""
+                        continue
+                    }
+                    val (w, h) = com.xnotes.core.text.VlmLatex.rasterSize(size.first, size.second)
+                    val bmp = src.renderPage(i, w, h)?.bitmap ?: error("page ${i + 1} could not be read")
+                    try {
+                        val png = java.io.ByteArrayOutputStream().use { bos ->
+                            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, bos)
+                            bos.toByteArray()
+                        }
+                        bodies += com.xnotes.platform.VlmClient.convertPage(png, i, total, config, format)
+                    } finally {
+                        bmp.recycle()
+                    }
+                    onProgress(total + i + 1, total * 2)
+                }
+                return bodies
+            } finally {
+                src.close()
+            }
+        } finally {
+            pdfTmp.delete()
+            discardWorkFile(doc.pdfFile)
             deleteImageTemps(doc)
         }
+    }
+
+    /**
+     * Loads the note at [srcUri] and writes it as a Samsung Notes `.sdocx` bundle
+     * in [out]. Canvases are not supported (a canvas has no pages to map onto
+     * Samsung pages). IO — call off-thread.
+     */
+    fun exportFileToSdocx(
+        srcUri: String,
+        out: OutputStream,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+        withLinks: Boolean = false,
+    ) {
+        val name = queryDisplayName(android.net.Uri.parse(srcUri)).orEmpty()
+        if (com.xnotes.core.util.DocumentKind.ofName(name) == com.xnotes.core.util.DocumentKind.CANVAS) return
+        val doc = readXnote(srcUri) ?: return
+        val expanded = if (withLinks) expandWithLinks(doc) else null
+        try {
+            val final = expanded?.document ?: doc
+            val total = final.pages.size.coerceAtLeast(1)
+            if (isCancelled()) throw com.xnotes.format.DocumentCodec.WriteCancelled()
+            onProgress(0, total)
+            com.xnotes.sdocx.SdocxExport.writeDocument(final, out)
+            onProgress(total, total)
+        } finally {
+            if (expanded != null) discardExpansion(expanded)
+            discardWorkFile(doc.pdfFile)
+            deleteImageTemps(doc)
+        }
+    }
+
+    /**
+     * Loads the note at [srcUri] and writes it as a `.xnote` bundle in [out]. With
+     * [withLinks], linked pages are inlined below their link and the links rewired to
+     * the appended same-file pages (a self-contained document). IO — call off-thread.
+     */
+    fun exportFileToXnote(
+        srcUri: String,
+        out: OutputStream,
+        withLinks: Boolean = false,
+        isCancelled: () -> Boolean = { false },
+    ) {
+        val doc = readXnote(srcUri) ?: return
+        val expanded = if (withLinks) expandWithLinks(doc) else null
+        try {
+            codec.write(expanded?.document ?: doc, out, isCancelled = isCancelled)
+        } finally {
+            if (expanded != null) discardExpansion(expanded)
+            discardWorkFile(doc.pdfFile)
+            deleteImageTemps(doc)
+        }
+    }
+
+    /** One file the Graph screen can show: its SAF document URI and its label. */
+    data class LinkGraphFile(val uri: String, val name: String)
+
+    /** A note the Graph screen scans: its URI, label and last-modified time. */
+    data class GraphNote(val uri: String, val name: String, val modified: Long)
+
+    /** Everything the Graph screen draws: the files, their outgoing links, and whether the scan timed out partway. */
+    data class LinkGraph(
+        val files: List<LinkGraphFile>,
+        val edges: Map<String, List<com.xnotes.platform.NoteLinkIndex.Edge>>,
+        val partial: Boolean = false,
+    )
+
+    /**
+     * Every note under the granted folder: URI, label and modification time, or null
+     * when no folder is granted or the root cannot be listed (so callers never mistake
+     * a failed listing for an empty folder and wipe the index). IO.
+     */
+    suspend fun listGraphNotes(): List<GraphNote>? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val root = browseRoot ?: return@withContext null
+        val listed = listNoteFiles(root) ?: return@withContext null
+        val out = ArrayList<GraphNote>(listed.size)
+        for (e in listed) {
+            kotlinx.coroutines.yield()
+            out.add(
+                GraphNote(
+                    e.documentUri,
+                    com.xnotes.core.util.DocumentKind.stripSuffix(e.name),
+                    e.modified,
+                ),
+            )
+        }
+        out
+    }
+
+    /**
+     * Re-read every listed file whose modification time moved (manifest only, no
+     * images), trusting unchanged ones, and prune rows for files no longer listed.
+     * Each file is isolated: an unreadable file is skipped, never aborting the scan.
+     * Bounded by [ImportKind.SCAN_TIMEOUT_MS] overall — on timeout the indexed part so far is
+     * returned with [LinkGraph.partial] set, instead of spinning forever. Suspends
+     * on IO; honours cancellation.
+     */
+    suspend fun refreshLinkGraph(
+        notes: List<GraphNote>,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): LinkGraph = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            kotlinx.coroutines.withTimeout(ImportKind.SCAN_TIMEOUT_MS) {
+                for ((i, n) in notes.withIndex()) {
+                    kotlinx.coroutines.yield()
+                    onProgress(i, notes.size)
+                    // Belt and braces: vault notes never enter the on-disk index, even if handed in directly.
+                    if (isVaultUri(n.uri)) continue
+                    noteLinkIndex.touchFile(n.uri, n.name)
+                    if (noteLinkIndex.scanMtime(n.uri) == n.modified) continue
+                    val doc = runCatching {
+                        openDocumentStream(n.uri)?.use { codec.read(it, null, null) }
+                    }.getOrNull()
+                    if (doc != null) {
+                        val links = com.xnotes.core.links.NoteLinkScan.of(doc)
+                            .filterNot { runCatching { isVaultUri(it.targetUri) }.getOrDefault(false) }
+                        noteLinkIndex.setLinks(n.uri, n.name, links)
+                    }
+                    noteLinkIndex.setScanMtime(n.uri, n.modified)
+                }
+                onProgress(notes.size, notes.size)
+                noteLinkIndex.prune(notes.map { it.uri }.toSet())
+                LinkGraph(notes.map { LinkGraphFile(it.uri, it.name) }, knownEdges(noteLinkIndex, notes.map { it.uri }.toSet()))
+            }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            val known = notes.map { it.uri }.toSet()
+            LinkGraph(notes.map { LinkGraphFile(it.uri, it.name) }, knownEdges(noteLinkIndex, known), partial = true)
+        }
+    }
+
+    /** Stored edges with both endpoints in [knownUris]: vault files (pre-existing rows) never reach the UI. */
+    private fun knownEdges(
+        index: com.xnotes.platform.NoteLinkIndex,
+        knownUris: Set<String>,
+    ): Map<String, List<com.xnotes.platform.NoteLinkIndex.Edge>> =
+        index.allEdges().mapNotNull { (source, list) ->
+            if (source !in knownUris) null
+            else (source to list.filter { it.targetUri in knownUris }).takeIf { it.second.isNotEmpty() }
+        }.toMap()
+
+
+    /** Every note file under [treeUri], skipping dotfiles, the trash folder and encrypted
+     *  folders (their names must never reach the on-disk link index). IO. */
+    private fun listNoteFiles(treeUri: String): List<BrowseEntry>? {
+        val out = ArrayList<BrowseEntry>()
+        val trashId = runCatching { trashDir(treeUri, false) }.getOrNull()
+        val rootId = runCatching { browseRootDocId(treeUri) }.getOrNull() ?: return null
+        fun walk(parentDocId: String) {
+            val children = runCatching { browseChildren(treeUri, parentDocId) }.getOrDefault(emptyList())
+            for (e in children) {
+                if (e.name.startsWith(".")) continue
+                val id = runCatching { browseDocId(e.documentUri) }.getOrNull() ?: continue
+                if (id == trashId) continue
+                if (e.isDir) {
+                    // Never descend into an encrypted folder: everything under it stays out of the index.
+                    if (!isVaultRoot(treeUri, id)) walk(id)
+                }
+                else if (com.xnotes.core.util.DocumentKind.ofName(e.name) == com.xnotes.core.util.DocumentKind.NOTE) out.add(e)
+            }
+        }
+        walk(rootId)
+        return out
     }
 
     /**
@@ -7634,6 +8962,8 @@ class Editor(
                 batchCancel = null
                 batchExport = null
             }
+            // The scratch holds rendered pages — including decrypted vault pages — so overwrite it rather than merely unlinking it.
+            com.xnotes.crypto.VaultCrypto.secureDeleteTree(batchDir)
         }
     }
 
@@ -8595,7 +9925,11 @@ class Editor(
             }
             if (importCancelled.get()) return@launch onDone(null)
             if (made == null) message = appContext.getString(R.string.err_merge_notes)
-            else viewStates.get(documentKey(uris.first()))?.let { v -> viewStates.put(documentKey(made.uri), v.zoom, v.scrollX, v.scrollY, v.overrides) }
+            else {
+                // The merged note's view never reaches view_states.json from inside a vault.
+                val sealed = cachedVaultId(root, parentId).let { (res, id) -> res == VaultResolution.RESOLVED && id != null }
+                if (!sealed) viewStates.get(documentKey(uris.first()))?.let { v -> viewStates.put(documentKey(made.uri), v.zoom, v.scrollX, v.scrollY, v.overrides) }
+            }
             onDone(made)
         }
     }

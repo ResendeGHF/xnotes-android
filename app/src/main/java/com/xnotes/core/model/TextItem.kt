@@ -33,7 +33,7 @@ class TextItem(
     var underline: Boolean = false,
     var strike: Boolean = false,
     var align: HAlign = HAlign.LEFT,
-    /** [text] is LaTeX, drawn as a formula (the handwritten-maths add-on makes these). */
+    /** [text] is LaTeX, drawn as a formula (Convert to math makes these). */
     var math: Boolean = false,
 ) : CanvasItem, Resizable {
 

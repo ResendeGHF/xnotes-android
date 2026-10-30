@@ -33,4 +33,12 @@ object AudioPositions {
         while (positions.size > LIMIT) positions.remove(positions.keys.first())
         store?.write(JSONObject().apply { for ((k, v) in positions) put(k, v) })
     }
+
+    /** Drop every position whose key matches [predicate] (a deleted file, or a locked vault). */
+    @Synchronized
+    fun removeMatching(predicate: (String) -> Boolean) {
+        if (positions.keys.removeAll(predicate)) {
+            store?.write(JSONObject().apply { for ((k, v) in positions) put(k, v) })
+        }
+    }
 }

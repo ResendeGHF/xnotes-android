@@ -1,0 +1,100 @@
+package com.dk.kuiver.ui
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.ProvidableCompositionLocal
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import com.dk.kuiver.model.KuiverEdge
+
+/**
+ * Color palette for graph elements rendered without an explicit color override.
+ *
+ * @property edge Color for forward/tree edges (default: black)
+ * @property backEdge Color for back edges and self-loops (default: red)
+ * @property labelText Color of edge label text (default: black)
+ * @property labelBackground Background color of the edge label box (default: white with 90% opacity)
+ * @property labelBorder Color of the edge label border, null for no border (default: black with 30% opacity)
+ */
+@Immutable
+data class KuiverColors(
+    val edge: Color = Color.Black,
+    val backEdge: Color = Color(0xFFFF6B6B),
+    val labelText: Color = Color.Black,
+    val labelBackground: Color = Color.White.copy(alpha = 0.9f),
+    val labelBorder: Color? = Color.Black.copy(alpha = 0.3f)
+)
+
+/**
+ * The [KuiverColors] used by composable defaults that don't receive an explicit color.
+ *
+ * Provide this to theme a graph once instead of overriding colors in every
+ * `edgeContent` lambda:
+ *
+ * ```
+ * CompositionLocalProvider(
+ *     LocalKuiverColors provides KuiverColors(
+ *         edge = MaterialTheme.colorScheme.onSurface,
+ *         backEdge = MaterialTheme.colorScheme.tertiary,
+ *         labelText = MaterialTheme.colorScheme.onSurface,
+ *         labelBackground = MaterialTheme.colorScheme.surface,
+ *     ),
+ * ) {
+ *     KuiverViewer(
+ *         state = viewerState,
+ *         nodeContent = { node -> Text(node.id) },
+ *         edgeContent = { edge, from, to -> StyledEdgeContent(edge, from, to) }
+ *     )
+ * }
+ * ```
+ */
+val LocalKuiverColors: ProvidableCompositionLocal<KuiverColors> =
+    staticCompositionLocalOf { KuiverColors() }
+
+/**
+ * Default values used by kuiver's edge composables, themeable via [LocalKuiverColors]
+ */
+object KuiverDefaults {
+
+    /**
+     * Builds the default edge label style
+     *
+     * @return an [EdgeLabelStyle] built from the current [LocalKuiverColors]
+     */
+    @Composable
+    fun edgeLabelStyle(): EdgeLabelStyle = LocalKuiverColors.current.let { colors ->
+        EdgeLabelStyle(
+            textColor = colors.labelText,
+            backgroundColor = colors.labelBackground,
+            borderColor = colors.labelBorder
+        )
+    }
+
+    /**
+     * Per-edge [EdgeStyle] built from the current [LocalKuiverColors], for the batched
+     * `KuiverViewer` overload.
+     *
+     * The batched viewer takes a plain `(KuiverEdge) -> EdgeStyle` lambda that runs while drawing,
+     * not while composing, so it can't read [LocalKuiverColors] itself. This reads the colors in
+     * composition and closes over them.
+     *
+     * @param strokeWidth width of the edge line
+     */
+    @Composable
+    fun edgeStyle(strokeWidth: Dp = 3.dp): (KuiverEdge) -> EdgeStyle {
+        val colors = LocalKuiverColors.current
+        return remember(colors, strokeWidth) {
+            { edge ->
+                EdgeStyle.styled(
+                    edge = edge,
+                    baseColor = colors.edge,
+                    backEdgeColor = colors.backEdge,
+                    strokeWidth = strokeWidth
+                )
+            }
+        }
+    }
+}

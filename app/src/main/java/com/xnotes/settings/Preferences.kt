@@ -1,5 +1,6 @@
 package com.xnotes.settings
 
+import com.xnotes.canvas.StylusCalibrator
 import com.xnotes.core.model.Orientation
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageSizeChoice
@@ -44,10 +45,20 @@ data class Preferences(
     val snapRotation90: Boolean = false,
     /** Language for handwriting-to-text (Convert to text): BCP-47 tag, "pt-BR" (Brazilian Portuguese) | "en" (English). */
     val ocrLanguage: String = "pt-BR",
+    /** Vision-model provider for whole-note LaTeX export: "gemini" | "openai" (any OpenAI-compatible endpoint) | "anthropic". */
+    val latexAiProvider: String = "gemini",
+    /** Model name sent to the provider; blank falls back to that provider's default. */
+    val latexAiModel: String = "",
+    /** Endpoint base URL for OpenAI-compatible providers; blank falls back to the default. */
+    val latexAiBaseUrl: String = "",
     /** Tool the stylus side button activates while held; "none" disables it. */
     val penButtonTool: String = "eraser",
     /** Whether the side-button tool also activates during hover (no contact needed); eraser/pan only. */
     val penButtonHover: Boolean = false,
+    /** Stylus parallax correction, in dp: added to every stylus/eraser sample before the
+     *  viewport→content transform. Set by the guided calibration, fine-tunable by hand. */
+    val stylusOffsetXDp: Double = 0.0,
+    val stylusOffsetYDp: Double = 0.0,
     /** Action mapped to a clean two-finger tap; "none" (default) disables it. */
     val twoFingerTap: String = "none",
     /** Action mapped to a clean three-finger tap; "none" (default) disables it. */
@@ -154,8 +165,17 @@ data class Preferences(
         .put("detect_shapes", detectShapes)
         .put("snap_rotation_90", snapRotation90)
         .put("ocr_language", ocrLanguage)
+        .put("latex_ai_provider", latexAiProvider)
+        .put("latex_ai_model", latexAiModel)
+        .put("latex_ai_base_url", latexAiBaseUrl)
         .put("pen_button_tool", penButtonTool)
         .put("pen_button_hover", penButtonHover)
+        .apply {
+            if (stylusOffsetXDp != 0.0 || stylusOffsetYDp != 0.0) {
+                put("stylus_offset_x_dp", stylusOffsetXDp)
+                put("stylus_offset_y_dp", stylusOffsetYDp)
+            }
+        }
         .put("two_finger_tap", twoFingerTap)
         .put("three_finger_tap", threeFingerTap)
         .put("stylus_double_tap", stylusDoubleTap)
@@ -282,8 +302,15 @@ data class Preferences(
                 detectShapes = o.optBoolean("detect_shapes", true),
                 snapRotation90 = o.optBoolean("snap_rotation_90", false),
                 ocrLanguage = o.optString("ocr_language", "pt-BR").takeIf { it == "en" || it == "pt-BR" } ?: "pt-BR",
+                latexAiProvider = o.optString("latex_ai_provider", "gemini").takeIf { it == "gemini" || it == "openai" || it == "anthropic" || it == "custom" } ?: "gemini",
+                latexAiModel = o.optString("latex_ai_model", ""),
+                latexAiBaseUrl = o.optString("latex_ai_base_url", ""),
                 penButtonTool = o.optString("pen_button_tool", "eraser").ifEmpty { "eraser" },
                 penButtonHover = o.optBoolean("pen_button_hover", false),
+                stylusOffsetXDp = o.optDouble("stylus_offset_x_dp", 0.0)
+                    .takeIf { it.isFinite() }?.coerceIn(-StylusCalibrator.MAX_OFFSET_DP, StylusCalibrator.MAX_OFFSET_DP) ?: 0.0,
+                stylusOffsetYDp = o.optDouble("stylus_offset_y_dp", 0.0)
+                    .takeIf { it.isFinite() }?.coerceIn(-StylusCalibrator.MAX_OFFSET_DP, StylusCalibrator.MAX_OFFSET_DP) ?: 0.0,
                 twoFingerTap = tapAction("two_finger_tap"),
                 threeFingerTap = tapAction("three_finger_tap"),
                 stylusDoubleTap = tapAction("stylus_double_tap"),

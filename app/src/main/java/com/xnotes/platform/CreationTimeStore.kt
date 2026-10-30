@@ -2,6 +2,8 @@ package com.xnotes.platform
 
 import com.xnotes.core.util.DocKeys
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Remembers when each note/folder was created, keyed by document identity (the same
@@ -13,10 +15,15 @@ import org.json.JSONObject
  * its modified time, and keeps that stamp until the file's own record replaces it ([put]).
  * Held in memory and mirrored to a small JSON file ([JsonStore.createdTimes]); [clear]ed
  * when the user forgets the folder, since the keys are only meaningful for it.
+ *
+ * Writes to disk are batched: relisting a folder stamps every new item at once, and a
+ * folder of new notes would otherwise rewrite the file once per item.
  */
 class CreationTimeStore(private val store: JsonStore) {
 
     private val times: MutableMap<String, Long> = load()
+    private val writer = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "created-times").apply { isDaemon = true } }
+    private var scheduled = false
 
     private fun load(): MutableMap<String, Long> {
         val out = HashMap<String, Long>()
@@ -33,7 +40,7 @@ class CreationTimeStore(private val store: JsonStore) {
     fun stampMissing(stamps: Map<String, Long>) {
         var changed = false
         for ((k, t) in stamps) if (k !in times) { times[k] = t; changed = true }
-        if (changed) store.write(toJson())
+        if (changed) writeSoon()
     }
 
     /** Record the created time a file carries itself, which outranks any first-seen stamp. */
@@ -41,7 +48,7 @@ class CreationTimeStore(private val store: JsonStore) {
     fun put(key: String, time: Long) {
         if (times[key] == time) return
         times[key] = time
-        store.write(toJson())
+        writeSoon()
     }
 
     /** Carry created times across a rename or move that changed the document id, a folder's descendants included. */
@@ -51,25 +58,38 @@ class CreationTimeStore(private val store: JsonStore) {
         if (moves.isEmpty()) return
         val values = moves.map { (old, _) -> times.remove(old) }
         moves.forEachIndexed { i, (_, new) -> values[i]?.let { times[new] = it } }
-        store.write(toJson())
+        writeSoon()
     }
 
     /** Forget the created time for every key matching [predicate] — a deleted file, or a deleted folder's whole subtree. */
     @Synchronized
     fun removeMatching(predicate: (String) -> Boolean) {
-        if (times.keys.removeAll(predicate)) store.write(toJson())
+        if (times.keys.removeAll(predicate)) writeSoon()
     }
 
     /** Forget every created time (e.g. when the granted folder is released). */
     @Synchronized
     fun clear() {
         times.clear()
-        store.write(JSONObject())
+        writeSoon()
     }
 
-    private fun toJson(): JSONObject {
+    // Called with the lock held. A change after a write took its snapshot schedules the next write.
+    private fun writeSoon() {
+        if (scheduled) return
+        scheduled = true
+        writer.schedule({ store.write(takeSnapshot()) }, WRITE_DELAY_MS, TimeUnit.MILLISECONDS)
+    }
+
+    @Synchronized
+    private fun takeSnapshot(): JSONObject {
+        scheduled = false
         val o = JSONObject()
         for ((k, v) in times) o.put(k, v)
         return o
+    }
+
+    private companion object {
+        const val WRITE_DELAY_MS = 1500L
     }
 }

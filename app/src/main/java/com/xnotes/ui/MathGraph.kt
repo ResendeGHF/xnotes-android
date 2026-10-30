@@ -31,8 +31,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddPhotoAlternate
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.GridOn
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
@@ -46,6 +51,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -65,6 +71,7 @@ import java.io.ByteArrayOutputStream
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /** One labelled swatch baked into an exported graph. [ramp] draws the height scale instead of a dot. */
 internal class ExportLegend(
@@ -72,6 +79,33 @@ internal class ExportLegend(
     val color: Int,
     val ramp: Boolean = false,
 )
+
+/**
+ * One plotted equation with its display overrides. [colorArgb] null means the automatic series
+ * colour; [visible] false hides the entry without deleting it.
+ */
+internal data class MathEntry(
+    val text: String = "",
+    val colorArgb: Int? = null,
+    val visible: Boolean = true,
+)
+
+/** Fixed palette offered by the per-entry colour picker. */
+internal val ENTRY_COLOR_CHOICES = listOf(
+    0xFFE06C75.toInt(),
+    0xFFD19A66.toInt(),
+    0xFFE5C07B.toInt(),
+    0xFF98C379.toInt(),
+    0xFF56B6C2.toInt(),
+    0xFF61AFEF.toInt(),
+    0xFFC678DD.toInt(),
+    0xFFF472B6.toInt(),
+    0xFFABB2BF.toInt(),
+    0xFF4BAE62.toInt(),
+)
+
+/** Camera presets matching the X / Y / Z / ISO view buttons over the 3D plots. */
+internal enum class GraphView { X, Y, Z, ISO }
 
 /** Palette colours flattened to Android ints so a bitmap can be painted off the UI thread. */
 internal class GraphTheme(
@@ -125,7 +159,8 @@ internal fun <T> rememberSettled(value: T, delayMillis: Long = 140L): T {
 
 /**
  * The shared frame for every graphical pane: the plot keeps the screen, the expressions sit in a
- * short scrolling tray, and Insert stays in the header.
+ * short scrolling tray, and Insert stays in the header. On wide screens the plot moves left and
+ * the controls dock right so both stay visible at once.
  */
 @Composable
 internal fun GraphWorkspace(
@@ -140,76 +175,129 @@ internal fun GraphWorkspace(
     onReset: () -> Unit,
     inserting: Boolean,
     onInsert: () -> Unit,
+    animInsertLabel: String? = null,
+    animInserting: Boolean = false,
+    onInsertAnim: (() -> Unit)? = null,
     status: String? = null,
     plot: @Composable BoxScope.() -> Unit,
     controls: @Composable ColumnScope.() -> Unit,
 ) {
     val palette = LocalPalette.current
-    Column(Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            MathToolSelector(modes, selected, Modifier.weight(1f), onSelect)
-            if (onToggleGrid != null && showGrid != null) {
-                MathIconButton(
-                    Icons.Outlined.GridOn,
-                    stringResource(R.string.math_toggle_grid),
-                    tint = if (showGrid) palette.accent.toComposeColor() else null,
-                    onClick = onToggleGrid,
-                )
+    androidx.compose.foundation.layout.BoxWithConstraints(
+        Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 6.dp),
+    ) {
+        val wide = maxWidth >= 760.dp
+        Column(Modifier.fillMaxSize()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                MathToolSelector(modes, selected, Modifier.weight(1f), onSelect)
+                if (onToggleGrid != null && showGrid != null) {
+                    MathIconButton(
+                        Icons.Outlined.GridOn,
+                        stringResource(R.string.math_toggle_grid),
+                        tint = if (showGrid) palette.accent.toComposeColor() else null,
+                        onClick = onToggleGrid,
+                    )
+                }
+                MathIconButton(Icons.Outlined.Refresh, stringResource(R.string.math_reset_view), onClick = onReset)
+                Spacer(Modifier.width(2.dp))
+                if (animInsertLabel != null && onInsertAnim != null) {
+                    InsertAnimButton(animInserting, animInsertLabel, onInsertAnim)
+                    Spacer(Modifier.width(6.dp))
+                }
+                InsertGraphButton(inserting, onInsert)
             }
-            MathIconButton(Icons.Outlined.Refresh, stringResource(R.string.math_reset_view), onClick = onReset)
-            Spacer(Modifier.width(2.dp))
-            InsertGraphButton(inserting, onInsert)
-        }
-        Spacer(Modifier.height(6.dp))
-        Box(
-            Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .border(1.dp, palette.border.toComposeColor(), RoundedCornerShape(12.dp))
-                .background(palette.paper.toComposeColor()),
-        ) {
-            plot()
-            if (legend.isNotEmpty() || ramp != null || caption != null) {
+            Spacer(Modifier.height(6.dp))
+            if (wide) {
+                Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PlotFrame(
+                        legend = legend,
+                        ramp = ramp,
+                        caption = caption,
+                        modifier = Modifier.weight(1f).fillMaxSize(),
+                        plot = plot,
+                    )
+                    Column(
+                        Modifier
+                            .width(320.dp)
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        content = controls,
+                    )
+                }
+            } else {
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                ) {
+                    PlotFrame(legend = legend, ramp = ramp, caption = caption, modifier = Modifier.fillMaxSize(), plot = plot)
+                }
+                if (status != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(status, color = palette.danger.toComposeColor(), fontSize = 11.sp, maxLines = 2)
+                }
                 Column(
                     Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(8.dp)
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(palette.paper.toComposeColor().copy(alpha = 0.92f))
-                        .padding(horizontal = 8.dp, vertical = 5.dp),
-                ) {
-                    if (legend.isNotEmpty()) PlotLegend(legend)
-                    if (ramp != null) {
-                        Spacer(Modifier.height(3.dp))
-                        RampRow(ramp.first, ramp.second)
-                    }
-                    if (caption != null) {
-                        Text(
-                            caption,
-                            color = palette.textDim.toComposeColor(),
-                            fontSize = 10.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
+                        .heightIn(max = 210.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(top = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    content = controls,
+                )
+                return@Column
+            }
+            if (status != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(status, color = palette.danger.toComposeColor(), fontSize = 11.sp, maxLines = 2)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlotFrame(
+    legend: List<Pair<String, Color>>,
+    ramp: Pair<String, String>?,
+    caption: String?,
+    modifier: Modifier = Modifier,
+    plot: @Composable BoxScope.() -> Unit,
+) {
+    val palette = LocalPalette.current
+    Box(
+        modifier
+            .clip(RoundedCornerShape(12.dp))
+            .border(1.dp, palette.border.toComposeColor(), RoundedCornerShape(12.dp))
+            .background(palette.paper.toComposeColor()),
+    ) {
+        plot()
+        if (legend.isNotEmpty() || ramp != null || caption != null) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(8.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(palette.paper.toComposeColor().copy(alpha = 0.92f))
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+            ) {
+                if (legend.isNotEmpty()) PlotLegend(legend)
+                if (ramp != null) {
+                    Spacer(Modifier.height(3.dp))
+                    RampRow(ramp.first, ramp.second)
+                }
+                if (caption != null) {
+                    Text(
+                        caption,
+                        color = palette.textDim.toComposeColor(),
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
         }
-        if (status != null) {
-            Spacer(Modifier.height(4.dp))
-            Text(status, color = palette.danger.toComposeColor(), fontSize = 11.sp, maxLines = 2)
-        }
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(max = 210.dp)
-                .verticalScroll(rememberScrollState())
-                .padding(top = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            content = controls,
-        )
     }
 }
 
@@ -237,6 +325,72 @@ private fun RampRow(low: String, high: String) {
         )
         Text(high, color = palette.textDim.toComposeColor(), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
     }
+}
+
+@Composable
+private fun InsertAnimButton(inserting: Boolean, label: String, onClick: () -> Unit) {
+    val palette = LocalPalette.current
+    val busyLabel = stringResource(R.string.math_3d_computing)
+    Row(
+        Modifier
+            .height(34.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .border(1.dp, palette.accent.toComposeColor(), RoundedCornerShape(9.dp))
+            .clickable(enabled = !inserting, onClick = onClick)
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            if (inserting) busyLabel else label,
+            color = palette.accent.toComposeColor(),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
+    }
+}
+
+/** Tiles per-frame bitmaps into a labelled filmstrip, then wraps it with the standard legend strip. */
+internal fun buildAnimationPng(
+    frames: List<Pair<Bitmap, String>>,
+    title: String,
+    legend: List<ExportLegend>,
+    footnote: String,
+    theme: GraphTheme,
+    cols: Int = 4,
+    specJson: String? = null,
+): ByteArray? {
+    if (frames.isEmpty()) return null
+    val cellW = frames.maxOf { it.first.width }
+    val cellH = frames.maxOf { it.first.height }
+    val labelH = 30
+    val n = frames.size
+    val c = cols.coerceIn(1, 4).coerceAtMost(n)
+    val rows = (n + c - 1) / c
+    val strip = Bitmap.createBitmap(cellW * c, (cellH + labelH) * rows, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(strip)
+    canvas.drawColor(theme.paper)
+    val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = theme.dim; textSize = 24f; typeface = Typeface.MONOSPACE
+    }
+    frames.forEachIndexed { i, (bmp, tag) ->
+        val x = (i % c) * cellW
+        val y = (i / c) * (cellH + labelH)
+        canvas.drawBitmap(bmp, null, android.graphics.Rect(x, y, x + cellW, y + cellH), Paint(Paint.FILTER_BITMAP_FLAG))
+        canvas.drawText(tag, (x + 8).toFloat(), (y + cellH + 22).toFloat(), labelPaint)
+        if (bmp !== strip) bmp.recycle()
+    }
+    val png = writeGraphPng(strip, title, legend, footnote, theme)
+    if (specJson == null) return png
+    return if (png == null) null else com.xnotes.platform.MathAnimPng.embed(png, specJson)
+}
+
+internal fun animFrameTs(lo: Double, hi: Double, steps: Int, maxFrames: Int = 12): DoubleArray {
+    val s = steps.coerceIn(2, 400)
+    val k = minOf(s, maxFrames).coerceAtLeast(2)
+    val a = minOf(lo, hi); val b = maxOf(lo, hi)
+    return DoubleArray(k) { i -> a + (b - a) * i / (k - 1) }
 }
 
 @Composable
@@ -500,4 +654,348 @@ internal fun cappedSize(width: Int, height: Int, maxDim: Int): Pair<Int, Int> {
     if (width <= 1 || height <= 1) return 2 to 2
     val scale = min(1f, maxDim.toFloat() / max(width, height).toFloat())
     return max(2, (width * scale).toInt()) to max(2, (height * scale).toInt())
+}
+
+// ------------------------------------------------- per-entry colour + visibility
+
+/**
+ * The colour dot leading an equation row. Tapping it opens a small palette; Auto follows the
+ * series colour. [effective] is the colour the entry is drawn with right now.
+ */
+@Composable
+internal fun EntryColorDot(
+    colorArgb: Int?,
+    effective: Color,
+    description: String,
+    onPick: (Int?) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val palette = LocalPalette.current
+    Box(
+        Modifier
+            .size(24.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(effective)
+            .border(
+                1.dp,
+                (if (colorArgb != null) palette.text else palette.border).toComposeColor(),
+                androidx.compose.foundation.shape.CircleShape,
+            )
+            .clickable { open = true },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (colorArgb == null) {
+            Icon(
+                Icons.Outlined.Palette,
+                contentDescription = description,
+                tint = palette.paper.toComposeColor(),
+                modifier = Modifier.size(13.dp),
+            )
+        }
+    }
+    if (open) {
+        EntryColorDialog(
+            current = colorArgb,
+            onDismiss = { open = false },
+            onPick = { onPick(it); open = false },
+        )
+    }
+}
+
+@Composable
+private fun EntryColorDialog(current: Int?, onDismiss: () -> Unit, onPick: (Int?) -> Unit) {
+    val palette = LocalPalette.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {},
+        title = { Text(stringResource(R.string.math_pick_color), color = palette.text.toComposeColor(), fontSize = 15.sp) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(9.dp))
+                        .border(1.dp, palette.border.toComposeColor(), RoundedCornerShape(9.dp))
+                        .clickable { onPick(null) }
+                        .padding(horizontal = 10.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Box(
+                        Modifier
+                            .size(20.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(palette.textDim.toComposeColor()),
+                    )
+                    Text(
+                        stringResource(R.string.math_color_auto),
+                        color = palette.text.toComposeColor(),
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (current == null) Icon(Icons.Outlined.Check, contentDescription = null, tint = palette.accent.toComposeColor(), modifier = Modifier.size(16.dp))
+                }
+                for (row in ENTRY_COLOR_CHOICES.chunked(5)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        for (c in row) {
+                            Box(
+                                Modifier
+                                    .size(34.dp)
+                                    .clip(androidx.compose.foundation.shape.CircleShape)
+                                    .background(Color(c))
+                                    .border(
+                                        2.dp,
+                                        if (current == c) palette.text.toComposeColor() else Color.Transparent,
+                                        androidx.compose.foundation.shape.CircleShape,
+                                    )
+                                    .clickable { onPick(c) },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/** Eye toggle hiding an equation without deleting it. */
+@Composable
+internal fun EntryEye(visible: Boolean, description: String, onToggle: () -> Unit) {
+    val palette = LocalPalette.current
+    Box(
+        Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onToggle),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            if (visible) Icons.Outlined.Visibility else Icons.Outlined.VisibilityOff,
+            contentDescription = description,
+            tint = (if (visible) palette.textDim else palette.disabled).toComposeColor(),
+            modifier = Modifier.size(19.dp),
+        )
+    }
+}
+
+// ------------------------------------------------- numeric domain fields
+
+/**
+ * A number field bound to a Double in state. Commits live while the text parses, keeps the raw
+ * keystrokes while focused, and resyncs when the value moves underneath (pinch zoom, reset).
+ */
+@Composable
+internal fun DomainField(
+    value: Double,
+    onCommit: (Double) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    var str by remember { mutableStateOf(Numbers.tick(value)) }
+    var lastExt by remember { mutableStateOf(value) }
+    var focused by remember { mutableStateOf(false) }
+    if (value != lastExt && !focused) {
+        str = Numbers.tick(value)
+        lastExt = value
+    }
+    MathTextField(
+        value = str,
+        onValueChange = { next ->
+            str = next
+            next.toDoubleOrNull()?.takeIf { it.isFinite() }?.let { v ->
+                lastExt = v
+                onCommit(v)
+            }
+        },
+        label = label,
+        modifier = modifier.onFocusChanged {
+            focused = it.isFocused
+            if (!it.isFocused) {
+                str = Numbers.tick(value)
+                lastExt = value
+            }
+        },
+    )
+}
+
+// ------------------------------------------------- 3D view presets
+
+/** Rotation matrix (row-major, as produced by [com.xnotes.ui.Quat.matrix]) back to a quaternion. */
+internal fun quatFromMatrix(m: DoubleArray): Quat {
+    if (m.size < 9) return Quat.IDENTITY
+    val t = m[0] + m[4] + m[8]
+    return if (t > 0) {
+        val s = sqrt(t + 1.0) * 2
+        Quat(0.25 * s, (m[7] - m[5]) / s, (m[2] - m[6]) / s, (m[3] - m[1]) / s).normalized()
+    } else if (m[0] > m[4] && m[0] > m[8]) {
+        val s = sqrt(1.0 + m[0] - m[4] - m[8]) * 2
+        Quat((m[7] - m[5]) / s, 0.25 * s, (m[1] + m[3]) / s, (m[2] + m[6]) / s).normalized()
+    } else if (m[4] > m[8]) {
+        val s = sqrt(1.0 + m[4] - m[0] - m[8]) * 2
+        Quat((m[2] - m[6]) / s, (m[1] + m[3]) / s, 0.25 * s, (m[5] + m[7]) / s).normalized()
+    } else {
+        val s = sqrt(1.0 + m[8] - m[0] - m[4]) * 2
+        Quat((m[3] - m[1]) / s, (m[2] + m[6]) / s, (m[5] + m[7]) / s, 0.25 * s).normalized()
+    }
+}
+
+/** The default isometric tilt, shared by reset and the ISO preset. */
+internal fun isoQuat(): Quat =
+    Quat.axisAngle(1.0, 0.0, 0.0, -0.46).times(Quat.axisAngle(0.0, 0.0, 1.0, 0.72))
+
+/**
+ * Points the camera down an axis or back to isometric. Looking from +x/+y keeps z up;
+ * Z looks straight down with x right and y up.
+ */
+internal fun OrbitState.setView(view: GraphView) {
+    quat = when (view) {
+        GraphView.X -> quatFromMatrix(doubleArrayOf(0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0))
+        GraphView.Y -> quatFromMatrix(doubleArrayOf(-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0))
+        GraphView.Z -> Quat.IDENTITY
+        GraphView.ISO -> isoQuat()
+    }
+}
+
+/** Floating semi-transparent X / Y / Z / ISO buttons over a 3D plot. */
+@Composable
+internal fun BoxScope.ViewPresetButtons(orbit: OrbitState) {
+    val palette = LocalPalette.current
+    Row(
+        Modifier
+            .align(Alignment.BottomEnd)
+            .padding(10.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(palette.panel.toComposeColor().copy(alpha = 0.78f))
+            .padding(horizontal = 3.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(1.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        for (v in GraphView.entries) {
+            Text(
+                v.name,
+                color = palette.text.toComposeColor(),
+                fontSize = 11.sp,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(13.dp))
+                    .clickable { orbit.setView(v) }
+                    .padding(horizontal = 9.dp, vertical = 7.dp),
+            )
+        }
+    }
+}
+
+// ------------------------------------------------- 3D space frame: coloured axes + grid with values
+
+/** Axis colours: x red, y green, z blue — readable on light and dark paper. */
+internal const val AXIS_X_COLOR = 0xFFE06C75.toInt()
+internal const val AXIS_Y_COLOR = 0xFF63B26B.toInt()
+internal const val AXIS_Z_COLOR = 0xFF4E9BE6.toInt()
+
+/**
+ * Draws the domain box, the three coloured axes from its centre, and — when [showGrid] — a
+ * labelled grid on the three faces turned away from the camera, so intersections stay readable
+ * while orbiting. [proj] maps world points to pixels.
+ */
+internal fun drawQuatSpaceFrame(
+    canvas: android.graphics.Canvas,
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    quat: Quat,
+    cx: Double, cy: Double, cz: Double,
+    hx: Double, hy: Double, hz: Double,
+    w: Int, h: Int,
+    theme: GraphTheme,
+    showGrid: Boolean,
+) {
+    if (!(hx.isFinite() && hy.isFinite() && hz.isFinite()) || hx <= 0 || hy <= 0 || hz <= 0) return
+    val m = quat.matrix()
+    val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.8f; alpha = 150 }
+    val corners = ArrayList<Triple<Float, Float, Float>>(8)
+    for (sz in listOf(-1.0, 1.0)) for (sy in listOf(-1.0, 1.0)) for (sx in listOf(-1.0, 1.0)) {
+        corners += proj(cx + sx * hx, cy + sy * hy, cz + sz * hz)
+    }
+    for ((a, b) in listOf(0 to 1, 1 to 3, 3 to 2, 2 to 0, 4 to 5, 5 to 7, 7 to 6, 6 to 4, 0 to 4, 1 to 5, 2 to 6, 3 to 7)) {
+        canvas.drawLine(corners[a].first, corners[a].second, corners[b].first, corners[b].second, edge)
+    }
+    // Coloured axes from the box centre.
+    val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = (min(w, h) * 0.045f).coerceIn(16f, 34f)
+        typeface = Typeface.MONOSPACE
+    }
+    val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 2.6f; alpha = 220 }
+    val o = proj(cx, cy, cz)
+    val axes = listOf(
+        Triple(proj(cx + hx * 0.92, cy, cz), "x", AXIS_X_COLOR),
+        Triple(proj(cx, cy + hy * 0.92, cz), "y", AXIS_Y_COLOR),
+        Triple(proj(cx, cy, cz + hz * 0.92), "z", AXIS_Z_COLOR),
+    )
+    for ((end, name, col) in axes) {
+        axisPaint.color = col
+        canvas.drawLine(o.first, o.second, end.first, end.second, axisPaint)
+        labelPaint.color = col
+        canvas.drawText(name, end.first + 5f, end.second + 6f, labelPaint)
+    }
+    if (!showGrid) return
+    // The grid lives on the three back faces: the min or max face whose outward normal
+    // points away from the viewer (view-space depth shrinking along it).
+    val backX = if (m[6] > 0) cx - hx else cx + hx
+    val backY = if (m[7] > 0) cy - hy else cy + hy
+    val backZ = if (m[8] > 0) cz - hz else cz + hz
+    // (fixed value, first varying axis lo/hi, second varying axis lo/hi)
+    drawGridFace(canvas, proj, 0, backX, cy - hy, cy + hy, cz - hz, cz + hz, w, h, theme)
+    drawGridFace(canvas, proj, 1, backY, cx - hx, cx + hx, cz - hz, cz + hz, w, h, theme)
+    drawGridFace(canvas, proj, 2, backZ, cx - hx, cx + hx, cy - hy, cy + hy, w, h, theme)
+}
+
+/** One gridded back face: [fixed] is the frozen axis (0=x, 1=y, 2=z), the grid spans [u0,u1]×[v0,v1]. */
+private fun drawGridFace(
+    canvas: android.graphics.Canvas,
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    fixed: Int,
+    fixedValue: Double,
+    u0: Double, u1: Double,
+    v0: Double, v1: Double,
+    w: Int, h: Int,
+    theme: GraphTheme,
+) {
+    val uSpan = abs(u1 - u0); val vSpan = abs(v1 - v0)
+    if (!uSpan.isFinite() || !vSpan.isFinite() || uSpan <= 0 || vSpan <= 0) return
+    fun point(u: Double, v: Double): Triple<Double, Double, Double> = when (fixed) {
+        0 -> Triple(fixedValue, u, v)
+        1 -> Triple(u, fixedValue, v)
+        else -> Triple(u, v, fixedValue)
+    }
+    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.2f; alpha = 120 }
+    val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = theme.dim
+        textSize = (min(w, h) * 0.032f).coerceIn(13f, 26f)
+        typeface = Typeface.MONOSPACE
+    }
+    fun draw(u: Double, v: Double): Triple<Float, Float, Float> {
+        val (x, y, z) = point(u, v)
+        return proj(x, y, z)
+    }
+    val uStep = niceStep(uSpan, 5)
+    val vStep = niceStep(vSpan, 5)
+    // Lines of constant u span v; lines of constant v span u. Each line is labelled
+    // with its tick value at whichever end is nearer the viewer, so numbers stay readable.
+    var u = kotlin.math.floor(u0 / uStep) * uStep
+    var guard = 0
+    while (u <= u1 && guard++ < 14) {
+        val a = draw(u, v0); val b = draw(u, v1)
+        canvas.drawLine(a.first, a.second, b.first, b.second, gridPaint)
+        val at = if (a.third >= b.third) a else b
+        canvas.drawText(Numbers.tick(u), at.first + 3f, at.second - 3f, textPaint)
+        u += uStep
+    }
+    var v = kotlin.math.floor(v0 / vStep) * vStep
+    guard = 0
+    while (v <= v1 && guard++ < 14) {
+        val a = draw(u0, v); val b = draw(u1, v)
+        canvas.drawLine(a.first, a.second, b.first, b.second, gridPaint)
+        val at = if (a.third >= b.third) a else b
+        canvas.drawText(Numbers.tick(v), at.first + 3f, at.second - 3f, textPaint)
+        v += vStep
+    }
 }

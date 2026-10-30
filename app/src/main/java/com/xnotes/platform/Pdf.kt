@@ -443,6 +443,12 @@ object PdfExporter {
             }
             renderer.endMark()
         }
+        // Appended linked pages carry their link's color as a frame (see LinkExport).
+        if (page.linkBorder != null) {
+            renderer.beginMark(Mark.Decoration)
+            com.xnotes.core.links.LinkBorder.paint(page, renderer)
+            renderer.endMark()
+        }
         renderer.endPage()
     }
 

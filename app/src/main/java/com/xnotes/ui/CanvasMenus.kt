@@ -57,6 +57,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.PopupProperties
@@ -81,6 +82,14 @@ import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import kotlin.math.roundToInt
+
+/** Where a selected expression goes when sent to Math Studio. */
+enum class MathStudioDestination(val tab: String) {
+    SYMBOLIC("SYMBOLIC"),
+    SOLVER("SOLVER"),
+    PLOT_2D("GRAPH_2D"),
+    PLOT_3D("GRAPH_3D"),
+}
 
 /**
  * What the selection menu needs from whichever editor is open.
@@ -156,11 +165,17 @@ interface SelectionMenuHost : SwatchHost {
     /** Recognize the selected handwriting and replace it with a text box (async). */
     fun convertSelectionToText()
 
-    /** True when the handwritten-maths add-on is downloaded (shows Convert to math). */
+    /** True when the selection holds handwriting (shows Convert to math, handled on-device). */
     val canConvertToMath: Boolean
 
     /** Recognize the selected handwriting as a formula and replace it with a formula box (async). */
     fun convertSelectionToMath()
+
+    /** True when the selection holds something sendable to Math Studio (math, text, ink). */
+    val canSendSelectionToMath: Boolean
+
+    /** Extract the selection's expression (OCR for ink) and open Math Studio at [destination] with it. */
+    fun sendSelectionToMathStudio(destination: MathStudioDestination)
 
     /** The colour and width of every selected stroke/shape, for the restyle popup to open on. */
     fun selectionStyles(): List<DrawStyle>
@@ -259,6 +274,7 @@ fun SelectionMenu(
     var linkDialogOpen by remember { mutableStateOf(false) }
     var functionDialogOpen by remember { mutableStateOf(false) }
     var mathDialogOpen by remember { mutableStateOf(false) }
+    var mathSendOpen by remember { mutableStateOf(false) }
     var renamingAudio by remember { mutableStateOf<com.xnotes.core.model.AudioItem?>(null) }
 
     val audio = host.selectedAudio()
@@ -376,6 +392,12 @@ fun SelectionMenu(
                             )
                         }
                     }
+                    if (host.canSendSelectionToMath) {
+                        DropdownMenuItem(
+                            text = { Text("Send to Math Studio") },
+                            onClick = { overflowOpen = false; mathSendOpen = true },
+                        )
+                    }
                     if (host.selectionCanLink) {
                         DropdownMenuItem(
                             text = { Text(if (host.selectionLink != null) "Edit link" else "Add link") },
@@ -460,6 +482,12 @@ fun SelectionMenu(
                         onDismiss = { linkDialogOpen = false },
                     )
                 }
+                if (mathSendOpen) {
+                    MathSendDialog(
+                        onPick = { mathSendOpen = false; host.sendSelectionToMathStudio(it) },
+                        onDismiss = { mathSendOpen = false },
+                    )
+                }
                 renamingAudio?.let { item ->
                     AudioNameDialog(item.name, onConfirm = { renamingAudio = null; host.renameSelectedAudio(it) }) { renamingAudio = null }
                 }
@@ -475,6 +503,46 @@ private val ARRANGE_ROWS = listOf(
     com.xnotes.core.model.Arrange.BACKWARD to R.string.send_backward,
     com.xnotes.core.model.Arrange.BACK to R.string.send_to_back,
 )
+
+/** Pick where a selection's expression goes: symbolic calculus or one of the plotters. */
+@Composable
+internal fun MathSendDialog(onPick: (MathStudioDestination) -> Unit, onDismiss: () -> Unit) {
+    val palette = LocalPalette.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Send to Math Studio") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "Open the selection in:",
+                    color = palette.textDim.toComposeColor(),
+                    fontSize = 13.sp,
+                )
+                MathSendRow("Symbolic calculus", "Differentiate, integrate, simplify", { onPick(MathStudioDestination.SYMBOLIC) })
+                MathSendRow("Advanced solver", "Full keyboard, numeric + symbolic", { onPick(MathStudioDestination.SOLVER) })
+                MathSendRow("Plot 2D", "Graph it as y = f(x)", { onPick(MathStudioDestination.PLOT_2D) })
+                MathSendRow("Plot 3D", "Graph it as z = f(x, y)", { onPick(MathStudioDestination.PLOT_3D) })
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
+    )
+}
+
+@Composable
+private fun MathSendRow(title: String, subtitle: String, onClick: () -> Unit) {
+    val palette = LocalPalette.current
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 8.dp),
+    ) {
+        Text(title, color = palette.text.toComposeColor(), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text(subtitle, color = palette.textDim.toComposeColor(), fontSize = 12.sp)
+    }
+}
 
 /** Rename a recording: its name, ready to type over. */
 @Composable
@@ -636,7 +704,7 @@ private fun LatexDialog(initial: String, onConfirm: (String) -> Unit, onDismiss:
                     MathKeys(
                         MathKeyActions(
                             onKey = { value = insertLatex(value, it) },
-                            onAbc = {
+                            onClear = {
                                 mathKeys = false
                                 // The field restarts its input with the interceptor out of the way.
                                 scope.launch {
@@ -1024,6 +1092,7 @@ fun LongPressMenu(
     host: LongPressMenuHost,
     onInsertImageAt: (com.xnotes.core.geometry.Pt) -> Unit,
     onTakePhotoAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
+    onInsertNoteLinkAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
 ) {
     val target = host.contextMenu ?: return
     val density = LocalDensity.current
@@ -1054,6 +1123,9 @@ fun LongPressMenu(
             })
             DropdownMenuItem(text = { Text(stringResource(R.string.take_photo)) }, onClick = {
                 onTakePhotoAt(target.content); host.dismissContextMenu()
+            })
+            DropdownMenuItem(text = { Text(stringResource(R.string.insert_note_link)) }, onClick = {
+                onInsertNoteLinkAt(target.content); host.dismissContextMenu()
             })
         }
     }

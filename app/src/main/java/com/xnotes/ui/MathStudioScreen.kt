@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,6 +36,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Functions
 import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.material.icons.outlined.ScatterPlot
+import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.Straighten
 import androidx.compose.material.icons.outlined.Summarize
 import androidx.compose.material.icons.outlined.ViewInAr
@@ -46,6 +46,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -53,6 +55,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -78,12 +81,16 @@ import com.xnotes.math.ExpressionParser
 import com.xnotes.math.MathCatalog
 import com.xnotes.math.Numbers
 import com.xnotes.ui.icons.XnotesIcons
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 
 /** The tabs of the maths workspace. */
 internal enum class MathTab(val labelRes: Int, val icon: ImageVector) {
     CALCULATOR(R.string.math_tab_calculator, Icons.Outlined.Calculate),
+    SOLVER(R.string.math_tab_solver, Icons.Outlined.Science),
     GRAPH_2D(R.string.math_tab_graph2d, Icons.AutoMirrored.Outlined.ShowChart),
     GRAPH_3D(R.string.math_tab_graph3d, Icons.Outlined.ViewInAr),
     FIELDS(R.string.math_tab_fields, Icons.Outlined.ScatterPlot),
@@ -105,13 +112,22 @@ internal class CalculatorState {
     var ans by mutableStateOf(Complex.ZERO)
     val history = mutableStateListOf<CalcHistory>()
     val variables = mutableStateMapOf<String, Complex>()
+    /** True right after `=` put the answer in the visor: operators keep chaining on it,
+     *  anything else starts a fresh entry. */
+    var justEvaluated by mutableStateOf(false)
 
     fun insert(text: String) {
+        if (justEvaluated && CONTINUE_AFTER_EQUALS.none { text.startsWith(it) }) {
+            input = TextFieldValue(text, TextRange(text.length))
+            justEvaluated = false
+            return
+        }
         val value = input
         val start = value.selection.start.coerceIn(0, value.text.length)
         val end = value.selection.end.coerceIn(start, value.text.length)
         val next = value.text.replaceRange(start, end, text)
         input = TextFieldValue(next, TextRange(start + text.length))
+        justEvaluated = false
     }
 
     fun backspace() {
@@ -123,18 +139,21 @@ internal class CalculatorState {
             start == 0 -> value
             else -> TextFieldValue(value.text.removeRange(start - 1, start), TextRange(start - 1))
         }
+        justEvaluated = false
     }
 
     fun clear() {
         input = TextFieldValue("")
         result = ""
         error = null
+        justEvaluated = false
     }
 
     fun evaluate() {
         val text = input.text.trim()
         if (text.isEmpty()) return
         error = null
+        justEvaluated = false
         try {
             val assignment = ASSIGNMENT.matchEntire(text)
             if (assignment != null) {
@@ -152,6 +171,9 @@ internal class CalculatorState {
                 result = Numbers.formatComplex(value)
                 addHistory(text, result)
             }
+            // The answer goes back into the visor, like a pocket calculator.
+            input = TextFieldValue(result, TextRange(result.length))
+            justEvaluated = true
         } catch (t: Throwable) {
             result = ""
             error = t.message ?: t.javaClass.simpleName
@@ -175,8 +197,15 @@ internal class CalculatorState {
 
     private companion object {
         val ASSIGNMENT = Regex("^([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.+)$")
+        /** Keypad entries that keep chaining on a just-computed answer instead of starting over. */
+        val CONTINUE_AFTER_EQUALS = setOf("+", "-", "*", "/", "^", "%", ")")
     }
 }
+
+/**
+ * A canvas selection's expression, opened in Math Studio at [tab] (a [MathTab] name).
+ */
+data class MathStudioRequest(val tab: String, val expression: String)
 
 /**
  * The full-screen maths workspace opened from a note or a canvas: calculator, 2D and 3D plots,
@@ -185,13 +214,21 @@ internal class CalculatorState {
  * instrument rather than eight unrelated screens.
  */
 @Composable
-internal fun MathStudioScreen(onClose: () -> Unit, onInsertGraph: (ByteArray) -> Unit) {
+internal fun MathStudioScreen(
+    onClose: () -> Unit,
+    onInsertGraph: (ByteArray) -> Unit,
+    onInsertMath: (String) -> Unit,
+    initialAnim: MathAnimSpec? = null,
+    initialRequest: MathStudioRequest? = null,
+    initialData: String? = null,
+    onPersist: ((String) -> Unit)? = null,
+) {
     val palette = LocalPalette.current
-    BackHandler(onBack = onClose)
 
     var tabName by rememberSaveable { mutableStateOf(MathTab.CALCULATOR.name) }
     val tab = MathTab.entries.firstOrNull { it.name == tabName } ?: MathTab.CALCULATOR
     val calculator = remember { CalculatorState() }
+    val solver = remember { SolverState() }
     val plot2d = remember { Plot2DState() }
     val plot3d = remember { Plot3DState() }
     val fields = remember { FieldState() }
@@ -199,13 +236,88 @@ internal fun MathStudioScreen(onClose: () -> Unit, onInsertGraph: (ByteArray) ->
     val symbolic = remember { SymbolicState() }
     val units = remember { UnitState() }
 
+    fun snapshotNow(): String = MathStudioData.capture(
+        tabName, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units,
+    )
+
+    // Every exit path funnels through here so the note's workspace is stored before it closes.
+    fun doClose() {
+        onPersist?.let { runCatching { it(snapshotNow()) } }
+        onClose()
+    }
+    BackHandler(onBack = ::doClose)
+
+    // Whatever removes the studio (close button, back, tab closed underneath) stores it first.
+    DisposableEffect(Unit) {
+        onDispose { onPersist?.let { runCatching { it(snapshotNow()) } } }
+    }
+
+    // A debounced live copy, so killing the app with the studio open still keeps the workspace.
+    LaunchedEffect(onPersist) {
+        if (onPersist == null) return@LaunchedEffect
+        snapshotFlow { snapshotNow() }
+            .distinctUntilChanged()
+            .drop(1)
+            .debounce(2000)
+            .collect { onPersist(it) }
+    }
+
+    // This note's stored workspace, restored once; a play badge or a sent selection then
+    // overrides only the panes it owns.
+    var appliedData by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(initialData) {
+        if (initialData != null && initialData != appliedData) {
+            appliedData = initialData
+            val tab = MathStudioData.restore(
+                initialData, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units,
+            )
+            if (tab != null) tabName = tab
+        }
+    }
+
+    // A tapped animation frame reopens Studio with its setup restored and playing.
+    var appliedAnim by remember { mutableStateOf<MathAnimSpec?>(null) }
+    LaunchedEffect(initialAnim) {
+        if (initialAnim != null && initialAnim != appliedAnim) {
+            appliedAnim = initialAnim
+            tabName = initialAnim.applyTo(plot2d, plot3d, fields)
+        }
+    }
+
+    // A canvas selection's expression, placed into symbolic calculus or a plotter on open.
+    var appliedRequest by remember { mutableStateOf<MathStudioRequest?>(null) }
+    LaunchedEffect(initialRequest) {
+        if (initialRequest != null && initialRequest != appliedRequest) {
+            appliedRequest = initialRequest
+            applyMathStudioRequest(initialRequest, plot2d, plot3d, symbolic, solver)
+            tabName = initialRequest.tab
+        }
+    }
+
+    // Tapping Reference in the calculator inserts the picked constant/function at the cursor
+    // instead of replacing the expression; any other entry into the catalog replaces as before.
+    var catalogInsert by rememberSaveable { mutableStateOf(false) }
+
     fun useInCalculator(text: String) {
-        calculator.input = TextFieldValue(text, TextRange(text.length))
+        if (catalogInsert) calculator.insert(text)
+        else {
+            calculator.input = TextFieldValue(text, TextRange(text.length))
+            calculator.justEvaluated = false
+        }
+        catalogInsert = false
         tabName = MathTab.CALCULATOR.name
     }
 
+    // The current real-valued answer, if any, seeds the unit converter.
+    val unitSeed = calculator.result
+        .takeIf { it.isNotEmpty() && calculator.error == null }
+        ?.let {
+            if (calculator.ans.im == 0.0 && calculator.ans.re.isFinite()) Numbers.format(calculator.ans.re)
+            else null
+        }
+
     Column(Modifier.fillMaxSize().background(palette.bg.toComposeColor())) {
-        MathStudioBar(onClose = onClose)
+        MathStudioBar(onClose = ::doClose)
         Row(
             Modifier
                 .fillMaxWidth()
@@ -221,14 +333,87 @@ internal fun MathStudioScreen(onClose: () -> Unit, onInsertGraph: (ByteArray) ->
         }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (tab) {
-                MathTab.CALCULATOR -> CalculatorPane(calculator)
+                MathTab.CALCULATOR -> CalculatorPane(
+                    calculator,
+                    onSendToUnits = { unitSeed?.let { units.value = it; tabName = MathTab.UNITS.name } },
+                    sendToUnitsEnabled = unitSeed != null,
+                    onOpenReference = { catalogInsert = true; tabName = MathTab.CATALOG.name },
+                )
+                MathTab.SOLVER -> SolverPane(solver, onInsertMath)
                 MathTab.GRAPH_2D -> Plot2DPane(plot2d, onInsertGraph)
                 MathTab.GRAPH_3D -> Plot3DPane(plot3d, onInsertGraph)
                 MathTab.FIELDS -> FieldPane(fields, onInsertGraph)
                 MathTab.CALCULUS -> CalculusPane(calculus)
                 MathTab.SYMBOLIC -> SymbolicPane(symbolic)
-                MathTab.UNITS -> UnitPane(units)
+                MathTab.UNITS -> UnitPane(units, onTakeResult = { v ->
+                    val text = Numbers.format(v)
+                    calculator.input = TextFieldValue(text, TextRange(text.length))
+                    calculator.evaluate()
+                    tabName = MathTab.CALCULATOR.name
+                })
                 MathTab.CATALOG -> CatalogPane(::useInCalculator)
+            }
+        }
+    }
+}
+
+/** Heads like `y =`, `z =` or `f(x) =` stripped when an expression lands in a plotter. */
+private val PLOT_HEAD_Y = Regex("^\\s*(?:y|f\\s*\\([^)]*\\))\\s*=(.+)$", RegexOption.DOT_MATCHES_ALL)
+private val PLOT_HEAD_Z = Regex("^\\s*(?:z|f\\s*\\([^)]*\\))\\s*=(.+)$", RegexOption.DOT_MATCHES_ALL)
+private val PLOT_HEAD_R = Regex("^\\s*r\\s*=(.+)$", RegexOption.DOT_MATCHES_ALL)
+
+/**
+ * Places a canvas selection's expression into symbolic calculus or one of the graphic
+ * calculators. Equations keep their meaning: `y = …`/`f(x) = …` plot the right-hand side,
+ * while `x`/`y` equations with no named head land in the implicit plotter.
+ */
+private fun applyMathStudioRequest(req: MathStudioRequest, plot2d: Plot2DState, plot3d: Plot3DState, symbolic: SymbolicState, solver: SolverState) {
+    val expr = req.expression.trim()
+    if (expr.isEmpty()) return
+    when (req.tab) {
+        MathTab.SOLVER.name -> {
+            solver.input = TextFieldValue(expr, TextRange(expr.length))
+            solver.title = ""
+            solver.result = ""
+            solver.detail = null
+            solver.latex = null
+            solver.insertLatex = ""
+            solver.error = null
+            solver.odePoints = emptyList()
+        }
+        MathTab.SYMBOLIC.name -> {
+            symbolic.expression = expr
+            symbolic.title = ""
+            symbolic.result = ""
+            symbolic.detail = null
+            symbolic.latex = null
+            symbolic.error = null
+        }
+        MathTab.GRAPH_2D.name -> {
+            val polar = PLOT_HEAD_R.matchEntire(expr)
+            val head = polar ?: PLOT_HEAD_Y.matchEntire(expr)
+            if (head != null) {
+                plot2d.mode = if (polar != null) Plot2DMode.POLAR else Plot2DMode.CARTESIAN
+                plot2d.setExpression(0, head.groupValues[1].trim().ifEmpty { expr })
+            } else if ('=' in expr && ('x' in expr || 'y' in expr)) {
+                plot2d.mode = Plot2DMode.IMPLICIT
+                plot2d.implicitList = listOf(MathEntry(expr))
+            } else {
+                plot2d.mode = Plot2DMode.CARTESIAN
+                plot2d.setExpression(0, expr)
+            }
+        }
+        MathTab.GRAPH_3D.name -> {
+            val head = PLOT_HEAD_Z.matchEntire(expr)
+            if (head != null) {
+                plot3d.mode = SurfaceMode.CARTESIAN
+                plot3d.cartesianList = listOf(MathEntry(head.groupValues[1].trim().ifEmpty { expr }))
+            } else if ('=' in expr && ('x' in expr || 'y' in expr || 'z' in expr)) {
+                plot3d.mode = SurfaceMode.IMPLICIT
+                plot3d.implicitList = listOf(MathEntry(expr))
+            } else {
+                plot3d.mode = SurfaceMode.CARTESIAN
+                plot3d.cartesianList = listOf(MathEntry(expr))
             }
         }
     }
@@ -312,22 +497,33 @@ private fun MathTabChip(tab: MathTab, selected: Boolean, onClick: () -> Unit) {
 // ---------------------------------------------------------------------------------- calculator
 
 @Composable
-private fun CalculatorPane(state: CalculatorState) {
+private fun CalculatorPane(
+    state: CalculatorState,
+    onSendToUnits: () -> Unit,
+    sendToUnitsEnabled: Boolean,
+    onOpenReference: () -> Unit,
+) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 760.dp
         if (wide) {
             Row(Modifier.fillMaxSize().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                CalculatorBody(state, Modifier.weight(1f))
+                CalculatorBody(state, Modifier.weight(1f), onSendToUnits, sendToUnitsEnabled, onOpenReference)
                 HistoryPanel(state, Modifier.width(290.dp).fillMaxHeight())
             }
         } else {
-            CalculatorBody(state, Modifier.fillMaxSize().padding(8.dp))
+            CalculatorBody(state, Modifier.fillMaxSize().padding(8.dp), onSendToUnits, sendToUnitsEnabled, onOpenReference)
         }
     }
 }
 
 @Composable
-private fun CalculatorBody(state: CalculatorState, modifier: Modifier = Modifier) {
+private fun CalculatorBody(
+    state: CalculatorState,
+    modifier: Modifier = Modifier,
+    onSendToUnits: () -> Unit = {},
+    sendToUnitsEnabled: Boolean = false,
+    onOpenReference: () -> Unit = {},
+) {
     val palette = LocalPalette.current
     val focus = LocalFocusManager.current
     Column(modifier.verticalScroll(rememberScrollState())) {
@@ -355,7 +551,7 @@ private fun CalculatorBody(state: CalculatorState, modifier: Modifier = Modifier
             Spacer(Modifier.height(6.dp))
             OutlinedTextField(
                 value = state.input,
-                onValueChange = { state.input = it; state.error = null },
+                onValueChange = { state.input = it; state.error = null; state.justEvaluated = false },
                 modifier = Modifier.fillMaxWidth(),
                 textStyle = TextStyle(
                     color = palette.text.toComposeColor(),
@@ -364,14 +560,6 @@ private fun CalculatorBody(state: CalculatorState, modifier: Modifier = Modifier
                 ),
                 minLines = 2,
                 maxLines = 4,
-                placeholder = {
-                    Text(
-                        "sin(x)^2 + cos(x)^2",
-                        color = palette.textDim.toComposeColor(),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 16.sp,
-                    )
-                },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { focus.clearFocus(); state.evaluate() }),
                 colors = mathFieldColors(),
@@ -386,6 +574,20 @@ private fun CalculatorBody(state: CalculatorState, modifier: Modifier = Modifier
                 AngleChip(state)
                 MathSecondaryButton(stringResource(R.string.math_clear)) { state.clear() }
             }
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                MathSecondaryButton(
+                    stringResource(R.string.math_send_to_units),
+                    Modifier.weight(1f),
+                    enabled = sendToUnitsEnabled,
+                    onClick = onSendToUnits,
+                )
+                MathSecondaryButton(
+                    stringResource(R.string.math_open_reference),
+                    Modifier.weight(1f),
+                    onClick = onOpenReference,
+                )
+            }
             if (state.error != null) {
                 Spacer(Modifier.height(7.dp))
                 Text(
@@ -394,99 +596,10 @@ private fun CalculatorBody(state: CalculatorState, modifier: Modifier = Modifier
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
                 )
-            } else if (state.result.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(9.dp))
-                        .background(palette.surface.toComposeColor())
-                        .padding(horizontal = 10.dp, vertical = 9.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "=",
-                        color = palette.accent.toComposeColor(),
-                        fontSize = 18.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        state.result,
-                        color = palette.text.toComposeColor(),
-                        fontSize = 21.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            if (state.history.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        stringResource(R.string.math_history).uppercase(),
-                        color = palette.textDim.toComposeColor(),
-                        fontSize = 9.sp,
-                        letterSpacing = 1.1.sp,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        stringResource(R.string.math_clear_history),
-                        color = palette.accent.toComposeColor(),
-                        fontSize = 10.sp,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable { state.history.clear() }
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(state.history.take(20)) { item ->
-                        Column(
-                            Modifier
-                                .widthIn(max = 220.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(palette.surface.toComposeColor())
-                                .border(1.dp, palette.border.toComposeColor(), RoundedCornerShape(8.dp))
-                                .clickable {
-                                    state.input = TextFieldValue(item.expression, TextRange(item.expression.length))
-                                }
-                                .padding(horizontal = 8.dp, vertical = 5.dp),
-                        ) {
-                            Text(
-                                item.expression,
-                                color = palette.textDim.toComposeColor(),
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                "= ${item.result}",
-                                color = palette.text.toComposeColor(),
-                                fontSize = 12.sp,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
-                }
             }
         }
         Spacer(Modifier.height(8.dp))
         CalculatorKeypad(state)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            stringResource(R.string.math_calculator_hint),
-            color = palette.textDim.toComposeColor(),
-            fontSize = 10.sp,
-            lineHeight = 14.sp,
-        )
     }
 }
 
@@ -549,6 +662,7 @@ private fun HistoryPanel(state: CalculatorState, modifier: Modifier = Modifier) 
                             .background(palette.surface.toComposeColor())
                             .clickable {
                                 state.input = TextFieldValue(item.expression, TextRange(item.expression.length))
+                                state.justEvaluated = false
                             }
                             .padding(horizontal = 8.dp, vertical = 6.dp),
                     ) {
@@ -581,7 +695,7 @@ private enum class KeyAction { INSERT, CLEAR, BACKSPACE, EVALUATE }
 
 private data class CalcKey(
     val label: String,
-    val insert: String = "",
+    val insert: String = label,
     val kind: KeyKind = KeyKind.NUMBER,
     val action: KeyAction = KeyAction.INSERT,
     val weight: Float = 1f,
@@ -609,41 +723,45 @@ private val CALC_ROWS: List<List<CalcKey>> = listOf(
         CalcKey("i", "i", KeyKind.FUNCTION),
     ),
     listOf(
-        CalcKey("7"), CalcKey("8"), CalcKey("9"), CalcKey("÷", "/", KeyKind.OPERATOR),
+        CalcKey("7", "7"), CalcKey("8", "8"), CalcKey("9", "9"), CalcKey("÷", "/", KeyKind.OPERATOR),
         CalcKey("C", kind = KeyKind.ACTION, action = KeyAction.CLEAR),
     ),
     listOf(
-        CalcKey("4"), CalcKey("5"), CalcKey("6"), CalcKey("×", "*", KeyKind.OPERATOR),
+        CalcKey("4", "4"), CalcKey("5", "5"), CalcKey("6", "6"), CalcKey("×", "*", KeyKind.OPERATOR),
         CalcKey("⌫", kind = KeyKind.ACTION, action = KeyAction.BACKSPACE),
     ),
     listOf(
-        CalcKey("1"), CalcKey("2"), CalcKey("3"), CalcKey("−", "-", KeyKind.OPERATOR),
+        CalcKey("1", "1"), CalcKey("2", "2"), CalcKey("3", "3"), CalcKey("−", "-", KeyKind.OPERATOR),
         CalcKey("Ans", "ans", KeyKind.FUNCTION),
     ),
     listOf(
-        CalcKey("0"), CalcKey(".", "."), CalcKey("+", "+", KeyKind.OPERATOR),
+        CalcKey("0", "0"), CalcKey(".", "."), CalcKey("+", "+", KeyKind.OPERATOR),
         CalcKey("=", kind = KeyKind.ACTION, action = KeyAction.EVALUATE, weight = 2f),
     ),
 )
 
 @Composable
 private fun CalculatorKeypad(state: CalculatorState) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        for (row in CALC_ROWS) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                for (key in row) {
-                    CalcKeyButton(key, Modifier.weight(key.weight)) {
-                        when (key.action) {
-                            KeyAction.INSERT -> state.insert(key.insert)
-                            KeyAction.CLEAR -> state.clear()
-                            KeyAction.BACKSPACE -> state.backspace()
-                            KeyAction.EVALUATE -> state.evaluate()
+    MathCard(Modifier.fillMaxWidth()) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            for ((rowIndex, row) in CALC_ROWS.withIndex()) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    for (key in row) {
+                        CalcKeyButton(key, Modifier.weight(key.weight)) {
+                            when (key.action) {
+                                KeyAction.INSERT -> state.insert(key.insert.ifEmpty { key.label })
+                                KeyAction.CLEAR -> state.clear()
+                                KeyAction.BACKSPACE -> state.backspace()
+                                KeyAction.EVALUATE -> state.evaluate()
+                            }
                         }
                     }
                 }
+                // Extra breathing room between the scientific block and the digit block.
+                if (rowIndex == 3) Spacer(Modifier.height(2.dp))
             }
         }
     }
@@ -652,32 +770,49 @@ private fun CalculatorKeypad(state: CalculatorState) {
 @Composable
 private fun CalcKeyButton(key: CalcKey, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val palette = LocalPalette.current
-    val bg = when (key.kind) {
-        KeyKind.NUMBER -> palette.surface.toComposeColor()
-        KeyKind.FUNCTION -> palette.panel.toComposeColor()
-        KeyKind.OPERATOR -> palette.surfaceHi.toComposeColor()
-        KeyKind.ACTION -> palette.accent.toComposeColor()
+    val isEquals = key.action == KeyAction.EVALUATE
+    val isDanger = key.label == "C"
+    val isUtil = key.label == "⌫"
+    val bg = when {
+        isEquals -> palette.accent.toComposeColor()
+        isDanger -> palette.danger.toComposeColor().copy(alpha = 0.14f)
+        key.kind == KeyKind.NUMBER -> palette.surface.toComposeColor()
+        key.kind == KeyKind.OPERATOR -> palette.accent.toComposeColor().copy(alpha = 0.14f)
+        else -> palette.panel.toComposeColor()
     }
-    val fg = when (key.kind) {
-        KeyKind.ACTION -> palette.onAccent.toComposeColor()
-        KeyKind.OPERATOR -> palette.accent.toComposeColor()
+    val border = when {
+        isEquals -> palette.accent.toComposeColor()
+        isDanger -> palette.danger.toComposeColor()
+        key.kind == KeyKind.OPERATOR -> palette.accent.toComposeColor().copy(alpha = 0.55f)
+        else -> palette.border.toComposeColor()
+    }
+    val fg = when {
+        isEquals -> palette.onAccent.toComposeColor()
+        isDanger -> palette.danger.toComposeColor()
+        isUtil -> palette.text.toComposeColor()
+        key.kind == KeyKind.OPERATOR -> palette.accent.toComposeColor()
         else -> palette.text.toComposeColor()
     }
+    val tall = key.kind == KeyKind.NUMBER || isEquals || isDanger || isUtil
     Box(
         modifier
-            .height(43.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .height(if (tall) 52.dp else 44.dp)
+            .clip(RoundedCornerShape(10.dp))
             .background(bg)
-            .border(1.dp, palette.border.toComposeColor(), RoundedCornerShape(8.dp))
+            .border(1.dp, border, RoundedCornerShape(10.dp))
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             key.label,
             color = fg,
-            fontSize = if (key.label.length > 2) 13.sp else 15.sp,
+            fontSize = when {
+                key.label.length > 3 -> 12.sp
+                key.kind == KeyKind.NUMBER -> 19.sp
+                else -> 15.sp
+            },
             fontFamily = FontFamily.Monospace,
-            fontWeight = if (key.kind == KeyKind.ACTION) FontWeight.Bold else FontWeight.Medium,
+            fontWeight = if (key.kind == KeyKind.NUMBER || isEquals) FontWeight.Bold else FontWeight.Medium,
             maxLines = 1,
         )
     }

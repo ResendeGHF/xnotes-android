@@ -77,6 +77,31 @@ internal val MATH_FUNCTION_KEYS = listOf(
     ).map { k(it) },
 ).flatten()
 
+/** Letters, Greek and differential operators: the ABC screen of the keyboard. */
+internal val LETTER_KEYS: List<MathKey> = buildList {
+    for (c in 'A'..'Z') add(k(c.toString()))
+    for (c in 'a'..'z') add(k(c.toString()))
+    for (g in listOf(
+        "alpha" to "α", "beta" to "β", "gamma" to "γ", "delta" to "δ",
+        "epsilon" to "ε", "zeta" to "ζ", "eta" to "η", "theta" to "θ",
+        "iota" to "ι", "kappa" to "κ", "lambda" to "λ", "mu" to "μ",
+        "nu" to "ν", "xi" to "ξ", "omicron" to "ο", "pi" to "π",
+        "rho" to "ρ", "sigma" to "σ", "varsigma" to "ς", "tau" to "τ",
+        "upsilon" to "υ", "phi" to "φ", "chi" to "χ", "psi" to "ψ",
+        "omega" to "ω",
+    )) add(MathKey("\\" + g.first, "\\" + g.first + " "))
+    for (g in listOf(
+        "Alpha" to "Α", "Beta" to "Β", "Gamma" to "Γ", "Delta" to "Δ",
+        "Epsilon" to "Ε", "Zeta" to "Ζ", "Eta" to "Η", "Theta" to "Θ",
+        "Iota" to "Ι", "Kappa" to "Κ", "Lambda" to "Λ", "Mu" to "Μ",
+        "Nu" to "Ν", "Xi" to "Ξ", "Omicron" to "Ο", "Pi" to "Π",
+        "Rho" to "Ρ", "Sigma" to "Σ", "Tau" to "Τ", "Upsilon" to "Υ",
+        "Phi" to "Φ", "Chi" to "Χ", "Psi" to "Ψ", "Omega" to "Ω",
+    )) add(MathKey("\\" + g.first, "\\" + g.first + " "))
+    add(MathKey("\\partial", "\\partial "))
+    add(MathKey("\\nabla", "\\nabla "))
+}
+
 /**
  * What a key puts in after [before], wrapping [selected] at the template's `#`, and where the cursor
  * lands within it. A letter right after a command would run into its name (\pi then e must not
@@ -198,7 +223,7 @@ private fun NumberGrid(onKey: (MathKey) -> Unit, modifier: Modifier = Modifier) 
 /** What the maths keyboard's keys do to whatever it types into. */
 internal class MathKeyActions(
     val onKey: (String) -> Unit,
-    val onAbc: () -> Unit,
+    val onClear: () -> Unit,
     val onMove: (Int) -> Unit,
     val onDelete: () -> Unit,
     val onEnter: () -> Unit,
@@ -207,12 +232,14 @@ internal class MathKeyActions(
 /**
  * The maths keyboard: on a wide screen the number block beside the function pages with bigger keys;
  * on a phone one or the other, swapped by a key as a phone keyboard swaps letters for symbols.
+ * ABC opens the letters screen (Latin, Greek, ∂, ∇); C runs the host's clear/dismiss action.
  */
 @Composable
 internal fun MathKeys(actions: MathKeyActions, modifier: Modifier = Modifier) {
     val wide = LocalConfiguration.current.screenWidthDp >= COMPACT_WIDTH_DP
     val size = if (wide) MathKeySize.LARGE else MathKeySize.NORMAL
     var functions by remember { mutableStateOf(false) }
+    var letters by remember { mutableStateOf(false) }
     val onKey: (MathKey) -> Unit = { actions.onKey(it.insert) }
     CompositionLocalProvider(LocalMathKeySize provides size) {
         Column(modifier, verticalArrangement = Arrangement.spacedBy(size.gap)) {
@@ -221,8 +248,11 @@ internal fun MathKeys(actions: MathKeyActions, modifier: Modifier = Modifier) {
                 if (wide) {
                     Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         NumberGrid(onKey, Modifier.weight(0.38f))
-                        MathKeyPager(MATH_FUNCTION_KEYS, onKey, Modifier.weight(0.62f).fillMaxHeight())
+                        if (letters) MathKeyPager(LETTER_KEYS, onKey, Modifier.weight(0.62f).fillMaxHeight())
+                        else MathKeyPager(MATH_FUNCTION_KEYS, onKey, Modifier.weight(0.62f).fillMaxHeight())
                     }
+                } else if (letters) {
+                    MathKeyPager(LETTER_KEYS, onKey, Modifier.fillMaxSize())
                 } else if (functions) {
                     MathKeyPager(MATH_FUNCTION_KEYS, onKey, Modifier.fillMaxSize())
                 } else {
@@ -231,12 +261,20 @@ internal fun MathKeys(actions: MathKeyActions, modifier: Modifier = Modifier) {
             }
             // Every key shares the row by weight, space the widest, so a narrow phone never squeezes one.
             Row(horizontalArrangement = Arrangement.spacedBy(size.gap)) {
-                TextKey("ABC", actions.onAbc, Modifier.weight(1f))
-                if (!wide) TextKey(if (functions) "123" else "f(x)", { functions = !functions }, Modifier.weight(1f))
+                TextKey("ABC", { letters = !letters }, Modifier.weight(1f))
+                if (!wide) TextKey(
+                    if (letters || functions) "123" else "f(x)",
+                    {
+                        if (letters) letters = false
+                        else functions = !functions
+                    },
+                    Modifier.weight(1f),
+                )
                 TextKey("<", { actions.onMove(-1) }, Modifier.weight(0.8f))
                 TextKey(">", { actions.onMove(1) }, Modifier.weight(0.8f))
                 TextKey("space", { actions.onKey(" ") }, Modifier.weight(2f))
                 TextKey("Del", actions.onDelete, Modifier.weight(1f))
+                TextKey("C", actions.onClear, Modifier.weight(0.9f))
                 TextKey("Enter", actions.onEnter, Modifier.weight(1.2f))
             }
         }
@@ -251,7 +289,7 @@ fun MathKeyboardPanel(editor: Editor) {
     MathKeys(
         MathKeyActions(
             onKey = { editor.flowMathKey(it) },
-            onAbc = { editor.setMathKeyboard(false) },
+            onClear = { editor.setMathKeyboard(false) },
             onMove = { editor.flowMathMove(it) },
             onDelete = { editor.flowMathBackspace() },
             onEnter = { editor.flowMathEnter() },

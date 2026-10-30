@@ -71,4 +71,23 @@ class NoteTabsTest {
         assertEquals("content://notes/diagram.xcanvas", backToCanvas.primaryUri)
         assertEquals("content://notes/math.xnote", backToCanvas.close("content://notes/diagram.xcanvas").primaryUri)
     }
+
+    @Test fun closeUrisRemovesDeletedTabsAndKeepsSurvivorSelected() {
+        val workspace = NoteTabs().open("deleted", "Gone").open("open", "Here")
+        val afterDelete = workspace.closeUris(listOf("deleted"))
+        assertEquals(listOf("open"), afterDelete.tabs.map { it.uri })
+        assertEquals("open", afterDelete.primaryUri)
+        val empty = afterDelete.closeUris(listOf("open"))
+        assertNull(empty.primaryUri)
+        assertEquals(emptyList<NoteTab>(), empty.tabs)
+    }
+
+    @Test fun closeUrisHandlesFolderDeletionAcrossPanes() {
+        val workspace = NoteTabs().open("a", "A").open("b", "B")
+            .open("c", "C", secondary = true)
+        val after = workspace.closeUris(listOf("a", "b"))
+        assertEquals(listOf("c"), after.tabs.map { it.uri })
+        assertNull(after.primaryUri)
+        assertEquals("c", after.secondaryUri)
+    }
 }

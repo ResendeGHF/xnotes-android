@@ -18,6 +18,12 @@ class Page(
     @Volatile var markups: List<TextMarkup> = emptyList(),
     /** Quarter turns clockwise its PDF page is shown at past the PDF's own /Rotate, 0 to 3. */
     var pdfTurn: Int = 0,
+    /**
+     * Colored border painted around this page on export (and in thumbnails), matching the
+     * [NoteLinkItem.color] whose linked pages this page holds. Set by link-aware export when it
+     * appends linked pages; null for ordinary pages.
+     */
+    var linkBorder: Rgba? = null,
 ) {
     /**
      * A process-unique, stable id (not persisted). Pages compare by identity, but Compose list keys

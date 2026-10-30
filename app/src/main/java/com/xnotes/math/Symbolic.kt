@@ -580,6 +580,6 @@ object Symbolic {
     }
 
     /** Human-readable result for a solved variable. */
-    fun formatRoots(roots: List<Complex>): String =
-        roots.joinToString(", ") { Numbers.formatComplex(it) }
+    fun formatRoots(roots: List<Complex>, fractions: Boolean = false): String =
+        roots.joinToString(", ") { if (fractions) Numbers.formatComplexFraction(it) else Numbers.formatComplex(it) }
 }

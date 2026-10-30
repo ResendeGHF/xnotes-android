@@ -14,6 +14,7 @@ import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.NoteLinkItem
 import com.xnotes.core.model.PagePattern
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageStyle
@@ -148,6 +149,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             for (wp in doc.waypoints) writeWaypoint(j, wp)
             j.endArray()
         }
+        doc.mathStudioJson?.takeIf { it.isNotEmpty() }?.let { j.name("math_studio").value(it) }
         j.name("items").beginArray()
         val nextAsset = intArrayOf(0)
         val nextAudio = intArrayOf(0)
@@ -177,6 +179,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             is ShapeItem -> writeShape(j, item, ids[item])
             is ConnectorItem -> writeConnector(j, item, ids)
             is TapeItem -> writeTape(j, item)
+            is NoteLinkItem -> writeNoteLink(j, item, ids[item])
             else -> {} // text and any unrecognized kind: not written, the canvas has none
         }
     }
@@ -410,6 +413,28 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         j.endObject()
     }
 
+    /** A note link: its button box, label, target (uri + name), pages and color. */
+    private fun writeNoteLink(j: JsonWrite, item: NoteLinkItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(NoteLinkItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("rect").beginArray().value(item.rect.x).value(item.rect.y).value(item.rect.w).value(item.rect.h).endArray()
+        if (item.displayName.isNotEmpty()) j.name("display_name").value(item.displayName)
+        if (item.targetUri.isNotEmpty()) j.name("target_uri").value(item.targetUri)
+        if (item.targetName.isNotEmpty()) j.name("target_name").value(item.targetName)
+        if (item.pages.isNotEmpty()) {
+            j.name("pages").beginArray()
+            for (p in item.pages) j.value(p)
+            j.endArray()
+        }
+        j.name("color")
+        writeRgba(j, item.color)
+        if (item.rounded) j.name("rounded").value(true)
+        if (item.locked) j.name("locked").value(true)
+        item.group?.let { j.name("group").value(it) }
+        j.endObject()
+    }
+
     private fun writeConnector(j: JsonWrite, c: ConnectorItem, ids: Map<CanvasItem, Int>) {
         val line = PathFlattener.flatten(c.body(), STAND_IN_FLATTEN)
         val drawn = Rect.bounding(line)
@@ -545,6 +570,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         doc.background = m.background
         doc.lastView = m.view
         doc.waypoints.addAll(m.waypoints)
+        doc.mathStudioJson = m.mathStudio
 
         // Image entries stream out of the zip after the manifest, so image items materialize only
         // now that their files exist; the recorded slot restores each one's z-order position.
@@ -617,6 +643,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var dpi = PageSize.DEFAULT_DPI
         var background = CanvasBackground()
         var view: Waypoint? = null
+        var mathStudio: String? = null
         val waypoints = ArrayList<Waypoint>()
         val items = ArrayList<CanvasItem>()
         val images = ArrayList<Pending>()
@@ -667,6 +694,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "dpi" -> m.dpi = intOr(p, PageSize.DEFAULT_DPI)
                 "background" -> m.background = parseBackground(p)
                 "view" -> m.view = parseWaypoint(p, named = false)
+                "math_studio" -> m.mathStudio = stringOrNull(p)
                 "waypoints" -> parseWaypoints(p, m.waypoints)
                 "items" -> parseItems(p, m.items, m.images, m.glue)
                 else -> p.skipValue()
@@ -794,6 +822,12 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var pattern: String? = null
         var tapeWidth: Double? = null
         var rgba: Rgba? = null
+        var targetUri = ""
+        var targetName = ""
+        var displayName = ""
+        var notePages: List<Int>? = null
+        var linkColor: Rgba? = null
+        var linkRounded = false
     }
 
     /** Stroke config fields as written; null = absent, so defaults resolve exactly as before. */
@@ -873,6 +907,12 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "pattern" -> s.pattern = stringOrNull(p)
                 "width" -> s.tapeWidth = doubleOrNull(p)
                 "rgba" -> s.rgba = rgbaOrNull(p)
+                "target_uri" -> s.targetUri = stringOr(p, "")
+                "target_name" -> s.targetName = stringOr(p, "")
+                "display_name" -> s.displayName = stringOr(p, "")
+                "pages" -> s.notePages = intListOrNull(p)
+                "color" -> s.linkColor = rgbaOrNull(p)
+                "rounded" -> s.linkRounded = boolOr(p, false)
                 else -> p.skipValue()
             }
         }
@@ -903,6 +943,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
             }
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
+            NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
             else -> {} // text and any unrecognized kind: skipped (forgiving)
         }
         if (items.size > before) glue.named(items[before], s.id)
@@ -921,6 +962,20 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             TapeShape(mode, if (mode == TapeMode.FREEHAND) points else points.take(2), width),
             s.rgba ?: InkPalette.DEFAULT,
             TapePattern.fromId(s.pattern),
+        )
+    }
+
+    private fun buildNoteLink(s: ItemScratch): NoteLinkItem? {
+        val rect = s.rect ?: return null
+        if (!(rect.w.isFinite() && rect.h.isFinite() && rect.w > 0.0 && rect.h > 0.0)) return null
+        return NoteLinkItem(
+            rect = rect,
+            displayName = s.displayName,
+            targetUri = s.targetUri,
+            targetName = s.targetName,
+            pages = s.notePages.orEmpty(),
+            color = s.linkColor ?: NoteLinkItem.DEFAULT_COLOR,
+            rounded = s.linkRounded,
         )
     }
 
@@ -1337,6 +1392,18 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         while (out.isNotEmpty() && out.last().x.isNaN()) out.removeAt(out.size - 1)
         while (out.isNotEmpty() && out.first().x.isNaN()) out.removeAt(0)
         return if (out.count { !it.x.isNaN() } >= 2) out else null
+    }
+
+    private fun intListOrNull(p: JsonPull): List<Int>? {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return null
+        }
+        val out = ArrayList<Int>()
+        p.beginArray()
+        while (p.hasNext()) intOrNull(p)?.let { out.add(it) }
+        p.endArray()
+        return out
     }
 
     companion object {

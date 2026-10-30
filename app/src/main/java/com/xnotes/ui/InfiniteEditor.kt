@@ -157,6 +157,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         isEditingText = { editingLabel != null },
         onCommitText = { commitText() },
         onAudioTap = { tapAudio(it) },
+        onMathAnimTap = { tapMathAnim(it) },
         onPeelTape = { peelTape(it) },
         onUserMovedView = { AudioPlayback.userMoved(this) },
     )
@@ -340,11 +341,13 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private val modelListener = object : InfiniteDocument.Listener {
         override fun onItemAdded(item: CanvasItem) {
             itemsRevision++
+            sceneBuildRemoved.remove(item)
             pushItem(item)
         }
 
         override fun onItemRemoved(item: CanvasItem) {
             itemsRevision++
+            sceneBuildRemoved.add(item) // a pending load batch must not resurrect this item
             if (textResizeState?.item === item) textResizeState = null
             // Drop any mesh job still running for it, so its result cannot file the record again.
             if (item is ImageItem) vectorMeshGen.remove(item)
@@ -757,16 +760,41 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private val vectorMeshGen = java.util.concurrent.ConcurrentHashMap<ImageItem, Long>()
     private val vectorMeshSeq = java.util.concurrent.atomic.AtomicLong()
 
+    /**
+     * Building every stroke synchronously here blocked the UI while a dense .xcanvas opened.
+     * Publish the first few items immediately, then yield a frame between later batches.
+     * A document switch invalidates the old callbacks, and removals cannot resurrect items.
+     */
+    private val sceneBuild = com.xnotes.core.infinite.IncrementalBuild<CanvasItem>()
+    private val sceneBuildRemoved = java.util.Collections.newSetFromMap(
+        java.util.IdentityHashMap<CanvasItem, Boolean>(),
+    )
+
     /** Re-tessellate the whole document, after a load or a wholesale list replacement. */
     private fun rebuildScene() {
+        sceneBuild.cancel()
+        sceneBuildRemoved.clear()
         scene.reset()
         vectorMeshGen.clear()
         textMeshes.clear()
         textRasters.clear()
         preparedText.clear()
         presentedText.clear()
-        scene.batch { for (item in document.items) pushItem(item) }
-        scene.setOrder(document.items)
+        val items = document.items.toList()
+        scene.setOrder(items)
+        sceneBuild.start(
+            items = items,
+            // Keep each UI-thread meshing burst short, including on mid-range tablets.
+            batchSize = 4,
+            onBatch = { batch ->
+                scene.batch {
+                    for (item in batch) if (item !in sceneBuildRemoved) pushItem(item)
+                }
+                view.publish()
+            },
+            // Yield to queued input without imposing 16 ms of artificial latency per four items.
+            schedule = { next -> view.post(next) },
+        )
     }
 
     /** Repaint the canvas with whatever the model currently says. */
@@ -980,6 +1008,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     override val selectionMath: String? get() = null
     override fun setSelectionMath(latex: String): Boolean = false
     override fun convertSelectionToMath() {}
+    override val canSendSelectionToMath: Boolean get() = false
+    override fun sendSelectionToMathStudio(destination: MathStudioDestination) {}
 
     override fun unlockItem(item: CanvasItem) {
         if (!item.locked) return
@@ -2246,6 +2276,26 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         return item
     }
 
+    /**
+     * Place a Math Studio result as a formula box in the middle of the view, selected
+     * so it can be dragged at once. Returns false when there is nothing to place.
+     */
+    fun placeMathResult(latex: String): Boolean {
+        if (latex.isBlank()) return false
+        val probe = TextItem(Pt(0.0, 0.0), TextItem.DEFAULT_WIDTH, 0.0, latex, inkColor, textPointSize, textFace, measurer = textMeasurer, math = true)
+        val w = probe.mathBox()?.takeIf { it.width > 0 }?.width ?: TextItem.DEFAULT_WIDTH
+        val h = probe.mathBox()?.takeIf { it.height > 0 }?.height ?: TextItem.DEFAULT_WIDTH / 4
+        val centre = viewport.centerContent
+        val box = TextItem(Pt(centre.x - w / 2.0, centre.y - h / 2.0), w, 0.0, latex, inkColor, textPointSize, textFace, measurer = textMeasurer, math = true)
+        document.add(box)
+        history.push(AddCanvasItem(document, box))
+        selection.select(listOf(box))
+        markDirty()
+        refresh()
+        publishOverlay()
+        return true
+    }
+
     /** Shows a message to the user, with an optional button; the paged editor that owns this canvas sets it. */
     var onMessage: ((String, Pair<String, () -> Unit>?) -> Unit)? = null
 
@@ -2253,7 +2303,13 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     override fun holdsAudio(item: com.xnotes.core.model.AudioItem): Boolean = document.containsRef(item)
 
-    override fun audioPositionKey(rid: Int): String? = document.path?.let { "$it#$rid" }
+    /** True while the open canvas lives in an encrypted folder: set by the owning editor. Positions stay in RAM only then. */
+    var vaultGuard: () -> Boolean = { false }
+
+    override fun audioPositionKey(rid: Int): String? {
+        if (vaultGuard()) return null
+        return document.path?.let { "$it#$rid" }
+    }
 
     override fun audioFailed() {
         onMessage?.invoke(appContext.getString(com.xnotes.R.string.err_audio_unplayable), null)
@@ -2311,6 +2367,23 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val ink = near.lastOrNull { it.sync?.rid == s.item.rid && (it.contains(at) || it.intersectsCircle(at.x, at.y, reach)) } ?: return false
         AudioPlayback.playFromMoment(ink.sync!!.ms)
         return true
+    }
+
+    /** Reopens a Math Studio animation when its play badge is tapped. */
+    var onMathAnimSpec: ((MathAnimSpec) -> Unit)? = null
+
+    fun tapMathAnim(at: Pt): Boolean {
+        val item = document.itemsIn(Rect(at.x - 1, at.y - 1, 2.0, 2.0))
+            .lastOrNull { it is com.xnotes.core.model.ImageItem && it.contains(at) } as? com.xnotes.core.model.ImageItem
+            ?: return false
+        if (!com.xnotes.platform.MathAnimPng.hasSpec(item.image.file.path)) return false
+        val pxPerUnit = devicePxPerDp * viewport.zoom
+        val lx = at.x - item.rect.left; val ly = at.y - item.rect.top
+        if (!com.xnotes.platform.MathAnimPng.hitsBadge(item.rect.w, item.rect.h, pxPerUnit, lx, ly)) return false
+        val spec = com.xnotes.platform.MathAnimPng.readSpec(item.image.file)
+            ?.let { MathAnimSpec.parse(it) } ?: return false
+        onMathAnimSpec?.invoke(spec)
+        return onMathAnimSpec != null
     }
 
     /** The playing recording's items in moment order, kept until the canvas changes. */

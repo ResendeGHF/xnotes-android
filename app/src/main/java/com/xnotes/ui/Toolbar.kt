@@ -103,6 +103,7 @@ fun Toolbar(
     onOpenMathStudio: () -> Unit = {},
     onInsertAudio: () -> Unit = {},
     onRecordAudio: () -> Unit = {},
+    onInsertNoteLink: () -> Unit = {},
 ) {
     // The five stroke tools use the designed vector drawables (res/drawable/ic_stroke_*),
     // tinted at the call site like every other icon; the rest use the built-in line set.
@@ -148,6 +149,7 @@ fun Toolbar(
         onOpenMathStudio = onOpenMathStudio,
         onInsertAudio = onInsertAudio,
         onRecordAudio = onRecordAudio,
+        onInsertNoteLink = onInsertNoteLink,
     )
     if (editor.readerMode) {
         // The file reader's bar for a note: where you are and how you see it, and the way back to editing.
@@ -216,6 +218,7 @@ private fun ToolbarItemView(
     onOpenMathStudio: () -> Unit,
     onInsertAudio: () -> Unit,
     onRecordAudio: () -> Unit,
+    onInsertNoteLink: () -> Unit = {},
 ) {
     when (item) {
         // Canvas-only items; a stored paged layout can never hold one, so nothing is drawn.
@@ -260,7 +263,7 @@ private fun ToolbarItemView(
         ToolbarItem.RULER ->
             ToolbarIcon(XnotesIcons.ruler, stringResource(R.string.tool_ruler), active = editor.rulerVisible) { editor.toggleRuler() }
 
-        ToolbarItem.IMAGE -> NoteInsertMenu(editor, onInsertImage, onTakePhoto, onImagePage, onAddStickers, onInsertAudio, onRecordAudio)
+        ToolbarItem.IMAGE -> NoteInsertMenu(editor, onInsertImage, onTakePhoto, onImagePage, onAddStickers, onInsertAudio, onRecordAudio, onInsertNoteLink)
 
         ToolbarItem.UNDO -> ToolbarIcon(XnotesIcons.undo, stringResource(R.string.undo), enabled = editor.canUndo, shortcut = Keys.UNDO) { editor.undo() }
         ToolbarItem.REDO -> ToolbarIcon(XnotesIcons.redo, stringResource(R.string.redo), enabled = editor.canRedo, shortcut = Keys.REDO) { editor.redo() }
@@ -679,6 +682,7 @@ private fun NoteInsertMenu(
     onAddStickers: () -> Unit,
     onInsertAudio: () -> Unit,
     onRecordAudio: () -> Unit,
+    onInsertNoteLink: () -> Unit = {},
 ) {
     var stickersOpen by remember { mutableStateOf(false) }
     InsertButton(
@@ -688,6 +692,7 @@ private fun NoteInsertMenu(
             InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
             InsertRow(XnotesIcons.paste, stringResource(R.string.paste_image)) { editor.pasteImage() },
             InsertRow(XnotesIcons.page, stringResource(R.string.image_as_page)) { onImagePage() },
+            InsertRow(XnotesIcons.link, stringResource(R.string.insert_note_link)) { onInsertNoteLink() },
             InsertRow(XnotesIcons.sticker, stringResource(R.string.stickers), more = true) { stickersOpen = true },
         ),
         onAudioFromFile = onInsertAudio,

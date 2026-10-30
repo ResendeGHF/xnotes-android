@@ -30,6 +30,8 @@
     <string name="markup_note">Note</string>
     <string name="markup_note_hint">Write a note</string>
     <string name="open_link">Open link</string>
+    <string name="pdf_link_back">Go Back</string>
+    <string name="pdf_link_forget">Forget</string>
     <string name="tool_image">Image</string>
     <string name="toolbar_home">Home</string>
     <string name="toolbar_title">Title</string>
@@ -418,6 +420,28 @@
     <string name="pref_three_finger_tap">Three-finger tap</string>
     <string name="pref_stylus_double_tap">Stylus double-tap</string>
     <string name="pref_stylus_button_tap">Stylus side button (tap)</string>
+    <string name="pref_stylus_calibrate">Stylus calibration (offset)</string>
+    <string name="pref_stylus_calibrate_help">If ink lands beside the nib, calibrate: tap each crosshair exactly with the pen tip. The measured shift is added to every pen stroke. Fine-tune it below, or reset to zero.</string>
+    <string name="pref_stylus_offset">Current offset  %1$s, %2$s dp</string>
+    <string name="pref_stylus_offset_x">Offset X  %1$s dp</string>
+    <string name="pref_stylus_offset_y">Offset Y  %1$s dp</string>
+    <string name="stylus_calibrate_now">Calibrate…</string>
+    <string name="stylus_calibrate_reset">Reset</string>
+    <string name="stylus_calibrate_title">Stylus calibration</string>
+    <string name="stylus_calibrate_intro">Tap each crosshair exactly with the stylus tip, holding the pen as you write. %1$d taps. Use the stylus — finger taps are ignored.</string>
+    <string name="stylus_calibrate_tap_n">Tap %1$d of %2$d</string>
+    <string name="stylus_calibrate_use_stylus">Please use the stylus for this.</string>
+    <string name="stylus_calibrate_result">Measured offset  %1$s, %2$s dp</string>
+    <string name="stylus_calibrate_spread">Scatter  %1$s dp  (%2$s)</string>
+    <string name="stylus_calibrate_dropped">%1$d tap(s) looked off and were ignored.</string>
+    <string name="stylus_calibrate_excellent">Excellent</string>
+    <string name="stylus_calibrate_good">Good</string>
+    <string name="stylus_calibrate_fair">Fair</string>
+    <string name="stylus_calibrate_poor">Poor — retake it</string>
+    <string name="stylus_calibrate_retry">Retake</string>
+    <string name="stylus_calibrate_test_help">Try it: draw here. The line follows the corrected nib.</string>
+    <string name="stylus_calibrate_no_pen">No usable taps yet. Tap each crosshair with the stylus.</string>
+    <string name="search_keywords_calibrate">Calibrate stylus pen offset parallax nib shift tune</string>
     <string name="pref_redmi_buttons">Redmi Smart Pen side buttons (tap)</string>
     <string name="pen_button_1">Button 1</string>
     <string name="pen_button_2">Button 2</string>
@@ -540,6 +564,15 @@
     <string name="err_unlock_folder">That password did not open the folder.</string>
     <string name="err_nested_vault">An encrypted folder cannot sit inside another one.</string>
     <string name="err_vault_locked">Unlock the folder before opening this note.</string>
+    <string name="err_vault_private">Not available for encrypted folders: names stay encrypted or in memory only.</string>
+    <string name="vault_locked_title">This folder is locked</string>
+    <string name="vault_locked_message">Notes in this folder are encrypted. Enter the folder password to see them and to create new ones.</string>
+    <string name="vault_locked_hint">Nothing here can be opened, created, pasted or moved until the folder is unlocked.</string>
+    <string name="vault_destination_locked">The destination folder is locked. Unlock it first.</string>
+    <string name="argon2_preset_quick">Quick</string>
+    <string name="argon2_preset_default">Default</string>
+    <string name="argon2_preset_strong">Strong</string>
+    <string name="argon2_cipher_note">Cipher is fixed to AES-256-GCM with a random 256-bit key (authenticated; XTS offers no authentication and is not used for files). Only the Argon2id cost below is tunable.</string>
     <string name="export_pgp">Export encrypted</string>
     <string name="export_pgp_help">Sign and encrypt %1$s for someone whose public key you have imported.</string>
     <string name="import_pgp">Import encrypted note</string>
@@ -604,6 +637,9 @@
     <string name="save_copy_ellipsis">Save a copy…</string>
     <string name="export_pdf">Export to PDF</string>
     <string name="export_pdf_action">Export PDF</string>
+    <string name="export_sdocx">Export to Samsung Notes</string>
+    <string name="convert_handwritten_latex">Convert handwritten to LaTeX</string>
+    <string name="convert_handwritten_markdown">Convert handwritten to Markdown</string>
     <string name="sort_descending">Descending</string>
     <string name="sort_ascending">Ascending</string>
     <string name="folder">Folder</string>
@@ -689,6 +725,8 @@
     <!-- Messages, sharing and export -->
     <string name="exporting_pdf">Exporting to PDF…</string>
     <string name="exporting_pdfs">Exporting PDFs…</string>
+    <string name="exporting_note">Exporting note…</string>
+    <string name="exporting_sdocx">Exporting to Samsung Notes…</string>
     <string name="may_take_moment">This may take a moment.</string>
     <string name="saving_notes">Saving your notes…</string>
     <string name="opening_note">Opening note…</string>
@@ -704,6 +742,26 @@
         <item quantity="other">Exported %d PDFs.</item>
     </plurals>
     <string name="err_export_pdf">Could not export to PDF.</string>
+    <string name="exported_sdocx">Exported to Samsung Notes.</string>
+    <string name="err_export_sdocx">Could not export to Samsung Notes.</string>
+    <string name="exported_latex">Exported to LaTeX.</string>
+    <string name="exported_markdown">Exported Markdown.</string>
+    <string name="exporting_latex">Converting handwriting to LaTeX…</string>
+    <string name="exporting_markdown">Converting handwriting to Markdown…</string>
+    <string name="err_export_latex">Could not convert the note to LaTeX.</string>
+    <string name="err_export_markdown">Could not convert the note to Markdown.</string>
+    <string name="latex_export_empty">No readable handwriting on these pages.</string>
+    <string name="latex_ai_section">AI handwriting conversion (vision model)</string>
+    <string name="latex_ai_custom">Custom endpoint</string>
+    <string name="latex_ai_help">Whole-note LaTeX and Markdown are read by a vision model. Gemini has a free tier (Google AI Studio); OpenAI-compatible covers ChatGPT, OpenRouter (free models) and Pollinations (works without a key); Claude needs an Anthropic Console key. Custom endpoint takes any server speaking the OpenAI chat format — a self-hosted model (Ollama, LM Studio, llama.cpp server) or another online service — and the key may be left empty when the server needs none.</string>
+    <string name="latex_ai_model">Model</string>
+    <string name="latex_ai_base_url">API base URL</string>
+    <string name="latex_ai_api_key">API key</string>
+    <string name="latex_ai_show_key">Show</string>
+    <string name="latex_ai_hide_key">Hide</string>
+    <string name="latex_ai_missing_key">Add an AI API key in Settings → LaTeX AI first.</string>
+    <string name="latex_ai_missing_endpoint">Enter the custom endpoint URL in Settings → LaTeX AI first (for example http://192.168.1.10:11434/v1).</string>
+    <string name="latex_ai_missing_model">Enter the model name in Settings → LaTeX AI first (the name the server expects, e.g. qwen2.5vl).</string>
     <string name="err_save_copy">Could not save a copy.</string>
     <string name="err_save_image">Could not save the image.</string>
     <string name="err_save_images">Could not save the images.</string>
@@ -1230,6 +1288,56 @@
     <!-- notes fork additions -->
     <string name="tool_table">Table</string>
     <string name="import_file">Import file</string>
+    <string name="close">Close</string>
+    <string name="trace_scan_menu">Trace scan into strokes</string>
+    <string name="trace_from_camera">Trace from camera</string>
+    <string name="scan_title">Scan page</string>
+    <string name="scan_hint">Drag the corners onto the page edges.</string>
+    <string name="scan_auto">Auto corners</string>
+    <string name="scan_no_edges">Couldn\'t find the page edges — drag the corners by hand.</string>
+    <string name="scan_retake">Retake</string>
+    <string name="scan_save">Save scan</string>
+    <string name="scan_trace">Trace strokes</string>
+    <string name="scan_filter">Scan filter</string>
+    <string name="scan_filter_original">Original</string>
+    <string name="scan_filter_gray">Grey</string>
+    <string name="scan_filter_ink">Ink</string>
+    <string name="scan_filter_hint">Applied when the scan is saved as a note.</string>
+    <string name="trace_scan_title">Trace scan into strokes</string>
+    <string name="trace_section_paper">Paper position</string>
+    <string name="trace_section_filters">Filters</string>
+    <string name="trace_section_ink">Ink</string>
+    <string name="trace_rotation">Rotation</string>
+    <string name="trace_degrees">%1$d°</string>
+    <string name="trace_fine_angle">Fine angle</string>
+    <string name="trace_margin_left">Margin left</string>
+    <string name="trace_margin_top">Margin top</string>
+    <string name="trace_margin_right">Margin right</string>
+    <string name="trace_margin_bottom">Margin bottom</string>
+    <string name="trace_brightness">Brightness</string>
+    <string name="trace_contrast">Contrast</string>
+    <string name="trace_auto_threshold">Auto threshold</string>
+    <string name="trace_auto_local">Local threshold adapts to shadows and uneven light.</string>
+    <string name="trace_auto_enhance">Auto enhance</string>
+    <string name="trace_auto_enhance_hint">Levels the paper background and boosts faint ink before tracing.</string>
+    <string name="trace_threshold">Threshold</string>
+    <string name="trace_auto_level">Auto level: %1$d</string>
+    <string name="trace_invert">Light ink on dark</string>
+    <string name="trace_invert_hint">Turn on for whiteboard photos or dark paper, where the ink is lighter than the page.</string>
+    <string name="trace_cleanup">Speckle cleanup</string>
+    <string name="trace_stroke_width">Stroke width</string>
+    <string name="trace_ink_colour">Ink colour</string>
+    <string name="trace_note_name">Note name</string>
+    <string name="trace_show_edges">Edges</string>
+    <string name="trace_photo_preview">Adjusted photo</string>
+    <string name="trace_strokes_found">~%1$d strokes</string>
+    <string name="trace_page_of">Page %1$d of %2$d</string>
+    <string name="trace_all_pages_note">All %1$d pages are traced with these settings.</string>
+    <string name="trace_progress_pages">Tracing page %1$d of %2$d…</string>
+    <string name="trace_convert">Trace %1$d strokes into a new note</string>
+    <string name="trace_too_big">This image is too complex to trace — try a tighter crop, a smaller page, or more cleanup.</string>
+    <string name="trace_working">Tracing…</string>
+    <string name="trace_nothing_found">No ink found with these settings. Lower the threshold or check Invert.</string>
     <string name="kind_read_only_file">Read-only file</string>
     <string name="kind_read_only_files">Read-only files</string>
     <string name="kind_no_read_only_files">No read-only files here.</string>
@@ -1275,6 +1383,7 @@
     <string name="math_toolbar">Math Studio</string>
 
     <string name="math_tab_calculator">Calculator</string>
+    <string name="math_tab_solver">Solver</string>
     <string name="math_tab_graph2d">2D plot</string>
     <string name="math_tab_graph3d">3D plot</string>
     <string name="math_tab_fields">Fields</string>
@@ -1292,12 +1401,19 @@
     <string name="math_calculator_hint">Assign with x = 3, reuse the last answer as ans, and switch DEG/RAD for trigonometric functions. Complex values use i, for example exp(i*pi).</string>
     <string name="math_angle_deg">DEG</string>
     <string name="math_angle_rad">RAD</string>
+    <string name="math_send_to_units">Send to units</string>
+    <string name="math_use_in_calculator">Use in calculator</string>
+    <string name="math_open_reference">Reference</string>
 
     <string name="math_reset_view">Reset view</string>
     <string name="math_toggle_grid">Toggle grid</string>
     <string name="math_insert_graph">Insert graph</string>
+    <string name="math_insert_animation">Insert animation</string>
+    <string name="math_insert_result">Insert result</string>
     <string name="math_inserted">Graph inserted</string>
+    <string name="math_result_inserted">Result inserted</string>
     <string name="math_insert_failed">Could not build the graph image</string>
+    <string name="math_solver_hint">Type LaTeX with the keyboard below, plain text like integral(f,x,0,1), or send a handwritten formula here. ABC opens the letter keyboard (A–Z, Greek, ∂, ∇); C clears the entry, Enter computes. Angles are in radians.</string>
     <string name="math_remove">Remove</string>
     <string name="math_compute">Compute</string>
     <string name="math_error">Error</string>
@@ -1309,6 +1425,8 @@
     <string name="math_left">Left</string>
     <string name="math_right">Right</string>
     <string name="math_guess">Guess</string>
+    <string name="math_bracket_from">Bracket from</string>
+    <string name="math_bracket_to">Bracket to</string>
     <string name="math_no_convergence">did not converge</string>
 
     <string name="math_2d_cartesian">Cartesian</string>
@@ -1333,7 +1451,11 @@
     <string name="math_ramp_magnitude">colour = magnitude</string>
     <string name="math_ramp_height">colour = value</string>
 
-    <string name="math_3d_real_surface">Real surface</string>
+    <string name="math_3d_real_surface">Cartesian</string>
+    <string name="math_3d_cylindrical">Cylindrical</string>
+    <string name="math_3d_spherical">Spherical</string>
+    <string name="math_3d_parametric">Parametric</string>
+    <string name="math_3d_implicit">Implicit</string>
     <string name="math_3d_complex_surface">Complex surface</string>
     <string name="math_3d_function_xy">z = f(x, y)</string>
     <string name="math_3d_complex_function">f(z), z = x + iy</string>
@@ -1342,6 +1464,18 @@
     <string name="math_3d_computing">Computing…</string>
     <string name="math_3d_hint_real">Orbit with one finger, pinch to zoom. Height is mapped to colour so ridges and wells stay readable.</string>
     <string name="math_3d_hint_complex">Choose the real part, imaginary part, magnitude or argument of f(x + iy) to build the surface.</string>
+    <string name="math_3d_hint_cylindrical">x=r·cosθ y=r·sinθ, θ∈[0,2π), z from the domain box</string>
+    <string name="math_3d_hint_spherical">θ azimuth [0,2π), φ polar [0,π]</string>
+    <string name="math_domain">Domain</string>
+    <string name="math_x_min">x min</string>
+    <string name="math_x_max">x max</string>
+    <string name="math_y_min">y min</string>
+    <string name="math_y_max">y max</string>
+    <string name="math_z_min">z min</string>
+    <string name="math_z_max">z max</string>
+    <string name="math_toggle_visibility">Show/hide curve</string>
+    <string name="math_pick_color">Curve colour</string>
+    <string name="math_color_auto">Automatic</string>
     <string name="math_component_real">Re</string>
     <string name="math_component_imag">Im</string>
     <string name="math_component_magnitude">|f|</string>
@@ -1407,4 +1541,46 @@
     <string name="math_catalog_constants">Constants</string>
     <string name="math_catalog_functions">Functions</string>
     <string name="math_catalog_empty">No function or constant matches that search.</string>
+
+    <string name="note_link">Note link</string>
+    <string name="insert_note_link">Insert note link…</string>
+    <string name="note_link_display_name">Label shown on canvas</string>
+    <string name="note_link_target">Linked note</string>
+    <string name="note_link_this_note">Link within this note</string>
+    <string name="note_link_choose_file">Choose file…</string>
+    <string name="note_link_pages">Pages (e.g. 1, 3-5)</string>
+    <string name="note_link_pages_hint">1-based page numbers</string>
+    <string name="note_link_color">Color</string>
+    <string name="note_link_shape">Shape</string>
+    <string name="note_link_shape_rect">Rectangle</string>
+    <string name="note_link_shape_rounded">Rounded</string>
+    <string name="note_link_browse_notes">Browse app notes…</string>
+    <string name="note_link_pick_title">Choose a note</string>
+    <string name="note_link_pick_root">Files</string>
+    <string name="note_link_pick_empty">Nothing here.</string>
+    <string name="note_link_no_pages">This link has no pages set.</string>
+    <string name="note_link_cannot_open">This link cannot be opened here.</string>
+    <string name="note_link_unreadable">The linked note could not be opened.</string>
+    <string name="note_link_bad_pages">Enter at least one page (e.g. 1, 3-5).</string>
+    <string name="note_link_needs_target">Choose a linked note or link within this note.</string>
+    <string name="export_with_links">Export with links</string>
+    <string name="export_with_links_hint">Inline linked pages below their link as a self-contained document</string>
+
+    <string name="graph">Graph</string>
+    <string name="graph_all">All</string>
+    <string name="graph_tree">Tree</string>
+    <string name="graph_graph">Graph</string>
+    <string name="graph_refresh">Refresh</string>
+    <string name="graph_fit">Fit to screen</string>
+    <string name="graph_root">Root: %1$s</string>
+    <string name="graph_no_folder">Pick a folder to see the link graph.</string>
+    <string name="graph_no_notes">No notes to show.</string>
+    <string name="graph_scanning">Scanning %1$d / %2$d…</string>
+    <string name="graph_rescanning">Refreshing links…</string>
+    <string name="graph_partial">Scan timed out — showing partial results.</string>
+    <string name="graph_failed">Could not scan notes.</string>
+    <string name="retry">Retry</string>
+    <string name="graph_truncated">Showing %1$s of %2$s notes</string>
+    <string name="graph_from_here">From here</string>
+    <string name="graph_no_outgoing">This file links to no other file.</string>
 </resources>

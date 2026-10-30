@@ -99,6 +99,7 @@ fun TextFormatBar(editor: Editor) {
     val para = editor.flowCaretParagraph()
     val inCell = para?.table != null
     var tableDialog by remember { mutableStateOf(false) }
+    var mathSendOpen by remember { mutableStateOf(false) }
 
     // The bar rides the bottom edge, so its tips open upward.
     CompositionLocalProvider(LocalTipSide provides TipSide.ABOVE) {
@@ -138,6 +139,9 @@ fun TextFormatBar(editor: Editor) {
             BarIcon(Icons.Filled.Functions, stringResource(R.string.equation), active = style.math, enabled = editor.flowEditingActive) {
                 editor.flowToggleMath()
             }
+            BarIcon(XnotesIcons.graph, "Send to Math Studio", enabled = editor.flowEditingActive && editor.canSendFlowSelectionToMath()) {
+                mathSendOpen = true
+            }
             BarIcon(Icons.Outlined.TableChart, stringResource(R.string.insert_table), enabled = editor.flowEditingActive && !inCell) {
                 tableDialog = true
             }
@@ -152,6 +156,12 @@ fun TextFormatBar(editor: Editor) {
         }
     }
     if (tableDialog) TableDialog(editor, null) { tableDialog = false }
+    if (mathSendOpen) {
+        MathSendDialog(
+            onPick = { mathSendOpen = false; editor.sendFlowSelectionToMathStudio(it) },
+            onDismiss = { mathSendOpen = false },
+        )
+    }
 }
 
 private fun alignIcon(align: ParaAlign): ImageVector = when (align) {

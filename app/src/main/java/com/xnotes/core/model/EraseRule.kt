@@ -43,5 +43,5 @@ object EraseRule {
         item is ShapeItem && !item.isFill && erasable(item) && touchesFill(item, cx, cy, r) && !touchesLine(item, cx, cy, r)
 
     /** Whether an eraser may touch [item] at all. */
-    fun erasable(item: CanvasItem): Boolean = !item.locked && item !is ImageItem && item !is TextItem && item !is AudioItem
+    fun erasable(item: CanvasItem): Boolean = !item.locked && item !is ImageItem && item !is TextItem && item !is AudioItem && item !is NoteLinkItem
 }

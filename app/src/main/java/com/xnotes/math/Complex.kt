@@ -9,6 +9,7 @@ import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.cosh
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.ln
 import kotlin.math.pow
@@ -193,5 +194,91 @@ object Numbers {
         if (a >= 1e4 || a < 1e-3) return "%.2e".format(v)
         return if (abs(v - Math.rint(v)) < 1e-8) Math.rint(v).toLong().toString()
         else "%.3f".format(v).trimEnd('0').trimEnd('.')
+    }
+
+    /**
+     * Closest simple fraction p/q (|q| ≤ [maxDen]) within 1e-9 relative, or null when the value
+     * is not finite or not close to one. Continued fractions, so 0.333… finds 1/3, not 333/1000.
+     */
+    fun fractionOf(v: Double, maxDen: Int = 1000): Pair<Long, Long>? {
+        if (!v.isFinite()) return null
+        if (v == 0.0) return 0L to 1L
+        val neg = v < 0
+        val x = abs(v)
+        var hPrev = 0L; var h = 1L
+        var kPrev = 1L; var k = 0L
+        var b = x
+        while (true) {
+            val a = floor(b)
+            if (a > maxDen || a.isNaN()) break
+            val ai = a.toLong()
+            if (ai != 0L && (h > Long.MAX_VALUE / ai || k > Long.MAX_VALUE / ai)) break
+            val hNew = ai * h + hPrev
+            val kNew = ai * k + kPrev
+            if (kNew > maxDen || kNew <= 0) break
+            if (abs(x - hNew.toDouble() / kNew) <= 1e-9 * maxOf(1.0, x)) {
+                return (if (neg) -hNew else hNew) to kNew
+            }
+            hPrev = h; h = hNew; kPrev = k; k = kNew
+            val f = b - a
+            if (f < 1e-12) return (if (neg) -h else h) to k
+            b = 1.0 / f
+            if (!b.isFinite() || b > 1e12) break
+        }
+        return null
+    }
+
+    /**
+     * `("1/3", "\\frac{1}{3}")` when a close simple fraction (|q| ≤ 1000) reads no longer than
+     * the decimal, else null. Integers, zero and non-finite values never qualify, so typed
+     * decimals like `0.333` stay decimal while computed rationals like 1/3 become fractions.
+     */
+    fun fractionText(v: Double): Pair<String, String>? {
+        if (!v.isFinite() || v == 0.0) return null
+        if (abs(v - Math.rint(v)) <= 1e-10 * maxOf(1.0, abs(v))) return null
+        val (p, q) = fractionOf(v) ?: return null
+        if (q == 1L) return null
+        val text = "$p/$q"
+        // %.12g pads ("0.333000000000"), so compare against the stripped decimal.
+        if (text.length > stripZeros(format(v)).length) return null
+        val body = "\\frac{${abs(p)}}{$q}"
+        return text to if (p < 0) "-$body" else body
+    }
+
+    /**
+     * `1/3` style rendering when a close simple fraction exists, else a stripped [format].
+     * Integers and zero stay plain; non-finite values fall back to [format].
+     */
+    fun formatFraction(v: Double): String = fractionText(v)?.first ?: stripZeros(format(v))
+
+    /** LaTeX twin of [formatFraction]: close fractions become `\frac{p}{q}`. */
+    fun formatFractionLatex(v: Double): String = fractionText(v)?.second ?: stripZeros(format(v))
+
+    /** Drop `%g` padding (`0.333000000000` → `0.333`); exponent and integer forms are untouched. */
+    private fun stripZeros(s: String): String {
+        if ('e' in s || 'E' in s || '.' !in s) return s
+        return s.trimEnd('0').trimEnd('.')
+    }
+
+    /** [formatComplex] with fractional real and imaginary parts. */
+    fun formatComplexFraction(z: Complex): String {
+        if (z.re.isNaN() || z.im.isNaN()) return "NaN"
+        if (!z.isFinite) return format(z.re)
+        val re = if (abs(z.re) <= 1e-13 * maxOf(1.0, z.abs())) 0.0 else z.re
+        val im = if (abs(z.im) <= 1e-13 * maxOf(1.0, z.abs())) 0.0 else z.im
+        return when {
+            im == 0.0 -> formatFraction(re)
+            re == 0.0 -> when (im) {
+                1.0 -> "i"
+                -1.0 -> "-i"
+                else -> "${formatFraction(im)}i"
+            }
+            else -> {
+                val sign = if (im < 0) "−" else "+"
+                val mag = formatFraction(abs(im))
+                val body = if (mag == "1") "i" else "${mag}i"
+                "${formatFraction(re)} $sign $body"
+            }
+        }
     }
 }

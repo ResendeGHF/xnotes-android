@@ -238,12 +238,17 @@ internal fun EncryptedFolderDialog(
     var iterations by remember { mutableStateOf(VaultCrypto.Params.DEFAULT.iterations.toString()) }
     var lanes by remember { mutableStateOf(VaultCrypto.Params.DEFAULT.parallelism.toString()) }
     val mismatch = again.isNotEmpty() && again != password
+    fun applyPreset(m: Int, i: Int, l: Int) {
+        memory = m.toString()
+        iterations = i.toString()
+        lanes = l.toString()
+    }
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = { Text(androidx.compose.ui.res.stringResource(R.string.new_encrypted_folder)) },
         text = {
             Column(
-                Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
@@ -266,11 +271,26 @@ internal fun EncryptedFolderDialog(
                     label = { Text(androidx.compose.ui.res.stringResource(R.string.password_again)) },
                 )
                 Text(androidx.compose.ui.res.stringResource(R.string.argon2_params), color = palette.accent.toComposeColor(), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    androidx.compose.ui.res.stringResource(R.string.argon2_cipher_note),
+                    color = palette.textDim.toComposeColor(),
+                    fontSize = 11.sp,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(memory, { memory = it.filter { c -> c.isDigit() } }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_memory)) }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(iterations, { iterations = it.filter { c -> c.isDigit() } }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_iterations)) }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(lanes, { lanes = it.filter { c -> c.isDigit() } }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_lanes)) }, modifier = Modifier.weight(1f))
+                    TextButton(enabled = !busy, onClick = { applyPreset(32 * 1024, 2, 1) }) { Text(androidx.compose.ui.res.stringResource(R.string.argon2_preset_quick)) }
+                    TextButton(enabled = !busy, onClick = { applyPreset(VaultCrypto.Params.DEFAULT.memoryKiB, VaultCrypto.Params.DEFAULT.iterations, VaultCrypto.Params.DEFAULT.parallelism) }) { Text(androidx.compose.ui.res.stringResource(R.string.argon2_preset_default)) }
+                    TextButton(enabled = !busy, onClick = { applyPreset(128 * 1024, 4, 2) }) { Text(androidx.compose.ui.res.stringResource(R.string.argon2_preset_strong)) }
                 }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(memory, { memory = it.filter { c -> c.isDigit() }.take(6) }, singleLine = true, enabled = !busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_memory)) }, modifier = Modifier.weight(1f))
+                    OutlinedTextField(iterations, { iterations = it.filter { c -> c.isDigit() }.take(2) }, singleLine = true, enabled = !busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_iterations)) }, modifier = Modifier.weight(1f))
+                    OutlinedTextField(lanes, { lanes = it.filter { c -> c.isDigit() }.take(1) }, singleLine = true, enabled = !busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), label = { Text(androidx.compose.ui.res.stringResource(R.string.argon2_lanes)) }, modifier = Modifier.weight(1f))
+                }
+                Text(
+                    "8 192 – 262 144 KiB · 1 – 16 passes · 1 – 4 lanes",
+                    color = palette.textDim.toComposeColor(),
+                    fontSize = 11.sp,
+                )
                 error?.let { Text(it, color = palette.danger.toComposeColor(), fontSize = 12.sp) }
             }
         },

@@ -185,22 +185,26 @@ object Evaluator {
                 val a = evaluate(args[2], scope).realValue()
                 val b = evaluate(args[3], scope).realValue()
                 val old = scope.vars[variable]
-                val result = Numerical.adaptiveSimpson({ t ->
+                val fn: (Double) -> Double = { t ->
                     scope.vars[variable] = Complex.real(t)
                     evaluate(args[0], scope).realValue()
-                }, a, b, 1e-10, 20)
+                }
+                // Endpoints at ±infinity switch to a compactifying change of variables.
+                val result = if (a.isFinite() && b.isFinite()) Numerical.adaptiveSimpson(fn, a, b, 1e-10, 20)
+                else Numerical.improperQuad(fn, a, b, 1e-10)
                 if (old == null) scope.vars.remove(variable) else scope.vars[variable] = old
                 Complex.real(result.value)
             }
             "derivative", "diff" -> {
-                requireArgs(name, args, 3)
+                if (args.size != 3 && args.size != 4) throw EvalException("derivative expects 3 arguments")
                 val variable = (args[1] as? Expr.Var)?.name ?: throw EvalException("derivative needs a variable")
                 val at = evaluate(args[2], scope).realValue()
+                val order = if (args.size == 4) evaluate(args[3], scope).realValue().roundToIntOrThrow("derivative order") else 1
                 val old = scope.vars[variable]
                 val result = Numerical.derivative({ t ->
                     scope.vars[variable] = Complex.real(t)
                     evaluate(args[0], scope).realValue()
-                }, at, 1)
+                }, at, order)
                 if (old == null) scope.vars.remove(variable) else scope.vars[variable] = old
                 Complex.real(result)
             }
@@ -466,6 +470,7 @@ object Evaluator {
             "euler" to Complex(0.5772156649015329, 0.0),
             "inf" to Complex.INF,
             "infinity" to Complex.INF,
+            "infty" to Complex.INF,
             "oo" to Complex.INF,
             "nan" to Complex.NaN,
             "c" to Complex(299792458.0, 0.0),

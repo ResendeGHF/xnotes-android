@@ -4,9 +4,11 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.PI
 import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tan
 
 /** A point sampled from a function or an ODE solution. */
 data class SamplePoint(val x: Double, val y: Double)
@@ -70,6 +72,49 @@ object Numerical {
         }
         val value = recurse(a, b, fa, fb, fm, whole, tolerance, maxDepth)
         return QuadratureResult(value, error, evaluations)
+    }
+
+    /** Quadrature over infinite intervals via a compactifying change of variables. */
+    fun improperQuad(
+        f: (Double) -> Double,
+        a: Double,
+        b: Double,
+        tolerance: Double = 1e-10,
+    ): QuadratureResult {
+        if (a.isFinite() && b.isFinite()) return adaptiveSimpson(f, a, b, tolerance)
+        // Shrink the mapped endpoints a touch: tan and 1/(1-t) blow up exactly at the poles.
+        return when {
+            a.isInfinite() && b.isInfinite() -> {
+                val lo = -PI / 2.0 + 1e-10
+                val hi = PI / 2.0 - 1e-10
+                adaptiveSimpson({ u ->
+                    val x = tan(u)
+                    val w = 1.0 + x * x
+                    val fx = f(x)
+                    if (!x.isFinite() || !fx.isFinite() || !w.isFinite()) Double.NaN else fx * w
+                }, lo, hi, tolerance)
+            }
+            b.isInfinite() -> {
+                val hi = 1.0 - 1e-12
+                adaptiveSimpson({ t ->
+                    val s = 1.0 - t
+                    val x = a + t / s
+                    val w = 1.0 / (s * s)
+                    val fx = f(x)
+                    if (!x.isFinite() || !fx.isFinite() || !w.isFinite()) Double.NaN else fx * w
+                }, 0.0, hi, tolerance)
+            }
+            else -> {
+                val hi = 1.0 - 1e-12
+                adaptiveSimpson({ t ->
+                    val s = 1.0 - t
+                    val x = b - t / s
+                    val w = 1.0 / (s * s)
+                    val fx = f(x)
+                    if (!x.isFinite() || !fx.isFinite() || !w.isFinite()) Double.NaN else fx * w
+                }, 0.0, hi, tolerance)
+            }
+        }
     }
 
     /** Composite Gauss–Legendre with [panels] intervals and [order] nodes each. */

@@ -55,6 +55,11 @@ class InfiniteDocument(
     var lastView: Waypoint? = null,
     /** When the canvas was created (epoch ms), or null for files written before this was recorded. */
     var created: Long? = null,
+    /**
+     * This canvas's Math Studio workspace, serialized JSON — same contract as
+     * [com.xnotes.core.model.Document.mathStudioJson].
+     */
+    var mathStudioJson: String? = null,
 ) {
 
     /** Something that must be patched when the item list changes: the GL geometry store. */
@@ -111,7 +116,7 @@ class InfiniteDocument(
      * drawn or edited.
      */
     fun snapshotForWrite(): InfiniteDocument {
-        val copy = InfiniteDocument(dpi, path, displayName, dirty, background, waypoints.toMutableList(), lastView, created)
+        val copy = InfiniteDocument(dpi, path, displayName, dirty, background, waypoints.toMutableList(), lastView, created, mathStudioJson)
         copy.backing.addAll(backing)
         return copy
     }

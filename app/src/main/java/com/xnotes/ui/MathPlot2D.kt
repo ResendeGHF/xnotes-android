@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
@@ -30,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
@@ -39,6 +41,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
@@ -84,13 +87,20 @@ internal enum class Plot2DMode(val labelRes: Int) {
     COMPLEX(R.string.math_2d_complex),
 }
 
-/** State kept across tab switches for the 2D plotter. */
+/** One parametric curve x(t), y(t). */
+internal data class ParamCurve2D(
+    val x: String = "cos(3t)",
+    val y: String = "sin(2t)",
+    val colorArgb: Int? = null,
+    val visible: Boolean = true,
+)
+
+/** Everything the 2D plotter keeps: the entry lists carry each curve's colour and visibility. */
 internal class Plot2DState {
     var mode by mutableStateOf(Plot2DMode.CARTESIAN)
-    var expressions by mutableStateOf(listOf("sin(x)", "cos(x)/2"))
-    var parametricX by mutableStateOf("cos(3t)")
-    var parametricY by mutableStateOf("sin(2t)")
-    var implicit by mutableStateOf("x^2 + y^2 - 4")
+    var expressions by mutableStateOf(listOf(MathEntry("sin(x)"), MathEntry("cos(x)/2")))
+    var paramCurves by mutableStateOf(listOf(ParamCurve2D(), ParamCurve2D("sin(3t)", "cos(2t)")))
+    var implicitList by mutableStateOf(listOf(MathEntry("x^2 + y^2 - 4")))
     var complex by mutableStateOf("gamma(z)")
     var polarTurns by mutableStateOf("2")
     var xMin by mutableStateOf(-10.0)
@@ -98,6 +108,7 @@ internal class Plot2DState {
     var yMin by mutableStateOf(-6.25)
     var yMax by mutableStateOf(6.25)
     var showGrid by mutableStateOf(true)
+    val anim = AnimState()
 
     fun resetView() {
         xMin = -10.0; xMax = 10.0; yMin = -6.25; yMax = 6.25
@@ -106,14 +117,19 @@ internal class Plot2DState {
     fun addExpression() {
         if (expressions.size >= 6) return
         expressions = expressions + when (mode) {
-            Plot2DMode.POLAR -> "1 + cos(theta)"
-            else -> "x"
+            Plot2DMode.POLAR -> MathEntry("1 + cos(theta)")
+            else -> MathEntry("x")
         }
     }
 
     fun setExpression(index: Int, text: String) {
         if (index !in expressions.indices) return
-        expressions = expressions.toMutableList().also { it[index] = text }
+        expressions = expressions.toMutableList().also { it[index] = it[index].copy(text = text) }
+    }
+
+    fun setExpressionStyle(index: Int, colorArgb: Int?, visible: Boolean) {
+        if (index !in expressions.indices) return
+        expressions = expressions.toMutableList().also { it[index] = it[index].copy(colorArgb = colorArgb, visible = visible) }
     }
 
     fun removeExpression(index: Int) {
@@ -121,25 +137,63 @@ internal class Plot2DState {
         expressions = expressions.toMutableList().also { it.removeAt(index) }
     }
 
-    fun snapshot(): Plot2DSnap = Plot2DSnap(
-        mode = mode,
-        expressions = expressions.toList(),
-        parametricX = parametricX,
-        parametricY = parametricY,
-        implicit = implicit,
-        complex = complex,
-        polarTurns = polarTurns.toDoubleOrNull()?.coerceIn(0.05, 64.0) ?: 2.0,
-        xMin = xMin, xMax = xMax, yMin = yMin, yMax = yMax,
-        showGrid = showGrid,
-    )
+    fun addParam() {
+        if (paramCurves.size >= 6) return
+        paramCurves = paramCurves + ParamCurve2D("cos(t)", "sin(t)")
+    }
+    fun setParam(i: Int, x: String, y: String) {
+        if (i !in paramCurves.indices) return
+        paramCurves = paramCurves.toMutableList().also { it[i] = it[i].copy(x = x, y = y) }
+    }
+    fun setParamStyle(i: Int, colorArgb: Int?, visible: Boolean) {
+        if (i !in paramCurves.indices) return
+        paramCurves = paramCurves.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+    }
+    fun removeParam(i: Int) {
+        if (paramCurves.size <= 1) return
+        paramCurves = paramCurves.toMutableList().also { it.removeAt(i) }
+    }
+
+    fun addImplicit() {
+        if (implicitList.size >= 6) return
+        implicitList = implicitList + MathEntry("x^2 - y")
+    }
+    fun setImplicit(i: Int, text: String) {
+        if (i !in implicitList.indices) return
+        implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(text = text) }
+    }
+    fun setImplicitStyle(i: Int, colorArgb: Int?, visible: Boolean) {
+        if (i !in implicitList.indices) return
+        implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+    }
+    fun removeImplicit(i: Int) {
+        if (implicitList.size <= 1) return
+        implicitList = implicitList.toMutableList().also { it.removeAt(i) }
+    }
+
+    fun snapshot(): Plot2DSnap {
+        // Item A: t is not valid for complex functions, so the snapshot stays static there.
+        val isComplex = mode == Plot2DMode.COMPLEX
+        return Plot2DSnap(
+            mode = mode,
+            expressions = expressions.toList(),
+            paramCurves = paramCurves.toList(),
+            implicitList = implicitList.toList(),
+            complex = complex,
+            polarTurns = polarTurns.toDoubleOrNull()?.coerceIn(0.05, 64.0) ?: 2.0,
+            xMin = xMin, xMax = xMax, yMin = yMin, yMax = yMax,
+            showGrid = showGrid,
+            anim = if (isComplex) null else anim.snap(),
+            animT = if (anim.enabled && !isComplex) anim.tCurrent else null,
+        )
+    }
 }
 
-internal class Plot2DSnap(
+internal data class Plot2DSnap(
     val mode: Plot2DMode,
-    val expressions: List<String>,
-    val parametricX: String,
-    val parametricY: String,
-    val implicit: String,
+    val expressions: List<MathEntry>,
+    val paramCurves: List<ParamCurve2D>,
+    val implicitList: List<MathEntry>,
     val complex: String,
     val polarTurns: Double,
     val xMin: Double,
@@ -147,6 +201,8 @@ internal class Plot2DSnap(
     val yMin: Double,
     val yMax: Double,
     val showGrid: Boolean,
+    val anim: AnimSnap? = null,
+    val animT: Double? = null,
 )
 
 private data class ViewBox(val xMin: Double, val xMax: Double, val yMin: Double, val yMax: Double)
@@ -154,12 +210,15 @@ private data class ViewBox(val xMin: Double, val xMax: Double, val yMin: Double,
 private class LivePlot(
     val mode: Plot2DMode,
     val curves: List<List<Polyline>>,
-    val implicit: List<WorldSegment>,
+    val curveColors: List<Int>,
+    val implicit: List<List<WorldSegment>>,
+    val implicitColors: List<Int>,
     val domain: ImageBitmap?,
     val xMin: Double,
     val xMax: Double,
     val yMin: Double,
     val yMax: Double,
+    val animT: Double? = null,
 )
 
 @Composable
@@ -168,16 +227,19 @@ internal fun Plot2DPane(state: Plot2DState, onInsert: (ByteArray) -> Unit) {
     val title = stringResource(R.string.math_tab_graph2d)
     val phase = stringResource(R.string.math_2d_phase_legend)
     val failedText = stringResource(R.string.math_insert_failed)
+    val animLabel = stringResource(R.string.math_insert_animation)
     val scope = rememberCoroutineScope()
     val colors = mathPlotColors()
     var inserting by remember { mutableStateOf(false) }
+    var animInserting by remember { mutableStateOf(false) }
     var failed by remember { mutableStateOf(false) }
     val legend = plot2DLegend(state, colors)
+    val animOn = state.anim.enabled && state.mode != Plot2DMode.COMPLEX
     GraphWorkspace(
         modes = Plot2DMode.entries.map { it.name to stringResource(it.labelRes) },
         selected = state.mode.name,
         onSelect = { state.mode = Plot2DMode.valueOf(it) },
-        legend = legend,
+        legend = legend.map { it.label to it.color },
         caption = if (state.mode == Plot2DMode.COMPLEX) phase else null,
         showGrid = state.showGrid,
         onToggleGrid = { state.showGrid = !state.showGrid },
@@ -186,9 +248,8 @@ internal fun Plot2DPane(state: Plot2DState, onInsert: (ByteArray) -> Unit) {
         onInsert = {
             if (inserting) return@GraphWorkspace
             val snap = state.snapshot()
-            val exported = legend.mapIndexed { index, (label, _) ->
-                ExportLegend(label, theme.series[index % theme.series.size])
-            } + if (snap.mode == Plot2DMode.COMPLEX) listOf(ExportLegend(phase, theme.dim)) else emptyList()
+            val exported = legend.map { ExportLegend(it.label, it.argb) } +
+                if (snap.mode == Plot2DMode.COMPLEX) listOf(ExportLegend(phase, theme.dim)) else emptyList()
             scope.launch {
                 inserting = true
                 failed = false
@@ -197,36 +258,88 @@ internal fun Plot2DPane(state: Plot2DState, onInsert: (ByteArray) -> Unit) {
                 if (bytes == null) failed = true else onInsert(bytes)
             }
         },
+        animInsertLabel = if (animOn) animLabel else null,
+        animInserting = animInserting,
+        onInsertAnim = if (animOn) ({
+            if (animInserting || inserting) return@GraphWorkspace
+            val base = state.snapshot()
+            val exported = legend.map { ExportLegend(it.label, it.argb) }
+            scope.launch {
+                animInserting = true
+                failed = false
+                val bytes = withContext(Dispatchers.Default) { exportPlot2DAnimation(base, theme, title, exported) }
+                animInserting = false
+                if (bytes == null) failed = true else onInsert(bytes)
+            }
+        }) else null,
         status = if (failed) failedText else null,
         plot = { Plot2DCanvas(state, Modifier.fillMaxSize()) },
         controls = { Plot2DInputs(state) },
     )
 }
 
+/** One visible legend row: display colour plus the packed colour baked into exports. */
+private class Plot2DLegendRow(val label: String, val color: Color, val argb: Int)
+
 @Composable
-private fun plot2DLegend(state: Plot2DState, colors: List<Color>): List<Pair<String, Color>> = when (state.mode) {
-    Plot2DMode.CARTESIAN -> state.expressions.mapIndexed { index, text ->
-        "f${index + 1}(x) = ${text.ifBlank { "—" }}" to colors[index % colors.size]
+private fun plot2DLegend(state: Plot2DState, colors: List<Color>): List<Plot2DLegendRow> {
+    // Item A: t is not valid for complex functions, so it never appears there.
+    val showT = state.anim.enabled && state.mode != Plot2DMode.COMPLEX
+    val series = mathPlotColors()
+    fun effective(index: Int, custom: Int?): Pair<Color, Int> {
+        val c = custom?.let { Color(it) } ?: series[index % series.size]
+        return c to c.toArgb()
     }
-    Plot2DMode.POLAR -> state.expressions.mapIndexed { index, text ->
-        "r${index + 1}(θ) = ${text.ifBlank { "—" }}" to colors[index % colors.size]
+    val base: List<Plot2DLegendRow> = when (state.mode) {
+        Plot2DMode.CARTESIAN -> state.expressions.mapIndexedNotNull { index, e ->
+            if (!e.visible) null else {
+                val (c, a) = effective(index, e.colorArgb)
+                Plot2DLegendRow("f${index + 1}(x) = ${e.text.ifBlank { "—" }}", c, a)
+            }
+        }
+        Plot2DMode.POLAR -> state.expressions.mapIndexedNotNull { index, e ->
+            if (!e.visible) null else {
+                val (c, a) = effective(index, e.colorArgb)
+                Plot2DLegendRow("r${index + 1}(θ) = ${e.text.ifBlank { "—" }}", c, a)
+            }
+        }
+        Plot2DMode.PARAMETRIC -> state.paramCurves.mapIndexedNotNull { index, p ->
+            if (!p.visible) null else {
+                val (c, a) = effective(index, p.colorArgb)
+                Plot2DLegendRow("C${index + 1}: x=${p.x.ifBlank { "—" }} y=${p.y.ifBlank { "—" }}", c, a)
+            }
+        }
+        Plot2DMode.IMPLICIT -> state.implicitList.mapIndexedNotNull { index, e ->
+            if (!e.visible) null else {
+                val (c, a) = effective(index, e.colorArgb)
+                Plot2DLegendRow("C${index + 1}: ${e.text.ifBlank { "—" }} = 0", c, a)
+            }
+        }
+        Plot2DMode.COMPLEX -> listOf(Plot2DLegendRow("f(z) = ${state.complex.ifBlank { "—" }}", colors[0], colors[0].toArgb()))
     }
-    Plot2DMode.PARAMETRIC -> listOf("x(t) = ${state.parametricX}    y(t) = ${state.parametricY}" to colors[0])
-    Plot2DMode.IMPLICIT -> listOf("${state.implicit.ifBlank { "—" }} = 0" to colors[0])
-    Plot2DMode.COMPLEX -> listOf("f(z) = ${state.complex.ifBlank { "—" }}" to colors[0])
+    if (showT) {
+        return base + Plot2DLegendRow("t = ${"%.3f".format(state.anim.tCurrent)}", colors[base.size % colors.size], colors[base.size % colors.size].toArgb())
+    }
+    return base
 }
 
 @Composable
 private fun Plot2DInputs(state: Plot2DState) {
     val palette = LocalPalette.current
     val colors = mathPlotColors()
+    val eyeLabel = stringResource(R.string.math_toggle_visibility)
+    val colorLabel = stringResource(R.string.math_pick_color)
+    fun effectiveColor(index: Int, custom: Int?): Color =
+        custom?.let { Color(it) } ?: colors[index % colors.size]
     when (state.mode) {
         Plot2DMode.CARTESIAN, Plot2DMode.POLAR -> {
-            state.expressions.forEachIndexed { index, text ->
+            state.expressions.forEachIndexed { index, e ->
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    BoxSpacer(colors[index % colors.size])
+                    EntryColorDot(e.colorArgb, effectiveColor(index, e.colorArgb), colorLabel) {
+                        state.setExpressionStyle(index, it, e.visible)
+                    }
                     MathTextField(
-                        value = text,
+                        value = e.text,
                         onValueChange = { state.setExpression(index, it) },
                         label = if (state.mode == Plot2DMode.POLAR) {
                             stringResource(R.string.math_2d_r_theta, index + 1)
@@ -235,6 +348,9 @@ private fun Plot2DInputs(state: Plot2DState) {
                         },
                         modifier = Modifier.weight(1f),
                     )
+                    EntryEye(e.visible, eyeLabel) {
+                        state.setExpressionStyle(index, e.colorArgb, !e.visible)
+                    }
                     if (state.expressions.size > 1) {
                         MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
                             state.removeExpression(index)
@@ -254,26 +370,81 @@ private fun Plot2DInputs(state: Plot2DState) {
                     )
                 }
             }
+            Plot2DDomain(state)
+            AnimPanel(state.anim)
         }
-        Plot2DMode.PARAMETRIC -> Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            MathTextField(state.parametricX, { state.parametricX = it }, stringResource(R.string.math_2d_x_t), Modifier.weight(1f))
-            MathTextField(state.parametricY, { state.parametricY = it }, stringResource(R.string.math_2d_y_t), Modifier.weight(1f))
+        Plot2DMode.PARAMETRIC -> {
+            state.paramCurves.forEachIndexed { index, p ->
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    EntryColorDot(p.colorArgb, effectiveColor(index, p.colorArgb), colorLabel) {
+                        state.setParamStyle(index, it, p.visible)
+                    }
+                    MathTextField(p.x, { state.setParam(index, it, p.y) }, stringResource(R.string.math_2d_x_t) + " ${index + 1}", Modifier.weight(1f))
+                    MathTextField(p.y, { state.setParam(index, p.x, it) }, stringResource(R.string.math_2d_y_t) + " ${index + 1}", Modifier.weight(1f))
+                    EntryEye(p.visible, eyeLabel) {
+                        state.setParamStyle(index, p.colorArgb, !p.visible)
+                    }
+                    if (state.paramCurves.size > 1) {
+                        MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
+                            state.removeParam(index)
+                        }
+                    }
+                }
+            }
+            MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addParam() }
+            Plot2DDomain(state)
+            AnimPanel(state.anim, showShare = true)
         }
-        Plot2DMode.IMPLICIT -> MathTextField(
-            state.implicit, { state.implicit = it }, stringResource(R.string.math_2d_implicit_equation), Modifier.fillMaxWidth(),
-        )
-        Plot2DMode.COMPLEX -> MathTextField(
-            state.complex, { state.complex = it }, stringResource(R.string.math_2d_complex_function), Modifier.fillMaxWidth(),
-        )
+        Plot2DMode.IMPLICIT -> {
+            state.implicitList.forEachIndexed { index, e ->
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    EntryColorDot(e.colorArgb, effectiveColor(index, e.colorArgb), colorLabel) {
+                        state.setImplicitStyle(index, it, e.visible)
+                    }
+                    MathTextField(
+                        e.text, { state.setImplicit(index, it) }, stringResource(R.string.math_2d_implicit_equation) + " ${index + 1}", Modifier.weight(1f),
+                    )
+                    EntryEye(e.visible, eyeLabel) {
+                        state.setImplicitStyle(index, e.colorArgb, !e.visible)
+                    }
+                    if (state.implicitList.size > 1) {
+                        MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
+                            state.removeImplicit(index)
+                        }
+                    }
+                }
+            }
+            MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addImplicit() }
+            Plot2DDomain(state)
+            AnimPanel(state.anim)
+        }
+        Plot2DMode.COMPLEX -> {
+            MathTextField(
+                state.complex, { state.complex = it }, stringResource(R.string.math_2d_complex_function), Modifier.fillMaxWidth(),
+            )
+            Plot2DDomain(state)
+        }
     }
 }
 
+/** Explicit plot domain for every 2D mode: the sampling window is exactly what is typed here. */
 @Composable
-private fun BoxSpacer(color: Color) {
-    androidx.compose.foundation.layout.Box(
-        Modifier.size(12.dp).clip(CircleShape).background(color),
-    )
+private fun Plot2DDomain(state: Plot2DState) {
+    MathCard(Modifier.fillMaxWidth()) {
+        MathSectionTitle(stringResource(R.string.math_domain), Modifier.fillMaxWidth())
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            DomainField(state.xMin, { state.xMin = it }, stringResource(R.string.math_x_min), Modifier.weight(1f))
+            DomainField(state.xMax, { state.xMax = it }, stringResource(R.string.math_x_max), Modifier.weight(1f))
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            DomainField(state.yMin, { state.yMin = it }, stringResource(R.string.math_y_min), Modifier.weight(1f))
+            DomainField(state.yMax, { state.yMax = it }, stringResource(R.string.math_y_max), Modifier.weight(1f))
+        }
+    }
 }
+
 
 @Composable
 private fun Plot2DCanvas(state: Plot2DState, modifier: Modifier = Modifier) {
@@ -284,44 +455,79 @@ private fun Plot2DCanvas(state: Plot2DState, modifier: Modifier = Modifier) {
     val measurer = rememberTextMeasurer()
     val computingLabel = stringResource(R.string.math_3d_computing)
     val colors = mathPlotColors()
+    val seriesArgb = colors.map { it.toArgb() }
     val xMin = state.xMin
     val xMax = state.xMax
     val yMin = state.yMin
     val yMax = state.yMax
     val showGrid = state.showGrid
     val mode = state.mode
+    AnimTicker(state.anim)
     val view = rememberSettled(ViewBox(xMin, xMax, yMin, yMax), 80)
-    val expressions = rememberSettled(state.expressions.joinToString("\u0001"), 160)
-    val parametricX = rememberSettled(state.parametricX, 160)
-    val parametricY = rememberSettled(state.parametricY, 160)
-    val implicit = rememberSettled(state.implicit, 160)
+    /** Style trailer inside a settled key: colour ARGB (empty = auto) + visibility flag. */
+    fun styleOf(colorArgb: Int?, visible: Boolean) = "\u0003" + (colorArgb?.toString() ?: "") + "\u0003" + (if (visible) "1" else "0")
+    fun parseStyle(raw: String): MathEntry {
+        val parts = raw.split("\u0003")
+        return MathEntry(parts.getOrElse(0) { "" }, parts.getOrNull(1)?.toIntOrNull(), parts.getOrElse(2) { "1" } != "0")
+    }
+    val expressions = rememberSettled(state.expressions.joinToString("\u0001") { it.text + styleOf(it.colorArgb, it.visible) }, 160)
+    val params = rememberSettled(state.paramCurves.map { it.x + "\u0002" + it.y + styleOf(it.colorArgb, it.visible) }.joinToString("\u0001"), 160)
+    val implicits = rememberSettled(state.implicitList.joinToString("\u0001") { it.text + styleOf(it.colorArgb, it.visible) }, 160)
     val complex = rememberSettled(state.complex, 180)
     val turns = rememberSettled(state.polarTurns, 160)
+    val animT = state.anim.tCurrent
+    val animOn = state.anim.enabled
+    val animSnapKey = if (animOn) "${state.anim.tMinStr}|${state.anim.tMaxStr}|${state.anim.tStepsStr}|${state.anim.shareT}" else "off"
+    val animSnapSettled = rememberSettled(animSnapKey, 160)
     var picture by remember { mutableStateOf<LivePlot?>(null) }
+    var viewPx by remember { mutableStateOf(800 to 600) }
 
-    BoxWithConstraints(modifier.clipToBounds()) {
-        val pxW = constraints.maxWidth
-        val pxH = constraints.maxHeight
-        LaunchedEffect(mode, expressions, parametricX, parametricY, implicit, complex, turns, view, pxW, pxH) {
+    androidx.compose.foundation.layout.Box(
+        modifier.clipToBounds().onSizeChanged { viewPx = it.width to it.height },
+    ) {
+        val pxW = viewPx.first
+        val pxH = viewPx.second
+        LaunchedEffect(mode, expressions, params, implicits, complex, turns, view, pxW, pxH, animT, animSnapSettled) {
+            val exprList = if (expressions.isEmpty()) emptyList() else expressions.split("\u0001").map(::parseStyle)
+            val paramList = if (params.isEmpty()) emptyList() else params.split("\u0001").map {
+                val parts = it.split("\u0002")
+                val yAndStyle = parts.getOrElse(1) { "" }.split("\u0003")
+                val style = parseStyle("\u0003" + yAndStyle.getOrElse(1) { "" } + "\u0003" + yAndStyle.getOrElse(2) { "1" })
+                ParamCurve2D(parts.getOrElse(0) { "" }, yAndStyle.getOrElse(0) { "" }, style.colorArgb, style.visible)
+            }
+            val implList = if (implicits.isEmpty()) emptyList() else implicits.split("\u0001").map(::parseStyle)
+            val shareT = animSnapSettled.endsWith("|true")
+            val tVal: Double? = if (animOn) animT else null
             val snap = Plot2DSnap(
                 mode = mode,
-                expressions = expressions.split("\u0001"),
-                parametricX = parametricX,
-                parametricY = parametricY,
-                implicit = implicit,
+                expressions = exprList,
+                paramCurves = paramList,
+                implicitList = implList,
                 complex = complex,
                 polarTurns = turns.toDoubleOrNull()?.coerceIn(0.05, 64.0) ?: 2.0,
                 xMin = view.xMin, xMax = view.xMax, yMin = view.yMin, yMax = view.yMax,
                 showGrid = true,
+                animT = tVal,
+                anim = if (animOn) AnimSnap(0.0, 1.0, 60, tVal ?: 0.0, shareT) else null,
             )
+            // Resolve full anim range for shared parametric sampling.
+            val fullAnim: AnimSnap? = if (animOn) {
+                val lo = state.anim.tMinStr.toDoubleOrNull()
+                val hi = state.anim.tMaxStr.toDoubleOrNull()
+                if (lo != null && hi != null && lo.isFinite() && hi.isFinite() && lo != hi)
+                    AnimSnap(lo, hi, 60, tVal ?: lo, shareT) else null
+            } else null
             val (dw, dh) = if (mode == Plot2DMode.COMPLEX) cappedSize(pxW, pxH, 150) else 0 to 0
-            val sampled = withContext(Dispatchers.Default) { samplePlot2D(snap, dw, dh) }
+            val sampled = withContext(Dispatchers.Default) { samplePlot2D(snap, dw, dh, fullAnim, seriesArgb) }
             picture = LivePlot(
                 mode = snap.mode,
                 curves = sampled.curves,
-                implicit = sampled.implicit,
+                curveColors = sampled.curveColors,
+                implicit = sampled.implicitCurves,
+                implicitColors = sampled.implicitColors,
                 domain = sampled.domain?.asImageBitmap(),
                 xMin = snap.xMin, xMax = snap.xMax, yMin = snap.yMin, yMax = snap.yMax,
+                animT = tVal,
             )
         }
         val shown = picture?.takeIf { it.mode == mode }
@@ -415,15 +621,16 @@ private fun Plot2DCanvas(state: Plot2DState, modifier: Modifier = Modifier) {
                             i += 2
                         }
                     }
-                    drawPath(path, colors[index % colors.size], style = stroke)
+                    drawPath(path, Color(plot.curveColors.getOrElse(index) { seriesArgb[index % seriesArgb.size] }), style = stroke)
                 }
-                if (plot.implicit.isNotEmpty()) {
+                plot.implicit.forEachIndexed { index, segs ->
+                    if (segs.isEmpty()) return@forEachIndexed
                     val path = Path()
-                    for (segment in plot.implicit) {
+                    for (segment in segs) {
                         path.moveTo(sx(segment.x1), sy(segment.y1))
                         path.lineTo(sx(segment.x2), sy(segment.y2))
                     }
-                    drawPath(path, colors[0], style = stroke)
+                    drawPath(path, Color(plot.implicitColors.getOrElse(index) { seriesArgb[index % seriesArgb.size] }), style = stroke)
                 }
             }
             if (plot == null) {
@@ -431,12 +638,15 @@ private fun Plot2DCanvas(state: Plot2DState, modifier: Modifier = Modifier) {
                 drawText(layout, topLeft = Offset((size.width - layout.size.width) / 2f, (size.height - layout.size.height) / 2f))
             }
         }
+        if (state.mode != Plot2DMode.COMPLEX) AnimPlayOverlay(state.anim)
     }
 }
 
 private class PlotGeometry(
     val curves: List<List<Polyline>>,
-    val implicit: List<WorldSegment>,
+    val curveColors: List<Int>,
+    val implicitCurves: List<List<WorldSegment>>,
+    val implicitColors: List<Int>,
     val domain: Bitmap?,
 )
 
@@ -446,39 +656,8 @@ private suspend fun exportPlot2D(
     title: String,
     legend: List<ExportLegend>,
 ): ByteArray? = try {
-    val (dw, dh) = cappedSize(EXPORT_PLOT_W, EXPORT_PLOT_H, 220)
-    val sampled = samplePlot2D(snap, dw, dh)
-    val plot = Bitmap.createBitmap(EXPORT_PLOT_W, EXPORT_PLOT_H, Bitmap.Config.ARGB_8888)
-    val canvas = android.graphics.Canvas(plot)
-    canvas.drawColor(theme.paper)
-    sampled.domain?.let { domain ->
-        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
-        canvas.drawBitmap(domain, null, android.graphics.Rect(0, 0, EXPORT_PLOT_W, EXPORT_PLOT_H), paint)
-        domain.recycle()
-    }
-    if (snap.showGrid || snap.mode != Plot2DMode.COMPLEX) {
-        drawPlotFrame(canvas, EXPORT_PLOT_W, EXPORT_PLOT_H, snap.xMin, snap.xMax, snap.yMin, snap.yMax, theme, snap.showGrid)
-    }
-    sampled.curves.forEachIndexed { index, strokes ->
-        drawPolylines(
-            canvas, strokes, theme.series[index % theme.series.size],
-            snap.xMin, snap.xMax, snap.yMin, snap.yMax, EXPORT_PLOT_W, EXPORT_PLOT_H, 3.4f,
-        )
-    }
-    if (sampled.implicit.isNotEmpty()) {
-        drawWorldSegments(
-            canvas, sampled.implicit, theme.series[0],
-            snap.xMin, snap.xMax, snap.yMin, snap.yMax, EXPORT_PLOT_W, EXPORT_PLOT_H, 3.2f,
-        )
-    }
-    val foot = buildString {
-        append(windowFootnote(snap.xMin, snap.xMax, snap.yMin, snap.yMax))
-        when (snap.mode) {
-            Plot2DMode.PARAMETRIC -> append("    t ∈ [0, 2π]")
-            Plot2DMode.POLAR -> append("    θ ∈ [0, ${Numbers.tick(snap.polarTurns)}·2π]")
-            else -> Unit
-        }
-    }
+    val plot = renderPlot2DFrame(snap, theme, EXPORT_PLOT_W, EXPORT_PLOT_H)
+    val foot = plot2DFoot(snap)
     writeGraphPng(plot, title, legend, foot, theme)
 } catch (cancelled: CancellationException) {
     throw cancelled
@@ -486,34 +665,116 @@ private suspend fun exportPlot2D(
     null
 }
 
-private suspend fun samplePlot2D(snap: Plot2DSnap, domainW: Int, domainH: Int): PlotGeometry {
+private suspend fun exportPlot2DAnimation(
+    base: Plot2DSnap,
+    theme: GraphTheme,
+    title: String,
+    legend: List<ExportLegend>,
+): ByteArray? {
+    return try {
+    val lo = base.anim?.lo ?: return null
+    val hi = base.anim.hi
+    val steps = base.anim.steps
+    val shareT = base.anim.shareT
+    val ts = animFrameTs(lo, hi, steps, 12)
+    val fw = 480; val fh = 300
+    val frames = ArrayList<Pair<Bitmap, String>>(ts.size)
+    for (t in ts) {
+        coroutineContext.ensureActive()
+        val fullAnim = AnimSnap(lo, hi, steps, t, shareT)
+        val snap = Plot2DSnap(base.mode, base.expressions, base.paramCurves, base.implicitList, base.complex,
+            base.polarTurns, base.xMin, base.xMax, base.yMin, base.yMax, base.showGrid,
+            anim = AnimSnap(lo, hi, steps, t, shareT), animT = t)
+        frames += renderPlot2DFrame(snap, theme, fw, fh, fullAnim) to "t=${Numbers.tick(t)}"
+    }
+    val foot = plot2DFoot(base.copy(animT = null)) + "    frames=${ts.size} t∈[${Numbers.tick(minOf(lo, hi))}, ${Numbers.tick(maxOf(lo, hi))}]"
+    buildAnimationPng(frames, title, legend, foot, theme, specJson = MathAnimSpec.capture2D(base)?.toJson())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (_: Throwable) {
+    null
+}
+}
+
+private suspend fun renderPlot2DFrame(snap: Plot2DSnap, theme: GraphTheme, w: Int, h: Int, fullAnim: AnimSnap? = null): Bitmap {
+    val full = fullAnim ?: snap.anim
+    val (dw, dh) = if (snap.mode == Plot2DMode.COMPLEX) cappedSize(w, h, 220) else 0 to 0
+    val sampled = samplePlot2D(snap, dw, dh, full, theme.series)
+    val plot = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(plot)
+    canvas.drawColor(theme.paper)
+    sampled.domain?.let { domain ->
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(domain, null, android.graphics.Rect(0, 0, w, h), paint)
+        domain.recycle()
+    }
+    if (snap.showGrid || snap.mode != Plot2DMode.COMPLEX) {
+        drawPlotFrame(canvas, w, h, snap.xMin, snap.xMax, snap.yMin, snap.yMax, theme, snap.showGrid)
+    }
+    sampled.curves.forEachIndexed { index, strokes ->
+        drawPolylines(canvas, strokes, sampled.curveColors.getOrElse(index) { theme.series[index % theme.series.size] },
+            snap.xMin, snap.xMax, snap.yMin, snap.yMax, w, h, 3.4f)
+    }
+    sampled.implicitCurves.forEachIndexed { index, segs ->
+        if (segs.isNotEmpty()) drawWorldSegments(canvas, segs, sampled.implicitColors.getOrElse(index) { theme.series[index % theme.series.size] },
+            snap.xMin, snap.xMax, snap.yMin, snap.yMax, w, h, 3.2f)
+    }
+    return plot
+}
+
+private fun plot2DFoot(snap: Plot2DSnap): String = buildString {
+    append(windowFootnote(snap.xMin, snap.xMax, snap.yMin, snap.yMax))
+    when (snap.mode) {
+        Plot2DMode.PARAMETRIC -> {
+            if (snap.anim != null) append("    t ∈ [${Numbers.tick(snap.anim.lo)}, ${Numbers.tick(snap.anim.hi)}] t=${Numbers.tick(snap.animT ?: 0.0)}${if (snap.anim.shareT) " shared" else ""}")
+            else append("    t ∈ [0, 2π]")
+        }
+        Plot2DMode.POLAR -> append("    θ ∈ [0, ${Numbers.tick(snap.polarTurns)}·2π]")
+        else -> Unit
+    }
+    // Item A: complex mode never carries t.
+    if (snap.animT != null && snap.mode != Plot2DMode.PARAMETRIC && snap.mode != Plot2DMode.COMPLEX) append("    t=${Numbers.tick(snap.animT)}")
+}
+
+private suspend fun samplePlot2D(snap: Plot2DSnap, domainW: Int, domainH: Int, fullAnim: AnimSnap? = null, series: List<Int> = emptyList()): PlotGeometry {
     coroutineContext.ensureActive()
     val curves = ArrayList<List<Polyline>>()
-    var implicit = emptyList<WorldSegment>()
+    val curveColors = ArrayList<Int>()
+    val implicits = ArrayList<List<WorldSegment>>()
+    val implicitColors = ArrayList<Int>()
     var domain: Bitmap? = null
+    fun seriesColor(i: Int): Int = series.getOrElse(i % series.size.coerceAtLeast(1)) { 0xFF888888.toInt() }
     when (snap.mode) {
-        Plot2DMode.CARTESIAN -> for (text in snap.expressions) {
-            val expr = runCatching { ExpressionParser.parse(text) }.getOrNull()
-            curves += if (expr == null) emptyList() else sampleCartesian(expr, snap.xMin, snap.xMax, snap.yMin, snap.yMax)
+        Plot2DMode.CARTESIAN -> snap.expressions.forEachIndexed { i, e ->
+            if (!e.visible) { curves.add(emptyList()); curveColors.add(seriesColor(i)); return@forEachIndexed }
+            val expr = runCatching { ExpressionParser.parse(e.text) }.getOrNull()
+            curves.add(if (expr == null) emptyList() else sampleCartesian(expr, snap.xMin, snap.xMax, snap.yMin, snap.yMax, snap.animT))
+            curveColors.add(e.colorArgb ?: seriesColor(i))
         }
-        Plot2DMode.POLAR -> for (text in snap.expressions) {
-            val expr = runCatching { ExpressionParser.parse(text) }.getOrNull()
-            curves += if (expr == null) emptyList() else samplePolar(expr, snap.polarTurns)
+        Plot2DMode.POLAR -> snap.expressions.forEachIndexed { i, e ->
+            if (!e.visible) { curves.add(emptyList()); curveColors.add(seriesColor(i)); return@forEachIndexed }
+            val expr = runCatching { ExpressionParser.parse(e.text) }.getOrNull()
+            curves.add(if (expr == null) emptyList() else samplePolar(expr, snap.polarTurns, snap.animT))
+            curveColors.add(e.colorArgb ?: seriesColor(i))
         }
-        Plot2DMode.PARAMETRIC -> {
-            val xExpr = runCatching { ExpressionParser.parse(snap.parametricX) }.getOrNull()
-            val yExpr = runCatching { ExpressionParser.parse(snap.parametricY) }.getOrNull()
-            curves += if (xExpr == null || yExpr == null) emptyList() else sampleParametric(xExpr, yExpr, snap)
+        Plot2DMode.PARAMETRIC -> snap.paramCurves.forEachIndexed { i, p ->
+            if (!p.visible) { curves.add(emptyList()); curveColors.add(seriesColor(i)); return@forEachIndexed }
+            val xExpr = runCatching { ExpressionParser.parse(p.x) }.getOrNull()
+            val yExpr = runCatching { ExpressionParser.parse(p.y) }.getOrNull()
+            curves.add(if (xExpr == null || yExpr == null) emptyList() else sampleParametric(xExpr, yExpr, snap, fullAnim))
+            curveColors.add(p.colorArgb ?: seriesColor(i))
         }
-        Plot2DMode.IMPLICIT -> {
-            val expr = runCatching { ExpressionParser.parse(snap.implicit) }.getOrNull()
-            if (expr != null) implicit = sampleImplicit(expr, snap)
+        Plot2DMode.IMPLICIT -> snap.implicitList.forEachIndexed { i, e ->
+            if (!e.visible) { implicits.add(emptyList()); implicitColors.add(seriesColor(i)); return@forEachIndexed }
+            val expr = runCatching { ExpressionParser.parse(e.text) }.getOrNull()
+            implicits.add(if (expr == null) emptyList() else sampleImplicit(expr, snap, snap.animT))
+            implicitColors.add(e.colorArgb ?: seriesColor(i))
         }
         Plot2DMode.COMPLEX -> if (domainW > 1 && domainH > 1) {
             domain = renderDomain(snap.complex, domainW, domainH, snap.xMin, snap.xMax, snap.yMin, snap.yMax)
         }
     }
-    return PlotGeometry(curves, implicit, domain)
+    return PlotGeometry(curves, curveColors, implicits, implicitColors, domain)
 }
 
 private class StrokeBuf {
@@ -533,10 +794,11 @@ private class StrokeBuf {
     }
 }
 
-private suspend fun sampleCartesian(expr: Expr, xMin: Double, xMax: Double, yMin: Double, yMax: Double): List<Polyline> {
-    val n = 320
+private suspend fun sampleCartesian(expr: Expr, xMin: Double, xMax: Double, yMin: Double, yMax: Double, tAnim: Double? = null): List<Polyline> {
+    val n = 400
     val span = (yMax - yMin).takeIf { it.isFinite() && it > 0.0 } ?: return emptyList()
     val scope = EvalScope()
+    if (tAnim != null && tAnim.isFinite()) scope.vars["t"] = Complex.real(tAnim)
     val buf = StrokeBuf()
     var prev = Double.NaN
     for (i in 0..n) {
@@ -555,16 +817,18 @@ private suspend fun sampleCartesian(expr: Expr, xMin: Double, xMax: Double, yMin
     return buf.out
 }
 
-private suspend fun samplePolar(expr: Expr, turns: Double): List<Polyline> {
-    val n = 480
+private suspend fun samplePolar(expr: Expr, turns: Double, tAnim: Double? = null): List<Polyline> {
+    val n = 560
     val scope = EvalScope()
+    if (tAnim != null && tAnim.isFinite()) scope.vars["tAnim"] = Complex.real(tAnim)
     val buf = StrokeBuf()
     for (i in 0..n) {
         if (i % 40 == 0) coroutineContext.ensureActive()
         val theta = i.toDouble() / n * turns * 2.0 * PI
         val angle = Complex.real(theta)
         scope.vars["theta"] = angle
-        scope.vars["t"] = angle
+        // Preserve theta in t unless an animation drives t separately.
+        if (tAnim == null) scope.vars["t"] = angle else scope.vars["t"] = Complex.real(tAnim)
         val r = runCatching { Evaluator.evaluate(expr, scope).realValue() }.getOrDefault(Double.NaN)
         if (!r.isFinite()) {
             buf.flush(); continue
@@ -575,16 +839,30 @@ private suspend fun samplePolar(expr: Expr, turns: Double): List<Polyline> {
     return buf.out
 }
 
-private suspend fun sampleParametric(xExpr: Expr, yExpr: Expr, snap: Plot2DSnap): List<Polyline> {
-    val n = 400
+private suspend fun sampleParametric(xExpr: Expr, yExpr: Expr, snap: Plot2DSnap, fullAnim: AnimSnap? = null): List<Polyline> {
+    val n = 480
     val limit = hypot(snap.xMax - snap.xMin, snap.yMax - snap.yMin) * 0.45
     val scope = EvalScope()
     val buf = StrokeBuf()
     var prevX = Double.NaN
     var prevY = Double.NaN
+    val shareT = fullAnim?.shareT == true && snap.animT != null && fullAnim != null
+    val tLo: Double
+    val tHi: Double
+    if (shareT && fullAnim != null) {
+        val lo = minOf(fullAnim.lo, fullAnim.hi); val hi = maxOf(fullAnim.lo, fullAnim.hi)
+        tLo = lo; tHi = (snap.animT ?: hi).coerceIn(lo, hi)
+        if (tHi <= tLo) return emptyList()
+    } else {
+        tLo = 0.0; tHi = 2.0 * PI
+        if (snap.animT != null && snap.animT.isFinite() && fullAnim?.shareT != true) scope.vars["tAnim"] = Complex.real(snap.animT)
+        // When not sharing, animation t is also visible as tAnim; expressions using t keep parametric t.
+        if (snap.animT != null && snap.animT.isFinite()) scope.vars["tAnim"] = Complex.real(snap.animT)
+    }
     for (i in 0..n) {
         if (i % 40 == 0) coroutineContext.ensureActive()
-        val t = i.toDouble() / n * 2.0 * PI
+        val frac = i.toDouble() / n
+        val t = if (shareT) tLo + frac * (tHi - tLo) else tLo + frac * (tHi - tLo)
         scope.vars["t"] = Complex.real(t)
         val x = runCatching { Evaluator.evaluate(xExpr, scope).realValue() }.getOrDefault(Double.NaN)
         val y = runCatching { Evaluator.evaluate(yExpr, scope).realValue() }.getOrDefault(Double.NaN)
@@ -599,10 +877,11 @@ private suspend fun sampleParametric(xExpr: Expr, yExpr: Expr, snap: Plot2DSnap)
     return buf.out
 }
 
-private suspend fun sampleImplicit(expr: Expr, snap: Plot2DSnap): List<WorldSegment> {
-    val nx = 72
-    val ny = 72
+private suspend fun sampleImplicit(expr: Expr, snap: Plot2DSnap, tAnim: Double? = null): List<WorldSegment> {
+    val nx = 96
+    val ny = 96
     val scope = EvalScope()
+    if (tAnim != null && tAnim.isFinite()) scope.vars["t"] = Complex.real(tAnim)
     val values = Array(ny) { r ->
         coroutineContext.ensureActive()
         DoubleArray(nx) { c ->

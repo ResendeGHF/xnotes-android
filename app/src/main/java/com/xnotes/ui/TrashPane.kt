@@ -66,7 +66,13 @@ import java.time.ZoneId
  * go back to their folder on Restore; Empty trash and Delete permanently remove them.
  */
 @Composable
-internal fun TrashPane(editor: Editor, sidebarOpen: Boolean, onShowSidebar: () -> Unit, onOpenPreferences: () -> Unit) {
+internal fun TrashPane(
+    editor: Editor,
+    sidebarOpen: Boolean,
+    onShowSidebar: () -> Unit,
+    onOpenPreferences: () -> Unit,
+    onCloseTabsForDeletion: (List<String>) -> Unit = {},
+) {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val root = editor.browseRoot
@@ -203,6 +209,9 @@ internal fun TrashPane(editor: Editor, sidebarOpen: Boolean, onShowSidebar: () -
                 TextButton(onClick = {
                     confirmEmpty = false
                     busy = true
+                    // Tabs for trashed files were closed when they were trashed; close any that
+                    // remain (e.g. a file opened from Trash) before its wrapper goes away.
+                    onCloseTabsForDeletion(items.orEmpty().map { it.entry.documentUri })
                     scope.launch {
                         withContext(Dispatchers.IO) { editor.emptyTrash(root) }
                         busy = false
@@ -222,6 +231,7 @@ internal fun TrashPane(editor: Editor, sidebarOpen: Boolean, onShowSidebar: () -
             confirmButton = {
                 TextButton(onClick = {
                     confirmDelete = null
+                    onCloseTabsForDeletion(listOf(item.entry.documentUri))
                     scope.launch {
                         withContext(Dispatchers.IO) { editor.deleteTrash(root, item) }
                         refresh++

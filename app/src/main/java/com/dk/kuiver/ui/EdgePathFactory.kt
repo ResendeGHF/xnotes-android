@@ -1,0 +1,425 @@
+package com.dk.kuiver.ui
+
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+/**
+ * Factory functions to create EdgePath instances.
+ *
+ * Encapsulates all control point calculation logic that was previously
+ * duplicated between drawing functions and label positioning code.
+ * Provides a single source of truth for edge geometry.
+ *
+ * Endpoints and the returned paths are in pixels, matching the draw scope. Sizes are in dp and
+ * resolved through the [Density] each function takes.
+ */
+object EdgePathFactory {
+
+    /**
+     * Create a straight edge path.
+     *
+     * @param from Start point of the edge, in pixels
+     * @param to End point of the edge, in pixels
+     * @param density Resolves the dp sizes against the current density
+     * @param showArrow Whether the edge will have an arrow (affects pathEndpoint)
+     * @param strokeWidth Width of the edge line (affects arrow gap calculation)
+     * @return EdgePath.Straight with calculated endpoint and length
+     */
+    fun createStraightPath(
+        from: Offset,
+        to: Offset,
+        density: Density,
+        showArrow: Boolean = true,
+        strokeWidth: Dp = 3.dp
+    ): EdgePath.Straight {
+        val direction = Offset(to.x - from.x, to.y - from.y)
+        val distance = sqrt(direction.x * direction.x + direction.y * direction.y)
+
+        val pathEndpoint = if (showArrow && distance > 0f) {
+            val normalized = Offset(direction.x / distance, direction.y / distance)
+            val shortenBy = density.arrowShortenPx(strokeWidth)
+            Offset(
+                to.x - normalized.x * shortenBy,
+                to.y - normalized.y * shortenBy
+            )
+        } else {
+            to
+        }
+
+        return EdgePath.Straight(
+            from = from,
+            to = to,
+            pathEndpoint = pathEndpoint,
+            edgeLength = distance
+        )
+    }
+
+    /**
+     * Create a curved edge path using quadratic Bezier.
+     *
+     * The control point is calculated perpendicular to the edge direction,
+     * offset proportionally to the edge length to maintain consistent curvature.
+     *
+     * @param from Start point of the edge, in pixels
+     * @param to End point of the edge, in pixels
+     * @param density Resolves the dp sizes against the current density
+     * @param showArrow Whether the edge will have an arrow
+     * @param strokeWidth Width of the edge line
+     * @param bend Control point offset as a fraction of the edge length, 0.25 by default. Negative
+     * values curve to the other side
+     * @return EdgePath.Curved with calculated control point and endpoint
+     */
+    fun createCurvedPath(
+        from: Offset,
+        to: Offset,
+        density: Density,
+        showArrow: Boolean = true,
+        strokeWidth: Dp = 3.dp,
+        bend: Float = EdgeDrawingDefaults.CURVE_PROPORTIONAL_OFFSET
+    ): EdgePath.Curved {
+        // Calculate direction and distance
+        val direction = Offset(to.x - from.x, to.y - from.y)
+        val distance = sqrt(direction.x * direction.x + direction.y * direction.y)
+
+        if (distance == 0f) {
+            // Degenerate case: from and to are the same point
+            return EdgePath.Curved(
+                from = from,
+                to = to,
+                controlPoint = from,
+                pathEndpoint = to,
+                edgeLength = 0f
+            )
+        }
+
+        val normalizedDir = Offset(direction.x / distance, direction.y / distance)
+
+        // Calculate perpendicular direction (rotate 90 degrees)
+        val perpendicular = Offset(-normalizedDir.y, normalizedDir.x)
+
+        // Control point offset proportional to edge length
+        val proportionalOffset = distance * bend
+
+        val midPoint = Offset((from.x + to.x) / 2f, (from.y + to.y) / 2f)
+        val controlPoint = Offset(
+            midPoint.x + perpendicular.x * proportionalOffset,
+            midPoint.y + perpendicular.y * proportionalOffset
+        )
+
+        // Calculate tangent at the end of the curve for arrow positioning
+        val tangent = Offset(to.x - controlPoint.x, to.y - controlPoint.y)
+        val tangentDist = sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
+
+        val pathEndpoint = if (showArrow && tangentDist > 0f) {
+            val normalized = Offset(tangent.x / tangentDist, tangent.y / tangentDist)
+            val shortenBy = density.arrowShortenPx(strokeWidth)
+            Offset(
+                to.x - normalized.x * shortenBy,
+                to.y - normalized.y * shortenBy
+            )
+        } else {
+            to
+        }
+
+        // Estimate curve length (simple approximation using chord length)
+        val curveLength = estimateQuadraticBezierLength(from, controlPoint, to)
+
+        return EdgePath.Curved(
+            from = from,
+            to = to,
+            controlPoint = controlPoint,
+            pathEndpoint = pathEndpoint,
+            edgeLength = curveLength
+        )
+    }
+
+    /**
+     * Create a self-loop edge path using quadratic Bezier.
+     *
+     * The control point is positioned above the node to create a visible arc.
+     *
+     * @param from Start point of the self-loop, in pixels
+     * @param to End point of the self-loop (typically close to from), in pixels
+     * @param density Resolves the dp sizes against the current density
+     * @param loopRadius Radius that determines the height of the loop
+     * @param showArrow Whether the edge will have an arrow
+     * @param strokeWidth Width of the edge line
+     * @param bend Extra loop height as a fraction of the default, 0 by default
+     * @return EdgePath.SelfLoop with calculated control point and endpoint
+     */
+    fun createSelfLoopPath(
+        from: Offset,
+        to: Offset,
+        density: Density,
+        loopRadius: Dp = 40.dp,
+        showArrow: Boolean = true,
+        strokeWidth: Dp = 3.dp,
+        bend: Float = 0f
+    ): EdgePath.SelfLoop {
+        // Calculate center point between from and to
+        val center = Offset((from.x + to.x) / 2f, (from.y + to.y) / 2f)
+
+        // Control point well above the node, higher for each nested loop
+        val loopHeight = with(density) { loopRadius.toPx() } *
+            EdgeDrawingDefaults.SELF_LOOP_HEIGHT_MULTIPLIER *
+            (1f + bend)
+        val controlPoint = Offset(center.x, center.y - loopHeight)
+
+        // Calculate tangent at the end for arrow direction
+        val direction = Offset(to.x - controlPoint.x, to.y - controlPoint.y)
+        val distance = sqrt(direction.x * direction.x + direction.y * direction.y)
+
+        val pathEndpoint = if (showArrow && distance > 0f) {
+            val normalizedDirection = Offset(direction.x / distance, direction.y / distance)
+            val shortenBy = density.arrowShortenPx(strokeWidth)
+            Offset(
+                to.x - normalizedDirection.x * shortenBy,
+                to.y - normalizedDirection.y * shortenBy
+            )
+        } else {
+            to
+        }
+
+        val loopLength = estimateQuadraticBezierLength(from, controlPoint, to)
+
+        return EdgePath.SelfLoop(
+            from = from,
+            to = to,
+            controlPoint = controlPoint,
+            pathEndpoint = pathEndpoint,
+            edgeLength = loopLength
+        )
+    }
+
+    /**
+     * Create an orthogonal edge path using cubic Bezier (S-curve).
+     *
+     * The control points create horizontal tangents at both start and end,
+     * resulting in a smooth S-shaped curve ideal for hierarchical layouts.
+     *
+     * @param from Start point of the edge, in pixels
+     * @param to End point of the edge, in pixels
+     * @param density Resolves the dp sizes against the current density
+     * @param curveFactor How far the control points extend horizontally (0.0 to 1.0)
+     * @param showArrow Whether the edge will have an arrow
+     * @param strokeWidth Width of the edge line
+     * @return EdgePath.Orthogonal with calculated control points and endpoint
+     */
+    fun createOrthogonalPath(
+        from: Offset,
+        to: Offset,
+        density: Density,
+        curveFactor: Float = 0.5f,
+        showArrow: Boolean = true,
+        strokeWidth: Dp = 3.dp
+    ): EdgePath.Orthogonal {
+        val dx = to.x - from.x
+
+        // Control point distance - how far the curve extends horizontally
+        // Sign matches direction of travel so curves don't loop back
+        val controlDistance = dx * curveFactor
+
+        // Calculate control points for S-curve (horizontal tangents)
+        val controlPoint1 = Offset(from.x + controlDistance, from.y)
+        val controlPoint2 = Offset(to.x - controlDistance, to.y)
+
+        // Calculate endpoint (shortened for arrow along the tangent at t=1)
+        // Cubic Bezier tangent at t=1 is proportional to (P3 - P2)
+        val tangent = Offset(to.x - controlPoint2.x, to.y - controlPoint2.y)
+        val tangentDist = sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
+
+        val pathEndpoint = if (showArrow && tangentDist > 0f) {
+            val normalized = Offset(tangent.x / tangentDist, tangent.y / tangentDist)
+            val shortenBy = density.arrowShortenPx(strokeWidth)
+            Offset(
+                to.x - normalized.x * shortenBy,
+                to.y - normalized.y * shortenBy
+            )
+        } else {
+            to
+        }
+
+        // Estimate S-curve length
+        val curveLength = estimateCubicBezierLength(from, controlPoint1, controlPoint2, to)
+
+        return EdgePath.Orthogonal(
+            from = from,
+            to = to,
+            controlPoint1 = controlPoint1,
+            controlPoint2 = controlPoint2,
+            pathEndpoint = pathEndpoint,
+            edgeLength = curveLength,
+            curveFactor = curveFactor
+        )
+    }
+
+    /**
+     * Estimate the length of a quadratic Bezier curve.
+     *
+     * Uses a simple approximation based on the chord length and control polygon length.
+     * This is more accurate than straight-line distance but faster than numerical integration.
+     *
+     * @param p0 Start point
+     * @param p1 Control point
+     * @param p2 End point
+     * @return Approximate arc length
+     */
+    private fun estimateQuadraticBezierLength(p0: Offset, p1: Offset, p2: Offset): Float {
+        // Chord length (straight line from start to end)
+        val chordLength = distance(p0, p2)
+
+        // Control polygon length (p0->p1 + p1->p2)
+        val polyLength = distance(p0, p1) + distance(p1, p2)
+
+        // Weighted average provides good approximation
+        // (chord + 2*polygon) / 3
+        return (chordLength + 2f * polyLength) / 3f
+    }
+
+    /**
+     * Estimate the length of a cubic Bezier curve.
+     *
+     * Similar approximation to quadratic, but with two control points.
+     *
+     * @param p0 Start point
+     * @param p1 First control point
+     * @param p2 Second control point
+     * @param p3 End point
+     * @return Approximate arc length
+     */
+    private fun estimateCubicBezierLength(
+        p0: Offset,
+        p1: Offset,
+        p2: Offset,
+        p3: Offset
+    ): Float {
+        // Chord length
+        val chordLength = distance(p0, p3)
+
+        // Control polygon length (p0->p1 + p1->p2 + p2->p3)
+        val polyLength = distance(p0, p1) + distance(p1, p2) + distance(p2, p3)
+
+        // Weighted average
+        return (chordLength + 2f * polyLength) / 3f
+    }
+
+    /**
+     * Calculate Euclidean distance between two points.
+     */
+    private fun distance(a: Offset, b: Offset): Float {
+        val dx = b.x - a.x
+        val dy = b.y - a.y
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    /**
+     * Create a right-angle orthogonal edge path (draw.io style).
+     *
+     * Creates paths with only horizontal and vertical segments, connected
+     * at right angles. The routing strategy determines how the path is laid out.
+     *
+     * @param from Start point of the edge, in pixels
+     * @param to End point of the edge, in pixels
+     * @param routing The routing strategy for the edge segments
+     * @param density Resolves the dp sizes against the current density
+     * @param showArrow Whether the edge will have an arrow
+     * @param strokeWidth Width of the edge line
+     * @return EdgePath.RightAngle with calculated waypoints and endpoint
+     */
+    fun createRightAnglePath(
+        from: Offset,
+        to: Offset,
+        routing: RightAngleRouting,
+        density: Density,
+        showArrow: Boolean = true,
+        strokeWidth: Dp = 3.dp
+    ): EdgePath.RightAngle {
+        // Calculate waypoints based on routing
+        val waypoints = when (routing) {
+            RightAngleRouting.HORIZONTAL_FIRST -> {
+                // Single corner: go horizontal then vertical
+                listOf(Offset(to.x, from.y))
+            }
+            RightAngleRouting.VERTICAL_FIRST -> {
+                // Single corner: go vertical then horizontal
+                listOf(Offset(from.x, to.y))
+            }
+            RightAngleRouting.HORIZONTAL_VERTICAL_HORIZONTAL -> {
+                // Two corners: horizontal -> vertical -> horizontal
+                val midX = (from.x + to.x) / 2f
+                listOf(
+                    Offset(midX, from.y),
+                    Offset(midX, to.y)
+                )
+            }
+            RightAngleRouting.VERTICAL_HORIZONTAL_VERTICAL -> {
+                // Two corners: vertical -> horizontal -> vertical
+                val midY = (from.y + to.y) / 2f
+                listOf(
+                    Offset(from.x, midY),
+                    Offset(to.x, midY)
+                )
+            }
+        }
+
+        // Determine arrow direction based on final segment
+        val lastWaypoint = waypoints.lastOrNull() ?: from
+        val finalDx = to.x - lastWaypoint.x
+        val finalDy = to.y - lastWaypoint.y
+
+        val arrowDirection = when {
+            abs(finalDx) > abs(finalDy) -> {
+                // Horizontal final segment
+                if (finalDx > 0) Offset(1f, 0f) else Offset(-1f, 0f)
+            }
+            abs(finalDy) > abs(finalDx) -> {
+                // Vertical final segment
+                if (finalDy > 0) Offset(0f, 1f) else Offset(0f, -1f)
+            }
+            else -> null
+        }
+
+        // Calculate path endpoint (shortened for arrow)
+        val pathEndpoint = if (showArrow && arrowDirection != null) {
+            val shortenBy = density.arrowShortenPx(strokeWidth)
+            Offset(
+                to.x - arrowDirection.x * shortenBy,
+                to.y - arrowDirection.y * shortenBy
+            )
+        } else {
+            to
+        }
+
+        // Calculate total path length
+        val points = buildList {
+            add(from)
+            addAll(waypoints)
+            add(to)
+        }
+        var totalLength = 0f
+        for (i in 0 until points.size - 1) {
+            totalLength += distance(points[i], points[i + 1])
+        }
+
+        return EdgePath.RightAngle(
+            from = from,
+            to = to,
+            waypoints = waypoints,
+            pathEndpoint = pathEndpoint,
+            edgeLength = totalLength,
+            arrowDirection = arrowDirection
+        )
+    }
+}
+
+/**
+ * Pixel distance the line stops short of the arrow tip, leaving room for the arrow head plus a
+ * small gap that scales with the line so thick lines don't touch the head.
+ */
+internal fun Density.arrowShortenPx(strokeWidth: Dp): Float =
+    (EdgeDrawingDefaults.ARROW_OFFSET + strokeWidth / 2f + EdgeDrawingDefaults.ARROW_GAP_FROM_LINE)
+        .toPx()

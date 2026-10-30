@@ -57,7 +57,7 @@
 - **Your notes, your folders**: notes are saved as files in a folder you choose, not locked away in an app's database, so you stay in full control of them.
 - **Works with stylus pens**: S Pen and many others.
 - **Always editable**: nothing gets flattened, so every stroke can be moved, restyled or erased later.
-- **Private**: open source, no account, no ads, no tracking. The only network use is an optional on-device maths add-on.
+- **Private**: open source, no account, no ads, no tracking. The only network use is the one-time download of on-device recognition models (handwriting, optional maths).
 
 ## Install
 
@@ -85,11 +85,12 @@ JAVA_HOME=/path/to/jdk-17 ./gradlew assembleDebug
 - **Browser-style tabs**: keep several notes open at once, each with its own history and editor state.
 - **Settings backup**: export settings, fonts, templates and stickers to one file and import them on another device.
 - **Handwriting to text**: turn selected handwriting (Portuguese (Brazil), English) into an editable text box.
-- **Handwriting to math**: an optional on-device add-on turns handwritten formulas into editable LaTeX.
+- **Handwriting to math**: turn selected handwritten formulas — including complex expressions with fractions, integrals and derivatives — into editable LaTeX, offline after a one-time model download.
 - **Plain text to equation**: turn typed maths like `int_0^1 x^2 dx` into a formula.
 - **Maths keyboard**: a dedicated keyboard for equations and the formula editor.
 - **Math Studio**: a scientific calculator, 2D and 3D plots, scalar and vector fields, numerical and symbolic calculus, and unit conversion.
-- **File import**: create notes from PDFs, images, txt, md, rtf, html, epub, docx, xlsx and csv.
+- **File import**: create notes from PDFs, images, txt, md, rtf, html, epub, docx, xlsx, csv and Samsung Notes (.sdocx) — including files shared from other apps.
+- **Samsung Notes exchange**: save notes as .sdocx files (pages, ink, flattened shapes and tables, text, images, PDFs) and open Samsung notes back (ink, shapes, lines, text, images, voice memos, PDFs). A .sdocx sitting in the notes folder converts with one tap.
 - **Automatic PDF import**: PDFs found in the notes folders and their subfolders become notes on their own, silently.
 - **Import and merge**: import a file into an existing note, merge notes, and add images or photos as pages.
 - **Read-only reader**: open md, docx, pptx, xlsx, csv and pdf files as they are, or convert them to notes.

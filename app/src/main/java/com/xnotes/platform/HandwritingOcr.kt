@@ -37,6 +37,16 @@ object HandwritingOcr {
         DigitalInkRecognition.getClient(DigitalInkRecognizerOptions.builder(modelFor(tag)).build())
     }
 
+    private val preparedTags = HashSet<String>()
+
+    @Synchronized
+    private fun prepared(tag: String): Boolean = tag in preparedTags
+
+    @Synchronized
+    private fun markPrepared(tag: String) {
+        preparedTags += tag
+    }
+
     /** Download the [tag] model if it is not already present. Blocks; call off the main thread. */
     fun ensureModelDownloaded(tag: String) {
         val model = modelFor(tag)
@@ -51,7 +61,10 @@ object HandwritingOcr {
      */
     fun recognize(strokes: List<Stroke>, tag: String): String {
         val ink = buildInk(strokes) ?: return ""
-        ensureModelDownloaded(tag)
+        if (!prepared(tag)) {
+            ensureModelDownloaded(tag)
+            markPrepared(tag)
+        }
         val result = Tasks.await(recognizerFor(tag).recognize(ink))
         return result.candidates.firstOrNull()?.text.orEmpty()
     }

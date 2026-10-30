@@ -13,6 +13,7 @@ import com.xnotes.core.model.Document
 import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.NoteLinkItem
 import com.xnotes.core.model.Orientation
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.PagePattern
@@ -320,6 +321,7 @@ class DocumentCodec(
         writeStyle(j, doc.style)
         writeMargins(j, doc.margins)
         doc.newPageSize?.let { writeNewPageSize(j, it) }
+        doc.mathStudioJson?.takeIf { it.isNotEmpty() }?.let { j.name("math_studio").value(it) }
         j.endObject()
     }
 
@@ -359,12 +361,17 @@ class DocumentCodec(
                 is ConnectorItem -> writeConnector(j, item, ids)
                 is TableItem -> writeTable(j, item)
                 is TapeItem -> writeTape(j, item)
+                is NoteLinkItem -> writeNoteLink(j, item, ids[item])
                 else -> {} // unrecognized kind: not written
             }
         }
         j.endArray()
         writeStyle(j, page.style)
         writeMargins(j, page.margins)
+        page.linkBorder?.let {
+            j.name("link_border")
+            writeRgba(j, it)
+        }
         j.endObject()
     }
 
@@ -589,6 +596,29 @@ class DocumentCodec(
         if (t.locked) j.name("locked").value(true)
         t.link?.let { j.name("link").value(it) }
         t.group?.let { j.name("group").value(it) }
+        j.endObject()
+    }
+
+    /** A note link: its button box, label, target (uri + name), pages and color. All additive. */
+    private fun writeNoteLink(j: JsonWrite, item: NoteLinkItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(NoteLinkItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("rect").beginArray().value(item.rect.x).value(item.rect.y).value(item.rect.w).value(item.rect.h).endArray()
+        if (item.displayName.isNotEmpty()) j.name("display_name").value(item.displayName)
+        if (item.targetUri.isNotEmpty()) j.name("target_uri").value(item.targetUri)
+        if (item.targetName.isNotEmpty()) j.name("target_name").value(item.targetName)
+        if (item.pages.isNotEmpty()) {
+            j.name("pages").beginArray()
+            for (p in item.pages) j.value(p)
+            j.endArray()
+        }
+        j.name("color")
+        writeRgba(j, item.color)
+        if (item.rounded) j.name("rounded").value(true)
+        if (item.locked) j.name("locked").value(true)
+        item.link?.let { j.name("link").value(it) }
+        item.group?.let { j.name("group").value(it) }
         j.endObject()
     }
 
@@ -855,6 +885,7 @@ class DocumentCodec(
         doc.style = m.style
         doc.margins = m.margins
         doc.newPageSize = m.newPageSize
+        doc.mathStudioJson = m.mathStudio
 
         if (m.hasPdf) {
             doc.pdfFile = pdfFile
@@ -931,6 +962,7 @@ class DocumentCodec(
         var style = PageStyle()
         var margins = PageMargins()
         var newPageSize: PageSizeChoice? = null
+        var mathStudio: String? = null
         val bookmarks = ArrayList<Bookmark>()
         val pages = ArrayList<Page>()
         val pageImages = ArrayList<Triple<Page, List<Pending>, GlueRead>>()
@@ -1031,6 +1063,7 @@ class DocumentCodec(
                 "style" -> m.style = parseStyle(p)
                 "margins" -> m.margins = parseMargins(p)
                 "new_page_size" -> m.newPageSize = parseNewPageSize(p)
+                "math_studio" -> m.mathStudio = stringOrNull(p)
                 "bookmarks" -> parseBookmarks(p, m.bookmarks)
                 "pages" -> parsePages(p, m)
                 else -> p.skipValue()
@@ -1080,6 +1113,7 @@ class DocumentCodec(
             var cover = false
             var style = PageStyle()
             var margins = PageMargins()
+            var linkBorder: Rgba? = null
             val items = mutableListOf<CanvasItem>()
             val pending = ArrayList<Pending>()
             val glue = GlueRead()
@@ -1093,6 +1127,7 @@ class DocumentCodec(
                     "cover" -> cover = boolOr(p, false)
                     "style" -> style = parseStyle(p)
                     "margins" -> margins = parseMargins(p)
+                    "link_border" -> linkBorder = rgbaOrNull(p)
                     "items" -> parseItems(p, items, pending, glue)
                     else -> p.skipValue()
                 }
@@ -1109,6 +1144,7 @@ class DocumentCodec(
                 width = width, height = height, items = items, pdfPage = pdfPage, style = style, margins = margins,
                 pdfTurn = if (pdfPage == null) 0 else PageTurn.normalize(pdfTurn),
             )
+            page.linkBorder = linkBorder
             // Only the first page can be the cover; a flag anywhere else is dropped.
             page.cover = cover && m.pages.isEmpty()
             m.pages.add(page)
@@ -1186,6 +1222,12 @@ class DocumentCodec(
         var functionYMax: Double? = null
         var tableCols: List<Double>? = null
         var tableRows: List<Double>? = null
+        var targetUri = ""
+        var targetName = ""
+        var displayName = ""
+        var notePages: List<Int>? = null
+        var linkColor: Rgba? = null
+        var linkRounded = false
         var rid = 0
         var name = ""
         var durationMs = 0
@@ -1278,6 +1320,12 @@ class DocumentCodec(
                 "function_ymax" -> s.functionYMax = doubleOr(p, 0.0)
                 "cols" -> s.tableCols = doubleListOrNull(p)
                 "rows" -> s.tableRows = doubleListOrNull(p)
+                "target_uri" -> s.targetUri = stringOr(p, "")
+                "target_name" -> s.targetName = stringOr(p, "")
+                "display_name" -> s.displayName = stringOr(p, "")
+                "pages" -> s.notePages = intListOrNull(p)
+                "color" -> s.linkColor = rgbaOrNull(p)
+                "rounded" -> s.linkRounded = boolOr(p, false)
                 "locked" -> s.locked = boolOr(p, false)
                 "link" -> s.link = stringOr(p, "").ifEmpty { null }
                 "group" -> s.group = intOrNull(p)
@@ -1342,6 +1390,7 @@ class DocumentCodec(
             }
             TableItem.KIND -> buildTable(s)?.let { items.add(it) }
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
+            NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
             else -> {} // unrecognized kind: skipped (forgiving)
         }
         if (items.size > before) glue.named(items[before], s.id)
@@ -1576,6 +1625,20 @@ class DocumentCodec(
         val cols = s.tableCols?.takeIf { it.isNotEmpty() } ?: return null
         val rows = s.tableRows?.takeIf { it.isNotEmpty() } ?: return null
         return TableItem(rect, cols, rows, s.strokeRgba ?: Rgba(0, 0, 0, 255), s.strokeWidth)
+    }
+
+    private fun buildNoteLink(s: ItemScratch): NoteLinkItem? {
+        val rect = s.rect ?: return null
+        if (!(rect.w.isFinite() && rect.h.isFinite() && rect.w > 0.0 && rect.h > 0.0)) return null
+        return NoteLinkItem(
+            rect = rect,
+            displayName = s.displayName,
+            targetUri = s.targetUri,
+            targetName = s.targetName,
+            pages = s.notePages.orEmpty(),
+            color = s.linkColor ?: NoteLinkItem.DEFAULT_COLOR,
+            rounded = s.linkRounded,
+        )
     }
 
     private fun parseConfig(p: JsonPull): ConfigScratch? {
@@ -1906,6 +1969,18 @@ class DocumentCodec(
         while (p.hasNext()) doubleOrNull(p)?.let { out.add(it) }
         p.endArray()
         return out.ifEmpty { null }
+    }
+
+    private fun intListOrNull(p: JsonPull): List<Int>? {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return null
+        }
+        val out = ArrayList<Int>()
+        p.beginArray()
+        while (p.hasNext()) intOrNull(p)?.let { out.add(it) }
+        p.endArray()
+        return out
     }
 
     companion object {

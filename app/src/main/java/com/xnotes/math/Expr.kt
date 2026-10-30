@@ -291,7 +291,9 @@ object ExpressionParser {
                             do { args += or() } while (match(T.COMMA))
                             expect(T.RPAREN, ")")
                         }
-                        return bind(name, args)
+                        var base = bind(name, args)
+                        base = finishChainedSumProd(name, base)
+                        return base
                     }
                     // A few functions read naturally without brackets: sin x, sqrt 2, ln x.
                     if (name.lowercase() in MathCatalog.unaryFunctionNames && startsFactor(peek()) && !isOp("^")) {
@@ -313,7 +315,81 @@ object ExpressionParser {
                     else Expr.Product(v.name, args[1], args[2], args[3])
                 }
             }
+            // A 3-arg sum/prod is a partial binder awaiting trailing (binder)*(body) groups,
+            // e.g. sum(n,0,10)(x^n/n!) or sum(n,0,10)(m,0,10)(x^n/m!).
+            if ((key == "sum" || key == "prod" || key == "product") && args.size == 3) {
+                val v = args[0]
+                if (v is Expr.Var) return Expr.Call(key, args)
+            }
             return Expr.Call(key, args)
+        }
+
+        /**
+         * Finishes chained summatory/productory forms:
+         * `sum(n,0,10)(body)`, `prod(n,0,10)(body)`,
+         * `sum(n,0,10)(m,0,10)(body)` (bare binder groups inherit the head operation),
+         * and mixed nesting via an explicit body such as `sum(n,0,10)(prod(m,0,10)(body))`.
+         * The legacy 4-arg form passes through untouched.
+         */
+        private fun finishChainedSumProd(head: String, base: Expr): Expr {
+            val headKey = head.lowercase()
+            if (headKey != "sum" && headKey != "prod" && headKey != "product") return base
+            if (base !is Expr.Call) return base
+            if (base.args.size != 3) return base
+            val headVar = base.args[0] as? Expr.Var ?: return base
+            val headOp = if (headKey == "sum") "sum" else "prod"
+            val binders = ArrayList<Triple<String, Expr, Expr>>()
+            binders += Triple(headVar.name, base.args[1], base.args[2])
+            while (peek().type == T.LPAREN) {
+                val saved = i
+                i++ // consume '('
+                // Try a bare binder group: Var ',' expr ',' expr ')'.
+                val binder = tryParseBareBinder()
+                if (binder != null) {
+                    binders += binder
+                    continue
+                }
+                // Otherwise a final body group: '(' expr ')'.
+                i = saved
+                i++ // consume '(' again
+                val body: Expr = try {
+                    val e = or()
+                    expect(T.RPAREN, ")")
+                    e
+                } catch (_: Exception) {
+                    i = saved
+                    break
+                }
+                var wrapped: Expr = body
+                for (k in binders.indices.reversed()) {
+                    val (v, from, to) = binders[k]
+                    wrapped = if ((if (k == 0) headOp else headOp) == "sum") Expr.Sum(v, from, to, wrapped)
+                    else Expr.Product(v, from, to, wrapped)
+                }
+                // Allow further application like sum(...)(...)(body)(extra)? No: body completes it.
+                // But the body itself may already contain nested chains, which were parsed recursively.
+                return wrapped
+            }
+            // No trailing body: keep legacy behaviour (report as unknown function at eval time
+            // rather than silently dropping). Restore a Call so evaluation fails clearly.
+            return base
+        }
+
+        private fun tryParseBareBinder(): Triple<String, Expr, Expr>? {
+            val saved = i
+            try {
+                val first = or()
+                if (first !is Expr.Var) { i = saved; return null }
+                if (!match(T.COMMA)) { i = saved; return null }
+                val from = or()
+                if (!match(T.COMMA)) { i = saved; return null }
+                val to = or()
+                if (!match(T.RPAREN)) { i = saved; return null }
+                return Triple(first.name, from, to)
+            } catch (_: Exception) {
+                i = saved
+                return null
+            }
         }
 
         private fun startsFactor(t: Token): Boolean =
@@ -322,24 +398,29 @@ object ExpressionParser {
 }
 
 /** A small precedence-aware printer. The result can be parsed back unchanged. */
-fun Expr.toText(): String = when (this) {
-    is Expr.Num -> Numbers.format(value)
+fun Expr.toText(): String = renderText(Numbers::format)
+
+/** [toText] with close decimals rendered as fractions (`1/3` instead of `0.333…`). */
+fun Expr.toFracText(): String = renderText(Numbers::formatFraction)
+
+private fun Expr.renderText(fmt: (Double) -> String): String = when (this) {
+    is Expr.Num -> fmt(value)
     is Expr.Var -> name
-    is Expr.Neg -> "-${value.wrap(5)}"
+    is Expr.Neg -> "-${value.wrapP(5, fmt)}"
     is Expr.Bin -> {
         val p = op.precedence
-        val left = left.wrap(if (op == BinOp.POW) p + 1 else p)
-        val right = right.wrap(if (op == BinOp.POW) p else p + 1)
+        val left = left.wrapP(if (op == BinOp.POW) p + 1 else p, fmt)
+        val right = right.wrapP(if (op == BinOp.POW) p else p + 1, fmt)
         "$left ${op.symbol} $right"
     }
-    is Expr.Call -> "$name(${args.joinToString(", ") { it.toText() }})"
-    is Expr.Factorial -> "${value.wrap(7)}!"
-    is Expr.Sum -> "sum($variable, ${from.toText()}, ${to.toText()}, ${body.toText()})"
-    is Expr.Product -> "prod($variable, ${from.toText()}, ${to.toText()}, ${body.toText()})"
+    is Expr.Call -> "$name(${args.joinToString(", ") { it.renderText(fmt) }})"
+    is Expr.Factorial -> "${value.wrapP(7, fmt)}!"
+    is Expr.Sum -> "sum($variable, ${from.renderText(fmt)}, ${to.renderText(fmt)}, ${body.renderText(fmt)})"
+    is Expr.Product -> "prod($variable, ${from.renderText(fmt)}, ${to.renderText(fmt)}, ${body.renderText(fmt)})"
 }
 
-private fun Expr.wrap(parentPrecedence: Int): String {
-    val text = toText()
+private fun Expr.wrapP(parentPrecedence: Int, fmt: (Double) -> String): String {
+    val text = renderText(fmt)
     val mine = when (this) {
         is Expr.Bin -> op.precedence
         is Expr.Neg -> 5
@@ -349,34 +430,41 @@ private fun Expr.wrap(parentPrecedence: Int): String {
     return if (mine < parentPrecedence) "($text)" else text
 }
 
+private fun Expr.wrap(parentPrecedence: Int): String = wrapP(parentPrecedence, Numbers::format)
+
 /** LaTeX for a parsed expression, used by the symbolic result card. */
-fun Expr.toLatex(): String = when (this) {
-    is Expr.Num -> Numbers.format(value)
+fun Expr.toLatex(): String = renderLatex(Numbers::format)
+
+/** [toLatex] with close decimals rendered as `\frac{p}{q}`. */
+fun Expr.toFracLatex(): String = renderLatex(Numbers::formatFractionLatex)
+
+private fun Expr.renderLatex(fmt: (Double) -> String): String = when (this) {
+    is Expr.Num -> fmt(value)
     is Expr.Var -> when (name.lowercase()) {
         "pi", "π" -> "\\pi"
         "inf", "infinity", "oo" -> "\\infty"
         else -> name
     }
-    is Expr.Neg -> "-${value.toLatex()}"
+    is Expr.Neg -> "-${value.renderLatex(fmt)}"
     is Expr.Bin -> when (op) {
-        BinOp.DIV -> "\\frac{${left.toLatex()}}{${right.toLatex()}}"
-        BinOp.POW -> "{${left.toLatex()}}^{${right.toLatex()}}"
-        BinOp.MUL -> "${left.toLatex()} \\cdot ${right.toLatex()}"
-        BinOp.ADD -> "${left.toLatex()} + ${right.toLatex()}"
-        BinOp.SUB -> "${left.toLatex()} - ${right.toLatex()}"
-        else -> "${left.toLatex()} ${op.symbol} ${right.toLatex()}"
+        BinOp.DIV -> "\\frac{${left.renderLatex(fmt)}}{${right.renderLatex(fmt)}}"
+        BinOp.POW -> "{${left.renderLatex(fmt)}}^{${right.renderLatex(fmt)}}"
+        BinOp.MUL -> "${left.renderLatex(fmt)} \\cdot ${right.renderLatex(fmt)}"
+        BinOp.ADD -> "${left.renderLatex(fmt)} + ${right.renderLatex(fmt)}"
+        BinOp.SUB -> "${left.renderLatex(fmt)} - ${right.renderLatex(fmt)}"
+        else -> "${left.renderLatex(fmt)} ${op.symbol} ${right.renderLatex(fmt)}"
     }
     is Expr.Call -> when (name.lowercase()) {
-        "sqrt" -> "\\sqrt{${args.firstOrNull()?.toLatex().orEmpty()}}"
-        "abs" -> "\\left|${args.firstOrNull()?.toLatex().orEmpty()}\\right|"
-        "exp" -> "e^{${args.firstOrNull()?.toLatex().orEmpty()}}"
+        "sqrt" -> "\\sqrt{${args.firstOrNull()?.renderLatex(fmt).orEmpty()}}"
+        "abs" -> "\\left|${args.firstOrNull()?.renderLatex(fmt).orEmpty()}\\right|"
+        "exp" -> "e^{${args.firstOrNull()?.renderLatex(fmt).orEmpty()}}"
         "sin", "cos", "tan", "cot", "sec", "csc", "sinh", "cosh", "tanh", "ln", "log" ->
-            "\\${name}\\left(${args.joinToString(", ") { it.toLatex() }}\\right)"
-        else -> "\\operatorname{${name}}\\left(${args.joinToString(", ") { it.toLatex() }}\\right)"
+            "\\${name}\\left(${args.joinToString(", ") { it.renderLatex(fmt) }}\\right)"
+        else -> "\\operatorname{${name}}\\left(${args.joinToString(", ") { it.renderLatex(fmt) }}\\right)"
     }
-    is Expr.Factorial -> "${value.toLatex()}!"
-    is Expr.Sum -> "\\sum_{$variable=${from.toLatex()}}^{${to.toLatex()}} ${body.toLatex()}"
-    is Expr.Product -> "\\prod_{$variable=${from.toLatex()}}^{${to.toLatex()}} ${body.toLatex()}"
+    is Expr.Factorial -> "${value.renderLatex(fmt)}!"
+    is Expr.Sum -> "\\sum_{$variable=${from.renderLatex(fmt)}}^{${to.renderLatex(fmt)}} ${body.renderLatex(fmt)}"
+    is Expr.Product -> "\\prod_{$variable=${from.renderLatex(fmt)}}^{${to.renderLatex(fmt)}} ${body.renderLatex(fmt)}"
 }
 
 /** Variables that occur free in an expression (binding variables inside their own sums excluded). */

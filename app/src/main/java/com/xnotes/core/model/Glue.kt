@@ -22,6 +22,7 @@ object Glue {
         is ShapeItem -> if (item.shape == ShapeKind.GLYPHS || item.isFill) emptyList() else item.connectionPoints()
         is TextItem -> box(item.bounds(), 0.0)
         is ImageItem -> box(item.rect, item.angle)
+        is NoteLinkItem -> box(item.rect, 0.0)
         is ConnectorItem -> item.connectionPoints()
         else -> emptyList()
     }
@@ -31,7 +32,7 @@ object Glue {
 
     /** Whether a connector can glue to [item] at all. */
     fun accepts(item: CanvasItem): Boolean = when (item) {
-        is TextItem, is ImageItem, is ConnectorItem -> true
+        is TextItem, is ImageItem, is ConnectorItem, is NoteLinkItem -> true
         is ShapeItem -> points(item).isNotEmpty()
         else -> false
     }

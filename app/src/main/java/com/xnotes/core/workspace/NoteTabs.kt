@@ -58,6 +58,14 @@ data class NoteTabs(
         )
     }
 
+    /** Close several tabs at once (e.g. every tab beneath deleted entries), reusing [close]'s
+     *  nearest-survivor replacement for each so the surviving pane assignment stays valid. */
+    fun closeUris(uris: Collection<String>): NoteTabs {
+        var acc = this
+        for (uri in uris) acc = acc.close(uri)
+        return acc
+    }
+
     /** Workspace selection remains valid while the focused editor swaps documents asynchronously. */
     fun selectedUri(secondaryFocused: Boolean): String? =
         if (secondaryFocused) secondaryUri ?: primaryUri else primaryUri ?: secondaryUri

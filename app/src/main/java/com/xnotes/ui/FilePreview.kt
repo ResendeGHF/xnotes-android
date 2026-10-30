@@ -60,6 +60,7 @@ internal class PreviewActions(
     val openBeside: (() -> Unit)?,
     val share: () -> Unit,
     val exportPdf: () -> Unit,
+    val exportSdocx: (() -> Unit)? = null,
     val color: (Rgba?) -> Unit,
 )
 
@@ -104,6 +105,9 @@ internal fun FilePreview(b: ExplorerBody, e: BrowseEntry, where: String?, action
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         ExplorerIcon(XnotesIcons.share, stringResource(R.string.share), palette.accent.toComposeColor(), onClick = actions.share)
                         ExplorerIcon(XnotesIcons.pdfFile, stringResource(R.string.export_pdf), palette.accent.toComposeColor(), onClick = actions.exportPdf)
+                        if (actions.exportSdocx != null) {
+                            ExplorerIcon(XnotesIcons.exportDoc, stringResource(R.string.export_sdocx), palette.accent.toComposeColor(), onClick = { actions.exportSdocx?.invoke() })
+                        }
                         var colors by remember { mutableStateOf(false) }
                         Box {
                             ExplorerIcon(XnotesIcons.palette, stringResource(R.string.colour_code), palette.accent.toComposeColor()) { colors = true }

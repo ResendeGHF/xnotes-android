@@ -25,7 +25,7 @@
 # read back from, a saved document — the .xnote format must stay forward/backward compatible.
 -keep enum com.xnotes.core.** { *; }
 
-# --- ONNX Runtime (handwritten maths add-on) ----------------------------------------------------
+# --- ONNX Runtime (handwritten maths model) -------------------------------------------------------
 # The native library calls back into its Java classes through JNI by name.
 -keep class ai.onnxruntime.** { *; }
 

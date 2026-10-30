@@ -95,6 +95,7 @@ import com.xnotes.R
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.platform.PdfOpenError
 import com.xnotes.ui.CanvasToastPill
+import com.xnotes.ui.PdfLinkBackButtons
 import com.xnotes.ui.externalDropTarget
 import com.xnotes.ui.Editor
 import com.xnotes.ui.Toolbar
@@ -262,13 +263,30 @@ class MainActivity : ComponentActivity() {
     }
 
     // The PDF or markdown uri carried by an inbound VIEW ("Open with") or SEND ("Share") intent, else null.
+    // A Samsung Notes file often arrives typeless (unknown extension to the
+    // provider), so both actions fall back to the file name before declining.
     private fun pdfImportUri(intent: Intent?): Uri? = when (intent?.action) {
         // Only the import filters take VIEW, but a task started by another build's filters keeps its intent.
-        Intent.ACTION_VIEW -> intent.data?.takeIf { (intent.type ?: runCatching { contentResolver.getType(it) }.getOrNull()) in IMPORT_TYPES }
-        Intent.ACTION_SEND ->
-            if (intent.type in IMPORT_TYPES)
-                IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-            else null
+        Intent.ACTION_VIEW -> intent.data?.takeIf { uri ->
+            val type = intent.type ?: runCatching { contentResolver.getType(uri) }.getOrNull()
+            if (type in IMPORT_TYPES) true
+            else {
+                val name = runCatching { displayNameOf(contentResolver, uri) }.getOrNull().orEmpty()
+                (name.isNotEmpty() && com.xnotes.ui.ImportKind.isKnownImport(name, type ?: "")).also { ok ->
+                    if (!ok) android.util.Log.d("Import", "dropped VIEW data=${intent.data} type=$type")
+                }
+            }
+        }
+        Intent.ACTION_SEND -> IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.takeIf { uri ->
+            val type = intent.type ?: runCatching { contentResolver.getType(uri) }.getOrNull()
+            if (type in IMPORT_TYPES) true
+            else {
+                val name = runCatching { displayNameOf(contentResolver, uri) }.getOrNull().orEmpty()
+                (name.isNotEmpty() && com.xnotes.ui.ImportKind.isKnownImport(name, type ?: "")).also { ok ->
+                    if (!ok) android.util.Log.d("Import", "dropped SEND stream=$uri type=$type")
+                }
+            }
+        }
         else -> null
     }
 
@@ -350,7 +368,22 @@ private fun EditorScreen(
         // pane holds a decoded document; switching tabs reopens one on demand.
         val tabsStore = remember(context) { NoteTabsStore(context) }
         var noteTabs by remember { mutableStateOf(tabsStore.load()) }
-        LaunchedEffect(noteTabs) { tabsStore.save(noteTabs) }
+        // Tab URIs + titles persist to disk: vault documents stay in memory only, so their
+        // names never reach SharedPreferences. The in-memory workspace is untouched.
+        LaunchedEffect(noteTabs) {
+            val kept = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                noteTabs.tabs.filterNot { runCatching { editor.isVaultUri(it.uri) }.getOrDefault(false) }
+            }
+            val clean = if (kept.size == noteTabs.tabs.size) noteTabs else {
+                val keep = kept.map { it.uri }.toSet()
+                noteTabs.copy(
+                    tabs = kept,
+                    primaryUri = noteTabs.primaryUri?.takeIf { it in keep },
+                    secondaryUri = noteTabs.secondaryUri?.takeIf { it in keep },
+                )
+            }
+            tabsStore.save(clean)
+        }
         // Documents can also arrive here without going through the explorer (session restore, a new
         // note's first save, an import). Add them once they have a file, without resurrecting a tab
         // that closeTab just removed: noteTabs is deliberately not a key of this effect.
@@ -401,8 +434,22 @@ private fun EditorScreen(
         var pendingPdfInsert by remember { mutableStateOf<PendingPdfInsert?>(null) }
         var pendingShareUri by remember { mutableStateOf<String?>(null) }
         var pendingSaveCopyUri by remember { mutableStateOf<String?>(null) }
+        var pendingSaveCopyLinks by remember { mutableStateOf(false) }
+        // "Export with links": inline linked pages below their link (self-contained bundle/PDF).
+        var exportWithLinks by remember { mutableStateOf(false) }
+        var shareFormat by remember { mutableStateOf(ShareFormat.PDF) }
+        // Creating a note link: the pane (and canvas point) it goes to, plus the picked target.
+        var noteLinkRequest by remember { mutableStateOf<NoteLinkRequest?>(null) }
+        var noteLinkTargetUri by remember { mutableStateOf<String?>(null) }
+        var noteLinkTargetName by remember { mutableStateOf("") }
+        var noteLinkPicking by remember { mutableStateOf(false) }
+        val noteLinkForm = remember { com.xnotes.ui.NoteLinkFormState() }
         // A finished PDF render awaiting a SAF "Save as" destination (open-note / file / pages export).
         var pendingExportTemp by remember { mutableStateOf<java.io.File?>(null) }
+        // A finished SDOCX render awaiting a SAF "Save as" destination.
+        var pendingSdocxTemp by remember { mutableStateOf<java.io.File?>(null) }
+        var pendingTexTemp by remember { mutableStateOf<java.io.File?>(null) }
+        var pendingMdTemp by remember { mutableStateOf<java.io.File?>(null) }
         // In-flight PDF render; drives the progress dialog, null hides it.
         var exportProgress by remember { mutableStateOf<ExportProgress?>(null) }
         // The running export's coroutine and its own cancel flag. Each export gets a fresh flag so a new
@@ -415,6 +462,26 @@ private fun EditorScreen(
         val resolver = context.contentResolver
         val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
 
+        // Persisted tabs can outlive their files (deleted before tabs were closed, trashed, or removed
+        // elsewhere). Drop those once on launch so a missing replacement can never strand a pane open
+        // after its tab is closed.
+        LaunchedEffect(Unit) {
+            val loaded = noteTabs
+            if (loaded.tabs.isEmpty()) return@LaunchedEffect
+            val missing = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                loaded.tabs.filterNot { tab ->
+                    runCatching {
+                        resolver.query(
+                            Uri.parse(tab.uri),
+                            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                            null, null, null,
+                        )?.use { it.moveToFirst() } ?: false
+                    }.getOrDefault(false)
+                }.map { it.uri }.toSet()
+            }
+            if (missing.isNotEmpty()) noteTabs = noteTabs.closeUris(missing)
+        }
+
         // Read-only files open over everything; following a [[link]] stacks another, Back pops one.
         // Each tab keeps its own stack, so switching away and back does not lose the open reader.
         val readerStacks = remember {
@@ -424,6 +491,52 @@ private fun EditorScreen(
         // The full-screen maths workspace, opened from either bar. Kept per document so a tab
         // change does not leave it over another note.
         var mathStudioOpen by remember(editor) { mutableStateOf(false) }
+        // Animation setup carried by a tapped filmstrip's play badge; consumed once on open.
+        var mathAnimSpec by remember(editor) { mutableStateOf<com.xnotes.ui.MathAnimSpec?>(null) }
+        // A canvas selection's expression, placed into symbolic calculus or a plotter on open.
+        var mathStudioRequest by remember(editor) { mutableStateOf<com.xnotes.ui.MathStudioRequest?>(null) }
+        // Which note Math Studio was opened from. Closing that note's tab closes the
+        // workspace too, so a graph can never be built for a note that is no longer open.
+        var mathStudioUri by remember(editor) { mutableStateOf<String?>(null) }
+        // Each note's workspace snapshot, keyed by note URI (null for a never-saved note).
+        var mathStudioData by remember(editor) { mutableStateOf<Map<String?, String>>(emptyMap()) }
+        fun openMathStudio() {
+            mathStudioUri = editor.active.openDocumentUri
+            mathStudioOpen = true
+        }
+        fun closeMathStudio() {
+            if (!mathStudioOpen) return
+            mathStudioOpen = false
+            mathAnimSpec = null
+            mathStudioRequest = null
+            mathStudioUri = null
+        }
+        /** This note's stored workspace: the session map is freshest, then the live document. */
+        fun studioJsonFor(uri: String?): String? {
+            mathStudioData[uri]?.let { return it }
+            if (uri == null) return null
+            for (ed in listOfNotNull(editor, editor.secondary)) {
+                if (ed.noteOpen && ed.openDocumentUri == uri) return ed.mathStudioJson()
+            }
+            return null
+        }
+        /** Keeps the snapshot for [mathStudioUri] in the session map and in the open document. */
+        fun persistMathStudio(json: String) {
+            val uri = mathStudioUri ?: return
+            val bounded = (mathStudioData - uri) + (uri to json)
+            mathStudioData = if (bounded.size > 12) {
+                bounded.entries.drop(bounded.size - 12).associate { it.key to it.value }
+            } else bounded
+            for (ed in listOfNotNull(editor, editor.secondary)) {
+                if (ed.noteOpen && ed.openDocumentUri == uri) ed.storeMathStudioJson(json)
+            }
+        }
+        // Tapping a play badge on an inserted animation frame reopens Studio with it restored.
+        editor.onMathAnimSpec = { spec -> mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
+        editor.secondary?.onMathAnimSpec = { spec -> mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
+        // Sending a selection to Math Studio opens it on the requested tab with the expression set.
+        editor.onMathStudioRequest = { req -> mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
+        editor.secondary?.onMathStudioRequest = { req -> mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
 
         // Which pane a "Save as" writes: the focused one at the moment the picker opened.
         var savePane by remember { mutableStateOf(editor) }
@@ -444,39 +557,77 @@ private fun EditorScreen(
         // naming (each note takes its source file's name) and the explorer imports them one at a time. The
         // format (pdf / image / text) is classified from each picked file here.
         val importPdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-            fun pendingOf(u: android.net.Uri): com.xnotes.ui.PendingImport {
+            fun pendingOf(u: android.net.Uri): com.xnotes.ui.PendingImport? {
                 val name = displayNameOf(resolver, u) ?: "Document"
                 val mime = runCatching { resolver.getType(u) }.getOrNull() ?: ""
+                if (!com.xnotes.ui.ImportKind.isKnownImport(name, mime)) return null
                 val kind = com.xnotes.ui.ImportKind.classify(name, mime)
                 return com.xnotes.ui.PendingImport(kind, com.xnotes.core.util.Paths.stem(name), u.toString(), name, mime)
             }
-            when {
-                uris.isEmpty() -> Unit
-                uris.size == 1 -> pendingOf(uris[0]).let { editor.requestImport(it.kind, it.defaultName, it.uri, it.sourceName, it.mime) }
-                else -> editor.requestImports(uris.map(::pendingOf))
+            val pending = uris.mapNotNull(::pendingOf)
+            if (pending.isEmpty()) {
+                if (uris.isNotEmpty()) editor.message = context.getString(R.string.err_read_file)
+                return@rememberLauncherForActivityResult
             }
-            if (uris.isNotEmpty()) {
-                backstageView = com.xnotes.ui.BackstageView.HOME
-                editor.goHomeAll() // land on backstage to name the single pick, or to run the batch
+            if (pending.size == 1) {
+                val it = pending[0]
+                editor.requestImport(it.kind, it.defaultName, it.uri, it.sourceName, it.mime)
+            } else {
+                editor.requestImports(pending)
+            }
+            backstageView = com.xnotes.ui.BackstageView.HOME
+            editor.goHomeAll() // land on backstage to name the single pick, or to run the batch
+        }
+        // The "Import file" picker offers every file (*/*): provider-reported
+        // MIME types for .sdocx vary by device (often null or unknown), so MIME
+        // filtering would hide them. Files are validated by extension after
+        // picking instead (see ImportKind.isKnownImport); anything else is
+        // declined with an error rather than imported as garbage.
+        val importPickerTypes = arrayOf("*/*")
+        // A scan/photo/PDF picked for "trace into strokes": the trace dialog stages the
+        // file itself, so this only records the pick. Anything that is not an image or a
+        // PDF is declined rather than traced into garbage.
+        val traceScanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                val name = displayNameOf(resolver, uri) ?: "scan"
+                val mime = runCatching { resolver.getType(uri) }.getOrNull() ?: ""
+                if (com.xnotes.scan.TracePreprocess.classify(name, mime) != null) {
+                    editor.requestTrace(uri.toString(), name, mime)
+                    backstageView = com.xnotes.ui.BackstageView.HOME
+                    editor.goHomeAll()
+                } else {
+                    editor.message = context.getString(R.string.err_read_file)
+                }
             }
         }
-        // Exact MIME types the "Import file" picker offers, so it only shows files we can actually
-        // import (an explicit allowlist rather than image/* + text/* wildcards, which some pickers
-        // expand to unrelated files).
-        val importMimeTypes = arrayOf(
-            "application/pdf",
-            // images
-            "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
-            "image/svg+xml", "image/heic", "image/heif",
-            // plain text / markdown / csv / html / rtf
-            "text/plain", "text/markdown", "text/x-markdown",
-            "text/csv", "text/comma-separated-values", "application/csv",
-            "text/html", "text/rtf", "application/rtf",
-            // ebook / office
-            "application/epub+zip",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        // A photo just taken for "trace from camera": the scan dialog adjusts its
+        // corners first, then traces it or saves it filtered.
+        var pendingTracePhoto by remember { mutableStateOf<java.io.File?>(null) }
+        val traceCameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken ->
+            val file = pendingTracePhoto
+            pendingTracePhoto = null
+            if (file == null) return@rememberLauncherForActivityResult
+            if (!taken || file.length() == 0L) {
+                file.delete()
+                return@rememberLauncherForActivityResult
+            }
+            val stamp = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HHmm"))
+            editor.requestCameraScan(file, "Scan $stamp")
+            backstageView = com.xnotes.ui.BackstageView.HOME
+            editor.goHomeAll()
+        }
+        fun launchTraceCamera() {
+            val dir = java.io.File(context.cacheDir, "camera").apply { mkdirs() }
+            val file = java.io.File.createTempFile("scan-", ".jpg", dir)
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            pendingTracePhoto = file
+            runCatching { traceCameraLauncher.launch(uri) }.onFailure {
+                pendingTracePhoto = null
+                file.delete()
+                editor.message = context.getString(R.string.err_no_camera)
+            }
+        }
         // A PDF "Save as" destination. The note is already rendered into [pendingExportTemp]
         // (off-thread, behind the progress dialog), so the picker just chooses where to copy it —
         // shared by the open-note export, the explorer-file export, and side-panel page saves.
@@ -515,14 +666,70 @@ private fun EditorScreen(
         val exportPdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { exportPicked(it) }
         val exportZipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { exportPicked(it) }
 
+        // A Samsung Notes "Save as" destination. The note is already rendered into
+        // [pendingSdocxTemp] off-thread, so the picker just chooses where to copy it.
+        val saveSdocxLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/octet-stream"),
+        ) { uri ->
+            val temp = pendingSdocxTemp; pendingSdocxTemp = null
+            if (temp != null) {
+                if (uri != null) {
+                    val ok = runCatching { resolver.openOutputStream(uri)?.use { o -> temp.inputStream().use { it.copyTo(o) } } != null }.getOrDefault(false)
+                    editor.message = if (ok) context.getString(R.string.exported_sdocx) else context.getString(R.string.err_export_sdocx)
+                }
+                temp.delete()
+            }
+        }
+
+        // A LaTeX "Save as" destination: the .tex is already written into [pendingTexTemp].
+        val saveTexLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/x-tex"),
+        ) { uri ->
+            val temp = pendingTexTemp; pendingTexTemp = null
+            if (temp != null) {
+                if (uri != null) {
+                    val ok = runCatching { resolver.openOutputStream(uri)?.use { o -> temp.inputStream().use { it.copyTo(o) } } != null }.getOrDefault(false)
+                    editor.message = if (ok) context.getString(R.string.exported_latex) else context.getString(R.string.err_export_latex)
+                }
+                temp.delete()
+            }
+        }
+
+        // A Markdown "Save as" destination: the .md is already written into [pendingMdTemp].
+        val saveMdLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("text/markdown"),
+        ) { uri ->
+            val temp = pendingMdTemp; pendingMdTemp = null
+            if (temp != null) {
+                if (uri != null) {
+                    val ok = runCatching { resolver.openOutputStream(uri)?.use { o -> temp.inputStream().use { it.copyTo(o) } } != null }.getOrDefault(false)
+                    editor.message = if (ok) context.getString(R.string.exported_markdown) else context.getString(R.string.err_export_markdown)
+                }
+                temp.delete()
+            }
+        }
+
         // Save a copy of an explorer file (a note or a canvas) elsewhere.
         val saveCopyLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.CreateDocument("application/octet-stream"),
         ) { uri ->
             val src = pendingSaveCopyUri; pendingSaveCopyUri = null
+            val withLinks = pendingSaveCopyLinks; pendingSaveCopyLinks = false
             if (uri != null && src != null) {
-                runCatching { resolver.openOutputStream(uri)?.use { o -> editor.copyFileTo(src, o) } }
-                    .onFailure { editor.message = context.getString(R.string.err_save_copy) }
+                val isNote = com.xnotes.core.util.DocumentKind.ofName(
+                    displayNameOf(resolver, android.net.Uri.parse(src)).orEmpty(),
+                ) == com.xnotes.core.util.DocumentKind.NOTE
+                if (withLinks && isNote) {
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        val ok = runCatching {
+                            resolver.openOutputStream(uri)?.use { o -> editor.exportFileToXnote(src, o, withLinks = true) } != null
+                        }.getOrDefault(false)
+                        if (!ok) editor.message = context.getString(R.string.err_save_copy)
+                    }
+                } else {
+                    runCatching { resolver.openOutputStream(uri)?.use { o -> editor.copyFileTo(src, o) } }
+                        .onFailure { editor.message = context.getString(R.string.err_save_copy) }
+                }
             }
         }
 
@@ -579,6 +786,15 @@ private fun EditorScreen(
             }
         }
 
+        // The target note a note-link dialog links to ("" = within the same note, set at confirm).
+        val noteLinkFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                runCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                noteLinkTargetUri = uri.toString()
+                noteLinkTargetName = displayNameOf(resolver, uri) ?: uri.toString()
+            }
+        }
+
         // A PDF picked from a page's menu in the side panel; its pages go in right after that page.
         val insertPdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             val pending = pendingPdfInsert; pendingPdfInsert = null
@@ -591,6 +807,10 @@ private fun EditorScreen(
             if (uri == null || pending == null) return@rememberLauncherForActivityResult
             val name = displayNameOf(resolver, uri) ?: "Document"
             val mime = runCatching { resolver.getType(uri) }.getOrNull() ?: ""
+            if (!com.xnotes.ui.ImportKind.isKnownImport(name, mime)) {
+                editor.message = context.getString(R.string.err_read_file)
+                return@rememberLauncherForActivityResult
+            }
             scope.launch {
                 if (!pending.editor.importIntoOpenNote(uri.toString(), name, mime, pending.at)) {
                     editor.message = context.getString(
@@ -606,6 +826,10 @@ private fun EditorScreen(
             if (uri == null || note == null) return@rememberLauncherForActivityResult
             val name = displayNameOf(resolver, uri) ?: "Document"
             val mime = runCatching { resolver.getType(uri) }.getOrNull() ?: ""
+            if (!com.xnotes.ui.ImportKind.isKnownImport(name, mime)) {
+                editor.message = context.getString(R.string.err_read_file)
+                return@rememberLauncherForActivityResult
+            }
             scope.launch {
                 editor.message = context.getString(
                     when {
@@ -825,15 +1049,27 @@ private fun EditorScreen(
             }
         }
 
+        /** Whether [uriStr] still names a file the provider will report (false once deleted/trashed). IO. */
+        suspend fun fileExists(uriStr: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                resolver.query(
+                    Uri.parse(uriStr),
+                    arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                    null, null, null,
+                )?.use { it.moveToFirst() } ?: false
+            }.getOrDefault(false)
+        }
+
         /** Read [uriStr] into [target] and remember it as a tab only if that document is now open. */
-        suspend fun openTab(target: Editor, uriStr: String) {
+        suspend fun openTab(target: Editor, uriStr: String): String? {
             val opened = openInto(context, target, uriStr) { u, n -> readerStack.add(com.xnotes.ui.ReaderFile(u, n)) }
-                ?: return
+                ?: return null
             noteTabs = noteTabs.open(opened, target.openDocumentTitle, target.pane == com.xnotes.ui.Pane.SECONDARY)
+            return opened
         }
 
         fun openTreeFile(uriStr: String) {
-            scope.launch { openTab(editor, uriStr) }
+            scope.launch { openTab(editor, uriStr); Unit }
         }
 
         /** Switch the pane that owns [uri] to it, or load it there when it is not open yet. */
@@ -853,7 +1089,46 @@ private fun EditorScreen(
                 noteTabs = noteTabs.open(uri, target.openDocumentTitle, secondary)
                 return
             }
-            guarded(target) { scope.launch { openTab(target, uri) } }
+            guarded(target) { scope.launch { openTab(target, uri); Unit } }
+        }
+
+        /**
+         * Follow a note link from [from] to [uri] at 0-based [page]: in the split's other pane
+         * when one is open ("another tab"), else by switching this pane's tab. Jumps to [page]
+         * once the note lands, clamped to its pages.
+         */
+        fun followNoteLink(from: Editor, uri: String, page: Int) {
+            if (uri.isBlank()) return
+            if (from.openDocumentUri == uri) {
+                from.goToPage(page.coerceIn(0, from.state.document.pages.lastIndex.coerceAtLeast(0)))
+                return
+            }
+            val other = if (from.pane == com.xnotes.ui.Pane.PRIMARY) editor.secondary else editor
+            val target = if (other?.noteOpen == true) other else from
+            if (target === from) {
+                activateTab(uri)
+                // The jump lands once the open finishes; poll the pane, not the tab list.
+                scope.launch {
+                    var tries = 0
+                    while (tries++ < 100) {
+                        kotlinx.coroutines.delay(50)
+                        if (target.openDocumentUri == uri && target.noteOpen) {
+                            target.goToPage(page.coerceIn(0, target.state.document.pages.lastIndex.coerceAtLeast(0)))
+                            return@launch
+                        }
+                    }
+                }
+            } else {
+                guarded(target) {
+                    scope.launch {
+                        openTab(target, uri)
+                        editor.focusPane(target.pane)
+                        if (target.state.document.pages.isNotEmpty()) {
+                            target.goToPage(page.coerceIn(0, target.state.document.pages.lastIndex))
+                        }
+                    }
+                }
+            }
         }
 
         /** Close [uri]'s tab and swap its pane to the nearest surviving tab, or back to the explorer. */
@@ -867,6 +1142,7 @@ private fun EditorScreen(
                 pane.noteOpen && pane.openDocumentUri == uri
             }
             val finish = {
+                if (mathStudioUri != null && mathStudioUri == uri) closeMathStudio()
                 val updated = noteTabs.close(uri)
                 val replacement = when (matching?.pane) {
                     com.xnotes.ui.Pane.PRIMARY -> updated.primaryUri
@@ -877,12 +1153,85 @@ private fun EditorScreen(
                 editor.forgetInactiveDocument(uri)
                 editor.secondary?.forgetInactiveDocument(uri)
                 if (matching != null) {
-                    if (replacement != null) scope.launch { openTab(matching, replacement) }
+                    if (replacement != null) scope.launch {
+                        // The replacement may itself be gone (a note deleted while its tab lingered):
+                        // a failed open must still close the pane being left, never leave it showing
+                        // the document whose tab was just closed.
+                        val opened = openTab(matching, replacement)
+                        if (opened == null) {
+                            if (!fileExists(replacement)) {
+                                noteTabs = noteTabs.close(replacement)
+                                editor.forgetInactiveDocument(replacement)
+                                editor.secondary?.forgetInactiveDocument(replacement)
+                            }
+                            matching.goHome()
+                        }
+                    }
                     else matching.goHome()
+                } else {
+                    // No pane showed the closed tab, but an earlier failed replacement may have left a
+                    // pane showing a document with no tab (a deleted note). Sweep those now (blank new
+                    // notes have no URI and are never swept) so a closed tab is always really closed.
+                    for (pane in listOfNotNull(editor, editor.secondary)) {
+                        val openUri = pane.openDocumentUri
+                        if (pane.noteOpen && openUri != null && noteTabs.tabs.none { it.uri == openUri }) {
+                            scope.launch {
+                                if (!fileExists(openUri)) pane.goHome()
+                            }
+                        }
+                    }
                 }
                 Unit
             }
             if (matching != null) guarded(matching, finish) else finish()
+        }
+
+        /** Close every tab at or under [deletedUris] (files or folders) before the files go away, moving
+         *  any pane showing one of them to its nearest surviving tab or back to the explorer. Unlike
+         *  [closeTab] this never prompts: deleting already discards the open buffer without asking. */
+        fun closeTabsForDeletion(deletedUris: List<String>) {
+            if (deletedUris.isEmpty()) return
+            val affected = noteTabs.tabs.map { it.uri }.filter { tabUri ->
+                deletedUris.any { del -> editor.isUnderDocument(tabUri, del) }
+            }.toSet()
+            if (affected.isEmpty()) return
+            if (mathStudioUri != null && mathStudioUri in affected) closeMathStudio()
+            listOfNotNull(editor, editor.secondary).forEach { pane ->
+                val pending = pane.pendingOpenUri
+                if (pending != null && deletedUris.any { del -> editor.isUnderDocument(pending, del) }) {
+                    pane.cancelOpenInProgress()
+                }
+            }
+            val updated = noteTabs.closeUris(affected)
+            noteTabs = updated
+            affected.forEach {
+                editor.forgetInactiveDocument(it)
+                editor.secondary?.forgetInactiveDocument(it)
+            }
+            for (pane in listOfNotNull(editor, editor.secondary)) {
+                val openUri = pane.openDocumentUri
+                if (pane.noteOpen && openUri != null && deletedUris.any { del -> editor.isUnderDocument(openUri, del) }) {
+                    val replacement = when (pane.pane) {
+                        com.xnotes.ui.Pane.PRIMARY -> updated.primaryUri
+                        com.xnotes.ui.Pane.SECONDARY -> updated.secondaryUri
+                    }
+                    if (replacement != null) {
+                        scope.launch {
+                            val opened = openTab(pane, replacement)
+                            if (opened == null) {
+                                if (!fileExists(replacement)) {
+                                    noteTabs = noteTabs.close(replacement)
+                                    editor.forgetInactiveDocument(replacement)
+                                    editor.secondary?.forgetInactiveDocument(replacement)
+                                }
+                                pane.goHome()
+                            }
+                        }
+                    } else {
+                        pane.goHome()
+                    }
+                }
+            }
         }
 
         /** Open two picked files together, one per pane, and start the split focused on the first. */
@@ -914,6 +1263,9 @@ private fun EditorScreen(
             stem: String,
             shareDir: Boolean,
             counting: String = "page",
+            suffix: String = "pdf",
+            titleRes: Int = R.string.exporting_pdf,
+            errorRes: Int = R.string.err_export_pdf,
             render: (java.io.OutputStream, (Int, Int) -> Unit, () -> Boolean) -> Unit,
             onReady: (java.io.File) -> Unit,
         ) {
@@ -921,7 +1273,7 @@ private fun EditorScreen(
             val prevCancel = exportCancel
             val cancel = java.util.concurrent.atomic.AtomicBoolean(false)
             exportCancel = cancel // the dialog's Cancel flips THIS export's flag
-            exportProgress = ExportProgress(0, 0, counting) // show the dialog at once; the render fills in the real total
+            exportProgress = ExportProgress(0, 0, counting, titleRes) // show the dialog at once; the render fills in the real total
             exportJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 // Abort any still-running previous export (its write stream throws on the next buffer) and
                 // wait for it to fully unwind before we touch the shared temp dir — no overlapping saves.
@@ -929,12 +1281,12 @@ private fun EditorScreen(
                 prevJob?.join()
                 val dir = java.io.File(context.cacheDir, if (shareDir) "share" else "export").apply { mkdirs() }
                 dir.listFiles()?.forEach { it.delete() } // keep only the file this export produces
-                val temp = java.io.File(dir, "$stem.pdf")
+                val temp = java.io.File(dir, "$stem.$suffix")
                 val ok = runCatching {
                     java.io.FileOutputStream(temp).use { fo ->
                         // Abort the (otherwise uninterruptible) PdfBox save the moment Cancel is tapped.
                         val o = com.xnotes.platform.CancellableOutputStream(fo) { cancel.get() }
-                        render(o, { done, total -> if (!cancel.get()) exportProgress = ExportProgress(done, total, counting) }, { cancel.get() })
+                        render(o, { done, total -> if (!cancel.get()) exportProgress = ExportProgress(done, total, counting, titleRes) }, { cancel.get() })
                     }
                 }.isSuccess
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -942,7 +1294,7 @@ private fun EditorScreen(
                     when {
                         cancel.get() -> temp.delete()
                         ok -> onReady(temp)
-                        else -> { temp.delete(); if (exportCancel === cancel) editor.message = context.getString(R.string.err_export_pdf) }
+                        else -> { temp.delete(); if (exportCancel === cancel) editor.message = context.getString(errorRes) }
                     }
                 }
             }
@@ -958,13 +1310,108 @@ private fun EditorScreen(
             context.startActivity(Intent.createChooser(send, context.getString(R.string.share_named, stem)))
         }
 
-        fun shareFile(uriStr: String, asPdf: Boolean) {
+        /**
+         * Render a note as Samsung Notes `.sdocx` off-thread behind the export
+         * progress dialog, then hand the finished temp file to [onReady] (which
+         * launches the SAF picker). Mirrors [runPdfExport] but writes a ZIP
+         * bundle instead of a PDF.
+         */
+        fun runSdocxExport(
+            stem: String,
+            ext: String = "sdocx",
+            shareDir: Boolean = false,
+            errorRes: Int = R.string.err_export_sdocx,
+            titleRes: Int = R.string.exporting_sdocx,
+            render: (java.io.OutputStream, (Int, Int) -> Unit, () -> Boolean) -> Unit,
+            onReady: (java.io.File) -> Unit,
+            errorMessage: ((Throwable?) -> String)? = null,
+        ) {
+            val prevJob = exportJob
+            val prevCancel = exportCancel
+            val cancel = java.util.concurrent.atomic.AtomicBoolean(false)
+            exportCancel = cancel
+            exportProgress = ExportProgress(0, 0, "page", titleRes)
+            exportJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                prevCancel?.set(true)
+                prevJob?.join()
+                // Share flows must land in cache/share/ (the FileProvider-exposed
+                // dir, like runPdfExport); SAF saves stay in cache/export/.
+                val dir = java.io.File(context.cacheDir, if (shareDir) "share" else "export").apply { mkdirs() }
+                dir.listFiles()?.forEach { it.delete() }
+                val temp = java.io.File(dir, "$stem.$ext")
+                val failure = runCatching {
+                    java.io.FileOutputStream(temp).use { fo ->
+                        val o = com.xnotes.platform.CancellableOutputStream(fo) { cancel.get() }
+                        render(o, { done, total -> if (!cancel.get()) exportProgress = ExportProgress(done, total, "page", titleRes) }, { cancel.get() })
+                    }
+                }.exceptionOrNull()
+                val ok = failure == null && !cancel.get()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (exportCancel === cancel) exportProgress = null
+                    when {
+                        cancel.get() -> temp.delete()
+                        ok -> onReady(temp)
+                        else -> { temp.delete(); if (exportCancel === cancel) editor.message = errorMessage?.invoke(failure) ?: context.getString(errorRes) }
+                    }
+                }
+            }
+        }
+
+        fun exportSdocxFile(uriStr: String) {
             val stem = stemOf(uriStr)
-            if (asPdf) {
+            runSdocxExport(stem,
+                render = { o, prog, cancel -> editor.exportFileToSdocx(uriStr, o, prog, cancel) },
+                onReady = { temp -> pendingSdocxTemp = temp; saveSdocxLauncher.launch("$stem.sdocx") })
+        }
+
+        // "Convert handwritten to LaTeX" on a note: scan every page, then save the .tex file.
+        fun exportLatexFile(uriStr: String) {
+            editor.aiExportBlocker()?.let {
+                editor.say(it)
+                return
+            }
+            val stem = stemOf(uriStr)
+            runSdocxExport(stem, ext = "tex", errorRes = R.string.err_export_latex, titleRes = R.string.exporting_latex,
+                render = { o, prog, cancel -> editor.exportFileToLatex(uriStr, o, prog, cancel) },
+                onReady = { temp -> pendingTexTemp = temp; saveTexLauncher.launch("$stem.tex") },
+                errorMessage = { e -> e?.message?.takeIf { it.isNotBlank() } ?: context.getString(R.string.err_export_latex) })
+        }
+
+        // "Convert handwritten to Markdown" on a note: like LaTeX above, but the vision
+        // model returns headings, lists, tables and inline maths instead of a .tex body.
+        fun exportMarkdownFile(uriStr: String) {
+            editor.aiExportBlocker()?.let {
+                editor.say(it)
+                return
+            }
+            val stem = stemOf(uriStr)
+            runSdocxExport(stem, ext = "md", errorRes = R.string.err_export_markdown, titleRes = R.string.exporting_markdown,
+                render = { o, prog, cancel -> editor.exportFileToMarkdown(uriStr, o, prog, cancel) },
+                onReady = { temp -> pendingMdTemp = temp; saveMdLauncher.launch("$stem.md") },
+                errorMessage = { e -> e?.message?.takeIf { it.isNotBlank() } ?: context.getString(R.string.err_export_markdown) })
+        }
+
+        fun shareFile(uriStr: String, format: ShareFormat, withLinks: Boolean = false) {
+            val stem = stemOf(uriStr)
+            val note = kindOf(uriStr) == com.xnotes.core.util.DocumentKind.NOTE
+            // Samsung Notes export is only meaningful for notes; anything else shares as PDF.
+            val fmt = if (format == ShareFormat.SDOCX && !note) ShareFormat.PDF else format
+            if (fmt == ShareFormat.PDF) {
                 // Render with progress, then share the finished PDF (writes into cache/share for FileProvider).
                 runPdfExport(stem, shareDir = true, counting = countingOf(uriStr),
-                    render = { o, prog, cancel -> editor.exportFileToPdf(uriStr, o, prog, cancel) },
+                    render = { o, prog, cancel -> editor.exportFileToPdf(uriStr, o, prog, cancel, withLinks) },
                     onReady = { temp -> runCatching { launchShare(temp, stem, "application/pdf") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
+            } else if (fmt == ShareFormat.SDOCX) {
+                // A Samsung Notes bundle, self-contained when links are inlined below their link.
+                // Renders into cache/share/ so FileProvider can hand it to the share sheet.
+                runSdocxExport(stem, shareDir = true, titleRes = R.string.exporting_sdocx,
+                    render = { o, prog, cancel -> editor.exportFileToSdocx(uriStr, o, prog, cancel, withLinks) },
+                    onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
+            } else if (withLinks && note) {
+                // A self-contained bundle: linked pages inlined below their link, links rewired.
+                runSdocxExport(stem, ext = "xnote", shareDir = true, titleRes = R.string.exporting_note, errorRes = R.string.err_share_note,
+                    render = { o, _, cancel -> editor.exportFileToXnote(uriStr, o, withLinks = true) { cancel() } },
+                    onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
             } else {
                 // Sharing the bundle itself is just a fast byte copy — no render, no dialog needed. It
                 // keeps the source's own extension, so a canvas is shared as a canvas.
@@ -1069,7 +1516,7 @@ private fun EditorScreen(
                 exportPdf = {
                     val from = editor.active
                     runPdfExport(from.title, shareDir = false,
-                        render = { o, prog, cancel -> from.exportPdf(o, prog, cancel) },
+                        render = { o, prog, cancel -> from.exportPdf(o, prog, cancel, exportWithLinks) },
                         onReady = { temp -> pendingExportTemp = temp; savePdfLauncher.launch("${from.title}.pdf") })
                 },
                 preferences = { backstageView = com.xnotes.ui.BackstageView.PREFERENCES; guardedAll { editor.goHomeAll() } },
@@ -1091,23 +1538,33 @@ private fun EditorScreen(
             }
         }
 
-        // A PDF or markdown file opened from another app ("Open with"/Share): set up a pending import
+        // A file opened from another app ("Open with"/Share): set up a pending import
         // and land on the backstage so its name dialog appears, exactly like the in-app import button.
         // With no folder chosen yet, fall back to App storage so the explorer renders and the note autosaves.
-        // A markdown file becomes a new note whose text it is.
+        // A markdown file becomes a new note whose text it is; an unrecognized
+        // binary (a zip shared as octet-stream, say) is declined, not garbled.
         LaunchedEffect(importPdfUri) {
             val src = importPdfUri ?: return@LaunchedEffect
             onImportConsumed() // consume once; the body has no suspend point so it runs to completion
             val name = displayNameOf(resolver, src)
-            val markdown = runCatching { resolver.getType(src) }.getOrNull() in MARKDOWN_TYPES ||
+            val mime = runCatching { resolver.getType(src) }.getOrNull() ?: ""
+            if (name != null && !com.xnotes.ui.ImportKind.isKnownImport(name, mime)) {
+                editor.message = context.getString(R.string.err_read_file)
+                return@LaunchedEffect
+            }
+            val markdown = mime in MARKDOWN_TYPES ||
                 name?.substringAfterLast('.', "")?.lowercase() in MARKDOWN_EXTENSIONS
             val stem = com.xnotes.core.util.Paths.stem(name ?: "Document")
             guardedAll {
                 if (editor.browseRoot == null) editor.useInternalStorage()
+                val kind = if (markdown) com.xnotes.ui.ImportKind.TEXT
+                else com.xnotes.ui.ImportKind.classify(name ?: "Document", mime)
                 editor.requestImport(
-                    if (markdown) com.xnotes.ui.ImportKind.TEXT else com.xnotes.ui.ImportKind.PDF,
+                    kind,
                     stem,
                     src.toString(),
+                    sourceName = name ?: "",
+                    mime = mime,
                     markdown = markdown,
                 )
                 backstageView = com.xnotes.ui.BackstageView.HOME
@@ -1157,10 +1614,27 @@ private fun EditorScreen(
                             if (export) exportSettingsLauncher.launch("xnotes-settings-${java.time.LocalDate.now()}.zip")
                             else importSettingsLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
                         },
-                        onImportPdf = { importPdfLauncher.launch(importMimeTypes) },
+                        onImportPdf = { importPdfLauncher.launch(importPickerTypes) },
+                        onTraceScan = { traceScanLauncher.launch(arrayOf("image/*", "application/pdf")) },
+                        onTraceCamera = { launchTraceCamera() },
                         onOpenFile = { uri ->
                             val name = displayNameOf(resolver, Uri.parse(uri)).orEmpty()
-                            if (com.xnotes.core.util.ReaderKind.isReadable(name) && !name.endsWith(".pdf", ignoreCase = true)) {
+                            if (com.xnotes.core.util.ReaderKind.isSdocx(name)) {
+                                // A Samsung Notes file picked from elsewhere:
+                                // queue its conversion like an external share.
+                                guardedAll {
+                                    if (editor.browseRoot == null) editor.useInternalStorage()
+                                    editor.requestImport(
+                                        com.xnotes.ui.ImportKind.SDOCX,
+                                        com.xnotes.core.util.Paths.stem(name),
+                                        uri,
+                                        sourceName = name,
+                                        mime = runCatching { resolver.getType(Uri.parse(uri)) }.getOrNull() ?: "",
+                                    )
+                                    backstageView = com.xnotes.ui.BackstageView.HOME
+                                    editor.goHomeAll()
+                                }
+                            } else if (com.xnotes.core.util.ReaderKind.isReadable(name) && !name.endsWith(".pdf", ignoreCase = true)) {
                                 readerStack.add(com.xnotes.ui.ReaderFile(uri, name))
                             } else {
                                 guarded(editor) { openTreeFile(uri) }
@@ -1168,17 +1642,20 @@ private fun EditorScreen(
                         },
                         onPickRoot = { pickRootLauncher.launch(null) },
                         onShareFile = { uri -> pendingShareUri = uri; showShareChooser = true },
-                        onSaveCopyFile = { uri -> pendingSaveCopyUri = uri; saveCopyLauncher.launch("${stemOf(uri)}${kindOf(uri).suffix}") },
+                        onSaveCopyFile = { uri -> pendingSaveCopyUri = uri; pendingSaveCopyLinks = exportWithLinks; saveCopyLauncher.launch("${stemOf(uri)}${kindOf(uri).suffix}") },
                         onExportFilePdf = { uri ->
                             runPdfExport(stemOf(uri), shareDir = false, counting = countingOf(uri),
-                                render = { o, prog, cancel -> editor.exportFileToPdf(uri, o, prog, cancel) },
+                                render = { o, prog, cancel -> editor.exportFileToPdf(uri, o, prog, cancel, exportWithLinks) },
                                 onReady = { temp -> pendingExportTemp = temp; savePdfLauncher.launch("${stemOf(uri)}.pdf") })
                         },
+                        onExportFileSdocx = { uri -> exportSdocxFile(uri) },
+                        onExportFileLatex = { uri -> exportLatexFile(uri) },
+                        onExportFileMarkdown = { uri -> exportMarkdownFile(uri) },
                         onOpenSplit = { first, second -> guardedAll { openSplit(first, second) } },
                         onShareFiles = { uris -> shareFiles(uris) },
                         onImportIntoNote = { note ->
                             pendingImportInto = note
-                            importIntoLauncher.launch(importMimeTypes + arrayOf("application/octet-stream"))
+                            importIntoLauncher.launch(importPickerTypes)
                         },
                         onOpenBeside = { uri ->
                             editor.currentUri?.takeIf { !editor.isSameDocument(it, uri) }?.let { first -> { guardedAll { openSplit(first, uri) } } }
@@ -1194,6 +1671,7 @@ private fun EditorScreen(
                             pendingTemplateKind = kind
                             templateFromImageLauncher.launch(arrayOf("image/*"))
                         },
+                        onCloseTabsForDeletion = ::closeTabsForDeletion,
                     )
 
                     // TOP LAYER: the open panes (toolbar + canvas each), pushed over backstage. Back acts on
@@ -1288,7 +1766,7 @@ private fun EditorScreen(
                             when (kind) {
                                 com.xnotes.ui.PageInsert.FILE -> {
                                     pendingPageInsert = PendingPageInsert(pane, at)
-                                    insertPagesLauncher.launch(importMimeTypes + arrayOf("application/octet-stream"))
+                                    insertPagesLauncher.launch(importPickerTypes)
                                 }
                                 com.xnotes.ui.PageInsert.IMAGE -> {
                                     pendingImagePage = PendingPageInsert(pane, at)
@@ -1303,19 +1781,38 @@ private fun EditorScreen(
                                 .onFailure { editor.message = context.getString(R.string.err_share_image) }
                         },
                         onOpenFile = { pane, uri ->
-                            scope.launch { openTab(pane, uri) }
+                            scope.launch { openTab(pane, uri); Unit }
                         },
                         onImagePage = { pane ->
                             pendingImagePage = PendingPageInsert(pane, pane.pageIndex + 1)
                             imagePageLauncher.launch(arrayOf("image/*"))
                         },
-                        onOpenMathStudio = { mathStudioOpen = true },
+                        onOpenMathStudio = { openMathStudio() },
+                        onInsertNoteLink = { pane, at ->
+                            noteLinkTargetUri = null
+                            noteLinkTargetName = ""
+                            noteLinkPicking = false
+                            noteLinkForm.reset()
+                            noteLinkRequest = NoteLinkRequest(pane, at)
+                        },
                     )
+                    // Note-link taps open the target in the other split pane, or switch this tab.
+                    editor.onOpenNoteLink = { uri, page -> followNoteLink(editor.active, uri, page) }
+                    editor.secondary?.onOpenNoteLink = { uri, page ->
+                        followNoteLink(editor.secondary ?: editor.active, uri, page)
+                    }
                     SplitHost(editor, actions)
 
                     if (mathStudioOpen) {
+                        // Resolved once per opening: live snapshots flow back through onPersist,
+                        // so recomputing this on every persist would restore echoes of our own writes.
+                        val initialStudioData = remember(mathStudioOpen, mathStudioUri) { studioJsonFor(mathStudioUri) }
                         com.xnotes.ui.MathStudioScreen(
-                            onClose = { mathStudioOpen = false },
+                            onClose = { closeMathStudio() },
+                            initialAnim = mathAnimSpec,
+                            initialRequest = mathStudioRequest,
+                            initialData = initialStudioData,
+                            onPersist = { persistMathStudio(it) },
                             onInsertGraph = { bytes ->
                                 val target = editor.active
                                 if (target.canvasOpen) {
@@ -1326,6 +1823,12 @@ private fun EditorScreen(
                                     target.insertImage(bytes)
                                     if (target.message == before) target.say(context.getString(R.string.math_inserted))
                                 }
+                            },
+                            onInsertMath = { latex ->
+                                val target = editor.active
+                                val ok = if (target.canvasOpen) target.infinite.placeMathResult(latex) else target.placeMathResult(latex)
+                                if (ok) target.say(context.getString(R.string.math_result_inserted))
+                                else target.say(context.getString(R.string.math_insert_failed))
                             },
                         )
                     }
@@ -1362,15 +1865,54 @@ private fun EditorScreen(
             com.xnotes.ui.AlertDialog(
                 onDismissRequest = { showShareChooser = false; pendingShareUri = null },
                 title = { androidx.compose.material3.Text(stringResource(R.string.share_note)) },
-                text = { androidx.compose.material3.Text(stringResource(R.string.share_as, shareUri?.let { stemOf(it) } ?: "")) },
+                text = {
+                    androidx.compose.foundation.layout.Column {
+                        androidx.compose.material3.Text(stringResource(R.string.share_as, shareUri?.let { stemOf(it) } ?: ""))
+                        androidx.compose.foundation.layout.Row(
+                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(vertical = 8.dp),
+                        ) {
+                            val isNote = shareUri?.let { kindOf(it) == com.xnotes.core.util.DocumentKind.NOTE } != false
+                            androidx.compose.material3.FilterChip(
+                                selected = shareFormat == ShareFormat.FILE,
+                                onClick = { shareFormat = ShareFormat.FILE },
+                                label = { androidx.compose.material3.Text(shareSuffix) },
+                            )
+                            if (isNote) {
+                                androidx.compose.material3.FilterChip(
+                                    selected = shareFormat == ShareFormat.SDOCX,
+                                    onClick = { shareFormat = ShareFormat.SDOCX },
+                                    label = { androidx.compose.material3.Text(".sdocx") },
+                                )
+                            } else if (shareFormat == ShareFormat.SDOCX) {
+                                shareFormat = ShareFormat.PDF
+                            }
+                            androidx.compose.material3.FilterChip(
+                                selected = shareFormat == ShareFormat.PDF,
+                                onClick = { shareFormat = ShareFormat.PDF },
+                                label = { androidx.compose.material3.Text("PDF") },
+                            )
+                        }
+                        androidx.compose.foundation.layout.Row(
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                        ) {
+                            androidx.compose.material3.Checkbox(
+                                checked = exportWithLinks,
+                                onCheckedChange = { exportWithLinks = it },
+                            )
+                            androidx.compose.foundation.layout.Column {
+                                androidx.compose.material3.Text(stringResource(R.string.export_with_links))
+                                androidx.compose.material3.Text(
+                                    stringResource(R.string.export_with_links_hint),
+                                    style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                },
                 confirmButton = {
-                    androidx.compose.foundation.layout.Row {
-                        androidx.compose.material3.TextButton(onClick = { showShareChooser = false; pendingShareUri = null; shareUri?.let { shareFile(it, asPdf = false) } }) {
-                            androidx.compose.material3.Text(stringResource(R.string.file_of_kind, shareSuffix))
-                        }
-                        androidx.compose.material3.TextButton(onClick = { showShareChooser = false; pendingShareUri = null; shareUri?.let { shareFile(it, asPdf = true) } }) {
-                            androidx.compose.material3.Text("PDF")
-                        }
+                    androidx.compose.material3.TextButton(onClick = { val withLinks = exportWithLinks; val format = shareFormat; showShareChooser = false; pendingShareUri = null; shareUri?.let { shareFile(it, format, withLinks) } }) {
+                        androidx.compose.material3.Text(stringResource(R.string.share))
                     }
                 },
                 dismissButton = {
@@ -1379,6 +1921,67 @@ private fun EditorScreen(
                     }
                 },
             )
+        }
+        noteLinkRequest?.let { req ->
+            if (noteLinkPicking) {
+                com.xnotes.ui.NoteFilePickerDialog(
+                    editor = req.editor,
+                    excludeUri = req.editor.openDocumentUri,
+                    onPick = { uri, name ->
+                        runCatching { resolver.takePersistableUriPermission(android.net.Uri.parse(uri), Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                        noteLinkTargetUri = uri
+                        noteLinkTargetName = name
+                        noteLinkPicking = false
+                    },
+                    onDismiss = { noteLinkPicking = false },
+                )
+            } else {
+            com.xnotes.ui.NoteLinkDialog(
+                form = noteLinkForm,
+                initialTargetName = req.editor.title,
+                targetName = noteLinkTargetName,
+                onPickFile = { noteLinkFileLauncher.launch(arrayOf("*/*")) },
+                onPickInternal = { noteLinkPicking = true },
+                onConfirm = { form ->
+                    scope.launch {
+                        val uri = if (form.self) "" else noteLinkTargetUri.orEmpty()
+                        val name = if (form.self) req.editor.title else noteLinkTargetName
+                        if (!form.self && uri.isEmpty()) {
+                            req.editor.say(context.getString(R.string.note_link_needs_target))
+                            return@launch
+                        }
+                        // Clamp to pages that exist; an unreadable target or an empty
+                        // remainder reports instead of placing a dead link.
+                        val count = if (form.self) req.editor.state.document.pages.size
+                        else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            req.editor.loadNoteForExport(uri)?.doc?.pages?.size
+                        }
+                        if (count == null) {
+                            req.editor.say(context.getString(R.string.note_link_unreadable))
+                            return@launch
+                        }
+                        val pages = form.pages.filter { it < count }
+                        if (pages.isEmpty()) {
+                            req.editor.say(context.getString(R.string.note_link_bad_pages))
+                            return@launch
+                        }
+                        req.editor.insertNoteLink(
+                            form.displayName.ifBlank { name }, uri, name, pages, form.color, req.at,
+                            rounded = form.rounded,
+                        )
+                        noteLinkRequest = null
+                        noteLinkTargetUri = null
+                        noteLinkTargetName = ""
+                    }
+                },
+                onDismiss = {
+                    noteLinkRequest = null
+                    noteLinkPicking = false
+                    noteLinkTargetUri = null
+                    noteLinkTargetName = ""
+                },
+            )
+            }
         }
         pendingBackup?.let { backup ->
             com.xnotes.ui.AlertDialog(
@@ -1430,7 +2033,7 @@ private fun EditorScreen(
             )
         }
         exportProgress?.let { p ->
-            PdfExportDialog(done = p.done, total = p.total, counting = p.counting, onCancel = {
+            PdfExportDialog(done = p.done, total = p.total, counting = p.counting, titleRes = p.titleRes, onCancel = {
                 exportCancel?.set(true) // abort this export's page loop AND its write stream
                 exportProgress = null   // hide at once; the job then discards the half-written temp
             })
@@ -1477,7 +2080,13 @@ private fun EditorScreen(
 private class GuardRequest(val editor: Editor, val action: () -> Unit)
 
 /** A picked image on its way into [editor], at [at] when a long-press chose the spot. */
+/** Which file a share produces: the original bundle, a Samsung Notes bundle, or a PDF. */
+private enum class ShareFormat { FILE, SDOCX, PDF }
+
 private class PendingInsert(val editor: Editor, val at: com.xnotes.core.geometry.Pt?)
+
+/** A note link being created in [editor], placed at [at] when a long-press menu chose the spot. */
+private class NoteLinkRequest(val editor: Editor, val at: com.xnotes.core.geometry.Pt?)
 
 /** Pages about to go into [editor] before page [at], once a picker or the camera returns. */
 private class PendingPageInsert(val editor: Editor, val at: Int)
@@ -1500,7 +2109,7 @@ private class PendingPdfs(val picked: List<com.xnotes.ui.BrowseEntry>, val onSta
  * so the dialog cannot assume the unit. `total < 0` marks the final write phase, where [done] is a
  * 0..1000 permille of the output bytes.
  */
-private class ExportProgress(val done: Int, val total: Int, val counting: String) {
+private class ExportProgress(val done: Int, val total: Int, val counting: String, val titleRes: Int = R.string.exporting_pdf) {
     companion object {
         /** What a document of [kind] counts on its way out. */
         fun countingFor(kind: com.xnotes.core.util.DocumentKind): String =
@@ -1568,6 +2177,8 @@ private class PaneActions(
     val onImagePage: (Editor) -> Unit,
     /** Open the maths workspace over the current note or canvas. */
     val onOpenMathStudio: () -> Unit,
+    /** Open the note-link dialog for [Editor], placing at [com.xnotes.core.geometry.Pt] when set. */
+    val onInsertNoteLink: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
 )
 
 /** Neither pane of a split may be squeezed below this share of the split axis. */
@@ -1779,6 +2390,7 @@ private fun EditorPane(
                         onOpenMathStudio = actions.onOpenMathStudio,
                         onInsertAudio = { actions.onInsertAudio(editor) },
                         onRecordAudio = { actions.onRecordAudio(editor) },
+                        onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
                     )
                 }
             }
@@ -1816,7 +2428,7 @@ private fun EditorPane(
                         com.xnotes.ui.ScreenshotMenu(editor, onShare = actions.onShareImage)
                         com.xnotes.ui.CropMenu(editor)
                         com.xnotes.ui.TextStyleBar(editor)
-                        com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) })
+                        com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onInsertNoteLinkAt = { c -> actions.onInsertNoteLink(editor, c) })
                         com.xnotes.ui.PenMenu(editor)
                         com.xnotes.ui.FlowEditMenu(editor)
                         com.xnotes.ui.PdfSelectionMenu(editor)
@@ -1827,6 +2439,7 @@ private fun EditorPane(
                         com.xnotes.ui.FlowTableMenu(editor)
                         com.xnotes.ui.TableChrome(editor)
                         ZoomLockHint(editor)
+                        PdfLinkBackButtons(editor)
                         CanvasToastPill(editor)
                     }
                 }
@@ -1910,7 +2523,7 @@ private fun <T : android.view.View> detached(view: T): T =
  * back, or tapping outside) aborts the export via [onCancel]. Styled to match the monospace surfaces.
  */
 @Composable
-private fun PdfExportDialog(done: Int, total: Int, counting: String, onCancel: () -> Unit) {
+private fun PdfExportDialog(done: Int, total: Int, counting: String, titleRes: Int, onCancel: () -> Unit) {
     val palette = LocalPalette.current
     // Only the final PDF write has a meaningful, moving percentage (reported as byte progress with
     // total = -1, done a 0..1000 permille). Preparing and the page phase sit at 0% (the page loop is
@@ -1951,7 +2564,7 @@ private fun PdfExportDialog(done: Int, total: Int, counting: String, onCancel: (
             }
             Spacer(Modifier.height(18.dp))
             Text(
-                stringResource(R.string.exporting_pdf),
+                stringResource(titleRes),
                 color = palette.text.toComposeColor(),
                 fontSize = 15.sp,
             )
@@ -2259,8 +2872,19 @@ private fun audioMime(ext: String): String = when (ext.lowercase()) {
 private val MARKDOWN_TYPES = setOf("text/markdown", "text/x-markdown")
 private val MARKDOWN_EXTENSIONS = setOf("md", "markdown")
 
-/** What the import filters take: a PDF becomes a note on its pages, markdown a note of its text. */
-private val IMPORT_TYPES = MARKDOWN_TYPES + "application/pdf"
+/** What the import filters take: PDFs, markdown, images, text, office/ebook
+ *  files and Samsung Notes (unregistered, so shared as generic binary).
+ *  Unknown binary shares are declined later by ImportKind.isKnownImport. */
+private val IMPORT_TYPES = MARKDOWN_TYPES + "application/pdf" + setOf(
+    "application/octet-stream",
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
+    "image/svg+xml", "image/heic", "image/heif",
+    "text/plain", "text/csv", "text/comma-separated-values", "application/csv",
+    "text/html", "text/rtf", "application/rtf",
+    "application/epub+zip",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
 /** Queries the storage provider for a document's user-visible file name, if available. */
 private fun displayNameOf(resolver: android.content.ContentResolver, uri: Uri): String? = runCatching {

@@ -53,9 +53,8 @@ android {
             // The tree-sitter parser tables gzip ~6x: compressed packaging keeps the
             // APK at ~12MB instead of ~30MB, at the cost of extract-on-install.
             useLegacyPackaging = true
-            // ONNX Runtime's core library is downloaded with the handwritten-maths add-on (see
-            // MathOcr); only its small JNI bridge ships in the APK.
-            excludes += "**/libonnxruntime.so"
+            // ONNX Runtime ships inside the APK: the handwritten-maths model files are the
+            // only on-demand download (see MathOcr), so inference works offline after that.
         }
     }
 
@@ -136,6 +135,9 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.material.icons.extended)
+    // Kuiver's own JetBrains-compose transitives are excluded: the project already
+    // provides the same classes via androidx (BOM-pinned), and the republished
+    // 1.12.0 artifacts would demand AGP 9.1+ and duplicate every compose class.
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.pdfbox.android)
     implementation(libs.androidsvg)

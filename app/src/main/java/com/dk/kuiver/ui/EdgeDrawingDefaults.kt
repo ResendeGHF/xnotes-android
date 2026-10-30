@@ -1,0 +1,22 @@
+package com.dk.kuiver.ui
+
+import androidx.compose.ui.unit.dp
+import kotlin.math.atan
+
+/**
+ * Default constants for edge drawing calculations.
+ */
+internal object EdgeDrawingDefaults {
+    val ARROW_OFFSET = 8.dp
+    val ARROW_GAP_FROM_LINE = 2.dp
+    const val ARROW_ANGLE_SPREAD = 0.5f
+    const val LINE_ALPHA = 0.8f
+    const val CURVE_PROPORTIONAL_OFFSET = 0.25f
+    const val SELF_LOOP_HEIGHT_MULTIPLIER = 2f
+    val CURVE_TANGENT_ANGLE: Float = atan(2f * CURVE_PROPORTIONAL_OFFSET)
+    const val SELF_LOOP_SPREAD = 0.3f
+    const val SELF_LOOP_SPREAD_PER_BEND = 0.5f
+    const val SELF_LOOP_MAX_SPREAD = 0.9f
+    const val SELF_LOOP_NESTED_GROWTH = 0.5f
+    const val PARALLEL_EDGE_BEND = 0.15f
+}

@@ -254,6 +254,11 @@ object XnotesIcons {
     val view = icon("M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z", circle(12.0, 12.0, 3.0))
     val home = icon("M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z", "M9 22V12h6v10")
     val share = icon("M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8", "M16 6l-4-4-4 4", "M12 2v13")
+    /** Link graph: three notes joined by their links (the Graph screen). */
+    val graph = icon(
+        "M12 7.5v5", "M12 12.5 6.8 17", "M12 12.5l5.2 4.5",
+        circle(12.0, 5.0, 2.5), circle(5.0, 19.0, 2.5), circle(19.0, 19.0, 2.5),
+    )
     val check = icon("M20 6 9 17l-5-5")
     /** A page with an arrow leaving it: pages taken out into a note of their own. */
     val extract = icon(
@@ -262,6 +267,12 @@ object XnotesIcons {
     )
     /** Two corner brackets crossing: cutting a picture down. */
     val crop = icon("M6 2v14a2 2 0 0 0 2 2h14", "M18 22V8a2 2 0 0 0-2-2H2")
+    /** Corner brackets closing on a line of ink: a scan traced into editable strokes. */
+    val traceScan = icon(
+        "M3 7V5a2 2 0 0 1 2-2h2", "M17 3h2a2 2 0 0 1 2 2v2",
+        "M21 17v2a2 2 0 0 1-2 2h-2", "M7 21H5a2 2 0 0 1-2-2v-2",
+        "M4 12h16",
+    )
     /** A sheet standing and the same sheet lying down: a page's size and which way round it is. */
     val pageSize = icon(roundRect(6.0, 2.0, 12.0, 20.0, 2.0), roundRect(2.0, 6.0, 20.0, 12.0, 2.0))
     /** A quarter turn clockwise. */

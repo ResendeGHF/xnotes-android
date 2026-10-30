@@ -7,4 +7,6 @@
     <exclude domain="file" path="note_thumbs" />
     <exclude domain="file" path="session" />
     <exclude domain="file" path="session-b" />
+    <!-- Whole-note LaTeX API key: re-entered per device, never backed up. -->
+    <exclude domain="sharedpref" path="latex_ai.xml" />
 </full-backup-content>

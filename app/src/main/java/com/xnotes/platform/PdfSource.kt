@@ -83,13 +83,8 @@ class PdfSource private constructor(
     /** Immutable snapshot of one page's parsed links. */
     private class PageLinks(val index: Int, val links: List<PdfLink>)
 
-    /** Only the **current** page's links are held, replaced as the canvas moves — so link memory is
-     *  O(1) and there is no accumulating per-page cache that could grow without bound. Stale pages are
-     *  dropped, not kept. */
+    /** The most recently parsed page's links (tap fast-path); [linkCache] holds the rest. */
     @Volatile private var current: PageLinks? = null
-
-    /** The latest page whose links the canvas wants warmed (the coalesce target); -1 when none. */
-    @Volatile private var desiredLinkPage = -1
 
     /** Single-flight guard for the warm pump, so a burst of [warmLinks] folds into one worker pass. */
     private val linkPumpActive = AtomicBoolean(false)
@@ -249,34 +244,58 @@ class PdfSource private constructor(
 
     // --- Links ---
 
-    /** True when [index] is the page whose links are currently held (possibly an empty list). */
-    fun hasLinks(index: Int): Boolean = current?.index == index
+    /** Called on the link worker thread after a page's links land, so the view can repaint its boxes. */
+    @Volatile var onLinksChanged: (() -> Unit)? = null
+
+    /** How many pages' links are held at once for taps and boxes; beyond it the least recently
+     *  wanted page is dropped (each page holds a few small rects, so this stays tiny). */
+    private val linkCache = ConcurrentHashMap<Int, List<PdfLink>>()
+
+    /** Every page the canvas wants held (visible pages + tapped ones); only ids, so unbounded scrolling stays cheap. */
+    private val desiredLinkPages: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
+    /** True when [index]'s links are held (possibly an empty list). */
+    fun hasLinks(index: Int): Boolean = linkCache.containsKey(index) || current?.index == index
+
+    /** [index]'s held links, or null when not parsed yet (call [warmLinks]/[requestLinks]). */
+    fun cachedLinks(index: Int): List<PdfLink>? = linkCache[index] ?: current?.takeIf { it.index == index }?.links
 
     /** The topmost link whose area contains ([x], [y]), in points as displayed, or null.
-     *  Non-blocking: returns null unless [index] is the currently-held page — call [requestLinks] to
+     *  Non-blocking: returns null unless [index]'s links are held — call [requestLinks] to
      *  parse it off the main thread. Later annotations paint on top, so iterate back-to-front. */
     fun linkAt(index: Int, x: Float, y: Float): PdfLink? {
-        val c = current ?: return null
-        if (c.index != index) return null
-        for (i in c.links.indices.reversed()) {
-            if (c.links[i].rect.contains(x, y)) return c.links[i]
+        val links = linkCache[index] ?: current?.takeIf { it.index == index }?.links ?: return null
+        for (i in links.indices.reversed()) {
+            if (links[i].rect.contains(x, y)) return links[i]
         }
         return null
     }
 
-    /** Coalesce + cancel-stale warming: record [index] as the latest wanted page and ensure a single
-     *  worker is parsing the *latest* wanted page, skipping cached ones. A fast scroll across many
-     *  pages just overwrites the target, so only the page(s) the scroll settles on get parsed — never
-     *  a per-page backlog. Fire-and-forget: it only fills the cache so a later tap finds it hot. */
+    /** Coalesce warming: remember [index] as wanted and ensure a worker is parsing whatever is
+     *  wanted but not held yet. A fast scroll just adds targets; the single pump parses them in
+     *  turn, so there is never a per-page backlog. Fire-and-forget: it only fills the cache so a
+     *  later tap finds it hot and the link boxes can draw. */
     fun warmLinks(index: Int) {
         if (closed || index < 0) return
-        desiredLinkPage = index
-        if (current?.index != index) pumpLinks()
+        desiredLinkPages.add(index)
+        if (!linkCache.containsKey(index) && current?.index != index) pumpLinks()
     }
 
-    /** Drive the warm pump: a single in-flight worker that repeatedly parses whatever [desiredLinkPage]
-     *  currently is (the latest, so pages merely scrolled past are cancelled) until it is cached or
-     *  cleared. The single-flight [linkPumpActive] guard collapses a burst of [warmLinks] into one. */
+    /** Warm every page in [indices] (the visible pages, for boxes), coalesced like [warmLinks]. */
+    fun warmLinks(indices: Iterable<Int>) {
+        if (closed) return
+        var missing = false
+        for (i in indices) {
+            if (i < 0) continue
+            desiredLinkPages.add(i)
+            if (!linkCache.containsKey(i) && current?.index != i) missing = true
+        }
+        if (missing) pumpLinks()
+    }
+
+    /** Drive the warm pump: a single in-flight worker that parses whatever [desiredLinkPages]
+     *  wants but the cache lacks yet. The single-flight [linkPumpActive] guard collapses a burst
+     *  of [warmLinks] into one. */
     private fun pumpLinks() {
         if (closed) return
         if (!linkPumpActive.compareAndSet(false, true)) return
@@ -286,14 +305,14 @@ class PdfSource private constructor(
             executor.execute {
                 try {
                     while (!closed) {
-                        val target = desiredLinkPage // latest wins; intermediate scroll targets are skipped
-                        if (target < 0 || current?.index == target) break
+                        val target = desiredLinkPages.firstOrNull { !linkCache.containsKey(it) && current?.index != it }
+                            ?: break
                         setCurrentLinks(target)
                     }
                 } finally {
                     linkPumpActive.set(false)
-                    val d = desiredLinkPage // a request that arrived as we exited gets a fresh pump
-                    if (!closed && d >= 0 && current?.index != d) pumpLinks()
+                    val d = desiredLinkPages.firstOrNull { !linkCache.containsKey(it) && current?.index != it }
+                    if (!closed && d != null) pumpLinks()
                 }
             }
         }.isSuccess
@@ -305,7 +324,8 @@ class PdfSource private constructor(
      *  to the main thread itself). Cache-checked, so it no-ops if warming already parsed the page. */
     fun requestLinks(index: Int, onReady: () -> Unit) {
         if (closed) return
-        if (current?.index == index) { onReady(); return }
+        if (linkCache.containsKey(index) || current?.index == index) { onReady(); return }
+        desiredLinkPages.add(index)
         val executor = linksWorker() ?: return
         runCatching {
             executor.execute {
@@ -326,19 +346,38 @@ class PdfSource private constructor(
     }
 
     /**
-     * Parse [index]'s links and make them the current page's links, replacing (evicting) the previous
-     * page's — only one page is ever held, so link memory stays O(1). Interactive priority even when
-     * warming: the page is usually loaded already for its render, so a read takes well under 1 ms.
+     * Parse [index]'s links and hold them (plus as the current page's, for the tap fast-path).
+     * Interactive priority even when warming: the page is usually loaded already for its render,
+     * so a read takes well under 1 ms. Notifies [onLinksChanged] so boxes repaint.
      */
     private fun setCurrentLinks(index: Int): List<PdfLink> {
-        current?.let { if (it.index == index) return it.links }
+        linkCache[index]?.let { return it }
+        current?.let { if (it.index == index) return it.links.also { linkCache[index] = it } }
         val result = pdf.links(index, PdfPriority.INTERACTIVE).orEmpty()
         current = PageLinks(index, result)
+        linkCache[index] = result
+        evictLinks(except = index)
+        if (!closed) runCatching { onLinksChanged?.invoke() }
         return result
+    }
+
+    /** Drop held pages past [MAX_CACHED_LINK_PAGES], least-wanted first, so a huge book can't
+     *  accumulate link rects without bound. Pages still wanted are dropped last. */
+    private fun evictLinks(except: Int) {
+        while (linkCache.size > MAX_CACHED_LINK_PAGES) {
+            val victim = linkCache.keys.firstOrNull { it != except && !desiredLinkPages.contains(it) }
+                ?: linkCache.keys.firstOrNull { it != except }
+                ?: break
+            linkCache.remove(victim)
+        }
     }
 
     fun close() {
         closed = true
+        onLinksChanged = null
+        linkCache.clear()
+        desiredLinkPages.clear()
+        current = null
         synchronized(executorLock) {
             runCatching { linksExecutor?.shutdownNow() }
         }
@@ -352,6 +391,9 @@ class PdfSource private constructor(
 
         /** Bookmarks read at most, so a pathological outline can't flood the Contents tab. */
         private const val MAX_OUTLINE = 2000
+
+        /** Pages' links held at once for taps and boxes (each page holds a few small rects). */
+        private const val MAX_CACHED_LINK_PAGES = 12
 
         /** Page sizes read per job; a page dictionary takes up to a fraction of a ms. */
         private const val SIZES_PER_READ = 128

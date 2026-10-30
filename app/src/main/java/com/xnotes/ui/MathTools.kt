@@ -48,6 +48,8 @@ import com.xnotes.math.ExpressionParser
 import com.xnotes.math.Numerical
 import com.xnotes.math.Numbers
 import com.xnotes.math.OdeMethod
+import com.xnotes.math.toFracLatex
+import com.xnotes.math.toFracText
 import com.xnotes.math.toLatex
 import com.xnotes.math.toText
 import com.xnotes.math.SamplePoint
@@ -541,7 +543,7 @@ internal fun SymbolicPane(state: SymbolicState) {
                         val roots = Symbolic.solve(ExpressionParser.parse(state.expression), v)
                         if (roots == null) throw IllegalArgumentException("Not a polynomial in $v")
                         state.title = solveLabel
-                        state.result = Symbolic.formatRoots(roots)
+                        state.result = Symbolic.formatRoots(roots, fractions = true)
                         state.detail = "${roots.size} root(s) in the complex plane"
                         state.latex = null
                         state.error = null
@@ -618,9 +620,9 @@ private fun symbolicAction(
             throw IllegalArgumentException("No elementary closed form found")
         }
         state.title = title
-        state.result = text
+        state.result = result.toFracText()
         state.detail = "simplified symbolic form"
-        state.latex = result.toLatex()
+        state.latex = result.toFracLatex()
         state.error = null
     }.onFailure {
         state.error = it.message ?: "Could not evaluate symbolically"
@@ -645,7 +647,7 @@ internal class UnitState {
 }
 
 @Composable
-internal fun UnitPane(state: UnitState) {
+internal fun UnitPane(state: UnitState, onTakeResult: ((Double) -> Unit)? = null) {
     val palette = LocalPalette.current
     val category = Units.category(state.category)
     val from = category?.unit(state.from)
@@ -697,6 +699,14 @@ internal fun UnitPane(state: UnitState) {
                 "${Numbers.format(converted)}  ${to?.symbol.orEmpty()}",
                 detail = "${Numbers.format(input ?: 0.0)} ${from?.symbol.orEmpty()}  ·  ${to?.name.orEmpty()}",
             )
+            if (onTakeResult != null) {
+                Spacer(Modifier.height(6.dp))
+                MathSecondaryButton(
+                    stringResource(R.string.math_use_in_calculator),
+                    Modifier.fillMaxWidth(),
+                    onClick = { onTakeResult(converted) },
+                )
+            }
         } else {
             Spacer(Modifier.height(7.dp))
             MathResultCard(stringResource(R.string.math_error), stringResource(R.string.math_units_bad_value), isError = true)

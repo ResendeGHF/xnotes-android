@@ -130,6 +130,8 @@ class InfiniteInteraction(
     private val onCommitText: () -> Unit = {},
     /** A pan that ended as a tap, at this content point, which an audio pill there may take. */
     private val onAudioTap: (Pt) -> Boolean = { false },
+    /** A pan that ended as a tap on a Math Studio animation badge, which reopens the animation. */
+    private val onMathAnimTap: (Pt) -> Boolean = { false },
     /** Peel this tape back, or cover it again: a look, never an edit. */
     private val onPeelTape: (TapeItem) -> Unit = {},
     /** The view was panned or pinched by hand, as distinct from moved by the app. */
@@ -306,7 +308,32 @@ class InfiniteInteraction(
     private var liveStroke: Stroke? = null
     private var drawingPointerId = -1
     private var drawingIsStylus = false
+    /** True while the live gesture's down-pointer was a pen tip, so its samples take the offset. */
+    private var drawingIsCalibrated = false
     private var strokeStartTimeMs = 0L
+
+    /**
+     * Stylus parallax correction in dp (Settings → Input → Calibrate), applied to every
+     * stylus/eraser-tip sample before the viewport→content transform. Finger input is untouched.
+     */
+    var stylusOffsetDp: Pt = Pt.ZERO
+
+    private fun offsetPx(): Pt {
+        val d = devicePxPerDp().takeIf { it.isFinite() && it > 0 } ?: 1.0
+        return Pt(stylusOffsetDp.x * d, stylusOffsetDp.y * d)
+    }
+
+    private fun calDown(vx: Double, vy: Double, toolType: Int): Pt =
+        if (toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER) {
+            val o = offsetPx()
+            Pt(vx + o.x, vy + o.y)
+        } else Pt(vx, vy)
+
+    private fun calLive(vx: Double, vy: Double): Pt =
+        if (drawingIsCalibrated) {
+            val o = offsetPx()
+            Pt(vx + o.x, vy + o.y)
+        } else Pt(vx, vy)
 
     // Pan and inertial fling, in viewport px and viewport px/s.
     private var lastPan = Pt.ZERO
@@ -327,6 +354,11 @@ class InfiniteInteraction(
     private var downScroll = Pt.ZERO
     private var downZoom = 1.0
 
+    /** The view as the current pinch went down. A rejected palm finger only undoes the pinch
+     *  it joined, never the legitimate pan that came before it. */
+    private var pinchStartScroll = Pt.ZERO
+    private var pinchStartZoom = 1.0
+
     // Android took back a finger of this touch, so the rest of it is ignored.
     private var touchTakenBack = false
 
@@ -336,7 +368,7 @@ class InfiniteInteraction(
             MotionEvent.ACTION_DOWN -> {
                 touchTakenBack = false
                 tapCandidate = true
-                tapDownAt = Pt(e.x.toDouble(), e.y.toDouble())
+                tapDownAt = calDown(e.x.toDouble(), e.y.toDouble(), e.getToolType(0))
                 tapDownTime = e.eventTime
                 tapDownSelected = selection()?.items?.toHashSet() ?: emptySet()
                 handleDown(e)
@@ -348,13 +380,15 @@ class InfiniteInteraction(
                 handlePointerDown(e)
             }
             MotionEvent.ACTION_MOVE -> {
-                if (tapCandidate && Pt(e.x.toDouble(), e.y.toDouble()).distanceTo(tapDownAt) > TAP_SLOP_PX) tapCandidate = false
+                if (tapCandidate) {
+                    val mv = calLive(e.x.toDouble(), e.y.toDouble())
+                    if (Pt(mv.x, mv.y).distanceTo(tapDownAt) > TAP_SLOP_PX) tapCandidate = false
+                }
                 handleMove(e)
             }
             MotionEvent.ACTION_POINTER_UP ->
                 if (movingView() && InteractionController.isCancelledLift(e)) {
-                    touchTakenBack = true
-                    takeBackTouch()
+                    handleCancelledPointerUp(e)
                 } else {
                     handlePointerUp(e)
                 }
@@ -384,6 +418,41 @@ class InfiniteInteraction(
         }
     }
 
+    /**
+     * One finger of a pan/pinch was rejected as a palm: undo only what the pinch did since that
+     * finger landed, then carry on with the finger still down. Rewinding the whole touch to the
+     * touch-down view would also discard the legitimate pan from before the palm landed.
+     */
+    private fun handleCancelledPointerUp(e: MotionEvent) {
+        if (mode != CanvasPointerMode.PINCH) {
+            handlePointerUp(e)
+            return
+        }
+        viewport.zoom = pinchStartZoom
+        viewport.scrollX = pinchStartScroll.x
+        viewport.scrollY = pinchStartScroll.y
+        onViewChanged()
+        val remaining = (0 until e.pointerCount).filter { it != e.actionIndex }
+        if (remaining.size >= 2) {
+            val a = Pt(e.getX(remaining[0]).toDouble(), e.getY(remaining[0]).toDouble())
+            val b = Pt(e.getX(remaining[1]).toDouble(), e.getY(remaining[1]).toDouble())
+            val mid = (a + b) * 0.5
+            pinchInitDist = a.distanceTo(b).coerceAtLeast(1.0)
+            pinchInitZoom = viewport.zoom
+            pinchAnchorContent = viewport.viewportToContent(mid)
+            startTrackingVelocity(mid.x, mid.y)
+        } else if (remaining.size == 1) {
+            val rp = calDown(
+                e.getX(remaining[0]).toDouble(), e.getY(remaining[0]).toDouble(),
+                e.getToolType(remaining[0]),
+            )
+            beginPan(rp.x, rp.y)
+        } else {
+            mode = CanvasPointerMode.IDLE
+        }
+        requestRender()
+    }
+
     // Taps, for the double tap that types a shape's label.
     private var tapCandidate = false
     private var tapDownAt = Pt.ZERO
@@ -397,7 +466,7 @@ class InfiniteInteraction(
 
     /** A tap that follows another close by and soon after is a double tap. */
     private fun tapUp(e: MotionEvent) {
-        val at = Pt(e.x.toDouble(), e.y.toDouble())
+        val at = calLive(e.x.toDouble(), e.y.toDouble())
         val tap = tapCandidate && e.eventTime - tapDownTime < InteractionController.LONG_PRESS_MS
         tapCandidate = false
         if (!tap) {
@@ -483,16 +552,21 @@ class InfiniteInteraction(
             if (e.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER) {
                 drawingPointerId = e.getPointerId(0)
                 drawingIsStylus = false
+                drawingIsCalibrated = false
                 panMayCommit = true
-                beginPan(e.getX(0).toDouble(), e.getY(0).toDouble())
+                val pv = calLive(e.getX(0).toDouble(), e.getY(0).toDouble())
+                beginPan(pv.x, pv.y)
                 return
             }
             onCommitText()
         }
         drawingPointerId = e.getPointerId(0)
         drawingIsStylus = e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS
-        val vx = e.getX(0).toDouble()
-        val vy = e.getY(0).toDouble()
+        drawingIsCalibrated = e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS ||
+            e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+        val rawV = calDown(e.getX(0).toDouble(), e.getY(0).toDouble(), e.getToolType(0))
+        val vx = rawV.x
+        val vy = rawV.y
 
         // Which tool this pointer actually drives: the pen's eraser end and its held side button
         // both override the armed tool, and a finger pans unless finger-draw is on. This mirrors
@@ -660,27 +734,30 @@ class InfiniteInteraction(
     private fun handleMove(e: MotionEvent) {
         // A finger that wanders is panning or drawing, not holding still for the menu.
         if (longPressRunnable != null) {
-            val moved = Pt(e.getX(0).toDouble(), e.getY(0).toDouble()).distanceTo(longPressAt)
+            val lp = calLive(e.getX(0).toDouble(), e.getY(0).toDouble())
+            val moved = Pt(lp.x, lp.y).distanceTo(longPressAt)
             if (moved > InteractionController.LONG_PRESS_SLOP) cancelLongPress()
         }
+        // All single-pointer modes read through the calibration so the preview follows the nib.
+        val mv = calLive(e.getX(0).toDouble(), e.getY(0).toDouble())
         when (mode) {
-            CanvasPointerMode.PAN -> extendPan(e.getX(0).toDouble(), e.getY(0).toDouble())
+            CanvasPointerMode.PAN -> extendPan(mv.x, mv.y)
             CanvasPointerMode.PINCH -> updatePinch(e)
             CanvasPointerMode.DRAW -> extendDraw(e)
             CanvasPointerMode.ERASE -> extendErase(e)
-            CanvasPointerMode.SHAPE -> extendShape(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.TEXT_BOX -> extendTextBox(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.TAPE -> extendTape(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.CONNECT -> extendConnector(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.JOINT -> extendJoint(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.SLIDE -> extendSlide(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.BAND -> extendBand(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.LASSO -> extendLasso(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.MOVE -> extendMove(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.RESIZE -> extendResize(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.ROTATE -> extendRotate(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.VERTEX -> extendVertex(e.getX(0).toDouble(), e.getY(0).toDouble())
-            CanvasPointerMode.POLYGON -> showPolygonDraft(viewport.viewportToContent(Pt(e.getX(0).toDouble(), e.getY(0).toDouble())))
+            CanvasPointerMode.SHAPE -> extendShape(mv.x, mv.y)
+            CanvasPointerMode.TEXT_BOX -> extendTextBox(mv.x, mv.y)
+            CanvasPointerMode.TAPE -> extendTape(mv.x, mv.y)
+            CanvasPointerMode.CONNECT -> extendConnector(mv.x, mv.y)
+            CanvasPointerMode.JOINT -> extendJoint(mv.x, mv.y)
+            CanvasPointerMode.SLIDE -> extendSlide(mv.x, mv.y)
+            CanvasPointerMode.BAND -> extendBand(mv.x, mv.y)
+            CanvasPointerMode.LASSO -> extendLasso(mv.x, mv.y)
+            CanvasPointerMode.MOVE -> extendMove(mv.x, mv.y)
+            CanvasPointerMode.RESIZE -> extendResize(mv.x, mv.y)
+            CanvasPointerMode.ROTATE -> extendRotate(mv.x, mv.y)
+            CanvasPointerMode.VERTEX -> extendVertex(mv.x, mv.y)
+            CanvasPointerMode.POLYGON -> showPolygonDraft(viewport.viewportToContent(Pt(mv.x, mv.y)))
             CanvasPointerMode.IDLE -> Unit
         }
     }
@@ -691,7 +768,11 @@ class InfiniteInteraction(
         // relaxes into a drag does not jump.
         if (e.pointerCount == 2) {
             val remaining = if (e.actionIndex == 0) 1 else 0
-            beginPan(e.getX(remaining).toDouble(), e.getY(remaining).toDouble())
+            val rp = calDown(
+                e.getX(remaining).toDouble(), e.getY(remaining).toDouble(),
+                e.getToolType(remaining),
+            )
+            beginPan(rp.x, rp.y)
         } else {
             mode = CanvasPointerMode.IDLE
         }
@@ -699,23 +780,25 @@ class InfiniteInteraction(
 
     private fun handleUp(e: MotionEvent) {
         cancelLongPress()
+        val uv = calLive(e.getX(0).toDouble(), e.getY(0).toDouble())
         val wasMoving = (mode == CanvasPointerMode.PAN && singleFingerPanAllowed() && !panFromPenButton) ||
             (mode == CanvasPointerMode.PINCH && pinchPanAllowed())
         // A pan that never moved is a tap, and a tap on a pill plays it, as a finger opens links on a note.
-        val panTap = mode == CanvasPointerMode.PAN && !panFromPenButton && panWasTap(e.getX(0).toDouble(), e.getY(0).toDouble())
+        val panTap = mode == CanvasPointerMode.PAN && !panFromPenButton && panWasTap(uv.x, uv.y)
         // A tape lies over whatever else the tap could reach, so it takes the tap first.
-        val tapeTapped = panTap && peelTapeAt(viewport.viewportToContent(Pt(e.getX(0).toDouble(), e.getY(0).toDouble())))
-        val audioTapped = !tapeTapped && panTap && onAudioTap(viewport.viewportToContent(Pt(e.getX(0).toDouble(), e.getY(0).toDouble())))
+        val tapeTapped = panTap && peelTapeAt(viewport.viewportToContent(Pt(uv.x, uv.y)))
+        val animTapped = !tapeTapped && panTap && onMathAnimTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
+        val audioTapped = !tapeTapped && !animTapped && panTap && onAudioTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
         // A finger tap off the selection puts it away; a tap is the only way to say so with a
         // finger, since a drag there is a pan.
-        if (!audioTapped && !tapeTapped && mode == CanvasPointerMode.PAN && panMayDismiss &&
-            panWasTap(e.getX(0).toDouble(), e.getY(0).toDouble())
+        if (!audioTapped && !animTapped && !tapeTapped && mode == CanvasPointerMode.PAN && panMayDismiss &&
+            panWasTap(uv.x, uv.y)
         ) {
-            val picked = tool == Tool.SELECT && tapSelect(viewport.viewportToContent(Pt(e.getX(0).toDouble(), e.getY(0).toDouble())))
+            val picked = tool == Tool.SELECT && tapSelect(viewport.viewportToContent(Pt(uv.x, uv.y)))
             if (!picked) clearSelection()
         }
         panMayDismiss = false
-        if (mode == CanvasPointerMode.PAN && panMayCommit && panWasTap(e.getX(0).toDouble(), e.getY(0).toDouble())) onCommitText()
+        if (mode == CanvasPointerMode.PAN && panMayCommit && panWasTap(uv.x, uv.y)) onCommitText()
         panMayCommit = false
         if (mode == CanvasPointerMode.DRAW) endDraw(e)
         if (mode == CanvasPointerMode.ERASE) {
@@ -723,7 +806,7 @@ class InfiniteInteraction(
             onEraseLifted()
         }
         if (mode == CanvasPointerMode.SHAPE) endShape()
-        if (mode == CanvasPointerMode.TEXT_BOX) endTextBox(e.getX(0).toDouble(), e.getY(0).toDouble())
+        if (mode == CanvasPointerMode.TEXT_BOX) endTextBox(uv.x, uv.y)
         if (mode == CanvasPointerMode.TAPE) endTape()
         if (mode == CanvasPointerMode.CONNECT) endConnector()
         when (mode) {
@@ -734,7 +817,7 @@ class InfiniteInteraction(
             CanvasPointerMode.VERTEX -> endVertex(e.eventTime)
             CanvasPointerMode.JOINT -> endJoint(e.eventTime)
             CanvasPointerMode.SLIDE -> endSlide()
-            CanvasPointerMode.POLYGON -> endPolygonTap(viewport.viewportToContent(Pt(e.getX(0).toDouble(), e.getY(0).toDouble())), e.eventTime)
+            CanvasPointerMode.POLYGON -> endPolygonTap(viewport.viewportToContent(Pt(uv.x, uv.y)), e.eventTime)
             CanvasPointerMode.IDLE -> dismissPressAt?.let { at ->
                 dismissPressAt = null
                 if (tapCandidate) shapeTap(at)
@@ -753,6 +836,7 @@ class InfiniteInteraction(
 
     private fun abortGesture() {
         cancelLongPress()
+        drawingIsCalibrated = false
         if (mode == CanvasPointerMode.DRAW) abandonStroke()
         if (mode == CanvasPointerMode.ERASE) endErase()
         if (mode == CanvasPointerMode.SHAPE) abandonShape()
@@ -833,23 +917,28 @@ class InfiniteInteraction(
         // Historical points first: the digitizer batches several samples into one event, and
         // dropping them coarsens a fast stroke into visible chords.
         for (h in 0 until e.historySize) {
-            addStrokePoint(
+            val hp = calLive(
                 e.getHistoricalX(idx, h).toDouble(),
                 e.getHistoricalY(idx, h).toDouble(),
+            )
+            addStrokePoint(
+                hp.x,
+                hp.y,
                 if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0,
                 e.getHistoricalEventTime(h),
                 force = false,
             )
         }
+        val cp = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
-            e.getX(idx).toDouble(), e.getY(idx).toDouble(),
+            cp.x, cp.y,
             pressureOf(e, idx), e.eventTime, force = false,
         )
         onWetStroke(liveStroke)
         // Real movement restarts the clock; holding within the slop lets it mature, so the snap
         // fires only once the pen has actually come to rest.
         if (dwellEligible) {
-            val here = Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+            val here = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
             if (here.distanceTo(dwellAnchor) > InteractionController.SHAPE_DWELL_SLOP) armDwell(here)
         }
         requestRender()
@@ -877,8 +966,9 @@ class InfiniteInteraction(
         cancelDwell()
         dwellEligible = false
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
+        val up = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
-            e.getX(idx).toDouble(), e.getY(idx).toDouble(),
+            up.x, up.y,
             pressureOf(e, idx), e.eventTime, force = true,
         )
         val stroke = liveStroke
@@ -1943,9 +2033,14 @@ class InfiniteInteraction(
         // The historical points matter here as much as when drawing: a fast sweep that only sampled
         // the newest event would skip over strokes between one frame and the next.
         for (h in 0 until e.historySize) {
-            eraseAt(e.getHistoricalX(idx, h).toDouble(), e.getHistoricalY(idx, h).toDouble())
+            val hp = calLive(
+                e.getHistoricalX(idx, h).toDouble(),
+                e.getHistoricalY(idx, h).toDouble(),
+            )
+            eraseAt(hp.x, hp.y)
         }
-        eraseAt(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+        val cp = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+        eraseAt(cp.x, cp.y)
     }
 
     private fun eraseAt(vx: Double, vy: Double) {
@@ -2027,6 +2122,8 @@ class InfiniteInteraction(
     private fun beginPinch(e: MotionEvent) {
         mode = CanvasPointerMode.PINCH
         setInteractive(true, true)
+        pinchStartScroll = Pt(viewport.scrollX, viewport.scrollY)
+        pinchStartZoom = viewport.zoom
         val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
         val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
         val mid = (a + b) * 0.5

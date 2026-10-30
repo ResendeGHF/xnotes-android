@@ -167,7 +167,12 @@ import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -175,7 +180,7 @@ import kotlinx.coroutines.withTimeout
 import kotlin.math.roundToInt
 
 /** Which pane the backstage shows on the right. */
-enum class BackstageView { HOME, PREFERENCES, ABOUT, TRASH }
+enum class BackstageView { HOME, GRAPH, PREFERENCES, ABOUT, TRASH }
 
 /** Whether the Home explorer is awaiting a new file/folder name. */
 private enum class CreateMode { NONE, FILE, CANVAS, FOLDER, ENCRYPTED_FOLDER }
@@ -203,6 +208,9 @@ fun Backstage(
     onShareFile: (String) -> Unit,
     onSaveCopyFile: (String) -> Unit,
     onExportFilePdf: (String) -> Unit,
+    onExportFileSdocx: (String) -> Unit = {},
+    onExportFileLatex: (String) -> Unit = {},
+    onExportFileMarkdown: (String) -> Unit = {},
     /** Home is the app's root: back from here leaves the app rather than dropping into the editor. */
     onExitApp: () -> Unit,
     /** Preferences asked to import a Helix code theme. */
@@ -224,6 +232,12 @@ fun Backstage(
     onImportTemplate: () -> Unit = {},
     /** The New note screen asked to make a cover or page template from a picture. */
     onTemplateFromImage: (com.xnotes.core.template.TemplateKind) -> Unit = {},
+    /** The explorer asked to trace a scan/photo/PDF into editable strokes. */
+    onTraceScan: () -> Unit = {},
+    /** The explorer asked to shoot a photo to scan and optionally trace. */
+    onTraceCamera: () -> Unit = {},
+    /** Close tabs at or under these document URIs before the files are deleted/trashed. */
+    onCloseTabsForDeletion: (List<String>) -> Unit = {},
 ) {
     // Below this width the sidebar becomes a slide-over drawer instead of a persistent pane.
     val compact = LocalConfiguration.current.screenWidthDp < COMPACT_WIDTH_DP
@@ -236,16 +250,22 @@ fun Backstage(
         shareFiles = onShareFiles,
         saveCopyFile = onSaveCopyFile,
         exportFilePdf = onExportFilePdf,
+        exportFileSdocx = onExportFileSdocx,
+        exportFileLatex = onExportFileLatex,
+        exportFileMarkdown = onExportFileMarkdown,
         openSplit = onOpenSplit,
         openBeside = onOpenBeside,
         exportPdfs = onExportPdfs,
         importInto = onImportIntoNote,
         importTemplate = onImportTemplate,
         templateFromImage = onTemplateFromImage,
+        traceScan = { if (editor.browseRoot != null) onTraceScan() else onPickRoot() },
+        traceCamera = { if (editor.browseRoot != null) onTraceCamera() else onPickRoot() },
+        closeTabsForDeletion = onCloseTabsForDeletion,
     )
     // The backstage is the root of the stack — ordinary base content, not a dialog. The activity
     // window already runs edge-to-edge with the system bars hidden (MainActivity.applyFullscreen).
-    BackstageContent(editor, compact, view, onSelectView, calls, onExitApp, onImportCodeTheme, onImportFont, onBackup)
+    BackstageContent(editor, compact, view, onSelectView, calls, onExitApp, onImportCodeTheme, onImportFont, onBackup, onCloseTabsForDeletion)
 }
 
 /** How far a swipe right on Home travels before it opens the sidebar. */
@@ -261,6 +281,18 @@ private val SIDEBAR_WIDTH = 264.dp
 private val RAIL_WIDTH = 80.dp
 private val PANE_GUTTER = 16.dp
 private val DRAWER_WIDTH = 296.dp
+
+/** Manifest peeks resolved together per batch while metadata fills in behind the listing. */
+private const val META_BATCH = 16
+
+/** Folder child-count queries resolved together per batch for the folder-size labels. */
+private const val COUNT_BATCH = 8
+
+/** Subfolders warmed in the background after the current folder paints, for instant entry. */
+private const val PREFETCH_FOLDERS = 12
+
+/** Delay before warming subfolders, so the current folder's own paint is never held up. */
+private const val PREFETCH_DELAY_MS = 250L
 
 /**
  * The home-first layout: the explorer (or Preferences) fills the screen beside the sidebar. Wide
@@ -278,6 +310,7 @@ private fun BackstageContent(
     onImportCodeTheme: () -> Unit,
     onImportFont: () -> Unit,
     onBackup: (Boolean) -> Unit,
+    onCloseTabsForDeletion: (List<String>) -> Unit = {},
 ) {
     val palette = LocalPalette.current
     var createMode by remember { mutableStateOf(CreateMode.NONE) }
@@ -374,6 +407,7 @@ private fun BackstageContent(
             BackstageMain(
                 Modifier.fillMaxSize(), editor, view, compact, drawerOpen, { animateClose = true; drawerOpen = true }, { selectView(BackstageView.HOME) },
                 calls, createMode, { createMode = it }, onImportCodeTheme, onImportFont, onBackup, link, { selectView(BackstageView.PREFERENCES) },
+                onCloseTabsForDeletion,
             )
             AnimatedVisibility(
                 visible = drawerOpen,
@@ -407,6 +441,7 @@ private fun BackstageContent(
                 },
                 editor, view, compact, true, { setRailed(false) }, { selectView(BackstageView.HOME) },
                 calls, createMode, { createMode = it }, onImportCodeTheme, onImportFont, onBackup, link, { selectView(BackstageView.PREFERENCES) },
+                onCloseTabsForDeletion,
             )
             // Both stay composed so a fold never pays to build one; only the current one is measured and placed.
             Layout(
@@ -492,6 +527,7 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
             nav.recent?.let { on -> Command(XnotesIcons.clock, stringResource(R.string.recent), selected = on) { nav.onRecent() } }
             Command(XnotesIcons.home, stringResource(R.string.home), selected = nav.homeSelected) { nav.onHome() }
+            Command(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) {
                 Command(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH, count = nav.trashCount.takeIf { it > 0 }?.toString()) {
                     nav.onSelectView(BackstageView.TRASH)
@@ -545,6 +581,7 @@ private fun BackstageRail(modifier: Modifier, nav: SidebarNav, onExpand: () -> U
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
             nav.recent?.let { on -> RailItem(XnotesIcons.clock, stringResource(R.string.recent), selected = on) { nav.onRecent() } }
             RailItem(XnotesIcons.home, stringResource(R.string.home), selected = nav.homeSelected) { nav.onHome() }
+            RailItem(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) RailItem(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH) { nav.onSelectView(BackstageView.TRASH) }
             if (nav.pins.isNotEmpty()) Spacer(Modifier.height(8.dp))
             nav.pins.forEachIndexed { i, pin ->
@@ -582,6 +619,7 @@ private fun BackstageMain(
     onBackup: (Boolean) -> Unit,
     link: ExplorerLink,
     onOpenPreferences: () -> Unit,
+    onCloseTabsForDeletion: (List<String>) -> Unit = {},
 ) {
     val palette = LocalPalette.current
     Column(modifier) {
@@ -610,8 +648,9 @@ private fun BackstageMain(
         Box(Modifier.weight(1f).fillMaxWidth().padding(start = PANE_GUTTER, end = PANE_GUTTER, top = 4.dp, bottom = 12.dp)) {
             when (view) {
                 BackstageView.HOME -> HomePane(editor, calls, createMode, onCreateMode, sidebarOpen, onShowSidebar, link)
+                BackstageView.GRAPH -> GraphPane(editor, sidebarOpen, onShowSidebar, onBackToHome, calls.openFile)
                 BackstageView.PREFERENCES -> PreferencesPane(editor, compact, sidebarOpen, onShowSidebar, onBackToHome, onImportCodeTheme, onImportFont, onBackup)
-                BackstageView.TRASH -> TrashPane(editor, sidebarOpen, onShowSidebar, onOpenPreferences)
+                BackstageView.TRASH -> TrashPane(editor, sidebarOpen, onShowSidebar, onOpenPreferences, onCloseTabsForDeletion)
                 BackstageView.ABOUT -> AboutPane()
             }
         }
@@ -836,6 +875,8 @@ private fun NewItemMenuItems(
     onCreateMode: (CreateMode) -> Unit,
     onImportPdf: () -> Unit,
     onImportEncrypted: () -> Unit,
+    onTraceScan: () -> Unit = {},
+    onTraceCamera: () -> Unit = {},
 ) {
     val tint = LocalPalette.current.text.toComposeColor()
     // Taller than a default menu row (the explorer's primary create affordance), but only as wide
@@ -854,6 +895,8 @@ private fun NewItemMenuItems(
     item(XnotesIcons.edit, stringResource(R.string.new_note_menu)) { onCreateMode(CreateMode.FILE) }
     item(XnotesIcons.canvas, stringResource(R.string.new_canvas_menu)) { onCreateMode(CreateMode.CANVAS) }
     item(XnotesIcons.importDoc, stringResource(R.string.import_file)) { onImportPdf() }
+    item(XnotesIcons.traceScan, stringResource(R.string.trace_scan_menu)) { onTraceScan() }
+    item(XnotesIcons.camera, stringResource(R.string.trace_from_camera)) { onTraceCamera() }
     item(XnotesIcons.newFolder, stringResource(R.string.new_folder_menu)) { onCreateMode(CreateMode.FOLDER) }
     item(XnotesIcons.lock, stringResource(R.string.new_encrypted_folder_menu)) { onCreateMode(CreateMode.ENCRYPTED_FOLDER) }
     item(XnotesIcons.lock, stringResource(R.string.import_encrypted_menu)) { onImportEncrypted() }
@@ -868,6 +911,9 @@ private class ExplorerCalls(
     val shareFiles: (List<String>) -> Unit,
     val saveCopyFile: (String) -> Unit,
     val exportFilePdf: (String) -> Unit,
+    val exportFileSdocx: (String) -> Unit = {},
+    val exportFileLatex: (String) -> Unit = {},
+    val exportFileMarkdown: (String) -> Unit = {},
     val openSplit: (String, String) -> Unit,
     /** Opens a file beside the note last open, or null when there is none to pair it with. */
     val openBeside: (String) -> (() -> Unit)?,
@@ -877,6 +923,12 @@ private class ExplorerCalls(
     val importInto: (String) -> Unit,
     val importTemplate: () -> Unit,
     val templateFromImage: (com.xnotes.core.template.TemplateKind) -> Unit,
+    /** Picks a scan/photo/PDF to trace into editable strokes. */
+    val traceScan: () -> Unit = {},
+    /** Shoots a photo to scan (corners + filters) and optionally trace. */
+    val traceCamera: () -> Unit = {},
+    /** Close tabs at or under these document URIs before the files are deleted/trashed. */
+    val closeTabsForDeletion: (List<String>) -> Unit = {},
 )
 
 @Composable
@@ -938,6 +990,8 @@ private fun CreateButton(
     onCreateMode: (CreateMode) -> Unit,
     onImportPdf: () -> Unit,
     onImportEncrypted: () -> Unit,
+    onTraceScan: () -> Unit,
+    onTraceCamera: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -960,7 +1014,7 @@ private fun CreateButton(
             )
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-            NewItemMenuItems({ menuOpen = false }, onCreateMode, onImportPdf, onImportEncrypted)
+            NewItemMenuItems({ menuOpen = false }, onCreateMode, onImportPdf, onImportEncrypted, onTraceScan, onTraceCamera)
         }
     }
 }
@@ -1053,10 +1107,47 @@ private fun ExplorerSection(
     var askUnlock by remember(root) { mutableStateOf(false) }
     var vaultBusy by remember(root) { mutableStateOf(false) }
     val vaultEpoch = com.xnotes.crypto.VaultSession.epoch
-    var vaultFolderId by remember(root) { mutableStateOf<String?>(null) }
-    LaunchedEffect(root, currentDocId, vaultEpoch, refreshKey) {
-        vaultFolderId = withContext(Dispatchers.IO) { editor.vaultHere(root, currentDocId) }
+    // Per-folder vault + listing state, reset on navigation: a stale folder's list or gate
+    // can never paint under the new breadcrumb (the empty-with-create-buttons flash). The
+    // memory cache seeds each folder instantly; provider IO then refreshes it in place.
+    val vaultSeed = remember(root, currentDocId) { editor.cachedVaultId(root, currentDocId) }
+    var vaultFolderId by remember(root, currentDocId) { mutableStateOf(vaultSeed.second) }
+    var vaultResolved by remember(root, currentDocId) { mutableStateOf(vaultSeed.first == Editor.VaultResolution.RESOLVED) }
+    var folderEntries by remember(root, currentDocId) { mutableStateOf(editor.cachedChildren(root, currentDocId)) }
+    var navLoaded by remember(root, currentDocId) { mutableStateOf(false) }
+    // First load for this folder: resolve the vault and refresh the listing together.
+    // Until it lands the body shows a loading skeleton with no actions, never the
+    // empty-folder screen and never another folder's files.
+    LaunchedEffect(root, currentDocId) {
+        editor.cancelStaleTiles() // tiles queued for the folder just left abort before heavy work
+        val vault = async(Dispatchers.IO) { editor.vaultHere(root, currentDocId) }
+        val fresh = withContext(Dispatchers.IO) { editor.browseChildren(root, currentDocId) }
+        if (!isActive) return@LaunchedEffect
+        folderEntries = fresh
+        vaultFolderId = vault.await()
+        vaultResolved = true
+        navLoaded = true
     }
+    // Quiet in-place refresh for the same folder (create/rename/return from editor/...):
+    // the old list stays up until the fresh one lands, so nothing flashes.
+    LaunchedEffect(root, currentDocId, refreshKey, editor.noteOpen, editor.treeVersion) {
+        if (!navLoaded) return@LaunchedEffect
+        val fresh = withContext(Dispatchers.IO) { editor.browseChildren(root, currentDocId) }
+        if (isActive) folderEntries = fresh
+    }
+    // Vault revalidation that never hides the gate (lock/unlock): the current gate stays
+    // up while the new answer is read.
+    LaunchedEffect(root, currentDocId, vaultEpoch) {
+        if (!navLoaded) return@LaunchedEffect
+        val v = withContext(Dispatchers.IO) { editor.vaultHere(root, currentDocId) }
+        if (isActive) {
+            vaultFolderId = v
+            vaultResolved = true
+        }
+    }
+    // A locked encrypted folder shows a password gate instead of any files or create actions.
+    // Unknown until resolved: while the gate is unknown the body shows loading, never content.
+    val vaultLocked = vaultResolved && vaultFolderId != null && !editor.vaultUnlocked(vaultFolderId!!)
     val importEncrypted = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
@@ -1164,11 +1255,10 @@ private fun ExplorerSection(
     }
     val switcherLayouts = prefs.switcherLayouts.filter { !(compactScreen && it == ExplorerLayout.COLUMNS) }
 
-    // Listing. Re-keyed on noteOpen so returning from the editor re-queries the folder, picking up
-    // the just-closed note's new mtime (its tile refreshes) and any newly created/discovered items.
-    val entries by produceState(editor.cachedChildren(root, currentDocId), root, currentDocId, refreshKey, editor.noteOpen, editor.treeVersion) {
-        value = withContext(Dispatchers.IO) { editor.browseChildren(root, currentDocId) }
-    }
+    // Listing. [folderEntries] always belongs to [currentDocId] (it resets on navigation
+    // and refreshes in place otherwise), so returning from a folder can never flash its
+    // list — or the empty-folder screen — under the new breadcrumb.
+    val entries: List<BrowseEntry>? = folderEntries
     val trimmed = query.trim()
     // When searching, recurse the whole subtree (debounced) and show only the matching notes — no
     // folders, since a deep hit doesn't belong to the folder the breadcrumb is sitting in.
@@ -1196,11 +1286,12 @@ private fun ExplorerSection(
     // Pinned notes head the top folder in the layouts that read top to bottom, nowhere else.
     val showPinned = stack.isEmpty() && !flat &&
         (layout == ExplorerLayout.GRID || layout == ExplorerLayout.GALLERY || layout == ExplorerLayout.LIST)
-    val pinnedRaw by produceState(emptyList<BrowseEntry>(), root, showPinned, editor.notePins, refreshKey, editor.noteOpen, editor.treeVersion) {
+    val pinnedRaw by produceState<List<BrowseEntry>?>(null, root, showPinned, editor.notePins, refreshKey, editor.noteOpen, editor.treeVersion) {
         value = if (showPinned && editor.notePins.isNotEmpty()) withContext(Dispatchers.IO) { editor.pinnedEntries(root) } else emptyList()
     }
-    val pinnedUris = remember(pinnedRaw) { pinnedRaw.mapTo(HashSet()) { it.documentUri } }
+    val pinnedUris = remember(pinnedRaw) { pinnedRaw.orEmpty().mapTo(HashSet()) { it.documentUri } }
     val source: List<BrowseEntry>? = when {
+        showPinned && pinnedRaw == null -> null // pins still loading: loading skeleton, never the empty screen
         showRecent -> recents?.map { it.entry }
         colorFilter != null -> colorResults
         searching -> results
@@ -1209,13 +1300,20 @@ private fun ExplorerSection(
         showPinned && pinnedUris.isNotEmpty() -> entries?.filterNot { it.documentUri in pinnedUris }
         else -> entries
     }
-    // Page counts, PDF flags and the created times files record fill in behind the listing, a few files at a time.
+    // Page counts, PDF flags and the created times files record fill in behind the listing.
+    // Resolved concurrently in bounded batches, then published in at most two passes, so a
+    // folder of many notes paints its tiles at once instead of six at a time.
     LaunchedEffect(source) {
+        if (vaultLocked) return@LaunchedEffect // the gate shows no tiles; ciphertext peeks would fail anyway
         val todo = source?.filter { !it.isDir && editor.cachedMeta(it) == null && DocumentKind.isDocument(it.name) }
         if (todo.isNullOrEmpty()) return@LaunchedEffect
-        for (chunk in todo.chunked(6)) {
-            withContext(Dispatchers.IO) { chunk.forEach { editor.docMetaFor(it) } }
-            metaTick++
+        val groups = todo.chunked(META_BATCH)
+        for ((i, chunk) in groups.withIndex()) {
+            coroutineScope {
+                chunk.map { e -> async(Dispatchers.IO) { editor.docMetaFor(e) } }.awaitAll()
+            }
+            if (i == 0 || i == groups.lastIndex) metaTick++
+            ensureActive()
         }
     }
     val kindOf: (BrowseEntry) -> EntryKind = { entryKind(it, editor.cachedMeta(it)) }
@@ -1239,7 +1337,7 @@ private fun ExplorerSection(
                 .sortedWith(explorerComparator(view.sortKey, view.descending) { it.created })
         }
     }
-    val pinned = remember(pinnedRaw, arrange, showPinned) { if (showPinned) arrange(pinnedRaw).filterNot { it.isDir } else emptyList() }
+    val pinned = remember(pinnedRaw, arrange, showPinned) { if (showPinned) arrange(pinnedRaw.orEmpty()).filterNot { it.isDir } else emptyList() }
     val now = remember(arranged) { System.currentTimeMillis() }
     val folderRow = remember(arranged, view.folders, layout) {
         if (view.folders == FolderPlacement.TOP && layout != ExplorerLayout.TIMELINE) arranged.orEmpty().filter { it.isDir } else emptyList()
@@ -1257,7 +1355,13 @@ private fun ExplorerSection(
     val counts by produceState(emptyMap<String, Int>(), root, arranged, prefs.showFolderCounts) {
         val folders = arranged.orEmpty().filter { it.isDir }
         value = if (!prefs.showFolderCounts || folders.isEmpty()) emptyMap()
-        else withContext(Dispatchers.IO) { folders.associate { it.documentUri to editor.folderItemCount(root, it) } }
+        else withContext(Dispatchers.IO) {
+            folders.chunked(COUNT_BATCH).flatMap { chunk ->
+                coroutineScope {
+                    chunk.map { f -> async { f.documentUri to editor.folderItemCount(root, f) } }.awaitAll()
+                }
+            }.toMap()
+        }
     }
 
     // Drag-to-move state. While a selection is being dragged onto a folder, [dragPos] is the finger
@@ -1342,6 +1446,8 @@ private fun ExplorerSection(
     fun remove(items: List<BrowseEntry>) {
         if (items.isEmpty()) return
         if (prefsNow.value.trashDays == 0) { pendingDelete = items; return }
+        // Close their tabs before the files move, so no tab outlives its note.
+        callsNow.value.closeTabsForDeletion(items.map { it.documentUri })
         selection.clear(); opError = null
         scope.launch {
             val (trashed, failed) = withContext(Dispatchers.IO) { editor.trashEntries(root, items) }
@@ -1357,10 +1463,15 @@ private fun ExplorerSection(
         }
     }
     // PDFs go in as they are; the other reader files are printed to PDF first so the note looks like the reader.
+    // Samsung Notes files import natively (strokes, text, shapes, images): no printing involved.
     fun convertToNote(e: BrowseEntry) {
         opError = null
         val name = e.name.substringBeforeLast('.')
         val title = context.getString(R.string.convert_to_note)
+        if (com.xnotes.core.util.ReaderKind.isSdocx(e.name)) {
+            editor.requestImport(ImportKind.SDOCX, name, e.documentUri, e.name, "application/octet-stream", e.parentDocId, title)
+            return
+        }
         if (ReaderKind.ofName(e.name) == ReaderKind.PDF) {
             editor.requestImport(ImportKind.PDF, name, e.documentUri, e.name, "application/pdf", e.parentDocId, title)
             return
@@ -1396,6 +1507,10 @@ private fun ExplorerSection(
                 when {
                     selection.isNotEmpty() -> toggleSelect(e)
                     e.isDir -> openFolder(e)
+                    // A Samsung Notes file is an import source: tapping queues
+                    // its conversion (the name dialog appears) instead of
+                    // previewing or opening it.
+                    ReaderKind.isSdocx(e.name) -> convertToNote(e)
                     prefsNow.value.tapPreviews && !ReaderKind.isReadable(e.name) -> previewing = e
                     else -> callsNow.value.openFile(e.documentUri)
                 }
@@ -1416,17 +1531,28 @@ private fun ExplorerSection(
                 delete = { remove(listOf(it)) },
                 color = { e, c -> recolor(listOf(e), c) },
                 nameColor = { namingColor = it },
-                togglePin = { e -> if (editor.isPinned(e.documentUri)) editor.unpinFolder(e.documentUri) else editor.pinFolder(e.documentUri, e.name) },
+                togglePin = { e ->
+                    scope.launch {
+                        if (editor.isPinned(e.documentUri)) editor.unpinFolder(e.documentUri)
+                        else if (!withContext(Dispatchers.IO) { editor.pinFolder(e.documentUri, e.name) }) {
+                            opError = context.getString(R.string.err_vault_private)
+                        }
+                    }
+                },
                 toggleNotePin = { e ->
                     scope.launch {
-                        val ok = withContext(Dispatchers.IO) { editor.setNotePinned(e.documentUri, !editor.isNotePinned(e.documentUri)) }
-                        if (!ok) opError = context.getString(R.string.err_pin_note)
+                        val vaulted = withContext(Dispatchers.IO) { editor.isVaultUri(e.documentUri) }
+                        val ok = if (vaulted) false else withContext(Dispatchers.IO) { editor.setNotePinned(e.documentUri, !editor.isNotePinned(e.documentUri)) }
+                        if (!ok) opError = context.getString(if (vaulted) R.string.err_vault_private else R.string.err_pin_note)
                         refreshKey++
                     }
                 },
                 share = { callsNow.value.shareFile(it.documentUri) },
                 saveCopy = { callsNow.value.saveCopyFile(it.documentUri) },
                 exportPdf = { callsNow.value.exportFilePdf(it.documentUri) },
+                exportSdocx = { callsNow.value.exportFileSdocx(it.documentUri) },
+                exportLatex = { callsNow.value.exportFileLatex(it.documentUri) },
+                exportMarkdown = { callsNow.value.exportFileMarkdown(it.documentUri) },
                 exportPgp = { pgpExport = it },
                 preview = { previewing = it },
                 convertToNote = { convertToNote(it) },
@@ -1475,12 +1601,20 @@ private fun ExplorerSection(
         openBeside = calls.openBeside(e.documentUri)?.let { go -> { previewing = null; go() } },
         share = { calls.shareFile(e.documentUri) },
         exportPdf = { calls.exportFilePdf(e.documentUri) },
+        exportSdocx = if (com.xnotes.core.util.DocumentKind.ofName(e.name) == com.xnotes.core.util.DocumentKind.NOTE) {
+            { calls.exportFileSdocx(e.documentUri) }
+        } else null,
         color = { c -> recolor(listOf(e), c) },
     )
 
     fun paste(clip: ClipItem) {
         opError = null
         scope.launch {
+            val locked = withContext(Dispatchers.IO) { editor.isLockedFolder(root, currentDocId) }
+            if (locked) {
+                opError = context.getString(R.string.vault_destination_locked)
+                return@launch
+            }
             val allOk = withContext(Dispatchers.IO) {
                 val done = if (clip.isCut) editor.moveEntriesInto(root, clip.entries, currentDocId)
                 else editor.copyEntriesInto(root, clip.entries, currentDocId)
@@ -1493,7 +1627,38 @@ private fun ExplorerSection(
 
     // A failed operation shows in the app's snackbar, which stays in view however far the files are scrolled.
     LaunchedEffect(opError) { opError?.let { editor.say(it); opError = null } }
+    LaunchedEffect(vaultLocked) {
+        if (vaultLocked) {
+            selection.clear()
+            columnsPick = null
+        }
+    }
+    // Warm the next navigation: list the visible subfolders and resolve their vault markers
+    // in the background (cancellable on navigation), so tapping one paints from cache.
+    val entriesNow = rememberUpdatedState(folderEntries)
+    val gateNow = rememberUpdatedState(vaultLocked)
+    LaunchedEffect(root, currentDocId) {
+        delay(PREFETCH_DELAY_MS) // let the current folder paint first
+        if (gateNow.value) return@LaunchedEffect
+        val children = entriesNow.value?.filter { it.isDir }?.take(PREFETCH_FOLDERS)
+        if (children.isNullOrEmpty()) return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            children.chunked(3).forEach { chunk ->
+                coroutineScope {
+                    chunk.map { c ->
+                        async {
+                            val id = editor.browseDocId(c.documentUri)
+                            runCatching { editor.browseChildren(root, id) }
+                            runCatching { editor.vaultHere(root, id) }
+                        }
+                    }.awaitAll()
+                }
+                ensureActive()
+            }
+        }
+    }
     val empty = when {
+        !vaultResolved -> EmptyState(stringResource(R.string.loading))
         colorFilter != null && colorResults == null -> EmptyState(stringResource(R.string.finding))
         colorFilter != null && colorResults!!.isEmpty() -> EmptyState(stringResource(R.string.nothing_this_colour), EmptyArt.SEARCH)
         searching && results == null -> EmptyState(stringResource(R.string.searching))
@@ -1713,6 +1878,11 @@ private fun ExplorerSection(
                             val targetDocId = editor.browseDocId(target)
                             pulseUri = target; opError = null
                             scope.launch {
+                                val locked = withContext(Dispatchers.IO) { editor.isLockedFolder(root, targetDocId) }
+                                if (locked) {
+                                    opError = context.getString(R.string.vault_destination_locked)
+                                    return@launch
+                                }
                                 val ok = withContext(Dispatchers.IO) {
                                     val carried = items.filter { it.documentUri != target }
                                     editor.moveEntriesInto(root, carried, targetDocId) == carried.size
@@ -1739,14 +1909,24 @@ private fun ExplorerSection(
                 )
             })
             val gridTop: (LazyGridScope.() -> Unit)? = shelfBlock?.let { c -> { item(key = "shelves", span = { GridItemSpan(maxLineSpan) }, contentType = "shelves") { c() } } }
+            val lockedGate = vaultLocked && !flat
             when {
+                lockedGate -> LockedVaultPane(
+                    editor = editor,
+                    root = root,
+                    vaultId = vaultFolderId!!,
+                    folderName = stack.lastOrNull()?.second ?: rootName ?: stringResource(R.string.folder),
+                    onUnlocked = { refreshKey++ },
+                )
                 empty != null && !shelves -> Column(Modifier.fillMaxSize()) {
                     Spacer(Modifier.height(EXPLORER_HEADER))
                     chipRow(48.dp)
-                    EmptyPane(empty.text, empty.art, if (!empty.offersCreate) null else { {
+                    EmptyPane(empty.text, empty.art, if (!empty.offersCreate || vaultLocked) null else { {
                         PrimaryButton(XnotesIcons.edit, stringResource(R.string.new_note_menu)) { onCreateMode(CreateMode.FILE) }
                         PrimaryButton(XnotesIcons.canvas, stringResource(R.string.new_canvas_menu)) { onCreateMode(CreateMode.CANVAS) }
                         PrimaryButton(XnotesIcons.importDoc, stringResource(R.string.import_pdf), onClick = calls.importPdf)
+                        PrimaryButton(XnotesIcons.traceScan, stringResource(R.string.trace_scan_menu), onClick = calls.traceScan)
+                        PrimaryButton(XnotesIcons.camera, stringResource(R.string.trace_from_camera), onClick = calls.traceCamera)
                     } })
                 }
                 layout == ExplorerLayout.GRID -> GridBody(body, gridState, gridColumns(screenWidthDp, view.tileSize), chipRow, gridTop, Modifier.fillMaxSize())
@@ -1972,7 +2152,16 @@ private fun ExplorerSection(
                                 })
                                 if (one != null && !one.isDir) {
                                     DropdownMenuItem(text = { Text(stringResource(R.string.save_copy_ellipsis)) }, onClick = { moreOpen = false; selection.clear(); calls.saveCopyFile(one.documentUri) })
-                                    DropdownMenuItem(text = { Text(stringResource(R.string.export_pdf)) }, onClick = { moreOpen = false; selection.clear(); calls.exportFilePdf(one.documentUri) })
+                                    if (!ReaderKind.isSdocx(one.name)) {
+                                        DropdownMenuItem(text = { Text(stringResource(R.string.export_pdf)) }, onClick = { moreOpen = false; selection.clear(); calls.exportFilePdf(one.documentUri) })
+                                    } else {
+                                        DropdownMenuItem(text = { Text(stringResource(R.string.convert_to_note)) }, onClick = { moreOpen = false; selection.clear(); convertToNote(one) })
+                                    }
+                                    if (com.xnotes.core.util.DocumentKind.ofName(one.name) == com.xnotes.core.util.DocumentKind.NOTE) {
+                                        DropdownMenuItem(text = { Text(stringResource(R.string.export_sdocx)) }, onClick = { moreOpen = false; selection.clear(); calls.exportFileSdocx(one.documentUri) })
+                                        DropdownMenuItem(text = { Text(stringResource(R.string.convert_handwritten_latex)) }, onClick = { moreOpen = false; selection.clear(); calls.exportFileLatex(one.documentUri) })
+                                        DropdownMenuItem(text = { Text(stringResource(R.string.convert_handwritten_markdown)) }, onClick = { moreOpen = false; selection.clear(); calls.exportFileMarkdown(one.documentUri) })
+                                    }
                                 }
                                 // Only notes merge: a canvas has no pages, a folder no one order.
                                 val notes = selection.filter { !it.isDir && com.xnotes.core.util.DocumentKind.ofName(it.name) == com.xnotes.core.util.DocumentKind.NOTE }
@@ -1988,38 +2177,47 @@ private fun ExplorerSection(
                 }
             }
         }
-        CreateButton(
-            exporting = selection.isNotEmpty(),
-            onCreateMode = onCreateMode,
-            onImportPdf = calls.importPdf,
-            onImportEncrypted = { importEncrypted.launch(arrayOf("*/*")) },
-            onExport = {
-                val picked = selection.toList()
-                // A lone folder zips under its own name, anything else under the folder it was picked in.
-                val name = picked.singleOrNull()?.takeIf { it.isDir }?.name ?: stack.lastOrNull()?.second ?: rootName ?: context.getString(R.string.folder)
-                calls.exportPdfs(picked, name) { selection.clear() }
-            },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
-        )
+        if (vaultResolved && !vaultLocked) {
+            CreateButton(
+                exporting = selection.isNotEmpty(),
+                onCreateMode = onCreateMode,
+                onImportPdf = calls.importPdf,
+                onImportEncrypted = { importEncrypted.launch(arrayOf("*/*")) },
+                onTraceScan = calls.traceScan,
+                onTraceCamera = calls.traceCamera,
+                onExport = {
+                    val picked = selection.toList()
+                    // A lone folder zips under its own name, anything else under the folder it was picked in.
+                    val name = picked.singleOrNull()?.takeIf { it.isDir }?.name ?: stack.lastOrNull()?.second ?: rootName ?: context.getString(R.string.folder)
+                    calls.exportPdfs(picked, name) { selection.clear() }
+                },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
+            )
+        }
     }
 
     // A multi-file pick gets no name prompt: it imports straight into the folder on screen, one file
     // at a time, taking each note's name from its source. This runs here because the explorer is
     // where the target folder is known. Cancelling keeps whatever already landed.
     val pendingImports = editor.pendingImports
-    LaunchedEffect(pendingImports) {
+    LaunchedEffect(pendingImports, vaultLocked) {
         if (pendingImports.isNotEmpty()) {
-            val n = editor.commitImportsAsync(root, currentDocId)
-            refreshKey++
-            if (n > 0) editor.message = context.resources.getQuantityString(R.plurals.imported_pdfs, n, n)
+            if (vaultLocked) {
+                editor.say(context.getString(R.string.vault_destination_locked))
+            } else {
+                val n = editor.commitImportsAsync(root, currentDocId)
+                refreshKey++
+                if (n > 0) editor.message = context.resources.getQuantityString(R.plurals.imported_pdfs, n, n)
+            }
         }
     }
 
     val pendingImport = editor.pendingImport
     // Clear any stale error when a fresh name dialog opens for a new operation.
     LaunchedEffect(createMode, pendingImport, renaming) { fieldError = null }
+    // A locked folder allows no creation at all; its gate owns the screen instead.
     // A new note gets the full-screen New note; it opens once it is made.
-    if (createMode == CreateMode.FILE && pendingImport == null && !editor.importing) {
+    if (vaultResolved && !vaultLocked && createMode == CreateMode.FILE && pendingImport == null && !editor.importing) {
         var busy by remember { mutableStateOf(false) }
         NewNoteScreen(
             editor = editor,
@@ -2048,8 +2246,9 @@ private fun ExplorerSection(
         )
     }
     // Name entry for a new canvas, new folder, or a pending PDF import. Hidden while an import is
-    // actually being written, so only the "Importing…" dialog shows.
-    if ((createMode == CreateMode.CANVAS || createMode == CreateMode.FOLDER || pendingImport != null) && !editor.importing) {
+    // actually being written, so only the "Importing…" dialog shows. Also hidden in a locked
+    // folder: nothing can be created there until it is unlocked.
+    if (vaultResolved && !vaultLocked && (createMode == CreateMode.CANVAS || createMode == CreateMode.FOLDER || pendingImport != null) && !editor.importing) {
         val isFolder = pendingImport == null && createMode == CreateMode.FOLDER
         val default = when {
             pendingImport != null -> pendingImport.defaultName // import names default to the source file
@@ -2094,6 +2293,42 @@ private fun ExplorerSection(
                 }
             },
             onDismiss = { fieldError = null; if (pendingImport != null) editor.cancelImport() else onCreateMode(CreateMode.NONE) },
+        )
+    }
+    // A scan/photo/PDF picked for "trace into strokes": its preview + conversion dialog.
+    // Hidden in a locked folder like every other creation path.
+    val pendingTrace = editor.pendingTrace
+    if (vaultResolved && !vaultLocked && pendingTrace != null && !editor.importing) {
+        TraceScanDialog(
+            editor = editor,
+            request = pendingTrace,
+            root = root,
+            parentDocId = pendingTrace.parentDocId ?: currentDocId,
+            onClose = { editor.clearTrace() },
+            onDone = { uri -> editor.clearTrace(); refreshKey++; callsNow.value.openFile(uri) },
+        )
+    }
+    // A photo just taken for "trace from camera": corner adjustment first, then
+    // tracing or a filtered save. Hidden in a locked folder like every creation path.
+    val pendingCam = editor.pendingCameraScan
+    if (vaultResolved && !vaultLocked && pendingCam != null && !editor.importing) {
+        ScanCaptureDialog(
+            editor = editor,
+            photo = pendingCam.file,
+            initialName = pendingCam.name,
+            root = root,
+            parentDocId = currentDocId,
+            onClose = { pendingCam.file.delete(); editor.clearCameraScan() },
+            onRetake = { pendingCam.file.delete(); editor.clearCameraScan(); callsNow.value.traceCamera() },
+            onTraceStrokes = { warped, name ->
+                pendingCam.file.delete()
+                editor.requestTrace(
+                    android.net.Uri.fromFile(warped).toString(),
+                    "$name.jpg", "image/jpeg", currentDocId, file = warped,
+                )
+                editor.clearCameraScan()
+            },
+            onSaved = { uri -> editor.clearCameraScan(); refreshKey++; callsNow.value.openFile(uri) },
         )
     }
     if (createMode == CreateMode.ENCRYPTED_FOLDER) {
@@ -2198,6 +2433,15 @@ private fun ExplorerSection(
             onConfirm = { secret, pass ->
                 pgpBusy = true
                 scope.launch {
+                    val lockedFirst = withContext(Dispatchers.IO) { editor.isLockedFolder(root, currentDocId) }
+                    if (lockedFirst) {
+                        pgpBusy = false
+                        packet.fill(0)
+                        pgpImport = null
+                        pass.fill('\u0000')
+                        editor.message = context.getString(R.string.vault_destination_locked)
+                        return@launch
+                    }
                     val result = withContext(Dispatchers.IO) {
                         runCatching {
                             try {
@@ -2301,6 +2545,19 @@ private fun ExplorerSection(
             onPick = { target ->
                 moving = null
                 scope.launch {
+                    val nested = withContext(Dispatchers.IO) {
+                        val dstVault = editor.vaultHere(root, target) != null
+                        dstVault && items.any { it.isDir && editor.isVaultFolder(root, editor.browseDocId(it.documentUri)) }
+                    }
+                    if (nested) {
+                        opError = context.getString(R.string.err_nested_vault)
+                        return@launch
+                    }
+                    val locked = withContext(Dispatchers.IO) { editor.isLockedFolder(root, target) }
+                    if (locked) {
+                        opError = context.getString(R.string.vault_destination_locked)
+                        return@launch
+                    }
                     val moved = withContext(Dispatchers.IO) { editor.moveEntriesInto(root, items, target) }
                     selection.clear(); refreshKey++
                     opError = if (moved < items.size) context.getString(R.string.err_move_some) else null
@@ -2326,6 +2583,8 @@ private fun ExplorerSection(
                 TextButton(onClick = {
                     val items = targets.toList()
                     pendingDelete = null; selection.clear(); opError = null
+                    // Close their tabs before the files are gone, so no tab outlives its note.
+                    callsNow.value.closeTabsForDeletion(items.map { it.documentUri })
                     scope.launch {
                         val allOk = withContext(Dispatchers.IO) {
                             var ok = true
@@ -2470,6 +2729,9 @@ internal fun EntryMenu(
     onShare: (() -> Unit)? = null,
     onSaveCopy: (() -> Unit)? = null,
     onExportPdf: (() -> Unit)? = null,
+    onExportSdocx: (() -> Unit)? = null,
+    onConvertLatex: (() -> Unit)? = null,
+    onConvertMarkdown: (() -> Unit)? = null,
     onExportPgp: (() -> Unit)? = null,
     onColor: ((Rgba?) -> Unit)? = null,
     pinned: Boolean = false,
@@ -2512,7 +2774,8 @@ internal fun EntryMenu(
                 HorizontalDivider(color = palette.border.toComposeColor())
                 DropdownMenuItem(text = { Text(stringResource(R.string.share)) }, onClick = { onDismiss(); onShare() })
                 DropdownMenuItem(text = { Text(stringResource(R.string.save_copy_ellipsis)) }, onClick = { onDismiss(); onSaveCopy?.invoke() })
-                DropdownMenuItem(text = { Text(stringResource(R.string.export_pdf)) }, onClick = { onDismiss(); onExportPdf?.invoke() })
+                if (onConvertLatex != null) DropdownMenuItem(text = { Text(stringResource(R.string.convert_handwritten_latex)) }, onClick = { onDismiss(); onConvertLatex() })
+                if (onConvertMarkdown != null) DropdownMenuItem(text = { Text(stringResource(R.string.convert_handwritten_markdown)) }, onClick = { onDismiss(); onConvertMarkdown() })
                 if (onExportPgp != null) DropdownMenuItem(text = { Text(stringResource(R.string.export_pgp)) }, onClick = { onDismiss(); onExportPgp() })
             }
         }
@@ -2763,6 +3026,112 @@ private fun PrimaryButton(icon: ImageVector, label: String, modifier: Modifier =
 
 /** What an empty explorer body says, the picture above it, and whether it offers to make something. */
 private class EmptyState(val text: String, val art: EmptyArt? = null, val offersCreate: Boolean = false)
+
+/**
+ * Center gate for a locked encrypted folder: no files, no create actions, just the
+ * locked message and an inline password field. Unlocking restores the normal body.
+ */
+@Composable
+private fun LockedVaultPane(
+    editor: Editor,
+    root: String,
+    vaultId: String,
+    folderName: String,
+    onUnlocked: () -> Unit,
+) {
+    val palette = LocalPalette.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var password by remember(vaultId) { mutableStateOf("") }
+    var busy by remember(vaultId) { mutableStateOf(false) }
+    var error by remember(vaultId) { mutableStateOf<String?>(null) }
+    fun unlock() {
+        if (busy || password.isEmpty()) return
+        busy = true
+        error = null
+        val pass = password.toCharArray()
+        password = ""
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { editor.unlockVault(root, vaultId, pass) }
+            busy = false
+            if (ok) {
+                onUnlocked()
+            } else {
+                error = context.getString(R.string.err_unlock_folder)
+            }
+        }
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().imePadding()) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = maxHeight)
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Icon(XnotesIcons.lock, null, tint = palette.textDim.toComposeColor(), modifier = Modifier.size(44.dp))
+            Spacer(Modifier.height(16.dp))
+            Text(
+                stringResource(R.string.vault_locked_title),
+                color = palette.text.toComposeColor(),
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                stringResource(R.string.vault_locked_message),
+                color = palette.textDim.toComposeColor(),
+                fontSize = 14.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(max = 380.dp),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                stringResource(R.string.vault_locked_hint),
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(max = 380.dp),
+            )
+            Spacer(Modifier.height(20.dp))
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it; error = null },
+                singleLine = true,
+                label = { Text(stringResource(R.string.password)) },
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
+                    imeAction = ImeAction.Go,
+                ),
+                keyboardActions = KeyboardActions(onGo = { unlock() }),
+                enabled = !busy,
+                isError = error != null,
+                modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth(),
+            )
+            error?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = palette.danger.toComposeColor(), fontSize = 12.sp, textAlign = TextAlign.Center)
+            }
+            Spacer(Modifier.height(12.dp))
+            val canUnlock = !busy && password.isNotEmpty()
+            Box(Modifier.alpha(if (canUnlock) 1f else 0.4f)) {
+                PrimaryButton(
+                    XnotesIcons.unlock,
+                    stringResource(R.string.unlock_folder),
+                    onClick = { if (canUnlock) unlock() },
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                folderName,
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
 
 /** An empty body: a picture, what is (not) here, and ways to fill it; scrolls when the window is short. */
 @OptIn(ExperimentalLayoutApi::class)

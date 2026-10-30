@@ -107,6 +107,9 @@ internal class EntryActions(
     val share: (BrowseEntry) -> Unit,
     val saveCopy: (BrowseEntry) -> Unit,
     val exportPdf: (BrowseEntry) -> Unit,
+    val exportSdocx: (BrowseEntry) -> Unit = {},
+    val exportLatex: (BrowseEntry) -> Unit = {},
+    val exportMarkdown: (BrowseEntry) -> Unit = {},
     val exportPgp: (BrowseEntry) -> Unit,
     val preview: (BrowseEntry) -> Unit,
     val convertToNote: (BrowseEntry) -> Unit,
@@ -173,6 +176,9 @@ internal fun entryKind(e: BrowseEntry, meta: DocMetaStore.Meta?): EntryKind = wh
     e.isDir -> EntryKind.FOLDER
     DocumentKind.ofName(e.name) == DocumentKind.CANVAS -> EntryKind.CANVAS
     ReaderKind.isReadable(e.name) -> EntryKind.FILE
+    // Samsung Notes files are not editable or readable here; they are import
+    // sources, shown with the file icon until converted to a note.
+    ReaderKind.isSdocx(e.name) -> EntryKind.FILE
     meta?.pdf == true -> EntryKind.PDF
     else -> EntryKind.NOTE
 }
@@ -253,7 +259,7 @@ internal fun ThumbBadges(b: ExplorerBody, e: BrowseEntry, inset: Dp = 8.dp) {
             TileBadge(kindIcon(kind), if (kind == EntryKind.PDF) "PDF" else stringResource(R.string.kind_canvas), Modifier.align(Alignment.BottomStart))
         }
         if (b.view.showKind && kind == EntryKind.FILE) {
-            TileBadge(kindIcon(kind), ReaderKind.ofName(e.name)?.label.orEmpty(), Modifier.align(Alignment.BottomStart))
+            TileBadge(kindIcon(kind), ReaderKind.ofName(e.name)?.label ?: if (ReaderKind.isSdocx(e.name)) "SDOCX" else "", Modifier.align(Alignment.BottomStart))
         }
         val pages = b.pages(e)
         if (b.view.showPages && pages > 1) TileBadge(XnotesIcons.pages, "$pages", Modifier.align(Alignment.BottomEnd))
@@ -279,13 +285,20 @@ internal fun EntryMenuFor(b: ExplorerBody, e: BrowseEntry, expanded: Boolean, on
     val m = b.host.menu
     // Reader files have no share/copy/export block: those flows name and render editable documents.
     val readOnly = ReaderKind.isReadable(e.name)
+    // Samsung Notes files are import sources, not documents: no preview or
+    // export, but converting them to a note is the point of listing them.
+    val isSdocx = ReaderKind.isSdocx(e.name)
+    val isNote = DocumentKind.ofName(e.name) == DocumentKind.NOTE
     EntryMenu(
         expanded, onDismiss,
         onRename = { m.rename(e) }, onCopy = { m.copy(e) }, onCut = { m.cut(e) }, onDelete = { m.delete(e) },
         onShare = if (e.isDir || readOnly) null else ({ m.share(e) }),
         onSaveCopy = { m.saveCopy(e) },
-        onExportPdf = { m.exportPdf(e) },
-        onExportPgp = if (e.isDir || readOnly) null else ({ m.exportPgp(e) }),
+        onExportPdf = if (isSdocx) null else ({ m.exportPdf(e) }),
+        onExportSdocx = if (isNote) ({ m.exportSdocx(e) }) else null,
+        onConvertLatex = if (isNote) ({ m.exportLatex(e) }) else null,
+        onConvertMarkdown = if (isNote) ({ m.exportMarkdown(e) }) else null,
+        onExportPgp = if (e.isDir || readOnly || isSdocx) null else ({ m.exportPgp(e) }),
         onColor = { c -> m.color(e, c) },
         pinned = e.isDir && b.host.isPinned(e),
         onTogglePin = if (e.isDir) ({ m.togglePin(e) }) else null,
@@ -293,8 +306,8 @@ internal fun EntryMenuFor(b: ExplorerBody, e: BrowseEntry, expanded: Boolean, on
         onToggleNotePin = if (e.isDir) null else ({ m.toggleNotePin(e) }),
         onNameColor = e.color?.let { c -> { m.nameColor(c) } },
         onMoveTo = { m.moveTo(e) },
-        onPreview = if (e.isDir || readOnly) null else ({ m.preview(e) }),
-        onConvertToNote = if (readOnly) ({ m.convertToNote(e) }) else null,
+        onPreview = if (e.isDir || readOnly || isSdocx) null else ({ m.preview(e) }),
+        onConvertToNote = if (readOnly || isSdocx) ({ m.convertToNote(e) }) else null,
         onImportInto = if (DocumentKind.ofName(e.name) == DocumentKind.NOTE) ({ m.importInto(e) }) else null,
         deleteLabel = b.deleteLabel,
     )
