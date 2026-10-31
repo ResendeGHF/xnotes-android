@@ -1617,10 +1617,12 @@ class InteractionController(
         // Note-local sticky ink does not sync in v1: keep it off the wire entirely.
         if (drawTool.isStroke && stickyDrawTarget == null) onStrokeStarted?.invoke(pageIndex)
         // Shape snap: only solid ink pens (not the highlighter or its straight-line mode) arm the
-        // "hold still → shape" timer — and never while the ruler is up (you're drawing straight lines),
-        // nor under the wand, whose strokes are ephemeral and must never commit a shape to the page.
+        // "hold still to shape" timer. It stays off while the stroke rides the ruler, where the
+        // magnet has taken it and it is a line by definition; a ruler merely lying on the page
+        // blocks nothing, so a freehand stroke held well away from it still becomes a shape. And
+        // off under the wand, whose strokes are ephemeral and must never commit a shape to the page.
         dwellEligible = detectShapes && drawTool.isStroke && drawTool != Tool.HIGHLIGHTER && !straight &&
-            !ruler.visible && !wandMode
+            !snapEngaged && !wandMode
         if (dwellEligible) {
             dwellAnchor = downViewport
             armDwell()
@@ -1675,6 +1677,12 @@ class InteractionController(
         val pi = strokePageIndex ?: return
         if (state.pageRects.getOrNull(pi) == null) return
         val vp = magnetize(Pt(vx, vy))
+        // The magnet took the stroke mid-draw: it is a line from here, so the hold-to-snap
+        // clock stops for the rest of it, as it already does when a stroke crosses a page edge.
+        if (dwellEligible && snapEngaged) {
+            cancelDwell()
+            dwellEligible = false
+        }
         val nib = state.viewportToContent(vp)
         var t = (timeMs - strokeStartTimeMs).toDouble()
         // A steadied stroke takes the point the filter has reached and draws on to the nib as a
