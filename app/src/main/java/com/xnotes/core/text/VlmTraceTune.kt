@@ -49,7 +49,7 @@ object VlmTraceTune {
      */
     fun promptFor(current: String): String =
         """You tune a document-trace filter. The LEFT panel ("PHOTO") is the scanned page; the RIGHT panel ("EDGES") is what the tracer currently extracts (black = kept ink, white = dropped).
-Goal: EDGES must keep every text letter (including dots, accents, diacritics) and every illustration/diagram line, while dropping ruled-paper lines, speckles, shadows, punch holes and margin dirt.
+Goal: EDGES must keep every text letter (including dots, accents, diacritics), every hand-drawn underline and emphasis mark, and every illustration/diagram line, while dropping ALL pre-printed paper furniture: ruled lines, grid/graph squares, margin lines, date/score boxes, header/footer bands, printed logos, page borders, punch holes, plus speckles, shadows and margin dirt.
 Current settings: $current
 Rules:
 - Output ONLY a flat JSON object. No fences, no explanations, no commentary.
@@ -57,11 +57,12 @@ Rules:
 - "auto_threshold" and "enhance" MUST be false or omitted. Never use automatic modes: give explicit values instead. Ink is darker than "threshold".
 - Optional keys:
   "denoise": 0..60. Drops ink blobs smaller than this many pixels. Remove dust WITHOUT eating dots and accents.
-  "remove_lines": boolean. True erases ruled-paper lines so handwriting traces continuously.
+  "remove_lines": boolean. True removes paper furniture so only handwriting and drawings trace: ruled lines, grid squares, margin lines, date/score boxes, logos, footers. Set true whenever ANY of that is visible in PHOTO, even faintly. Hand-drawn underlines and emphasis strokes are content: keep them.
   "printed_text": boolean. True for typeset/printed pages (keeps neighbouring letters separate); false for handwriting (bridges faint pen lifts).
   "invert": boolean. True ONLY when the ink is LIGHTER than the page (whiteboard photo, dark paper).
   "quarter_turns": 0..3. Clockwise 90-degree steps to make the page upright (0 = already upright).
 - When unsure whether a faint mark is content or noise, keep it.
+- Before answering, re-check the EDGES panel for leftover straight grid/line pixels or pre-printed boxes: if any remain, set "remove_lines" true and adjust "threshold"/"denoise" until only text and drawings would remain.
 - Example: {"threshold": 140, "brightness": 5, "contrast": 120, "denoise": 6, "remove_lines": true, "printed_text": false, "quarter_turns": 0}""".trimIndent()
 
     /**

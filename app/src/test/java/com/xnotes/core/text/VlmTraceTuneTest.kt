@@ -20,6 +20,14 @@ class VlmTraceTuneTest {
         assertTrue(p, p.contains("ONLY"))
     }
 
+    @Test fun promptDemandsPaperFurnitureRemoval() {
+        val p = VlmTraceTune.promptFor("threshold 128")
+        assertTrue(p, p.contains("grid"))
+        assertTrue(p, p.contains("date"))
+        assertTrue(p, p.contains("remove_lines"))
+        assertTrue(p, p.contains("Hand-drawn underlines"))
+    }
+
     @Test fun fullAnswerParsesEveryField() {
         val raw = """{"auto_threshold": false, "threshold": 140, "brightness": -10, "contrast": 150,
             "denoise": 12, "remove_lines": true, "printed_text": true, "invert": false,

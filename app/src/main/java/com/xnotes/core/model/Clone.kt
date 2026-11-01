@@ -11,7 +11,7 @@ import com.xnotes.core.pal.TextMeasurer
  */
 fun CanvasItem.deepCopy(measurer: TextMeasurer): CanvasItem = when (this) {
     is Stroke -> Stroke(this)
-    is ImageItem -> ImageItem(image, rect, orientation, angle, flip)
+    is ImageItem -> ImageItem(image, rect, orientation, angle, flip, part)
     is NoteLinkItem -> NoteLinkItem(rect, displayName, targetUri, targetName, pages.toList(), color, rounded)
     is AudioItem -> AudioItem(audio, rect, name, rid, measurer)
     // The shape is immutable, so the copy can share it; a copy starts covered.
@@ -65,10 +65,9 @@ fun List<CanvasItem>.deepCopyAll(measurer: TextMeasurer): List<CanvasItem> {
     return out
 }
 
-/** A deep copy of a page — its items cloned ([deepCopyAll]) — keeping the size, PDF link, style, margins and markups. */
+/** A deep copy of a page — its items cloned ([deepCopyAll]) — keeping the size, PDF link, style, margins, markups and room. */
 fun Page.deepCopy(measurer: TextMeasurer): Page =
-    Page(width, height, items.deepCopyAll(measurer).toMutableList(), pdfPage, style, margins, markups, pdfTurn).also {
-        it.cover = cover
+    Page(width, height, items.deepCopyAll(measurer).toMutableList(), pdfPage, style, margins, markups, pdfTurn, rooms).also {
         it.linkBorder = linkBorder
     }
 
@@ -112,7 +111,7 @@ fun Document.deepCopy(measurer: TextMeasurer): Document = Document(
  */
 fun Document.snapshot(): Document = Document(
     pages = pages.mapTo(mutableListOf()) { p ->
-        Page(p.width, p.height, ArrayList(p.items), p.pdfPage, p.style, p.margins, p.markups, p.pdfTurn).also {
+        Page(p.width, p.height, ArrayList(p.items), p.pdfPage, p.style, p.margins, p.markups, p.pdfTurn, p.rooms).also {
             it.cover = p.cover
             it.linkBorder = p.linkBorder
         }

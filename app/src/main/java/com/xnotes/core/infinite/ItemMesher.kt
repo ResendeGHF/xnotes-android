@@ -297,7 +297,7 @@ object ItemMesher {
         if (stroke.isEmpty) return null
         if (stroke.tool == Tool.DASHED) return meshDashed(stroke, tolerance)
         if (stroke.tool == Tool.PENCIL) return meshPencil(stroke, tolerance)
-        val mesh = StrokeTessellator.tessellate(stroke.geometry(), tolerance)
+        val mesh = MeshClip.clip(StrokeTessellator.tessellate(stroke.geometry(), tolerance), stroke.cuts)
         if (mesh.isEmpty) return null
         if (stroke.config.neon && stroke.tool != Tool.HIGHLIGHTER) {
             return neonStroke(stroke, mesh, tolerance)
@@ -389,12 +389,15 @@ object ItemMesher {
      */
     private fun meshDashed(stroke: Stroke, tolerance: Double): MeshedItem? {
         val half = stroke.config.baseWidth / 2.0
-        val mesh = StrokeTessellator.tessellateDashed(
-            stroke.geometry(),
-            stroke.config.dashLength,
-            stroke.config.dashGap,
-            half,
-            tolerance,
+        val mesh = MeshClip.clip(
+            StrokeTessellator.tessellateDashed(
+                stroke.geometry(),
+                stroke.config.dashLength,
+                stroke.config.dashGap,
+                half,
+                tolerance,
+            ),
+            stroke.cuts,
         )
         if (mesh.isEmpty) return null
         return MeshedItem(listOf(MeshPart(mesh, stroke.renderColor, passFor(stroke))), stroke.bounds(), half)

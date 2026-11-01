@@ -59,7 +59,10 @@ enum class ToolbarItem(val id: String) {
     MINIMAP("minimap"),
 
     /** The full maths workspace, on both the note bar and the canvas bar. */
-    MATH("math");
+    MATH("math"),
+
+    /** Notes only: opens and closes room on a page. Last, so a stored bar missing older items too still gets it right after the lasso. */
+    INSERT_SPACE("insert_space");
 
     companion object {
         fun fromId(id: String?): ToolbarItem? = entries.firstOrNull { it.id == id }
@@ -167,6 +170,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
             ToolbarItem.TABLE to ToolbarItem.IMAGE,
             ToolbarItem.SEARCH to ToolbarItem.PAGE_NAV,
             ToolbarItem.TAPE to ToolbarItem.WAND,
+            ToolbarItem.INSERT_SPACE to ToolbarItem.LASSO,
             ToolbarItem.MARKUP to ToolbarItem.TEXT_BOX,
             ToolbarItem.READER to ToolbarItem.PAN,
             ToolbarItem.MATH to ToolbarItem.SHAPE,
@@ -202,7 +206,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
                 ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
             ),
-            listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
+            listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.INSERT_SPACE, ToolbarItem.SCREENSHOT),
             listOf(ToolbarItem.WAND, ToolbarItem.TAPE, ToolbarItem.SHAPE, ToolbarItem.MATH, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
             listOf(ToolbarItem.IMAGE, ToolbarItem.TABLE),
             listOf(ToolbarItem.COLORS),

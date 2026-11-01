@@ -127,6 +127,7 @@ fun Toolbar(
         Tool.TABLE to XnotesIcons.table,
         Tool.MARKUP to XnotesIcons.markup,
         Tool.TAPE to XnotesIcons.tape,
+        Tool.INSERT_SPACE to XnotesIcons.insertSpace,
     )
     var configForTool by remember { mutableStateOf<Tool?>(null) }
     var switcherIndex by remember { mutableStateOf<Int?>(null) }
@@ -253,7 +254,7 @@ private fun ToolbarItemView(
         ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
         ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER, ToolbarItem.PAN,
         ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT, ToolbarItem.SHAPE,
-        ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE, ToolbarItem.TAPE -> {
+        ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE, ToolbarItem.TAPE, ToolbarItem.INSERT_SPACE -> {
             val tool = Tool.fromId(item.id)
             if (tool != null) ToolButton(editor, tool, toolIcons[tool], configForTool, setConfigForTool)
         }

@@ -454,7 +454,11 @@ class Regroup(private val items: List<CanvasItem>, private val group: Int?) : Co
     override fun touched(locate: (CanvasItem) -> Page?): List<Pair<Page, CanvasItem>> = emptyList()
 }
 
-/** Replace an image's bitmap + rect (used by Crop), reversibly. */
+/**
+ * A picture swapped for another of itself, as a crop does: its file and its box, before and after.
+ * A crop writes just what showed, so the part it showed of the old file is all of the new one.
+ * (Also used by stylus-calibration-agnostic ReplaceImage callers with an explicit old/new pair.)
+ */
 class ReplaceImage(
     private val item: ImageItem,
     private val before: Pair<ImageData, Rect>,
@@ -468,14 +472,18 @@ class ReplaceImage(
         newRect: Rect,
     ) : this(item, oldImage to oldRect, newImage to newRect)
 
+    private val partBefore = item.part
+
     override fun redo() {
         item.image = after.first
         item.rect = after.second
+        item.part = null
     }
 
     override fun undo() {
         item.image = before.first
         item.rect = before.second
+        item.part = partBefore
     }
 
     override fun touched(locate: (CanvasItem) -> Page?) = pagedItems(listOf(item), locate)

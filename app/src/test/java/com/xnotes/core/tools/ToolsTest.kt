@@ -93,7 +93,7 @@ class ToolsTest {
 
     @Test fun toolIdRoundTrip() {
         for (t in Tool.entries) assertEquals(t, Tool.fromId(t.id))
-        assertEquals(16, Tool.wheelOrder.size)
+        assertEquals(17, Tool.wheelOrder.size)
     }
 
     @Test fun pencilDefaultsAndRanges() {
