@@ -122,7 +122,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
     var smoothing by remember { mutableStateOf(ToolConversions.blurToSmoothing(base.speedSmoothing).toFloat()) }
     var topSpeed by remember { mutableStateOf(ToolConversions.dpPerMsToTopSpeed(base.speedTop).toFloat()) }
     var taperTip by remember { mutableStateOf((base.taperMinFactor * 100).toFloat()) }
-    var width by remember { mutableStateOf(base.baseWidth.toFloat()) }
+    var width by remember { mutableStateOf(ToolConversions.snapWidth(tool, base.baseWidth).toFloat()) }
     var glow by remember { mutableStateOf(base.neon) }
     var glowIntensity by remember { mutableStateOf(ToolConversions.neonStrengthToIntensity(base.neonStrength).toFloat()) }
     var dashLen by remember { mutableStateOf(base.dashLength.toFloat()) }
@@ -148,7 +148,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
         editor.updateToolConfig(
             tool,
             base.copy(
-                baseWidth = width.toDouble(),
+                baseWidth = ToolConversions.snapWidth(tool, width.toDouble()),
                 pressureEnabled = pressure,
                 pressureMinFactor = m,
                 directionStrength = ds,
@@ -212,7 +212,10 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 SliderRow(stringResource(R.string.caption_tip_width), taperTip, 0f..100f) { taperTip = it; emit() }
             }
             val range = ToolConversions.widthRange(tool)
-            SliderRow(stringResource(R.string.caption_width), width, range.start.toFloat()..range.endInclusive.toFloat()) { width = it; emit() }
+            SliderRow(
+                stringResource(R.string.caption_width), width,
+                range.start.toFloat()..range.endInclusive.toFloat(), step = 1f,
+            ) { width = it; emit() }
             // SCALE off: ink keeps a constant on-screen thickness whatever zoom you draw at.
             ToggleRow(stringResource(R.string.caption_scale), scale) { scale = it; emit() }
             // Global dwell shape detection (holding the pen still). Off for the highlighter, which never dwells.
@@ -1374,24 +1377,39 @@ internal fun SliderRow(
     label: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
+    step: Float = 0f,
     enabled: Boolean = true,
     onChangeFinished: (() -> Unit)? = null,
     onChange: (Float) -> Unit,
 ) {
+    // A stepped row lands on whole stops, so the number in its label is the number the tool is
+    // given rather than a rounding of something sitting between two of them.
+    val shown = if (step > 0f) snapTo(value, range, step) else value
     Column {
         Text(
-            "$label  ${"%.0f".format(value)}",
+            "$label  ${"%.0f".format(shown)}",
             color = (if (enabled) LocalPalette.current.text else LocalPalette.current.textDim).toComposeColor(),
             fontSize = 12.sp,
         )
         Slider(
-            value = value,
-            onValueChange = onChange,
+            value = shown,
+            onValueChange = { if (step > 0f) onChange(snapTo(it, range, step)) else onChange(it) },
             onValueChangeFinished = onChangeFinished,
             valueRange = range,
+            steps = if (step > 0f) {
+                (((range.endInclusive - range.start) / step).roundToInt() - 1).coerceAtLeast(0)
+            } else {
+                0
+            },
             enabled = enabled,
         )
     }
+}
+
+/** [value] moved to the nearest [step] within [range]: 2.4 to 2, 2.6 to 3, held at the ends. */
+private fun snapTo(value: Float, range: ClosedFloatingPointRange<Float>, step: Float): Float {
+    return (range.start + ((value - range.start) / step).roundToInt() * step)
+        .coerceIn(range.start, range.endInclusive)
 }
 
 /** A chip's LaTeX: what a function chip plots, null for every other chip. */

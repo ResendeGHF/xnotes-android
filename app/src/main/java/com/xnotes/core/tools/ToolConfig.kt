@@ -8,6 +8,7 @@ import com.xnotes.core.stroke.Stabilizer
 import com.xnotes.core.stroke.StrokeEngine
 import kotlin.math.ln
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /**
  * Eraser behaviour (spec 04 §2): STROKE removes a whole stroke on contact; AREA removes only the
@@ -219,5 +220,15 @@ object ToolConversions {
         Tool.ERASER -> 1.0..80.0
         Tool.TAPE -> TapeItem.MIN_WIDTH..TapeItem.MAX_WIDTH
         else -> 1.0..20.0
+    }
+
+    /** WIDTH is whole px: [value] rounded to it and held inside the tool's own range.
+     *
+     *  A continuous slider could sit between two while the popup showed the rounded number, so
+     *  two strokes both labelled 2 were laid down at visibly different thicknesses. Whole px
+     *  makes the label the width, which is what a note needs to stay consistent. */
+    fun snapWidth(tool: Tool, value: Double): Double {
+        val range = widthRange(tool)
+        return value.roundToInt().toDouble().coerceIn(range.start, range.endInclusive)
     }
 }
