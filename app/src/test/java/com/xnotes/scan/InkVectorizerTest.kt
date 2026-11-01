@@ -24,7 +24,8 @@ class InkVectorizerTest {
         val w = 60
         val h = 20
         val lum = lumOf(w, h) { x, y -> y in 9..11 && x in 5..54 }
-        val paths = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128))
+        // Not a ruling: the bar is the subject, so ruling removal stays off.
+        val paths = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128, removeRulings = false))
         assertTrue("expected paths, got ${paths.size}", paths.isNotEmpty())
         val longest = paths.maxByOrNull { it.lengthPx }!!
         // A 50px bar thins to a ~50px centreline (junction splits may shorten it).
@@ -87,7 +88,7 @@ class InkVectorizerTest {
         val localInk = mask.count { it }
         // Just the bar (400 px) plus a little edge tolerance.
         assertTrue("sauvola should isolate the bar, got $localInk", localInk in 200..900)
-        val paths = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(denoisePx = 0))
+        val paths = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(denoisePx = 0, removeRulings = false))
         val longest = paths.maxByOrNull { it.lengthPx }!!
         assertTrue("bar should trace end to end, got ${longest.lengthPx}", longest.lengthPx > 70.0)
     }
@@ -185,11 +186,11 @@ class InkVectorizerTest {
         }
         val plain = InkVectorizer.vectorize(
             lum, w, h,
-            InkVectorizer.TraceOptions(threshold = 100, hysteresis = false, denoisePx = 0),
+            InkVectorizer.TraceOptions(threshold = 100, hysteresis = false, denoisePx = 0, removeRulings = false),
         )
         val grown = InkVectorizer.vectorize(
             lum, w, h,
-            InkVectorizer.TraceOptions(threshold = 100, hysteresis = true, weakExtra = 80, denoisePx = 0),
+            InkVectorizer.TraceOptions(threshold = 100, hysteresis = true, weakExtra = 80, denoisePx = 0, removeRulings = false),
         )
         val plainLongest = plain.maxByOrNull { it.lengthPx }?.lengthPx ?: 0.0
         val grownLongest = grown.maxByOrNull { it.lengthPx }?.lengthPx ?: 0.0
@@ -243,12 +244,171 @@ class InkVectorizerTest {
             val y = i / w
             if (y in 9..11 && x in 5..34) 250 else 10
         }
-        val inverted = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128, invert = true))
+        val inverted = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128, invert = true, removeRulings = false))
         // The bar comes out as one long path…
         assertTrue("inverted should find the bar", inverted.any { it.lengthPx > 15.0 })
         // …while the default polarity (correctly) refuses: the whole dark
         // background would be ink, so the degenerate guard bails out instead.
         val normal = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128))
         assertTrue("normal polarity must abort on a dark page, got ${normal.size}", normal.isEmpty())
+    }
+
+    @Test
+    fun `staircase curve is one junction-free through-line`() {
+        // A diagonal staircase: raw neighbour counts call every step a junction
+        // (3 neighbours), but topologically it is one curve (2 arms each).
+        val w = 30
+        val h = 30
+        val skel = BooleanArray(w * h)
+        for (i in 4..25) skel[i * w + i] = true
+        val mid = 15 * w + 15
+        assertEquals(2, InkVectorizer.skeletonArms(skel, w, h, mid))
+        val paths = InkVectorizer.trace(skel, w, h)
+        assertEquals("staircase should trace as one path, got ${paths.size}", 1, paths.size)
+        assertTrue(paths[0].size > 15)
+    }
+
+    @Test
+    fun `true Y junction still splits into three`() {
+        // A real branch point (3 separate arms) must keep splitting.
+        val w = 30
+        val h = 30
+        val skel = BooleanArray(w * h)
+        for (x in 5..25) skel[15 * w + x] = true // horizontal bar
+        for (y in 15..25) skel[y * w + 15] = true // vertical spur down
+        assertEquals(3, InkVectorizer.skeletonArms(skel, w, h, 15 * w + 15))
+        val paths = InkVectorizer.trace(skel, w, h)
+        assertTrue("Y junction should split, got ${paths.size}", paths.size >= 3)
+    }
+
+    @Test
+    fun `pruneSpurs cuts a spur but keeps dots and pen tips`() {
+        val w = 30
+        val h = 30
+        // An L: long bar with a 3px spur in the middle.
+        val skel = BooleanArray(w * h)
+        for (x in 4..25) skel[15 * w + x] = true
+        for (y in 15..17) skel[y * w + 12] = true // 3px spur down (tip at y=17)
+        val pruned = InkVectorizer.pruneSpurs(skel, w, h, maxLen = 5)
+        assertTrue("spur tip removed", !pruned[17 * w + 12])
+        assertTrue("bar survives", pruned[15 * w + 4] && pruned[15 * w + 25])
+        // An isolated 3px dash (no junction) is ink, not a spur: kept whole.
+        val lone = BooleanArray(w * h)
+        lone[10 * w + 10] = true
+        lone[10 * w + 11] = true
+        lone[10 * w + 12] = true
+        val kept = InkVectorizer.pruneSpurs(lone, w, h, maxLen = 5)
+        assertTrue(kept[10 * w + 10] && kept[10 * w + 12])
+    }
+
+    @Test
+    fun `closeMask bridges a 1px gap`() {
+        val w = 20
+        val h = 5
+        val ink = BooleanArray(w * h) { i -> (i / w) == 2 && (i % w) in 2..17 }
+        ink[2 * w + 10] = false // 1px gap in a horizontal stroke
+        val closed = InkVectorizer.closeMask(ink, w, h)
+        assertTrue("gap bridged", closed[2 * w + 10])
+        assertTrue("ends stay open", !closed[2 * w + 0] && !closed[2 * w + 19])
+    }
+
+    @Test
+    fun `removeRulings erases a full-span line but keeps an underline`() {
+        val w = 100
+        val h = 30
+        val ink = BooleanArray(w * h)
+        for (x in 0 until w) ink[5 * w + x] = true // full-width ruled line
+        for (x in 10..29) ink[20 * w + x] = true // short underline (20px)
+        val out = InkVectorizer.removeRulings(ink, w, h, spanFrac = 0.5, maxThick = 4)
+        assertTrue("ruled line erased", (0 until w).none { out[5 * w + it] })
+        assertTrue("underline kept", (10..29).all { out[20 * w + it] })
+    }
+
+    @Test
+    fun `removeRulings keeps text crossing the line`() {
+        // A vertical text stroke crossing the ruled line stays: the crossing
+        // pixels are thicker than a line, so they are text, not paper.
+        val w = 100
+        val h = 30
+        val ink = BooleanArray(w * h)
+        for (x in 0 until w) ink[15 * w + x] = true
+        for (y in 5..25) ink[y * w + 50] = true
+        val out = InkVectorizer.removeRulings(ink, w, h, spanFrac = 0.5, maxThick = 4)
+        assertTrue("crossing kept", out[15 * w + 50])
+        assertTrue("line gone elsewhere", !out[15 * w + 10])
+    }
+
+    @Test
+    fun `cursive word traces to a handful of long strokes`() {
+        // A cursive-like loop word: one ring crossed by its own tail. The old
+        // raw-count tracing shattered it (every stair-step a junction); the
+        // topological trace must hold each arc together.
+        val w = 60
+        val h = 30
+        val lum = lumOf(w, h) { x, y ->
+            // Ellipse ring (the bowl) plus an entry and an exit tail.
+            val ex = (x - 30) / 14.0
+            val ey = (y - 15) / 7.0
+            val ring = ex * ex + ey * ey
+            (ring > 0.7 && ring < 1.3) || (y == 15 && x in 2..16) || (y == 22 && x in 32..57)
+        }
+        val paths = InkVectorizer.vectorize(lum, w, h, InkVectorizer.TraceOptions(threshold = 128))
+        assertTrue("expected ink, got none", paths.isNotEmpty())
+        val long = paths.filter { it.lengthPx > 15.0 }
+        assertTrue("word should hold long arcs, got ${paths.size} paths", long.isNotEmpty())
+        assertTrue("word should not shatter, got ${paths.size} paths", paths.size <= 12)
+    }
+
+    @Test
+    fun `print mode keeps neighbouring glyphs separate`() {
+        // Two 3px bars with a 2px gap (like adjacent print stems): the default
+        // handwriting closing welds them, print mode must keep them apart.
+        val w = 40
+        val h = 40
+        val lum = lumOf(w, h) { x, y -> y in 4..15 && (x in 10..12 || x in 15..17) }
+        val hand = InkVectorizer.inkMask(lum, w, h, InkVectorizer.TraceOptions(threshold = 128))
+        val print = InkVectorizer.inkMask(lum, w, h, InkVectorizer.TraceOptions(threshold = 128, printedText = true))
+        // The gap column must stay paper in print mode…
+        assertTrue("print keeps the inter-glyph gap", (4..15).all { !print[it * w + 13] && !print[it * w + 14] })
+        // …while handwriting mode bridges it.
+        assertTrue("handwriting bridges the gap", (4..15).any { hand[it * w + 13] || hand[it * w + 14] })
+    }
+
+    @Test
+    fun `print words trace to separate readable glyphs`() {
+        // Two rings side by side (like "oo"): each must trace as its own loop,
+        // not one scribble through both.
+        val w = 60
+        val h = 30
+        val lum = lumOf(w, h) { x, y ->
+            val left = ((x - 18) / 7.0).let { it * it } + ((y - 15) / 9.0).let { it * it }
+            val right = ((x - 40) / 7.0).let { it * it } + ((y - 15) / 9.0).let { it * it }
+            (left > 0.7 && left < 1.3) || (right > 0.7 && right < 1.3)
+        }
+        val opts = InkVectorizer.TraceOptions(threshold = 128, printedText = true)
+        val paths = InkVectorizer.vectorize(lum, w, h, opts)
+        assertTrue("expected ink, got none", paths.isNotEmpty())
+        val long = paths.filter { it.lengthPx > 15.0 }
+        assertTrue("each ring should hold together, got ${paths.size} paths", long.size >= 2)
+        assertTrue("rings must not shatter, got ${paths.size} paths", paths.size <= 8)
+    }
+
+    @Test
+    fun `broken ruling dashes vanish but crossings and off-band bars stay`() {
+        // Two broken dashes of one ruled line (each shorter than the full-span
+        // pass sees), a vertical text stroke crossing them, and a fraction-bar
+        // like run between the ruling rows.
+        val w = 100
+        val h = 40
+        val ink = BooleanArray(w * h)
+        for (x in 0..39) ink[10 * w + x] = true // left dash of the ruling
+        for (x in 60..99) ink[10 * w + x] = true // right dash of the ruling
+        for (y in 2..20) ink[y * w + 50] = true // text stroke crossing the band
+        for (x in 10..34) ink[25 * w + x] = true // off-band bar (fraction bar)
+        val out = InkVectorizer.removeRulings(ink, w, h, spanFrac = 0.5, maxThick = 4)
+        assertTrue("left dash erased", (0..39).none { out[10 * w + it] })
+        assertTrue("right dash erased", (60..99).none { out[10 * w + it] })
+        assertTrue("crossing kept", out[10 * w + 50])
+        assertTrue("off-band bar kept", (10..34).all { out[25 * w + it] })
     }
 }

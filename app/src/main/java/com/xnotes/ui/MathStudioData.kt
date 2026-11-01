@@ -24,6 +24,7 @@ internal object MathStudioData {
         calculus: CalculusState,
         symbolic: SymbolicState,
         units: UnitState,
+        data: DataState = DataState(),
     ): String = JSONObject()
         .put("v", 1)
         .put("tab", tab)
@@ -49,6 +50,8 @@ internal object MathStudioData {
             .put("y0", solver.y0)
             .put("method", solver.odeMethod)
             .put("smethod", solver.method.name)
+            .put("samples", solver.samples)
+            .put("seed", solver.seed)
             .put("title", solver.title)
             .put("result", solver.result)
             .put("detail", solver.detail)
@@ -148,6 +151,38 @@ internal object MathStudioData {
             .put("from", units.from)
             .put("to", units.to)
             .put("value", units.value))
+        .put("data", JSONObject()
+            .put("series", JSONArray(data.series.map { s -> JSONObject()
+                .put("name", s.name)
+                .put("color", s.colorArgb ?: 0)
+                .put("visible", s.visible)
+                .put("points", s.showPoints)
+                .put("style", s.lineStyle.name)
+                .put("errors", s.showErrors)
+                .put("fill", s.fillUnder)
+                .put("tangents", s.tangents)
+                .put("spline", s.spline)
+                .put("fit", s.fit.name)
+                .put("degree", s.fitDegree)
+                .put("smooth", s.smooth.name)
+                .put("window", s.smoothWindow)
+                .put("x", numArray(s.x.take(5000)))
+                .put("y", numArray(s.y.take(5000)))
+                .put("xerr", numArray(s.xerr.take(5000)))
+                .put("yerr", numArray(s.yerr.take(5000)))
+            }))
+            .put("x0", data.xMin).put("x1", data.xMax)
+            .put("y0", data.yMin).put("y1", data.yMax)
+            .put("xscale", data.xScale.name).put("yscale", data.yScale.name)
+            .put("xpow", data.xPower).put("ypow", data.yPower)
+            .put("ticks", data.tickTarget)
+            .put("grid", data.showGrid)
+            .put("palette", data.palette.name)
+            .put("title", data.title)
+            .put("xlabel", data.xLabel).put("ylabel", data.yLabel)
+            .put("tan", data.showTangents)
+            .put("tcount", data.tangentCount)
+            .put("tfrom", data.tangentFrom).put("tto", data.tangentTo))
         .toString()
 
     /** Restores every pane from [json]; returns the tab to select, or null when unreadable. */
@@ -161,6 +196,7 @@ internal object MathStudioData {
         calculus: CalculusState,
         symbolic: SymbolicState,
         units: UnitState,
+        data: DataState = DataState(),
     ): String? = runCatching {
         val o = JSONObject(json)
         if (o.optInt("v", 1) != 1) return null
@@ -196,6 +232,8 @@ internal object MathStudioData {
             solver.y0 = j.optString("y0", "1")
             solver.odeMethod = j.optString("method", "RK45")
             if (j.has("smethod")) solver.method = runCatching { SolverMethod.valueOf(j.optString("smethod", "AUTO")) }.getOrDefault(SolverMethod.AUTO)
+            if (j.has("samples")) solver.samples = j.optString("samples", "100000")
+            if (j.has("seed")) solver.seed = j.optString("seed", "1")
             solver.title = j.optString("title", "")
             solver.result = j.optString("result", "")
             solver.detail = if (j.has("detail")) j.optString("detail") else null
@@ -336,6 +374,51 @@ internal object MathStudioData {
             if (j.has("to")) units.to = j.optString("to", "")
             if (j.has("value")) units.value = j.optString("value", "1")
         }
+        o.optJSONObject("data")?.let { j ->
+            j.optJSONArray("series")?.let { a ->
+                val list = ArrayList<DataSeries>()
+                for (i in 0 until a.length()) {
+                    val e = a.optJSONObject(i) ?: continue
+                    val s = DataSeries(e.optString("name", "Series ${list.size + 1}"))
+                    s.colorArgb = e.optInt("color", 0).takeIf { it != 0 }
+                    s.visible = e.optBoolean("visible", true)
+                    s.showPoints = e.optBoolean("points", true)
+                    s.lineStyle = runCatching { DataLineStyle.valueOf(e.optString("style", "SOLID")) }.getOrDefault(DataLineStyle.SOLID)
+                    s.showErrors = e.optBoolean("errors", true)
+                    s.fillUnder = e.optBoolean("fill", false)
+                    s.tangents = e.optBoolean("tangents", false)
+                    s.spline = e.optBoolean("spline", false)
+                    s.fit = runCatching { DataFit.valueOf(e.optString("fit", "NONE")) }.getOrDefault(DataFit.NONE)
+                    s.fitDegree = e.optString("degree", "2")
+                    s.smooth = runCatching { DataSmooth.valueOf(e.optString("smooth", "NONE")) }.getOrDefault(DataSmooth.NONE)
+                    s.smoothWindow = e.optString("window", "5")
+                    s.x = numList(e.optJSONArray("x"))
+                    s.y = numList(e.optJSONArray("y"))
+                    s.xerr = numList(e.optJSONArray("xerr"), s.x.size)
+                    s.yerr = numList(e.optJSONArray("yerr"), s.y.size)
+                    list.add(s)
+                }
+                data.series = list
+            }
+            if (j.has("x0")) data.xMin = j.optDouble("x0", 0.0)
+            if (j.has("x1")) data.xMax = j.optDouble("x1", 1.0)
+            if (j.has("y0")) data.yMin = j.optDouble("y0", 0.0)
+            if (j.has("y1")) data.yMax = j.optDouble("y1", 1.0)
+            if (j.has("xscale")) data.xScale = runCatching { DataAxisScale.valueOf(j.optString("xscale", "LINEAR")) }.getOrDefault(DataAxisScale.LINEAR)
+            if (j.has("yscale")) data.yScale = runCatching { DataAxisScale.valueOf(j.optString("yscale", "LINEAR")) }.getOrDefault(DataAxisScale.LINEAR)
+            if (j.has("xpow")) data.xPower = j.optString("xpow", "4")
+            if (j.has("ypow")) data.yPower = j.optString("ypow", "2")
+            if (j.has("ticks")) data.tickTarget = j.optString("ticks", "6")
+            if (j.has("grid")) data.showGrid = j.optBoolean("grid", true)
+            if (j.has("palette")) data.palette = runCatching { DataPalette.valueOf(j.optString("palette", "STUDIO")) }.getOrDefault(DataPalette.STUDIO)
+            if (j.has("title")) data.title = j.optString("title", "")
+            if (j.has("xlabel")) data.xLabel = j.optString("xlabel", "x")
+            if (j.has("ylabel")) data.yLabel = j.optString("ylabel", "y")
+            if (j.has("tan")) data.showTangents = j.optBoolean("tan", false)
+            if (j.has("tcount")) data.tangentCount = j.optString("tcount", "5")
+            if (j.has("tfrom")) data.tangentFrom = j.optString("tfrom", "")
+            if (j.has("tto")) data.tangentTo = j.optString("tto", "")
+        }
         if (o.has("tab")) o.optString("tab") else null
     }.getOrNull()
 
@@ -377,6 +460,24 @@ internal object MathStudioData {
         if (o.has("t")) a.tCurrent = o.optDouble("t", 0.0)
         if (o.has("on")) a.enabled = o.optBoolean("on", false)
         if (o.has("playing")) a.playing = o.optBoolean("playing", false)
+    }
+
+    private fun numArray(xs: List<Double>): JSONArray = JSONArray(
+        xs.map { if (it.isFinite()) it else JSONObject.NULL },
+    )
+
+    private fun numList(a: JSONArray?, fill: Int = -1): List<Double> {
+        if (a == null) return if (fill >= 0) List(fill) { Double.NaN } else emptyList()
+        val out = ArrayList<Double>(a.length())
+        for (i in 0 until a.length()) {
+            val v = a.opt(i)
+            out.add(if (v is Number) v.toDouble() else Double.NaN)
+        }
+        if (fill >= 0) {
+            while (out.size < fill) out.add(Double.NaN)
+            if (out.size > fill) out.subList(fill, out.size).clear()
+        }
+        return out
     }
 
     private fun quatOf(q: Quat): JSONObject = JSONObject()

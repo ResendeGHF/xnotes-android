@@ -164,6 +164,7 @@ import androidx.compose.material.icons.Icons
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.ColorMath
 import com.xnotes.ui.theme.LocalPalette
+import com.xnotes.ui.theme.NotesBrandFont
 import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -515,7 +516,14 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
             Modifier.fillMaxWidth().padding(start = 18.dp, end = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("notes", color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Text(
+                "Notes",
+                color = palette.text.toComposeColor(),
+                fontFamily = NotesBrandFont,
+                fontWeight = FontWeight.Normal,
+                fontSize = 20.sp,
+                letterSpacing = 1.2.sp,
+            )
             Spacer(Modifier.weight(1f))
             Tooltip(stringResource(R.string.collapse_sidebar)) {
                 IconButton(onClick = onCollapse) {
@@ -525,8 +533,8 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
         }
         Spacer(Modifier.height(6.dp))
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-            nav.recent?.let { on -> Command(XnotesIcons.clock, stringResource(R.string.recent), selected = on) { nav.onRecent() } }
-            Command(XnotesIcons.home, stringResource(R.string.home), selected = nav.homeSelected) { nav.onHome() }
+            nav.recent?.let { on -> Command(XnotesIcons.home, stringResource(R.string.home), selected = on) { nav.onRecent() } }
+            Command(XnotesIcons.folder, stringResource(R.string.browse), selected = nav.homeSelected) { nav.onHome() }
             Command(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) {
                 Command(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH, count = nav.trashCount.takeIf { it > 0 }?.toString()) {
@@ -579,8 +587,8 @@ private fun BackstageRail(modifier: Modifier, nav: SidebarNav, onExpand: () -> U
         }
         Spacer(Modifier.height(10.dp))
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
-            nav.recent?.let { on -> RailItem(XnotesIcons.clock, stringResource(R.string.recent), selected = on) { nav.onRecent() } }
-            RailItem(XnotesIcons.home, stringResource(R.string.home), selected = nav.homeSelected) { nav.onHome() }
+            nav.recent?.let { on -> RailItem(XnotesIcons.home, stringResource(R.string.home), selected = on) { nav.onRecent() } }
+            RailItem(XnotesIcons.folder, stringResource(R.string.browse), selected = nav.homeSelected) { nav.onHome() }
             RailItem(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) RailItem(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH) { nav.onSelectView(BackstageView.TRASH) }
             if (nav.pins.isNotEmpty()) Spacer(Modifier.height(8.dp))
@@ -1046,7 +1054,7 @@ private fun ExplorerSection(
                         }
                     }
                     Spacer(Modifier.width(4.dp))
-                    Text("notes", color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    Text("Notes", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 19.sp, letterSpacing = 1.0.sp)
                 }
             }
             Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -2002,9 +2010,9 @@ private fun ExplorerSection(
                         Box(Modifier.height(40.dp).floatingBacking(liftNow, CircleShape, floatFill, floatEdge).liftPadding(liftNow, 14.dp), contentAlignment = Alignment.CenterStart) {
                             val filter = colorFilter
                             if (showRecent) Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(XnotesIcons.clock, null, tint = palette.accent.toComposeColor(), modifier = Modifier.size(18.dp))
+                                Icon(XnotesIcons.home, null, tint = palette.accent.toComposeColor(), modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text(stringResource(R.string.recent), color = palette.text.toComposeColor(), fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                                Text(stringResource(R.string.home), color = palette.text.toComposeColor(), fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1)
                                 Spacer(Modifier.width(6.dp))
                                 Text(stringResource(R.string.opened_on_device), color = palette.textDim.toComposeColor(), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                 if (!recents.isNullOrEmpty()) {
@@ -2329,6 +2337,16 @@ private fun ExplorerSection(
                 editor.clearCameraScan()
             },
             onSaved = { uri -> editor.clearCameraScan(); refreshKey++; callsNow.value.openFile(uri) },
+        )
+    }
+    // A multi-page scan session started from inside a note: tune every page,
+    // then place them all on the note. Hidden in a locked folder like every
+    // other creation path.
+    val scanSession = editor.scanSession
+    if (vaultResolved && !vaultLocked && scanSession != null && !editor.importing) {
+        ScanSessionDialog(
+            session = scanSession,
+            onClose = { editor.clearScanSession() },
         )
     }
     if (createMode == CreateMode.ENCRYPTED_FOLDER) {

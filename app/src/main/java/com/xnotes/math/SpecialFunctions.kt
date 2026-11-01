@@ -1381,4 +1381,55 @@ object Special {
 
     /** The digamma-like logarithmic derivative of Γ, used by symbolic factorial differentiation. */
     fun gammaPrimeOverGamma(x: Double): Double = digamma(x)
+
+    /**
+     * Complex spherical harmonic Y_l^m(θ, φ) in the Condon–Shortley physics convention:
+     * Y = N · P_l^m(cos θ) · e^(imφ) with N = √((2l+1)/(4π) · (l−m)!/(l+m)!).
+     * The associated Legendre factor carries the (−1)^m phase, matching [associatedLegendreP].
+     * Degrees past 1000 are rejected (callers validate); |m| > l is identically zero.
+     */
+    fun sphHarm(l: Int, m: Int, theta: Double, phi: Double): Complex {
+        if (l < 0 || l > 1000 || abs(m) > l || !theta.isFinite() || !phi.isFinite()) {
+            if (l >= 0 && abs(m) > l) return Complex.ZERO
+            return Complex.NaN
+        }
+        val mm = abs(m)
+        // Factorial ratio through log-gamma so mid degrees never overflow.
+        val logNorm = 0.5 * (ln((2 * l + 1).toDouble()) - ln(4.0 * PI) +
+            lnGamma((l - mm + 1).toDouble()) - lnGamma((l + mm + 1).toDouble()))
+        if (!logNorm.isFinite()) return Complex.NaN
+        val p = associatedLegendreP(l, mm, cos(theta))
+        if (!p.isFinite()) return Complex.NaN
+        val nrm = exp(logNorm)
+        // Keep the phase accurate for large |φ|.
+        val twopi = 2.0 * PI
+        val ph = ((phi % twopi) + twopi) % twopi
+        val angle = mm * ph
+        var re = nrm * p * cos(angle)
+        var im = nrm * p * sin(angle)
+        if (m < 0) {
+            // Y_l^(−m) = (−1)^m · conj(Y_l^|m|).
+            if (mm % 2 == 1) {
+                re = -re
+                im = -im
+            }
+            im = -im
+        }
+        return Complex(re, im)
+    }
+
+    /**
+     * Real (tesseral) spherical harmonic, the form textbooks actually plot: Y_l^0 for m = 0,
+     * √2·Re(Y_l^m) for m > 0 and √2·Im(Y_l^|m|) for m < 0. Use as a 3D spherical radius,
+     * e.g. `sphReal(3, 2, th, ph)`, and add terms for linear combinations (multipoles).
+     */
+    fun sphHarmReal(l: Int, m: Int, theta: Double, phi: Double): Double {
+        val y = sphHarm(l, abs(m), theta, phi)
+        if (y.isNaN || !y.isFinite) return Double.NaN
+        return when {
+            m == 0 -> y.re
+            m > 0 -> sqrt(2.0) * y.re
+            else -> sqrt(2.0) * y.im
+        }
+    }
 }

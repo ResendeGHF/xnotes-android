@@ -11,7 +11,10 @@ import com.xnotes.core.pal.Renderer
 import com.xnotes.core.stroke.Sample
 import com.xnotes.core.stroke.StrokeEngine
 import com.xnotes.core.stroke.StrokeGeometry
+import com.xnotes.core.stroke.PencilGrain
+import com.xnotes.core.stroke.RibbonPoints
 import com.xnotes.core.stroke.WetRibbon
+import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 
@@ -245,7 +248,7 @@ class Stroke(
             config.taperMinFactor,
             speedScale,
             smooth = !straight,
-            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER,
+            holdEnds = tool == Tool.PEN || tool == Tool.PENCIL || tool == Tool.HIGHLIGHTER,
             finished = finished,
             smoothScale = smoothScale,
         ).also { cachedGeometry = it }
@@ -333,7 +336,7 @@ class Stroke(
             speedStrength = config.speedStrength,
             speedScale = speedScale,
             smooth = !straight,
-            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER,
+            holdEnds = tool == Tool.PEN || tool == Tool.PENCIL || tool == Tool.HIGHLIGHTER,
             smoothScale = smoothScale,
         )
         // Everything before the sample being added; the caller appends that one itself.
@@ -359,12 +362,15 @@ class Stroke(
         val g = geometry()
         val color = renderColor
         when {
+            // The pencil draws its ribbon as short runs shaded by the paper tooth,
+            // so light strokes break into grain and hard ones fill toward solid.
+            tool == Tool.PENCIL -> paintPencil(r, g, color)
             // The dashed pen draws its (uniform-width) centreline as a dashed, round-capped
             // line rather than a solid ribbon; the full ribbon geometry is still used for
             // bounds/hit-testing/erasing, so the whole line stays selectable through the gaps.
             tool == Tool.DASHED -> paintDashed(r, g, color)
             // The highlighter never glows (a translucent marker; glow is meaningless there).
-            config.neon && tool != Tool.HIGHLIGHTER -> paintNeon(r, g, color)
+            config.neon && tool != Tool.HIGHLIGHTER && tool != Tool.PENCIL -> paintNeon(r, g, color)
             color.a >= 255 -> {
                 // Opaque ink: draw ribbon + caps directly.
                 paintFills(r, g, color)
@@ -399,6 +405,62 @@ class Stroke(
     }
 
     /**
+     * The pencil, for the paged renderer and the wet cache: the ribbon tessellated
+     * once (see [StrokeTessellator.tessellatePencil]) and shaded by the
+     * page-anchored graphite field — the same field the live GL grain samples, so
+     * the committed stroke is the live texture rather than a dotted fallback.
+     * Every value derives from the run's own ribbon points, so baking settled
+     * runs once lands exactly where a full repaint would.
+     */
+    private fun paintPencil(r: Renderer, g: StrokeGeometry, color: Rgba) {
+        if (color.a < 255) {
+            // Translucent ink: accumulate opaquely in a layer, then composite
+            // once, so self-overlaps don't compound — the same rule as all thin ink.
+            r.saveLayerBlended(bounds().outset(PencilGrain.BOUNDS_OUTSET), color.a / 255.0, BlendMode.SRC_OVER)
+            paintPencilOpaque(r, g, color.withAlpha(255))
+            r.restore()
+            return
+        }
+        paintPencilOpaque(r, g, color)
+    }
+
+    private fun paintPencilOpaque(r: Renderer, g: StrokeGeometry, color: Rgba) {
+        if (config.pencilGrain <= 0.0) {
+            paintFills(r, g, color)
+            return
+        }
+        paintPencilRuns(r, g, 0, g.pointCount, color)
+    }
+
+    internal fun paintPencilRuns(r: Renderer, ribbon: RibbonPoints, from: Int, count: Int, color: Rgba) {
+        if (count <= 0) return
+        val grain = config.pencilGrain.coerceIn(0.0, 1.0)
+        val base = color.withAlpha(255)
+        if (grain <= 0.0) {
+            // No tooth: plain fast path, one call like the pen.
+            val centers = FloatArray(2 * count)
+            val radii = FloatArray(count)
+            for (k in 0 until count) {
+                val i = from + k
+                centers[2 * k] = ribbon.cx(i).toFloat()
+                centers[2 * k + 1] = ribbon.cy(i).toFloat()
+                radii[k] = ribbon.hw(i).toFloat()
+            }
+            r.fillDiskRibbon(centers, radii, base)
+            return
+        }
+        val bw = config.baseWidth
+        val m = config.pressureMinFactor
+        val tipMix = PencilGrain.tipMixFor(bw)
+        val seed = PencilGrain.seedFor(ribbon.cx(0), ribbon.cy(0))
+        val mesh = StrokeTessellator.tessellatePencil(
+            ribbon, from, count, StrokeTessellator.DEFAULT_TOLERANCE,
+        ) { i -> PencilGrain.densityAt(ribbon.hw(i), bw, m, grain) }
+        if (mesh.isEmpty) return
+        r.fillPencil(mesh.positions, mesh.colors ?: IntArray(0), mesh.indices, base, seed, tipMix.toFloat())
+    }
+
+    /**
      * Paint [count] points of the live ribbon starting at [from]. The wet cache draws a stroke in
      * two runs — the settled one baked into a raster once, the moving one over it every frame — and
      * a growing ribbon's arrays are over-allocated, so neither run is describable by array length.
@@ -425,6 +487,8 @@ class Stroke(
                     dashPhase = dashPhase,
                 ),
             )
+        } else if (tool == Tool.PENCIL) {
+            paintPencilRuns(r, ribbon, from, count, color)
         } else {
             r.fillDiskRibbon(centers, ribbon.halfWidthArray(), from, count, color)
         }
@@ -432,9 +496,11 @@ class Stroke(
 
     /** Whether the wet cache may bake this stroke's settled ink into a raster. Neon stacks blurred
      *  layers composited at an alpha, and translucent ink compounds where it overlaps itself, so
-     *  neither survives being painted in two runs; both keep the plain every-frame redraw. */
+     *  neither survives being painted in two runs; both keep the plain every-frame redraw.
+     *  The pencil's runs are opaque solid fills like the pen's (neon never applies to it),
+     *  so they bake exactly as well. */
     val wetCacheable: Boolean
-        get() = !config.neon && renderColor.a >= 255
+        get() = renderColor.a >= 255 && (!config.neon || tool == Tool.PENCIL)
 
     /**
      * The dashed pen: a constant-width, round-capped dashed line traced down the smoothed
@@ -478,8 +544,12 @@ class Stroke(
             .coerceAtLeast(NEON_BLOOM_WIDE_MIN)
     }
 
+    /** The pencil's stipple reaches past the plain ribbon by a dot radius plus a
+     *  cell, so its paint bounds grow by that reach; everything else paints what
+     *  [bounds] says. */
     override fun paintBounds(): Rect =
-        if (config.neon && tool != Tool.HIGHLIGHTER) bounds().outset(neonGlowRadius() * 2 + 4)
+        if (config.neon && tool != Tool.HIGHLIGHTER && tool != Tool.PENCIL) bounds().outset(neonGlowRadius() * 2 + 4)
+        else if (tool == Tool.PENCIL) bounds().outset(PencilGrain.BOUNDS_OUTSET)
         else bounds()
 
     private fun paintNeon(r: Renderer, g: StrokeGeometry, color: Rgba) {

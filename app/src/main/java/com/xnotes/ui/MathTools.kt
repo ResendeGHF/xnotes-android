@@ -75,14 +75,14 @@ internal enum class CalculusTool(val labelRes: Int) {
 
 internal class CalculusState {
     var tool by mutableStateOf(CalculusTool.DERIVATIVE)
-    var expression by mutableStateOf("x^3 - 3x + 1")
+    var expression by mutableStateOf("")
     var variable by mutableStateOf("x")
     var at by mutableStateOf("1")
     var order by mutableStateOf("1")
     var a by mutableStateOf("0")
     var b by mutableStateOf("1")
     var method by mutableStateOf("adaptive")
-    var odeExpression by mutableStateOf("-0.8y + sin(x)")
+    var odeExpression by mutableStateOf("")
     var x0 by mutableStateOf("0")
     var y0 by mutableStateOf("1")
     var x1 by mutableStateOf("8")
@@ -92,7 +92,7 @@ internal class CalculusState {
     var rootB by mutableStateOf("2")
     var guess by mutableStateOf("1")
     var rootMethod by mutableStateOf("bisection")
-    var seriesExpression by mutableStateOf("1/n^2")
+    var seriesExpression by mutableStateOf("")
     var seriesFrom by mutableStateOf("1")
     var seriesTo by mutableStateOf("60")
 
@@ -465,7 +465,7 @@ internal fun MiniPlot(points: List<SamplePoint>, modifier: Modifier = Modifier) 
 // ---------------------------------------------------------------------------------- symbolic
 
 internal class SymbolicState {
-    var expression by mutableStateOf("x^3 - 3x + 1")
+    var expression by mutableStateOf("")
     var variable by mutableStateOf("x")
     var at by mutableStateOf("0")
     var order by mutableStateOf("6")
@@ -636,7 +636,7 @@ internal class UnitState {
     var category by mutableStateOf(Units.categories.first().name)
     var from by mutableStateOf(Units.categories.first().units.first().symbol)
     var to by mutableStateOf(Units.categories.first().units.getOrNull(1)?.symbol ?: Units.categories.first().units.first().symbol)
-    var value by mutableStateOf("1")
+    var value by mutableStateOf("")
 
     fun selectCategory(name: String) {
         val c = Units.category(name) ?: return

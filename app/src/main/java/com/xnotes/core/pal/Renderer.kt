@@ -175,6 +175,42 @@ interface Renderer {
         for (i in from until end) if (radii[i] > 0f) fillCircle(pt(i), radii[i].toDouble(), color)
     }
 
+    /**
+     * Fill a pencil run: the swept ribbon as a triangle mesh (see
+     * [com.xnotes.core.infinite.StrokeTessellator.tessellatePencil]) carrying
+     * per-vertex density/edge control bytes, shaded by the page-anchored
+     * graphite field. The mesh never self-overlaps, so compositing unions
+     * exactly like opaque ink and overlapping runs repaint identically.
+     * [seed] decorrelates the grain per stroke and [tipMix] fades the coarse
+     * bands for fine tips; both must match the live GL uniforms for the
+     * committed stroke to be the live texture.
+     * The default fills the silhouette flat, for backends without a rasterizer.
+     */
+    fun fillPencil(
+        positions: DoubleArray,
+        colors: IntArray,
+        indices: IntArray,
+        ink: Rgba,
+        seed: Int = 0,
+        tipMix: Float = 0f,
+    ) {
+        var t = 0
+        while (t + 2 < indices.size) {
+            val a = indices[t] * 2
+            val b = indices[t + 1] * 2
+            val c = indices[t + 2] * 2
+            fillPolygon(
+                listOf(
+                    Pt(positions[a], positions[a + 1]),
+                    Pt(positions[b], positions[b + 1]),
+                    Pt(positions[c], positions[c + 1]),
+                ),
+                ink,
+            )
+            t += 3
+        }
+    }
+
     // --- outlines (cosmetic for chrome, page-space for shapes) ---
     fun strokeRect(rect: Rect, pen: Pen)
     fun strokePolyline(points: List<Pt>, pen: Pen)

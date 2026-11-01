@@ -18,6 +18,7 @@ import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.ShapeLabel
 import com.xnotes.core.model.TapeItem
 import com.xnotes.core.model.TapePattern
+import com.xnotes.core.model.TableItem
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.model.TextStyle
@@ -233,6 +234,17 @@ class EditText(
         item.text = oldText
     }
 
+    override fun touched(locate: (CanvasItem) -> Page?) = pagedItems(listOf(item), locate)
+}
+
+/** Replace a table's cell grid (rows × cols of text) as one undoable edit. */
+class EditTableCells(
+    private val item: TableItem,
+    private val oldCells: List<List<String>>,
+    private val newCells: List<List<String>>,
+) : Command {
+    override fun redo() = item.setCells(newCells)
+    override fun undo() = item.setCells(oldCells)
     override fun touched(locate: (CanvasItem) -> Page?) = pagedItems(listOf(item), locate)
 }
 

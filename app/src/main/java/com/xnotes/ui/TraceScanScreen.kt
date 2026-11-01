@@ -38,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -55,13 +56,17 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.xnotes.R
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.text.VlmLatex
+import com.xnotes.core.text.VlmTraceTune
 import com.xnotes.core.util.Paths
+import com.xnotes.platform.VlmClient
 import com.xnotes.scan.InkVectorizer
 import com.xnotes.scan.TraceDocument
 import com.xnotes.scan.TracePreprocess
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
+import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -69,6 +74,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 /**
  * "Trace scan into strokes": turn a photo/scan of handwritten paper (or a PDF of
@@ -117,7 +123,9 @@ fun TraceScanDialog(
     var threshold by remember { mutableFloatStateOf(128f) }
     var enhance by remember { mutableStateOf(true) }
     var invert by remember { mutableStateOf(false) }
-    var denoise by remember { mutableFloatStateOf(8f) }
+    var denoise by remember { mutableFloatStateOf(4f) }
+    var removeLines by remember { mutableStateOf(true) }
+    var printedText by remember { mutableStateOf(false) }
     var inkWidth by remember { mutableFloatStateOf(3f) }
     var inkIndex by remember { mutableIntStateOf(0) }
     var showBinary by remember { mutableStateOf(true) }
@@ -132,6 +140,14 @@ fun TraceScanDialog(
     var converting by remember { mutableStateOf(false) }
     var convertProgress by remember { mutableStateOf("") }
     var convertError by remember { mutableStateOf<String?>(null) }
+    // Vision-model auto-tune: suggests the filter settings for this page.
+    var tuning by remember { mutableStateOf(false) }
+    var tuneMessage by remember { mutableStateOf<String?>(null) }
+    var tuneIsError by remember { mutableStateOf(false) }
+    // Per-page AI recipes: page index → the tune stored for it. The preview
+    // and the conversion use a page's recipe when present, the dialog sliders
+    // otherwise, so every PDF page can carry different settings.
+    val pageTunes = remember { mutableStateMapOf<Int, VlmTraceTune.TraceTune>() }
 
     // Serializes the preview pipeline against source-bitmap replacement, so a
     // trace never reads a bitmap the page flip just recycled.
@@ -160,6 +176,191 @@ fun TraceScanDialog(
         val r = 1f - (cropR / 100f).coerceIn(0f, 0.4f)
         val b = 1f - (cropB / 100f).coerceIn(0f, 0.4f)
         return TracePreprocess.CropFrac(l.coerceAtMost(r - 0.05f), t.coerceAtMost(b - 0.05f), r, b)
+    }
+
+    /**
+     * The filter settings in force for page [p]: its stored AI recipe where
+     * set, the dialog sliders everywhere else. Geometry (crop, fine angle)
+     * stays global; the quarter turn rides with the recipe since page
+     * orientation is genuinely per page.
+     */
+    fun effectiveFor(p: Int): EffectiveTraceParams {
+        val t = pageTunes[p]
+        return EffectiveTraceParams(
+            autoThreshold = t?.autoThreshold ?: autoThreshold,
+            threshold = (t?.threshold ?: threshold.toInt()).coerceIn(1, 254),
+            brightness = t?.brightness ?: brightness.toInt(),
+            contrast = (t?.contrast ?: contrast.toInt()).coerceIn(50, 200),
+            denoise = (t?.denoise ?: denoise.toInt()).coerceIn(0, 60),
+            removeLines = t?.removeLines ?: removeLines,
+            printedText = t?.printedText ?: printedText,
+            invert = t?.invert ?: invert,
+            enhance = t?.enhance ?: enhance,
+            quarterTurns = (t?.quarterTurns ?: quarterTurns).coerceIn(0, 3),
+        )
+    }
+
+    /** Human-readable summary of the present settings, sent along for the model. */
+    fun currentSettingsSummary(): String {
+        val on = context.getString(R.string.trace_ai_on)
+        val off = context.getString(R.string.trace_ai_off)
+        return listOf(
+            "${context.getString(R.string.trace_auto_threshold)} ${if (autoThreshold) on else "${context.getString(R.string.trace_threshold)} ${threshold.toInt()}"}",
+            "${context.getString(R.string.trace_brightness)} ${brightness.toInt()}",
+            "${context.getString(R.string.trace_contrast)} ${contrast.toInt()}%",
+            "${context.getString(R.string.trace_cleanup)} ${denoise.toInt()}px",
+            "${context.getString(R.string.trace_remove_lines)} ${if (removeLines) on else off}",
+            "${context.getString(R.string.trace_content)} ${context.getString(if (printedText) R.string.trace_content_print else R.string.trace_content_hand)}",
+            "${context.getString(R.string.trace_invert)} ${if (invert) on else off}",
+            "${context.getString(R.string.trace_auto_enhance)} ${if (enhance) on else off}",
+            "${context.getString(R.string.trace_rotation)} ${context.getString(R.string.trace_degrees, quarterTurns * 90)}",
+        ).joinToString("; ")
+    }
+
+    /**
+     * Build the image the model judges: the adjusted photo beside the current
+     * edges preview, labelled, so it can see which ink survives and which
+     * artifacts remain. Takes ownership of [photo] and [mask] (recycled).
+     */
+    fun labeledTuneImage(photo: Bitmap, mask: Bitmap): Bitmap {
+        val labelH = (maxOf(photo.height, mask.height) / 14).coerceIn(28, 72)
+        fun labeled(src: Bitmap, caption: String): Bitmap {
+            val out = Bitmap.createBitmap(src.width, src.height + labelH, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(out)
+            canvas.drawColor(0xFFFFFFFF.toInt())
+            canvas.drawBitmap(src, 0f, labelH.toFloat(), null)
+            val paint = android.graphics.Paint().apply {
+                color = 0xFF000000.toInt()
+                textSize = labelH * 0.55f
+                isAntiAlias = true
+            }
+            canvas.drawText(caption, labelH * 0.35f, labelH * 0.72f, paint)
+            return out
+        }
+        val left = labeled(photo, "PHOTO")
+        val right = labeled(mask, "EDGES")
+        // Same height halves keep thin strokes legible on both sides.
+        val h = maxOf(left.height, right.height)
+        fun fit(src: Bitmap): Bitmap {
+            if (src.height == h) return src
+            val w = (src.width * (h.toDouble() / src.height)).roundToInt().coerceAtLeast(1)
+            val scaled = Bitmap.createScaledBitmap(src, w, h, true)
+            if (scaled !== src) src.recycle()
+            return scaled
+        }
+        val l = fit(left)
+        val r = fit(right)
+        val out = Bitmap.createBitmap(l.width + r.width, h, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(out)
+        canvas.drawColor(0xFFFFFFFF.toInt())
+        canvas.drawBitmap(l, 0f, 0f, null)
+        canvas.drawBitmap(r, l.width.toFloat(), 0f, null)
+        l.recycle()
+        r.recycle()
+        return out
+    }
+
+    /**
+     * Ask the configured vision model for this page's best filter settings and
+     * apply whatever it returns. The model sees the photo beside the current
+     * edges preview and must answer with explicit values (automatic modes are
+     * normalized away); the recipe is stored for this page and applied to the
+     * dialog, so the preview updates at once and the conversion reuses it.
+     */
+    fun autoTune() {
+        val src = sourceBmp ?: return
+        if (tuning || converting) return
+        editor.aiExportBlocker()?.let {
+            tuneMessage = it
+            tuneIsError = true
+            return
+        }
+        tuning = true
+        tuneMessage = null
+        val page = pageIndex
+        val summary = currentSettingsSummary()
+        val snapCrop = crop()
+        val snapFine = fineDegrees
+        // Copy synchronously: the preview pipeline may retire this generation
+        // while the model call is in flight; everything below works on the copy.
+        val snap = runCatching { src.copy(src.config ?: Bitmap.Config.ARGB_8888, false) }.getOrNull()
+        scope.launch {
+            try {
+                if (snap == null) throw IllegalStateException(context.getString(R.string.trace_ai_failed))
+                val eff = effectiveFor(page)
+                // Photo + edges preview with the settings in force, built fresh
+                // so the model judges exactly what the tracer sees.
+                val built = withContext(Dispatchers.Default) {
+                    runCatching {
+                        val geo = TracePreprocess.adjustGeometry(snap, snapCrop, eff.quarterTurns, snapFine)
+                        val photo = TracePreprocess.adjustPhoto(geo, eff.brightness, eff.contrast)
+                        if (photo !== geo) geo.recycle()
+                        val raw = TracePreprocess.toLuminance(photo)
+                        val lum = if (eff.enhance) InkVectorizer.autoEnhance(raw, photo.width, photo.height) else raw
+                        val opts = InkVectorizer.TraceOptions(
+                            threshold = if (eff.autoThreshold) null else eff.threshold,
+                            adaptive = eff.autoThreshold && !eff.invert,
+                            invert = eff.invert,
+                            denoisePx = eff.denoise,
+                            removeRulings = eff.removeLines,
+                            printedText = eff.printedText,
+                        )
+                        val mask = InkVectorizer.inkMask(lum, photo.width, photo.height, opts)
+                        val edges = TracePreprocess.maskPreview(mask, photo.width, photo.height)
+                        val composed = labeledTuneImage(photo, edges)
+                        photo.recycle()
+                        edges.recycle()
+                        snap.recycle()
+                        Triple(composed, InkVectorizer.otsuThreshold(raw), opts)
+                    }.getOrNull()
+                } ?: throw IllegalStateException(context.getString(R.string.trace_ai_failed))
+                val png = withContext(Dispatchers.Default) {
+                    val bmp = built.first
+                    val (tw, th) = VlmLatex.rasterSize(bmp.width.toFloat(), bmp.height.toFloat())
+                    val scaled = Bitmap.createScaledBitmap(bmp, tw, th, true)
+                    bmp.recycle()
+                    val out = ByteArrayOutputStream()
+                    val ok = scaled.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    scaled.recycle()
+                    if (!ok) null else out.toByteArray()
+                } ?: throw IllegalStateException(context.getString(R.string.trace_ai_failed))
+                val config = editor.vlmConfig()
+                val raw = withContext(Dispatchers.IO) {
+                    VlmClient.askRaw(png, VlmTraceTune.promptFor(summary), config)
+                }
+                val parsed = VlmTraceTune.parseRecommendation(raw)
+                    ?: throw IllegalStateException(context.getString(R.string.trace_ai_failed))
+                // No automatic modes, ever: stray `true` values fall back to an
+                // explicit recipe (Otsu level for the threshold).
+                val tune = VlmTraceTune.normalizeManual(parsed, built.second)
+                pageTunes[page] = tune
+                val on = context.getString(R.string.trace_ai_on)
+                val off = context.getString(R.string.trace_ai_off)
+                val changes = ArrayList<String>()
+                tune.autoThreshold?.let { autoThreshold = it }
+                tune.threshold?.let { threshold = it.toFloat(); changes.add("${context.getString(R.string.trace_threshold)} $it") }
+                tune.brightness?.let { brightness = it.toFloat(); changes.add("${context.getString(R.string.trace_brightness)} $it") }
+                tune.contrast?.let { contrast = it.toFloat(); changes.add("${context.getString(R.string.trace_contrast)} $it%") }
+                tune.denoise?.let { denoise = it.toFloat(); changes.add("${context.getString(R.string.trace_cleanup)} ${it}px") }
+                tune.removeLines?.let { removeLines = it; changes.add("${context.getString(R.string.trace_remove_lines)} ${if (it) on else off}") }
+                tune.printedText?.let {
+                    printedText = it
+                    changes.add("${context.getString(R.string.trace_content)} ${context.getString(if (it) R.string.trace_content_print else R.string.trace_content_hand)}")
+                }
+                tune.invert?.let { invert = it; changes.add("${context.getString(R.string.trace_invert)} ${if (it) on else off}") }
+                tune.enhance?.let { enhance = it }
+                tune.quarterTurns?.let {
+                    quarterTurns = it
+                    changes.add("${context.getString(R.string.trace_rotation)} ${context.getString(R.string.trace_degrees, it * 90)}")
+                }
+                tuneMessage = context.getString(R.string.trace_ai_applied, changes.joinToString(", "))
+                tuneIsError = false
+            } catch (e: Exception) {
+                tuneMessage = e.message?.takeIf { it.isNotBlank() } ?: context.getString(R.string.trace_ai_failed)
+                tuneIsError = true
+            }
+            tuning = false
+        }
     }
 
     // Stage the pick once: copy the content URI aside, classify, count PDF pages.
@@ -201,6 +402,8 @@ fun TraceScanDialog(
             }
             staged = file
             kind = k
+            // A new document means new pages: drop any stored AI recipes.
+            pageTunes.clear()
         }
     }
 
@@ -226,41 +429,44 @@ fun TraceScanDialog(
         working = false
     }
 
-    // Debounced re-trace of the preview page on any param change.
+    // Debounced re-trace of the preview page on any param change. The page's
+    // stored AI recipe wins over the dialog sliders (see [effectiveFor]), so
+    // every PDF page previews exactly what the conversion will trace for it.
     LaunchedEffect(
-        sourceBmp, quarterTurns, fineDegrees, cropL, cropT, cropR, cropB,
-        brightness, contrast, enhance, autoThreshold, threshold, invert, denoise,
+        sourceBmp, pageIndex, quarterTurns, fineDegrees, cropL, cropT, cropR, cropB,
+        brightness, contrast, enhance, autoThreshold, threshold, invert, denoise, removeLines, printedText,
+        pageTunes[pageIndex],
     ) {
         val src = sourceBmp ?: return@LaunchedEffect
         delay(250)
         working = true
         outOfMemory = false
-        val snapAuto = autoThreshold
-        val snapLevel = threshold.toInt().coerceIn(1, 254)
-        val snapEnhance = enhance
-        val snapInvert = invert
-        val snapDenoise = denoise.toInt()
+        val eff = effectiveFor(pageIndex)
         val result = traceMutex.withLock {
             try {
                 withContext(Dispatchers.Default) {
                     runCatching {
-                        val geo = TracePreprocess.adjustGeometry(src, crop(), quarterTurns, fineDegrees)
-                        val photo = TracePreprocess.adjustPhoto(geo, brightness.toInt(), contrast.toInt())
+                        val geo = TracePreprocess.adjustGeometry(src, crop(), eff.quarterTurns, fineDegrees)
+                        val photo = TracePreprocess.adjustPhoto(geo, eff.brightness, eff.contrast)
                         if (photo !== geo) geo.recycle()
                         val raw = TracePreprocess.toLuminance(photo)
-                        val lum = if (snapEnhance) InkVectorizer.autoEnhance(raw, photo.width, photo.height) else raw
+                        val lum = if (eff.enhance) InkVectorizer.autoEnhance(raw, photo.width, photo.height) else raw
                         val opts = InkVectorizer.TraceOptions(
-                            threshold = if (snapAuto) null else snapLevel,
-                            adaptive = snapAuto && !snapInvert,
-                            invert = snapInvert,
-                            denoisePx = snapDenoise,
+                            threshold = if (eff.autoThreshold) null else eff.threshold,
+                            adaptive = eff.autoThreshold && !eff.invert,
+                            invert = eff.invert,
+                            denoisePx = eff.denoise,
+                            removeRulings = eff.removeLines,
+                            printedText = eff.printedText,
                         )
                         val paths = InkVectorizer.vectorize(lum, photo.width, photo.height, opts)
-                        val mask = InkVectorizer.applyThreshold(lum, photo.width, photo.height, opts)
+                        // The cleaned mask (denoise + ruling removal + gap closing),
+                        // so the preview is exactly what the tracer skeletonizes.
+                        val mask = InkVectorizer.inkMask(lum, photo.width, photo.height, opts)
                         val preview = TracePreprocess.maskPreview(mask, photo.width, photo.height)
                         photo.recycle()
                         // The level the auto mode settled on (-1 for local Sauvola).
-                        val shown = if (!snapAuto) snapLevel else if (snapInvert) InkVectorizer.otsuThreshold(lum) else -1
+                        val shown = if (!eff.autoThreshold) eff.threshold else if (eff.invert) InkVectorizer.otsuThreshold(lum) else -1
                         Triple(TraceDocument.TracedPage(paths, photo.width, photo.height), preview, shown)
                     }.getOrNull()
                 }
@@ -303,7 +509,6 @@ fun TraceScanDialog(
         converting = true
         convertError = null
         val snapCrop = crop()
-        val snapQ = quarterTurns
         val snapFine = fineDegrees
         val snapBright = brightness.toInt()
         val snapContrast = contrast.toInt()
@@ -312,9 +517,30 @@ fun TraceScanDialog(
         val snapEnhance = enhance
         val snapInvert = invert
         val snapDenoise = denoise.toInt()
+        val snapLines = removeLines
+        val snapPrint = printedText
+        val snapQ = quarterTurns
         val snapInk = inks[inkIndex.coerceIn(inks.indices)]
         val snapWidth = inkWidth
         val snapName = noteName.ifBlank { Paths.stem(request.sourceName).ifEmpty { "Traced notes" } }
+        // Freeze every page's recipe up front: flipping pages or dragging
+        // sliders mid-run must not change what later pages trace with.
+        val frozenTunes = HashMap(pageTunes)
+        fun effFor(p: Int): EffectiveTraceParams {
+            val t = frozenTunes[p]
+            return EffectiveTraceParams(
+                autoThreshold = t?.autoThreshold ?: snapAuto,
+                threshold = (t?.threshold ?: snapLevel).coerceIn(1, 254),
+                brightness = t?.brightness ?: snapBright,
+                contrast = (t?.contrast ?: snapContrast).coerceIn(50, 200),
+                denoise = (t?.denoise ?: snapDenoise).coerceIn(0, 60),
+                removeLines = t?.removeLines ?: snapLines,
+                printedText = t?.printedText ?: snapPrint,
+                invert = t?.invert ?: snapInvert,
+                enhance = t?.enhance ?: snapEnhance,
+                quarterTurns = (t?.quarterTurns ?: snapQ).coerceIn(0, 3),
+            )
+        }
         scope.launch {
             // An OOM anywhere below becomes a message, never a crash: nothing has
             // been written yet at this point, so there is no partial note to clean.
@@ -326,6 +552,7 @@ fun TraceScanDialog(
                     val n = if (k == TracePreprocess.TraceKind.PDF) pageCount else 1
                     for (p in 0 until n) {
                         convertProgress = if (n > 1) context.getString(R.string.trace_progress_pages, p + 1, n) else ""
+                        val eff = effFor(p)
                         val src = withContext(Dispatchers.IO) {
                             when (k) {
                                 TracePreprocess.TraceKind.IMAGE -> TracePreprocess.decodeBounded(file, side)
@@ -333,18 +560,20 @@ fun TraceScanDialog(
                             }
                         } ?: continue
                         val traced = runCatching {
-                            val geo = TracePreprocess.adjustGeometry(src, snapCrop, snapQ, snapFine)
-                            val photo = TracePreprocess.adjustPhoto(geo, snapBright, snapContrast)
+                            val geo = TracePreprocess.adjustGeometry(src, snapCrop, eff.quarterTurns, snapFine)
+                            val photo = TracePreprocess.adjustPhoto(geo, eff.brightness, eff.contrast)
                             if (photo !== geo) geo.recycle()
                             val raw = TracePreprocess.toLuminance(photo)
-                            val lum = if (snapEnhance) InkVectorizer.autoEnhance(raw, photo.width, photo.height) else raw
+                            val lum = if (eff.enhance) InkVectorizer.autoEnhance(raw, photo.width, photo.height) else raw
                             val paths = InkVectorizer.vectorize(
                                 lum, photo.width, photo.height,
                                 InkVectorizer.TraceOptions(
-                                    threshold = if (snapAuto) null else snapLevel,
-                                    adaptive = snapAuto && !snapInvert,
-                                    invert = snapInvert,
-                                    denoisePx = snapDenoise,
+                                    threshold = if (eff.autoThreshold) null else eff.threshold,
+                                    adaptive = eff.autoThreshold && !eff.invert,
+                                    invert = eff.invert,
+                                    denoisePx = eff.denoise,
+                                    removeRulings = eff.removeLines,
+                                    printedText = eff.printedText,
                                 ),
                             )
                             val page = TraceDocument.TracedPage(paths, photo.width, photo.height)
@@ -438,30 +667,46 @@ fun TraceScanDialog(
 
                 @Composable
                 fun PreviewBar(modifier: Modifier) {
-                    Row(
-                        modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        if (kind == TracePreprocess.TraceKind.PDF && pageCount > 1) {
-                            TextButton(onClick = { pageIndex = (pageIndex - 1).coerceAtLeast(0) }, enabled = pageIndex > 0) { Text("‹") }
-                            Text(
-                                context.getString(R.string.trace_page_of, pageIndex + 1, pageCount),
-                                color = dim, fontSize = 13.sp, modifier = Modifier.weight(1f),
-                            )
-                            TextButton(onClick = { pageIndex = (pageIndex + 1).coerceAtMost(pageCount - 1) }, enabled = pageIndex < pageCount - 1) { Text("›") }
-                        } else {
-                            val n = estimate?.paths?.size ?: 0
-                            Text(
-                                if (showBinary) context.getString(R.string.trace_strokes_found, n)
-                                else stringResource(R.string.trace_photo_preview),
-                                color = dim, fontSize = 13.sp, modifier = Modifier.weight(1f),
-                            )
+                    Column(modifier) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            if (kind == TracePreprocess.TraceKind.PDF && pageCount > 1) {
+                                TextButton(onClick = { pageIndex = (pageIndex - 1).coerceAtLeast(0) }, enabled = pageIndex > 0) { Text("‹") }
+                                Text(
+                                    context.getString(R.string.trace_page_of, pageIndex + 1, pageCount),
+                                    color = dim, fontSize = 13.sp, modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = { pageIndex = (pageIndex + 1).coerceAtMost(pageCount - 1) }, enabled = pageIndex < pageCount - 1) { Text("›") }
+                            } else {
+                                val n = estimate?.paths?.size ?: 0
+                                Text(
+                                    if (showBinary) context.getString(R.string.trace_strokes_found, n)
+                                    else stringResource(R.string.trace_photo_preview),
+                                    color = dim, fontSize = 13.sp, modifier = Modifier.weight(1f),
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { showBinary = !showBinary }) {
+                                Switch(checked = showBinary, onCheckedChange = { showBinary = it })
+                                Spacer(Modifier.width(6.dp))
+                                Text(stringResource(R.string.trace_show_edges), color = dim, fontSize = 13.sp)
+                            }
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { showBinary = !showBinary }) {
-                            Switch(checked = showBinary, onCheckedChange = { showBinary = it })
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.trace_show_edges), color = dim, fontSize = 13.sp)
+                        // A stored AI recipe overrides the sliders for this page.
+                        if (pageTunes.containsKey(pageIndex)) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    stringResource(R.string.trace_ai_page_badge, pageIndex + 1),
+                                    color = accent, fontSize = 13.sp, modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = { pageTunes.remove(pageIndex) }) { Text(stringResource(R.string.trace_ai_page_reset)) }
+                            }
                         }
                     }
                 }
@@ -495,6 +740,46 @@ fun TraceScanDialog(
                         TraceSlider(stringResource(R.string.trace_margin_bottom), cropB, 0f, 25f, "%.0f%%") { cropB = it }
                     }
                     TraceSection(stringResource(R.string.trace_section_filters)) {
+                        Button(
+                            onClick = ::autoTune,
+                            enabled = !tuning && !converting && sourceBmp != null,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (tuning) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text(stringResource(R.string.trace_ai_tuning))
+                            } else {
+                                Icon(XnotesIcons.magicWand, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(stringResource(R.string.trace_ai_tune))
+                            }
+                        }
+                        Text(stringResource(R.string.trace_ai_hint), color = dim, fontSize = 12.sp)
+                        if (tuneMessage != null) {
+                            Text(
+                                tuneMessage ?: "",
+                                color = if (tuneIsError) palette.danger.toComposeColor() else dim,
+                                fontSize = 13.sp, modifier = Modifier.padding(vertical = 4.dp),
+                            )
+                        }
+                        Text(stringResource(R.string.trace_content), color = dim, fontSize = 13.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for ((label, print) in listOf(
+                                stringResource(R.string.trace_content_hand) to false,
+                                stringResource(R.string.trace_content_print) to true,
+                            )) {
+                                val on = printedText == print
+                                Text(
+                                    label, color = if (on) accent else dim,
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                                        .background(if (on) palette.selectionBackground.toComposeColor() else palette.menuBg.toComposeColor())
+                                        .clickable { printedText = print }.padding(horizontal = 12.dp, vertical = 8.dp),
+                                )
+                            }
+                        }
+                        Text(stringResource(R.string.trace_content_hint), color = dim, fontSize = 12.sp)
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.trace_auto_enhance), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
                             Switch(checked = enhance, onCheckedChange = { enhance = it })
@@ -525,6 +810,11 @@ fun TraceScanDialog(
                         }
                         Text(stringResource(R.string.trace_invert_hint), color = dim, fontSize = 12.sp)
                         TraceSlider(stringResource(R.string.trace_cleanup), denoise, 0f, 60f, "%.0f") { denoise = it }
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Text(stringResource(R.string.trace_remove_lines), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                            Switch(checked = removeLines, onCheckedChange = { removeLines = it })
+                        }
+                        Text(stringResource(R.string.trace_remove_lines_hint), color = dim, fontSize = 12.sp)
                     }
                     TraceSection(stringResource(R.string.trace_section_ink)) {
                         TraceSlider(stringResource(R.string.trace_stroke_width), inkWidth, 1f, 12f, "%.1f") { inkWidth = it }
@@ -595,6 +885,23 @@ fun TraceScanDialog(
         }
     }
 }
+
+/**
+ * The filter settings in force for one page: plain values (no nulls), resolved
+ * from a stored AI recipe over the dialog sliders by [TraceScanDialog].
+ */
+private data class EffectiveTraceParams(
+    val autoThreshold: Boolean,
+    val threshold: Int,
+    val brightness: Int,
+    val contrast: Int,
+    val denoise: Int,
+    val removeLines: Boolean,
+    val printedText: Boolean,
+    val invert: Boolean,
+    val enhance: Boolean,
+    val quarterTurns: Int,
+)
 
 /** Max PDF pages traced in one run (memory + note-size bound). */
 private const val MAX_TRACE_PAGES = 30

@@ -9,10 +9,12 @@ import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TapeItem
 import com.xnotes.core.model.TapePattern
 import com.xnotes.core.pal.FontSpec
+import com.xnotes.core.stroke.PencilGrain
 import com.xnotes.core.stroke.RibbonPoints
 import com.xnotes.core.tape.TapeGeometry
 import com.xnotes.core.tools.Tool
@@ -21,6 +23,17 @@ import com.xnotes.core.tools.Tool
 enum class InkPass {
     /** Straight into the batched draw; the colour is baked into the vertices. */
     OPAQUE,
+
+    /**
+     * Like [OPAQUE] but the fragment shader shades the pencil's paper grain: the
+     * page-anchored graphite field evaluated per pixel, gated by the per-vertex
+     * graphite density (alpha channel) and edge falloff (red channel). Drawn in
+     * its own calls with the ink colour as a uniform override, so the batching
+     * [OPAQUE] enjoys never mixes grain with flat ink. The mesh carries no
+     * overlapping triangles, so alpha unions exactly like opaque ink and live
+     * runs join the committed stroke seamlessly.
+     */
+    PENCIL,
 
     /** Stencilled, then covered once at its own alpha, so self-overlap cannot darken. */
     TRANSLUCENT,
@@ -77,6 +90,8 @@ class MeshPart(
     val glow: GlowSpec? = null,
     /** Set on a covered tape's body: a highlight beneath it, composited last, has to be drawn round it. */
     val covers: Boolean = false,
+    /** Set on a [InkPass.PENCIL] part: the stroke's grain seed and tip mix. */
+    val pencil: PencilGrain.PencilParams? = null,
 )
 
 /** An item turned into triangles, with everything the renderer needs to draw it. */
@@ -116,12 +131,12 @@ object ItemMesher {
             is ConnectorItem -> meshConnector(item, tolerance)
             is AudioItem -> meshAudio(item, tolerance)
             is TapeItem -> meshTape(item, tolerance)
+            is StickyNoteItem -> meshSticky(item, tolerance)
             else -> null // images carry a texture rather than a colour, and take their own path
         }
 
     /** Tape as its body and the pattern printed on it, or, peeled, as the dashed edge of where it lies. All opaque. */
-    private fun meshTape(item: TapeItem, tolerance: Double): MeshedItem? {
-        val s = item.shape
+    private fun meshTape(item: TapeItem, tolerance: Double): MeshedItem? {        val s = item.shape
         val parts = ArrayList<MeshPart>(2)
         if (item.peeled) {
             val b = MeshBuilder()
@@ -142,6 +157,112 @@ object ItemMesher {
             if (!print.isEmpty) parts.add(MeshPart(print.build(), item.printColor, InkPass.OPAQUE))
         }
         return if (parts.isEmpty()) null else MeshedItem(parts, item.paintBounds())
+    }
+
+    /** Sticky paper as an opaque body with its fold, text glyphs and note-local ink. */
+    private fun meshSticky(item: StickyNoteItem, tolerance: Double): MeshedItem? {
+        val parts = ArrayList<MeshPart>()
+        if (item.collapsed) {
+            val b = item.iconRect()
+            val outline = StickyNoteItem.iconOutline(b)
+            MeshBuilder().also { body ->
+                body.polygon(outline)
+                if (!body.isEmpty) parts.add(MeshPart(body.build(), item.paperColor(), InkPass.OPAQUE, covers = true))
+            }
+            // Outline in the paper color itself, then the fold and ruled lines.
+            MeshBuilder().also { edge ->
+                edge.polylineRibbon(outline, StickyNoteItem.ICON_EDGE_WIDTH / 2.0, true, tolerance)
+                if (!edge.isEmpty) parts.add(MeshPart(edge.build(), item.edgeColor(), InkPass.OPAQUE))
+            }
+            val f = StickyNoteItem.ICON_FOLD
+            MeshBuilder().also { fold ->
+                fold.polygon(listOf(Pt(b.right - f, b.top), Pt(b.right, b.top + f), Pt(b.right - f, b.top + f)))
+                if (!fold.isEmpty) parts.add(MeshPart(fold.build(), item.foldColor(), InkPass.OPAQUE))
+            }
+            val linePen = StickyNoteItem.ICON_EDGE_WIDTH / 2.0 * 0.72
+            MeshBuilder().also { lines ->
+                val y1 = b.top + StickyNoteItem.ICON_SIZE * 0.55
+                val y2 = b.top + StickyNoteItem.ICON_SIZE * 0.72
+                lines.polylineRibbon(listOf(Pt(b.left + 8.0, y1), Pt(b.right - 8.0, y1)), linePen, false, tolerance)
+                lines.polylineRibbon(listOf(Pt(b.left + 8.0, y2), Pt(b.right - 15.0, y2)), linePen, false, tolerance)
+                if (!lines.isEmpty) parts.add(MeshPart(lines.build(), item.detailColor(), InkPass.OPAQUE))
+            }
+            return if (parts.isEmpty()) null else MeshedItem(parts, item.paintBounds())
+        }
+        val b = item.rect
+        MeshBuilder().also { body ->
+            body.polygon(listOf(b.topLeft, Pt(b.right, b.top), Pt(b.right, b.bottom), Pt(b.left, b.bottom)))
+            if (!body.isEmpty) parts.add(MeshPart(body.build(), item.paperColor(), InkPass.OPAQUE, covers = true))
+        }
+        MeshBuilder().also { border ->
+            border.polylineRibbon(
+                listOf(b.topLeft, Pt(b.right, b.top), Pt(b.right, b.bottom), Pt(b.left, b.bottom)),
+                StickyNoteItem.BORDER_WIDTH / 2.0, true, tolerance,
+            )
+            if (!border.isEmpty) parts.add(MeshPart(border.build(), item.borderColor(), InkPass.OPAQUE))
+        }
+        val f = StickyNoteItem.FOLD
+        MeshBuilder().also { fold ->
+            fold.polygon(listOf(Pt(b.right - f, b.top), Pt(b.right, b.top + f), Pt(b.right - f, b.top + f)))
+            if (!fold.isEmpty) parts.add(MeshPart(fold.build(), item.foldColor(), InkPass.OPAQUE))
+        }
+        // Collapse × (top-left) and the paper-color dot beside it.
+        val fg = item.textColor()
+        MeshBuilder().also { cross ->
+            val c = Pt(b.x + StickyNoteItem.CONTROL_HIT / 2.0, b.y + StickyNoteItem.CONTROL_HIT / 2.0)
+            val h = 5.0
+            cross.polylineRibbon(listOf(Pt(c.x - h, c.y - h), Pt(c.x + h, c.y + h)), 1.0, false, tolerance)
+            cross.polylineRibbon(listOf(Pt(c.x - h, c.y + h), Pt(c.x + h, c.y - h)), 1.0, false, tolerance)
+            if (!cross.isEmpty) parts.add(MeshPart(cross.build(), fg.withAlpha(190), InkPass.OPAQUE))
+        }
+        MeshBuilder().also { dot ->
+            val d = Pt(
+                b.x + StickyNoteItem.CONTROL_HIT + StickyNoteItem.CONTROL_HIT / 2.0,
+                b.y + StickyNoteItem.CONTROL_HIT / 2.0,
+            )
+            dot.circle(d.x, d.y, StickyNoteItem.DOT_RADIUS, tolerance)
+            if (!dot.isEmpty) parts.add(MeshPart(dot.build(), item.paperColor(), InkPass.OPAQUE))
+        }
+        MeshBuilder().also { ring ->
+            val d = Pt(
+                b.x + StickyNoteItem.CONTROL_HIT + StickyNoteItem.CONTROL_HIT / 2.0,
+                b.y + StickyNoteItem.CONTROL_HIT / 2.0,
+            )
+            ring.polylineRibbon(StickyNoteItem.circleOutline(d, StickyNoteItem.DOT_RADIUS), 0.9, true, tolerance)
+            if (!ring.isEmpty) parts.add(MeshPart(ring.build(), fg.withAlpha(190), InkPass.OPAQUE))
+        }
+        // Typed text as glyph triangles, laid out exactly like the paged painter.
+        if (item.text.isNotEmpty()) {
+            val font = FontSpec(StickyNoteItem.TEXT_SIZE, com.xnotes.core.pal.FontFace.SANS)
+            val flags = com.xnotes.core.pal.TextFlags(wordWrap = true, alignLeft = true, alignTop = true, hAlign = com.xnotes.core.pal.HAlign.LEFT)
+            val box = item.textBox()
+            val ink = item.textColor()
+            for (line in item.measurer.outlineLines(item.text, font, box.w, flags)) {
+                ShapeTessellator.textPart(line.contours, ink) { Pt(box.x + line.origin.x + it.x, box.y + line.origin.y + it.y) }
+                    ?.let { parts.add(it) }
+            }
+        }
+        // Note-local ink meshed in place, then shifted onto the paper.
+        var minHalfWidth = Double.MAX_VALUE
+        for (s in item.ink) {
+            val meshed = meshStroke(s, tolerance) ?: continue
+            for (part in meshed.parts) parts.add(translated(part, b.x, b.y))
+            if (meshed.minHalfWidth > 0.0) minHalfWidth = minOf(minHalfWidth, meshed.minHalfWidth)
+        }
+        if (parts.isEmpty()) return null
+        return MeshedItem(parts, item.paintBounds(), if (minHalfWidth == Double.MAX_VALUE) 0.0 else minHalfWidth)
+    }
+
+    /** [part] shifted by a paper offset, for note-local ink meshed at the origin. */
+    private fun translated(part: MeshPart, dx: Double, dy: Double): MeshPart {
+        if (dx == 0.0 && dy == 0.0) return part
+        val m = part.mesh
+        val pos = m.positions.copyOf()
+        for (i in pos.indices step 2) {
+            pos[i] += dx
+            pos[i + 1] += dy
+        }
+        return MeshPart(MeshData(pos, m.offsets, m.indices, m.colors), part.color, part.pass, part.glow, part.covers, part.pencil)
     }
 
     /** The pill as [AudioPill] lays it out, in opaque parts back to front, its text set as glyphs. */
@@ -175,6 +296,7 @@ object ItemMesher {
     private fun meshStroke(stroke: Stroke, tolerance: Double): MeshedItem? {
         if (stroke.isEmpty) return null
         if (stroke.tool == Tool.DASHED) return meshDashed(stroke, tolerance)
+        if (stroke.tool == Tool.PENCIL) return meshPencil(stroke, tolerance)
         val mesh = StrokeTessellator.tessellate(stroke.geometry(), tolerance)
         if (mesh.isEmpty) return null
         if (stroke.config.neon && stroke.tool != Tool.HIGHLIGHTER) {
@@ -209,11 +331,55 @@ object ItemMesher {
                 stroke.config.dashLength, stroke.config.dashGap, stroke.config.baseWidth / 2.0,
                 dashPhase, tolerance,
             )
+        } else if (stroke.tool == Tool.PENCIL) {
+            StrokeTessellator.tessellatePencil(ribbon, from, count, tolerance, pencilDensityAt(stroke, ribbon))
         } else {
             StrokeTessellator.tessellate(ribbon, from, count, tolerance)
         }
         if (mesh.isEmpty) return null
-        return MeshPart(mesh, stroke.renderColor, passFor(stroke))
+        return MeshPart(mesh, stroke.renderColor, passFor(stroke), pencil = pencilParams(stroke, ribbon))
+    }
+
+    /**
+     * The pencil's graphite load per ribbon point, closing over the stroke's own
+     * style. A pure function of each point's width, so settled runs and the live
+     * tail join without a seam — and identical for the paged rasterizer, which
+     * reads the same [PencilGrain.densityAt].
+     */
+    private fun pencilDensityAt(stroke: Stroke, ribbon: RibbonPoints): (Int) -> Double {
+        val bw = stroke.config.baseWidth
+        val m = stroke.config.pressureMinFactor
+        val grain = stroke.config.pencilGrain
+        return { i -> PencilGrain.densityAt(ribbon.hw(i), bw, m, grain) }
+    }
+
+    /**
+     * The pencil's per-stroke field parameters, derived from the stroke itself:
+     * the seed from the first ribbon point (quantized, so the live ribbon and
+     * the committed geometry agree) and the tip mix from the nominal tip size.
+     * Every run of the same stroke carries identical values, so settled runs
+     * and the live tail shade the identical field.
+     */
+    private fun pencilParams(stroke: Stroke, ribbon: RibbonPoints): PencilGrain.PencilParams? {
+        if (stroke.tool != Tool.PENCIL || ribbon.pointCount == 0) return null
+        return PencilGrain.PencilParams(
+            seed = PencilGrain.seedFor(ribbon.cx(0), ribbon.cy(0)),
+            tipMix = PencilGrain.tipMixFor(stroke.config.baseWidth).toFloat(),
+        )
+    }
+
+    /**
+     * The pencil as a miter-joined triangle strip carrying per-vertex density/edge
+     * control bytes (see [StrokeTessellator.tessellatePencil]). The fragment shader
+     * turns those into the page-anchored graphite field with no extra geometry;
+     * the ink colour rides a uniform override at draw time.
+     */
+    private fun meshPencil(stroke: Stroke, tolerance: Double): MeshedItem? {
+        val g = stroke.geometry()
+        if (g.pointCount == 0) return null
+        val mesh = StrokeTessellator.tessellatePencil(g, 0, g.pointCount, tolerance, pencilDensityAt(stroke, g))
+        if (mesh.isEmpty) return null
+        return MeshedItem(listOf(MeshPart(mesh, stroke.renderColor, passFor(stroke), pencil = pencilParams(stroke, g))), stroke.paintBounds(), narrowestHalfWidth(stroke))
     }
 
     /**
@@ -291,6 +457,9 @@ object ItemMesher {
 
     /** The pass a stroke has to take, from its tool and its resolved ink alpha. */
     fun passFor(stroke: Stroke): InkPass = when {
+        // The pencil's grain blends instead of discarding, so it needs full alpha
+        // to union; a translucent pencil falls back to the stencil cover (flat).
+        stroke.tool == Tool.PENCIL && stroke.renderColor.a >= 255 -> InkPass.PENCIL
         stroke.tool == Tool.HIGHLIGHTER ->
             if (stroke.config.highlighterInverse) InkPass.SCREEN else InkPass.MULTIPLY
         stroke.renderColor.a >= 255 -> InkPass.OPAQUE

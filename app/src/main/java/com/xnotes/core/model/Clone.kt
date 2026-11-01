@@ -1,5 +1,6 @@
 package com.xnotes.core.model
 
+import com.xnotes.core.geometry.Rect
 import com.xnotes.core.pal.TextMeasurer
 
 /**
@@ -34,7 +35,9 @@ fun CanvasItem.deepCopy(measurer: TextMeasurer): CanvasItem = when (this) {
             it.labelAt = labelAt
         }
     is TableItem ->
-        TableItem(rect, colFractions.toList(), rowFractions.toList(), strokeRgba, strokeWidth)
+        TableItem(rect, colFractions.toList(), rowFractions.toList(), strokeRgba, strokeWidth, cellGrid())
+    is StickyNoteItem ->
+        StickyNoteItem(Rect(rect.x, rect.y, rect.w, rect.h), color, collapsed, text, ink.mapTo(mutableListOf()) { Stroke(it) }, measurer)
     else -> this
     // Carried, not reset: autosave snapshots the document through this, so dropping the lock here
     // would quietly unlock everything on the next save.

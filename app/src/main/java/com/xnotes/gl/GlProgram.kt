@@ -26,6 +26,7 @@ class GlProgram private constructor(val id: Int, val contextGen: Int) {
     fun set(name: String, v: Float) = GLES30.glUniform1f(uniform(name), v)
     fun set(name: String, v: Int) = GLES30.glUniform1i(uniform(name), v)
     fun set(name: String, x: Float, y: Float) = GLES30.glUniform2f(uniform(name), x, y)
+    fun set3(name: String, x: Float, y: Float, z: Float) = GLES30.glUniform3f(uniform(name), x, y, z)
     fun set(name: String, x: Float, y: Float, z: Float, w: Float) =
         GLES30.glUniform4f(uniform(name), x, y, z, w)
 

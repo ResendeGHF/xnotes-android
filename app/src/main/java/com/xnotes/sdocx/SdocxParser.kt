@@ -7,9 +7,9 @@ package com.xnotes.sdocx
  *
  * Scope: pages, strokes (types 1/15/18), colors, images (page objects,
  * page backgrounds and photos embedded in note.note's title/body text),
- * PDFs, text, shapes, lines and voice memos. Tables (22), paintings,
- * videos and stickers stay skipped: the reference SDKs decode no
- * structure for them either.
+ * PDFs, text, shapes, lines, voice memos (types 10/8), tables (type 22 +
+ * note-body tables, with cell values) and sticky memos (nested `.sdocx`).
+ * Paintings (`.spi`), videos and other attachments stay skipped.
  */
 object SdocxParser {
     /** Parse an already-unzipped archive: entry name -> bytes. */
@@ -50,6 +50,8 @@ object SdocxParser {
         var stringTable: Map<Int, String> = emptyMap()
         var defaultTemplateUri: String? = null
         var bodyImages = listOf<SdocxImage>()
+        var bodyTables = listOf<SdocxTable>()
+        var docTitle: String? = null
         val noteBytes = entries["note.note"]
         if (noteBytes != null) {
             try {
@@ -60,9 +62,19 @@ object SdocxParser {
                 val fallback = scanPenStrings(noteBytes)
                 if (fallback.isNotEmpty()) stringTable = fallback
             }
-            // Photos pasted into Samsung text are stored here, not in any
-            // `.page`: without them every such photo vanishes on import.
-            bodyImages = parseNoteBodyImages(noteBytes)
+            // Photos and tables pasted into Samsung text live here, not in any
+            // `.page`: without them every such photo/table vanishes on import.
+            try {
+                val body = parseNoteBody(noteBytes)
+                bodyImages = body.first
+                bodyTables = body.second
+                docTitle = body.third
+            } catch (_: Exception) {
+                try {
+                    bodyImages = parseNoteBodyImages(noteBytes)
+                } catch (_: Exception) {
+                }
+            }
         }
 
         var orderedIds = listOf<String>()
@@ -122,6 +134,8 @@ object SdocxParser {
             stringTable = stringTable,
             defaultTemplateUri = defaultTemplateUri,
             bodyImages = bodyImages,
+            bodyTables = bodyTables,
+            title = docTitle,
         )
     }
 
@@ -338,9 +352,26 @@ object SdocxParser {
      */
     fun parseNoteBodyImages(data: ByteArray): List<SdocxImage> {
         return try {
-            val (title, body) = readNoteBlobs(data) ?: return emptyList()
-            val out = ArrayList<SdocxImage>()
-            for (blob in listOf(title, body)) {
+            parseNoteBody(data).first
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Full note-body walk: images, tables and the note title from `note.note`'s
+     * title/body text objects (base + 6 + 7 frames, TextCommon). Never throws;
+     * malformed blobs yield empty lists and null title.
+     */
+    fun parseNoteBody(data: ByteArray): Triple<List<SdocxImage>, List<SdocxTable>, String?> {
+        return try {
+            val (titleBlob, bodyBlob) = readNoteBlobs(data) ?: return Triple(emptyList(), emptyList(), null)
+            val images = ArrayList<SdocxImage>()
+            val tables = ArrayList<SdocxTable>()
+            var title: String? = null
+            val blobs = listOf(titleBlob, bodyBlob)
+            for (idx in blobs.indices) {
+                val blob = blobs[idx]
                 try {
                     val r = SdocxReader(blob)
                     readFrame(r) // kind 0 base
@@ -352,43 +383,61 @@ object SdocxParser {
                     if (shapeText.kind != 7 || !shapeText.fields.contains(0)) continue
                     val flex = SdocxReader(shapeText.flexible)
                     val rich = decodeTextCommon(flex.readBytes(flex.remaining))
-                    out.addAll(rich.images)
+                    images.addAll(rich.images)
+                    tables.addAll(rich.tables)
+                    if (idx == 0 && rich.text.isNotBlank()) {
+                        title = rich.text
+                    }
                 } catch (_: Exception) {
                 }
             }
-            out
+            Triple(images, tables, title?.takeIf { it.isNotBlank() })
         } catch (_: Exception) {
-            emptyList()
+            Triple(emptyList(), emptyList(), null)
         }
     }
 
     /** Raw title/body text-object blobs from `note.note`; null when not readable. */
     private fun readNoteBlobs(data: ByteArray): Pair<ByteArray, ByteArray>? {
-        return try {
-            val r = SdocxReader(data)
-            r.skip(4) // flexible offset
-            SdocxMask.read(r)
-            SdocxMask.read(r)
-            r.skip(4) // format version
-            // Note id: empty on real files; the 0xFFFF null sentinel is
-            // tolerated (not fatal) so body photos still import without it.
-            val idUnits = r.readU16()
-            if (idUnits != 0xFFFF) {
-                if (idUnits * 2 > r.remaining) return null
-                if (idUnits > 0) r.skip(idUnits * 2)
+        for (dims in listOf(44, 40)) {
+            try {
+                val r = SdocxReader(data)
+                r.skip(4) // flexible offset
+                SdocxMask.read(r)
+                SdocxMask.read(r)
+                r.skip(4) // format version
+                val idUnits = r.readU16()
+                if (idUnits != 0xFFFF) {
+                    if (idUnits * 2 > r.remaining) continue
+                    if (idUnits > 0) r.skip(idUnits * 2)
+                }
+                if (r.remaining < dims + 8) continue
+                r.skip(dims)
+                if (r.remaining < 4) continue
+                val titleSize = r.readU32().toInt()
+                if (titleSize < 0 || titleSize > r.remaining) continue
+                val title = r.readBytes(titleSize)
+                if (r.remaining < 4) continue
+                val bodySize = r.readU32().toInt()
+                if (bodySize < 0 || bodySize > r.remaining) continue
+                val body = r.readBytes(bodySize)
+                if (!looksLikeTextBlob(title) || !looksLikeTextBlob(body)) continue
+                return Pair(title, body)
+            } catch (_: Exception) {
+                continue
             }
-            // Page dimensions, paddings and format bounds.
-            r.skip(4 + 8 + 8 + 4 + 4 + 4 + 4 + 4)
-            if (r.remaining < 4) return null
-            val titleSize = r.readU32().toInt()
-            if (titleSize < 0 || titleSize > r.remaining) return null
-            val title = r.readBytes(titleSize)
-            if (r.remaining < 4) return null
-            val bodySize = r.readU32().toInt()
-            if (bodySize < 0 || bodySize > r.remaining) return null
-            Pair(title, r.readBytes(bodySize))
+        }
+        return null
+    }
+
+    private fun looksLikeTextBlob(blob: ByteArray): Boolean {
+        return try {
+            if (blob.size < 12) return false
+            val r = SdocxReader(blob)
+            val f = readFrame(r)
+            f.kind == 0
         } catch (_: Exception) {
-            null
+            false
         }
     }
 
@@ -478,6 +527,7 @@ object SdocxParser {
             shapes = content.shapes,
             lines = content.lines,
             voices = content.voices,
+            tables = content.tables,
             templateUri = templateUri,
             templateType = templateType,
             backgroundImageId = backgroundImageId,
@@ -495,6 +545,7 @@ object SdocxParser {
         val shapes = ArrayList<SdocxShape>()
         val lines = ArrayList<SdocxLine>()
         val voices = ArrayList<SdocxVoice>()
+        val tables = ArrayList<SdocxTable>()
     }
 
     private fun leI32(b: ByteArray, off: Int): Int {
@@ -560,14 +611,19 @@ object SdocxParser {
                 }
                 3 -> decodeImage(payload)?.let { out.images.add(it) }
                 // Type 4 containers only group children (walked below); types 7/8
-                // are shapes and lines; type 10 is a voice memo. Tables (22),
-                // paintings, videos and stickers stay skipped: the reference
-                // SDKs decode no structure for them either.
+                // are shapes and lines; type 10 is a voice memo; type 22 is a
+                // table. Paintings, videos and stickers stay skipped: the
+                // reference SDKs decode no structure for them either.
                 // Photos are sometimes stored as shapes with a bitmap fill
                 // instead of type-3 image objects: emit both the outline (if
-                // any) and every image fill found in the payload.
+                // any) and every image fill found in the payload. Tables reuse
+                // shape frames, so also try a table decode on type 7 payloads.
                 7 -> {
                     decodeShape(payload, stringTable)?.let { out.shapes.add(it) }
+                    try {
+                        decodeTable(payload)?.let { out.tables.add(it) }
+                    } catch (_: Exception) {
+                    }
                     for (id in scanImageBindIds(payload)) {
                         val box = try {
                             decodeShape(payload, stringTable)?.geoBox
@@ -585,6 +641,7 @@ object SdocxParser {
                 }
                 10 -> decodeVoice(payload)?.let { out.voices.add(it) }
                 18 -> decodeStroke(payload, stringTable)?.let { out.strokes.add(it) }
+                22 -> decodeTable(payload)?.let { out.tables.add(it) }
             }
         } catch (_: Exception) {
         }
@@ -593,7 +650,7 @@ object SdocxParser {
         }
     }
 
-    private class Frame(
+    class Frame(
         val kind: Int,
         val properties: SdocxMask,
         val fields: SdocxMask,
@@ -601,7 +658,7 @@ object SdocxParser {
         val flexible: ByteArray,
     )
 
-    private fun readFrame(r: SdocxReader): Frame {
+    fun readFrame(r: SdocxReader): Frame {
         val size = r.readU32().toInt()
         if (size < 12) throw SdocxFormatException("Invalid frame size $size")
         val start = r.offset
@@ -922,14 +979,15 @@ object SdocxParser {
     // kind-7 flexible block carries a `TextCommon` payload.
     // ------------------------------------------------------------------
 
-    private class SdocxSpan(val kind: Int, val start: Int, val end: Int, val payload: ByteArray)
-    private class SdocxPara(val kind: Int, val start: Int, val end: Int, val payload: ByteArray)
+    class SdocxSpan(val kind: Int, val start: Int, val end: Int, val payload: ByteArray)
+    class SdocxPara(val kind: Int, val start: Int, val end: Int, val payload: ByteArray)
 
-    private class SdocxRichText(
+    class SdocxRichText(
         val text: String,
         val spans: List<SdocxSpan>,
         val paragraphs: List<SdocxPara>,
         val images: List<SdocxImage> = emptyList(),
+        val tables: List<SdocxTable> = emptyList(),
     )
 
     /**
@@ -972,6 +1030,7 @@ object SdocxParser {
             paras.add(SdocxPara(kind, start, end, rec.readBytes(rec.remaining)))
         }
         val images = ArrayList<SdocxImage>()
+        val tables = ArrayList<SdocxTable>()
         // Margins (4 x f32) + gravity (u8) when present; sections and embedded
         // objects after them are skipped (xnotes boxes hold plain text only).
         if (c.remaining >= 17) {
@@ -1000,10 +1059,11 @@ object SdocxParser {
                     if (spanSize < 0 || spanSize > c.remaining) throw SdocxFormatException("Object span outside text")
                     val spanBytes = c.readBytes(spanSize)
                     decodeEmbeddedImage(spanBytes)?.let { images.add(it) }
+                    decodeEmbeddedTable(spanBytes)?.let { tables.add(it) }
                 }
             }
         }
-        return SdocxRichText(text, spans, paras, images)
+        return SdocxRichText(text, spans, paras, images, tables)
     }
 
     /**
@@ -1025,6 +1085,30 @@ object SdocxParser {
             // comes from the embedded object's own bbox, so they are unread.
             if (objectType != 3) return null
             decodeImage(objectData)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Decode one `TextCommon` object span of type 22 (embedded table) into
+     * a placed [SdocxTable]. Null for any other span or malformed data.
+     */
+    fun decodeEmbeddedTable(span: ByteArray): SdocxTable? {
+        return try {
+            if (span.size < 20) return null
+            val s = SdocxReader(span)
+            val objectSize = s.readU32().toInt()
+            val objectType = s.readU32().toInt()
+            if (objectSize < 0 || objectSize > span.size - 8) return null
+            // Need room for textIndex + layout + constraint after the object.
+            if (objectSize > span.size - 20 && span.size - 8 - objectSize < 12) {
+                // Tolerate spans that omit the 12-byte tail (synthetic builders).
+                if (objectSize > span.size - 8) return null
+            }
+            val objectData = s.readBytes(objectSize)
+            if (objectType != 22) return null
+            decodeTable(objectData)
         } catch (_: Exception) {
             null
         }
@@ -1405,6 +1489,370 @@ object SdocxParser {
             (secs.toLong() * 1000).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         } catch (_: Exception) {
             0
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Tables (type 22): grid geometry + cell texts.
+    // ------------------------------------------------------------------
+
+    /** Decode a type-22 table payload: base frames plus a kind-22 grid frame. */
+    fun decodeTable(payload: ByteArray): SdocxTable? {
+        val meta = try {
+            readObjectMeta(payload)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        if (!meta.visible) return null
+        return try {
+            val r = SdocxReader(payload)
+            try {
+                readFrame(r) // kind 0
+            } catch (_: Exception) {
+                return null
+            }
+            var result: SdocxTable? = null
+            while (!r.isEof) {
+                val frame: Frame = try {
+                    readFrame(r)
+                } catch (_: Exception) {
+                    break
+                }
+                if (frame.kind == 22) {
+                    try {
+                        val t = parseTableFrame(frame, meta.bbox)
+                        if (t != null) {
+                            result = t
+                            break
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            result
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Parse a kind-22 table frame with a fallback bbox (usually the object meta bbox). */
+    fun parseTableFrame(frame: Frame, fallbackBbox: SdocxRect): SdocxTable? {
+        return parseTableFrameInner(frame, fallbackBbox)
+    }
+
+    /** Parse a kind-22 table frame, using its bit-4 bbox or a zero rect when absent. */
+    fun parseTableFrame(frame: Frame): SdocxTable? {
+        return parseTableFrameInner(frame, null)
+    }
+
+    private fun parseTableFrameInner(frame: Frame, fallbackBbox: SdocxRect?): SdocxTable? {
+        return try {
+            if (frame.kind != 22) return null
+            val flex = SdocxReader(frame.flexible)
+            var columnWidths: List<Double>? = null
+            var rows: List<SdocxTableRow>? = null
+            var tableBbox: SdocxRect? = null
+            for (bit in 0..13) {
+                if (!frame.fields.contains(bit)) continue
+                when (bit) {
+                    2 -> {
+                        columnWidths = try {
+                            readColumnWidths(flex)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    3 -> {
+                        try {
+                            val count = flex.readU32().toInt()
+                            if (count < 0 || count > 1000) return null
+                            val out = ArrayList<SdocxTableRow>(minOf(count, 128))
+                            for (i in 0 until count) {
+                                if (flex.remaining < 4) return null
+                                val rowSize = flex.readU32().toInt()
+                                if (rowSize < 0 || rowSize > flex.remaining) return null
+                                val rowData = flex.readBytes(rowSize)
+                                val row = try {
+                                    parseTableRow(rowData)
+                                } catch (_: Exception) {
+                                    null
+                                } ?: return null
+                                out.add(row)
+                            }
+                            rows = out
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    4 -> {
+                        try {
+                            if (flex.remaining < 32) return null
+                            val l = flex.readF64()
+                            val t = flex.readF64()
+                            val r2 = flex.readF64()
+                            val b = flex.readF64()
+                            if (l.isFinite() && t.isFinite() && r2.isFinite() && b.isFinite()) {
+                                tableBbox = SdocxRect(minOf(l, r2), minOf(t, b), maxOf(l, r2), maxOf(t, b))
+                            }
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    5 -> {
+                        try {
+                            val sz = flex.readU32().toInt()
+                            if (sz < 0 || sz > flex.remaining) return null
+                            flex.skip(sz)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    6 -> {
+                        try {
+                            if (flex.remaining < 1) return null
+                            flex.skip(1)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    7, 8 -> {
+                        try {
+                            // Same layout as bit 2; discarded (kept only to hold offsets).
+                            readColumnWidths(flex)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    9, 10 -> {
+                        try {
+                            if (flex.remaining < 4) return null
+                            flex.skip(4)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    11 -> {
+                        try {
+                            val sz = flex.readU32().toInt()
+                            if (sz < 0 || sz > flex.remaining) return null
+                            flex.skip(sz)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    12, 13 -> {
+                        try {
+                            if (flex.remaining < 4) return null
+                            flex.skip(4)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                    else -> {
+                        // Bits 0-1 carry no grid data on known writers; consume a
+                        // U32 when present so offsets stay correct, else fail.
+                        try {
+                            if (flex.remaining < 4) return null
+                            flex.skip(4)
+                        } catch (_: Exception) {
+                            return null
+                        }
+                    }
+                }
+            }
+            if (columnWidths.isNullOrEmpty() || rows.isNullOrEmpty()) return null
+            val bbox = tableBbox ?: fallbackBbox ?: SdocxRect(0.0, 0.0, 0.0, 0.0)
+            SdocxTable(bbox, columnWidths, rows)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Read a column-width list: U32 count + that many F32 widths. */
+    fun readColumnWidths(r: SdocxReader): List<Double> {
+        val count = r.readU32().toInt()
+        if (count < 0 || count > 1000) throw SdocxFormatException("Unreasonable column count $count")
+        val out = ArrayList<Double>(minOf(count, 128))
+        for (i in 0 until count) {
+            val v = r.readF32().toDouble()
+            if (!v.isFinite()) throw SdocxFormatException("Non-finite column width")
+            out.add(v)
+        }
+        return out
+    }
+
+    /** Parse one table row record: height + index + cells. */
+    fun parseTableRow(data: ByteArray): SdocxTableRow? {
+        return try {
+            val r = SdocxReader(data)
+            val flexOffset = r.readU32().toInt()
+            SdocxMask.read(r) // properties
+            val fields = SdocxMask.read(r)
+            val headerEnd = r.offset
+            val end = data.size
+            val fixedEnd: Int = if (flexOffset == 0 && fields.isEmpty) end
+            else {
+                val v = flexOffset
+                if (v < headerEnd || v > end) end else v
+            }
+            if (headerEnd > fixedEnd) return null
+            val fixed = SdocxReader(data.copyOfRange(headerEnd, fixedEnd))
+            if (fixed.remaining < 4 + 4 + 4) return null
+            val height = fixed.readF32().toDouble()
+            if (!height.isFinite()) return null
+            fixed.readU32() // row index (ordering only)
+            val cellCount = fixed.readU32().toInt()
+            if (cellCount < 0 || cellCount > 1000) return null
+            val cells = ArrayList<SdocxTableCell>(minOf(cellCount, 128))
+            for (i in 0 until cellCount) {
+                if (fixed.remaining < 4) return null
+                val cellSize = fixed.readU32().toInt()
+                if (cellSize < 0 || cellSize > fixed.remaining) return null
+                val cellData = fixed.readBytes(cellSize)
+                try {
+                    parseTableCell(cellData)?.let { cells.add(it) }
+                } catch (_: Exception) {
+                }
+            }
+            SdocxTableRow(height, cells)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Parse one table cell record into its column and plain text. */
+    fun parseTableCell(data: ByteArray): SdocxTableCell? {
+        return try {
+            val r = SdocxReader(data)
+            val flexOffset = r.readU32().toInt()
+            SdocxMask.read(r) // properties
+            val fields = SdocxMask.read(r)
+            val headerEnd = r.offset
+            val end = data.size
+            val fixedEnd: Int = if (flexOffset == 0 && fields.isEmpty) end
+            else {
+                val v = flexOffset
+                if (v < headerEnd || v > end) end else v
+            }
+            if (headerEnd > fixedEnd) return null
+            val fixed = SdocxReader(data.copyOfRange(headerEnd, fixedEnd))
+            if (fixed.remaining < 4 + 4 + 4 + 4 + 32 + 1 + 4) return null
+            val col = fixed.readU32().toInt()
+            if (col < 0 || col > 1000) return null
+            fixed.skip(4) // rowSpan
+            fixed.skip(4) // colSpan
+            fixed.skip(4) // bg
+            fixed.skip(32) // bbox
+            fixed.skip(1) // editable
+            if (fixed.remaining < 4) return null
+            val textSize = fixed.readU32().toInt()
+            if (textSize < 0 || textSize > fixed.remaining) return null
+            val textBytes = fixed.readBytes(textSize)
+            val text = try {
+                plainTextFromCell(textBytes)
+            } catch (_: Exception) {
+                ""
+            }
+            SdocxTableCell(col, text)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Plain text from a cell's text blob: direct UTF-16 first, else TextCommon frames. */
+    fun plainTextFromCell(data: ByteArray): String {
+        try {
+            tryDirectText(data)?.let { return it }
+        } catch (_: Exception) {
+        }
+        // Walk embedded frames (base + 6 + 7 + tail) for the kind-7 TextCommon.
+        try {
+            val r = SdocxReader(data)
+            while (!r.isEof) {
+                if (r.remaining < 4) break
+                val pos = r.offset
+                val size: Int = try {
+                    r.readU32().toInt()
+                } catch (_: Exception) {
+                    break
+                }
+                if (size < 12 || size > data.size - pos) break
+                if (r.remaining < 2 + 4) break
+                val kind: Int = try {
+                    r.readI16()
+                } catch (_: Exception) {
+                    break
+                }
+                val flexOffset: Int = try {
+                    r.readU32().toInt()
+                } catch (_: Exception) {
+                    break
+                }
+                val props: SdocxMask = try {
+                    SdocxMask.read(r)
+                } catch (_: Exception) {
+                    break
+                }
+                val fields: SdocxMask = try {
+                    SdocxMask.read(r)
+                } catch (_: Exception) {
+                    break
+                }
+                val headerEnd = r.offset
+                val end = pos + size
+                if (end > data.size) break
+                val fixedEnd: Int = if (flexOffset == 0 && fields.isEmpty) end
+                else {
+                    val v = pos + flexOffset
+                    if (v < headerEnd || v > end) break
+                    v
+                }
+                val flexible = data.copyOfRange(fixedEnd, end)
+                if (kind == 7 && flexible.size >= 4) {
+                    try {
+                        val rich = decodeTextCommon(flexible)
+                        return rich.text
+                    } catch (_: Exception) {
+                    }
+                }
+                try {
+                    r.seek(end)
+                } catch (_: Exception) {
+                    break
+                }
+                if (r.offset <= pos) break
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            val rich = decodeTextCommon(data)
+            return rich.text
+        } catch (_: Exception) {
+        }
+        return ""
+    }
+
+    /** Try a direct plain-text blob (U32 units + UTF-16); null when not direct. */
+    fun tryDirectText(data: ByteArray): String? {
+        return directPlainText(data)
+    }
+
+    /** Direct plain text: U32 unit count followed by exactly that many UTF-16LE units. */
+    fun directPlainText(data: ByteArray): String? {
+        return try {
+            if (data.size < 4) return null
+            val r = SdocxReader(data)
+            val units = r.readU32().toInt()
+            if (units < 0 || units > 100_000) return null
+            if (units == 0) {
+                if (r.remaining != 0) return null
+                return ""
+            }
+            if (units * 2 != r.remaining) return null
+            val bytes = r.readBytes(units * 2)
+            SdocxReader.utf16LeToString(bytes)
+        } catch (_: Exception) {
+            null
         }
     }
 }

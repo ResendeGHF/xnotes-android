@@ -17,12 +17,24 @@ import kotlin.math.sqrt
  *     which adapts to remaining light gradients; a manual global level, or Otsu
  *     for light-on-dark sources, when asked.
  *  3. [despeckle] — drop ink blobs smaller than [TraceOptions.denoisePx].
- *  4. [distanceTransform] — chamfer distance to the background: the local stroke
+ *  4. [removeRulings] (optional, on by default) — erase full-span ruled-paper
+ *     lines plus broken line fragments on detected ruling bands, which would
+ *     otherwise cross every text stroke and shatter it at the junctions;
+ *     short underlines, fraction bars and diagram axes are left alone.
+ *  5. [closeMask] (optional, on by default; off for printed text) — 3×3
+ *     closing bridges 1px binarization gaps so letters thin to one connected
+ *     centreline. Skipped for print, where the same welding would fuse
+ *     neighbouring glyphs into unreadable scribbles.
+ *  6. [distanceTransform] — chamfer distance to the background: the local stroke
  *     radius, later mapped to per-sample pressure so the ink keeps its weight.
- *  5. [thin] — Zhang-Suen skeletonization down to 1px centrelines.
- *  6. [trace] — walk the skeleton into ordered polylines, splitting at
- *     junctions; isolated pixels survive as dot paths (i-dots, periods).
- *  7. [simplify] — Ramer-Douglas-Peucker per polyline plus short-path filtering.
+ *  7. [thin] — Zhang-Suen skeletonization down to 1px centrelines.
+ *  8. [pruneSpurs] (optional, on by default) — trim short terminal side
+ *     branches (edge-noise spurs) so they never become stub strokes.
+ *  9. [trace] — walk the skeleton into ordered polylines. Junctions are found
+ *     topologically (separate 8-neighbourhood arms, not raw neighbour counts),
+ *     so staircase pixels on curves read as through-pixels and handwriting
+ *     comes out as long continuous strokes instead of 2–3px fragments.
+ *  10. [simplify] — Ramer-Douglas-Peucker per polyline plus short-path filtering.
  *
  * Coordinates throughout are in working-image pixels; callers scale them onto
  * the note page (see [TraceDocument]).
@@ -51,19 +63,50 @@ object InkVectorizer {
         /** How much looser the weak level is than the strong one, in 0..255 steps. */
         val weakExtra: Int = 18,
         /** Drop ink blobs smaller than this many pixels. UI (0 = off). */
-        val denoisePx: Int = 8,
+        val denoisePx: Int = 4,
+        /**
+         * Printed (typeset) text instead of handwriting. UI. Only the gap
+         * closing changes: handwriting needs [closeMask] to bridge faint pen
+         * lifts, but on print the same closing welds neighbouring glyphs into
+         * unreadable scribbles, so it is skipped and each letter traces
+         * separately. Hysteresis, ruling removal and spur pruning stay on.
+         */
+        val printedText: Boolean = false,
+        /**
+         * Erase ruled-paper lines before thinning: ink runs spanning at least
+         * this fraction of the page width (or height) with a cross-thickness of
+         * at most [rulingMaxThick] px are paper, not handwriting, as are broken
+         * line fragments on detected ruling bands. Short underlines, fraction
+         * bars and diagram axes survive; full-bleed notebook lines do not. UI.
+         * When false, every long line is kept as ink.
+         */
+        val removeRulings: Boolean = true,
+        /** Span fraction (of page width/height) a straight run needs to count as ruling. */
+        val rulingMinSpan: Double = 0.5,
+        /** Thickest (px) a ruling line may be across its direction. */
+        val rulingMaxThick: Int = 4,
+        /** Bridge 1px binarization gaps with a 3×3 closing before thinning. */
+        val closeGaps: Boolean = true,
+        /**
+         * Trim terminal skeleton side-branches (edge-noise spurs) up to this
+         * long, in working px. Only endpoint→junction branches are cut — dots,
+         * accents and isolated dashes never end at a junction, so they survive.
+         * 0 disables.
+         */
+        val spurPrunePx: Int = 8,
         /** RDP simplification tolerance, in working px. */
         val simplifyEps: Double = 0.8,
         /** Drop paths shorter than this, in working px (dots are always kept). */
         val minPathLen: Double = 3.0,
         /** Keep at most this many paths (dots first, then longest first). */
-        val maxStrokes: Int = 6000,
+        val maxStrokes: Int = 12000,
         /**
          * Hard budget on traced samples across the page (dots first, then longest
          * paths). Bounds note size and render cost on pathological inputs, so a
          * noisy photo can never produce a note that crashes the app to open.
+         * Sized for dense printed pages (thousands of small glyphs).
          */
-        val maxTotalSamples: Int = 80_000,
+        val maxTotalSamples: Int = 150_000,
         /**
          * Bail out (no ink) when the strong mask covers more than this fraction
          * of the page: the threshold is certainly wrong (a photo of a dark desk,
@@ -221,12 +264,13 @@ object InkVectorizer {
     // --- threshold ---
 
     /**
-     * The ink mask [vectorize] thresholds with for [options]: the manual global
-     * level, Sauvola local thresholding for auto (dark-on-light), or a global
-     * Otsu level for auto on light-on-dark sources. With [TraceOptions.hysteresis]
-     * the strong mask grows into faint connected strokes through a looser weak
-     * level, which is what keeps pale letter parts. Shared with the preview so
-     * the black-on-white edges on screen are exactly what gets traced.
+     * Threshold [lum] for [options]: the manual global level, Sauvola local
+     * thresholding for auto (dark-on-light), or a global Otsu level for auto on
+     * light-on-dark sources. With [TraceOptions.hysteresis] the strong mask
+     * grows into faint connected strokes through a looser weak level, which is
+     * what keeps pale letter parts. The first stage of [inkMask], which the
+     * preview and [vectorize] share so the black-on-white on screen is exactly
+     * what gets traced.
      */
     fun applyThreshold(lum: IntArray, w: Int, h: Int, options: TraceOptions): BooleanArray {
         val strong = when {
@@ -346,6 +390,232 @@ object InkVectorizer {
             }
         }
         return out
+    }
+
+    // --- ruling lines + gap closing ---
+
+    /**
+     * Erase ruled-paper lines: horizontal ink runs spanning at least
+     * [spanFrac] of the page width (and vertical runs spanning the height)
+     * whose cross-thickness is at most [maxThick] px. Pixels where the ink is
+     * taller (horizontal lines) or wider (vertical lines) than [maxThick] are
+     * text crossing the line, and are kept; a later [closeMask] bridges the
+     * 1px notches this leaves in descenders. Short underlines and axes never
+     * reach the span, so they survive.
+     *
+     * A second pass catches *broken* line fragments: rows whose long
+     * (≥ 20px) runs cover ≥ 30% of the width form ruling bands (evenly spaced
+     * ones on notebook paper), and thin run pixels inside those bands are
+     * erased. Fragments of ruled lines that touch text stay connected to it
+     * and are kept as text — only isolated dashes vanish — and anything
+     * between the bands (fraction bars, minus signs, underlines drawn between
+     * the lines) is never touched. Returns a new array.
+     */
+    fun removeRulings(
+        ink: BooleanArray,
+        w: Int,
+        h: Int,
+        spanFrac: Double = 0.5,
+        maxThick: Int = 4,
+    ): BooleanArray {
+        if (w < 8 || h < 8) return ink
+        val out = ink.copyOf()
+        val thick = maxThick.coerceAtLeast(1)
+        val minHSpan = (w * spanFrac).toInt().coerceAtLeast(8)
+        val minVSpan = (h * spanFrac).toInt().coerceAtLeast(8)
+        // Vertical run length at each ink pixel (for the horizontal-line test).
+        val vert = IntArray(ink.size)
+        for (x in 0 until w) {
+            var y = 0
+            while (y < h) {
+                if (!ink[y * w + x]) {
+                    y++
+                    continue
+                }
+                var y2 = y
+                while (y2 < h && ink[y2 * w + x]) y2++
+                for (yy in y until y2) vert[yy * w + x] = y2 - y
+                y = y2
+            }
+        }
+        for (y in 0 until h) {
+            var x = 0
+            while (x < w) {
+                if (!ink[y * w + x]) {
+                    x++
+                    continue
+                }
+                var x2 = x
+                while (x2 < w && ink[y * w + x2]) x2++
+                if (x2 - x >= minHSpan) {
+                    for (xx in x until x2) {
+                        if (vert[y * w + xx] <= thick) out[y * w + xx] = false
+                    }
+                }
+                x = x2
+            }
+        }
+        // Horizontal run length at each ink pixel (for the vertical-line test).
+        val horiz = IntArray(ink.size)
+        for (y in 0 until h) {
+            var x = 0
+            while (x < w) {
+                if (!ink[y * w + x]) {
+                    x++
+                    continue
+                }
+                var x2 = x
+                while (x2 < w && ink[y * w + x2]) x2++
+                for (xx in x until x2) horiz[y * w + xx] = x2 - x
+                x = x2
+            }
+        }
+        for (x in 0 until w) {
+            var y = 0
+            while (y < h) {
+                if (!ink[y * w + x]) {
+                    y++
+                    continue
+                }
+                var y2 = y
+                while (y2 < h && ink[y2 * w + x]) y2++
+                if (y2 - y >= minVSpan) {
+                    for (yy in y until y2) {
+                        if (horiz[yy * w + x] <= thick) out[yy * w + x] = false
+                    }
+                }
+                y = y2
+            }
+        }
+        // Broken-line pass: ruling bands are rows whose long runs cover much
+        // of the width (faint scans break lines into short dashes that the
+        // full-span pass above cannot see). Thin run pixels inside those bands
+        // go; text crossings (tall runs) stay, as does everything between bands.
+        val inBand = BooleanArray(h)
+        var y = 0
+        while (y < h) {
+            var cover = 0
+            var x = 0
+            while (x < w) {
+                if (!ink[y * w + x]) {
+                    x++
+                    continue
+                }
+                var x2 = x
+                while (x2 < w && ink[y * w + x2]) x2++
+                if (x2 - x >= 20) cover += x2 - x
+                x = x2
+            }
+            if (cover * 1.0 / w >= 0.30) {
+                var y2 = y
+                // The band lasts while rows stay covered (recomputed per row).
+                while (y2 < h) {
+                    var c2 = 0
+                    var xx = 0
+                    while (xx < w) {
+                        if (!ink[y2 * w + xx]) {
+                            xx++
+                            continue
+                        }
+                        var e2 = xx
+                        while (e2 < w && ink[y2 * w + e2]) e2++
+                        if (e2 - xx >= 20) c2 += e2 - xx
+                        xx = e2
+                    }
+                    if (c2 * 1.0 / w < 0.30 || y2 - y >= 9) break
+                    y2++
+                }
+                for (yy in y until y2) inBand[yy] = true
+                y = y2
+            } else {
+                y++
+            }
+        }
+        for (yy in 0 until h) {
+            if (!inBand[yy]) continue
+            var x = 0
+            while (x < w) {
+                if (!ink[yy * w + x]) {
+                    x++
+                    continue
+                }
+                var x2 = x
+                while (x2 < w && ink[yy * w + x2]) x2++
+                if (x2 - x >= 20) {
+                    for (xx in x until x2) {
+                        if (vert[yy * w + xx] <= thick) out[yy * w + xx] = false
+                    }
+                }
+                x = x2
+            }
+        }
+        return out
+    }
+
+    /**
+     * 3×3 binary closing (dilation then erosion): bridges 1px binarization gaps
+     * along faint strokes so letters thin to one connected centreline. Returns
+     * a new array. Out-of-bounds neighbours count as background (the page edge
+     * never grows ink, and erosion clears the 1px border), so every index is
+     * bounds-checked.
+     */
+    fun closeMask(ink: BooleanArray, w: Int, h: Int): BooleanArray {
+        val dil = BooleanArray(ink.size)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (!ink[y * w + x]) continue
+                for (dy in -1..1) {
+                    val ny = y + dy
+                    if (ny < 0 || ny >= h) continue
+                    for (dx in -1..1) {
+                        val nx = x + dx
+                        if (nx < 0 || nx >= w) continue
+                        dil[ny * w + nx] = true
+                    }
+                }
+            }
+        }
+        val out = BooleanArray(ink.size) { true }
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                var all = true
+                for (dy in -1..1) {
+                    val ny = y + dy
+                    if (ny < 0 || ny >= h) {
+                        all = false
+                        break
+                    }
+                    for (dx in -1..1) {
+                        val nx = x + dx
+                        if (nx < 0 || nx >= w || !dil[ny * w + nx]) {
+                            all = false
+                            break
+                        }
+                    }
+                    if (!all) break
+                }
+                out[y * w + x] = all
+            }
+        }
+        return out
+    }
+
+    /**
+     * The final ink mask [vectorize] thins: threshold → denoise → optional
+     * ruling removal → optional gap closing (skipped for
+     * [TraceOptions.printedText], where closing would weld neighbouring glyphs
+     * together). The trace preview renders this, so the black-on-white on
+     * screen is exactly what gets traced.
+     */
+    fun inkMask(lum: IntArray, w: Int, h: Int, options: TraceOptions): BooleanArray {
+        val grown = applyThreshold(lum, w, h, options)
+        val clean = if (options.denoisePx > 0) despeckle(grown, w, h, options.denoisePx) else grown
+        val unruled = if (options.removeRulings) {
+            removeRulings(clean, w, h, options.rulingMinSpan, options.rulingMaxThick)
+        } else {
+            clean
+        }
+        return if (options.closeGaps && !options.printedText) closeMask(unruled, w, h) else unruled
     }
 
     // --- stroke radius ---
@@ -477,17 +747,124 @@ object InkVectorizer {
     }
 
     /**
-     * Walk the skeleton into ordered polylines (working-pixel [Pt]s), splitting at
-     * junctions so every path is a plain stroke without branches. Closed loops come
-     * out as first-point-repeated rings; isolated pixels as single-point dot paths.
-     * Steps favour the straightest unvisited neighbour, so curves hold together
-     * instead of zigzagging through the skeleton's stair-steps.
+     * Topological junction measure: the number of separate ink arms leaving
+     * [p], i.e. 0→1 transitions clockwise round its 8-neighbourhood ([DX8]/[DY8]
+     * are already circular). A raw neighbour count calls every staircase pixel
+     * on a curve a junction (its two steps touch diagonally *and* sideways);
+     * arms count them as one continuous curve, so only true branches —
+     * crossings, loop joins, real spurs — split a path. On dense handwriting
+     * this is ~9× fewer junctions, which is what turns 2–3px fragments back
+     * into readable strokes.
+     */
+    fun skeletonArms(skel: BooleanArray, w: Int, h: Int, p: Int): Int {
+        val x = p % w
+        val y = p / w
+        var prev = 0
+        // Clockwise ring, seeded from the last neighbour so the wrap counts.
+        run {
+            val nx = x + DX8[7]
+            val ny = y + DY8[7]
+            if (nx in 0 until w && ny in 0 until h && skel[ny * w + nx]) prev = 1
+        }
+        var arms = 0
+        for (k in 0 until 8) {
+            val nx = x + DX8[k]
+            val ny = y + DY8[k]
+            val cur = if (nx in 0 until w && ny in 0 until h && skel[ny * w + nx]) 1 else 0
+            if (cur == 1 && prev == 0) arms++
+            prev = cur
+        }
+        return arms
+    }
+
+    /**
+     * Trim short terminal side-branches (thinning spurs from ragged stroke
+     * edges): endpoint→junction walks of at most [maxLen] px are erased, the
+     * junction pixel itself kept. Only branches ending at a junction are cut —
+     * isolated dots, accents, dashes and pen tips end at endpoints or nowhere,
+     * so they always survive. Runs two passes (cutting one spur can expose the
+     * next) and returns a new array.
+     */
+    fun pruneSpurs(skel: BooleanArray, w: Int, h: Int, maxLen: Int): BooleanArray {
+        if (maxLen <= 0) return skel
+        var cur = skel.copyOf()
+        repeat(2) {
+            val counts = IntArray(cur.size)
+            val arms = IntArray(cur.size)
+            for (p in cur.indices) {
+                if (!cur[p]) continue
+                counts[p] = neighborCount(cur, w, h, p)
+                arms[p] = skeletonArms(cur, w, h, p)
+            }
+            val cut = BooleanArray(cur.size)
+            var any = false
+            for (s in cur.indices) {
+                if (!cur[s] || cut[s] || counts[s] != 1) continue
+                // Walk the branch through through-pixels (never through junctions).
+                val branch = ArrayList<Int>()
+                var prev = -1
+                var p = s
+                while (true) {
+                    branch.add(p)
+                    if (arms[p] >= 3) break // reached the junction: spur
+                    if (p != s && counts[p] == 1) break // isolated run, no junction
+                    if (arms[p] > 2) break
+                    val x = p % w
+                    val y = p / w
+                    var next = -1
+                    for (k in 0 until 8) {
+                        val nx = x + DX8[k]
+                        val ny = y + DY8[k]
+                        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+                        val q = ny * w + nx
+                        if (q == prev || !cur[q]) continue
+                        next = q
+                        break
+                    }
+                    if (next < 0) break
+                    prev = p
+                    p = next
+                    if (branch.size > maxLen + 1) break
+                }
+                // A spur ends at a junction and fits the budget (junction kept).
+                if (branch.size >= 2 && branch.size - 1 <= maxLen && arms[branch.last()] >= 3) {
+                    for (i in 0 until branch.size - 1) {
+                        if (!cut[branch[i]]) {
+                            cut[branch[i]] = true
+                            any = true
+                        }
+                    }
+                }
+            }
+            if (!any) return cur
+            for (i in cur.indices) if (cut[i]) cur[i] = false
+        }
+        return cur
+    }
+
+    /**
+     * Walk the skeleton into ordered polylines (working-pixel [Pt]s), splitting
+     * at topological junctions ([skeletonArms] ≥ 3) so every path is a plain
+     * stroke without branches. Endpoints are raw degree-1 pixels; staircase
+     * pixels on curves (two touching neighbours) read as through-pixels, which
+     * keeps curves whole. Closed loops come out as first-point-repeated rings;
+     * isolated pixels as single-point dot paths. Steps favour the straightest
+     * unvisited neighbour, so curves hold together instead of zigzagging
+     * through the skeleton's stair-steps.
      */
     fun trace(skel: BooleanArray, w: Int, h: Int): List<List<Pt>> {
         val visited = BooleanArray(skel.size)
         val out = ArrayList<List<Pt>>()
         val counts = IntArray(skel.size)
-        for (p in skel.indices) if (skel[p]) counts[p] = neighborCount(skel, w, h, p)
+        val arms = IntArray(skel.size)
+        for (p in skel.indices) {
+            if (!skel[p]) continue
+            counts[p] = neighborCount(skel, w, h, p)
+            arms[p] = skeletonArms(skel, w, h, p)
+        }
+        // A path stops at endpoints (one neighbour), true junctions (3+ arms)
+        // and isolated dots — never at a staircase curve pixel.
+        fun isStop(p: Int): Boolean = counts[p] == 1 || arms[p] >= 3 || counts[p] == 0
 
         fun walkFrom(start: Int, prev: Int): ArrayList<Pt> {
             val path = ArrayList<Pt>()
@@ -526,7 +903,7 @@ object InkVectorizer {
                 hasDir = true
                 back = cur
                 cur = best
-                if (counts[cur] != 2) {
+                if (isStop(cur)) {
                     visited[cur] = true
                     path.add(Pt((cur % w).toDouble(), (cur / w).toDouble()))
                     break
@@ -543,7 +920,7 @@ object InkVectorizer {
         // 2) Junction-started remainders (spurs the endpoint pass stopped short of).
         for (p in skel.indices) {
             if (!skel[p] || visited[p]) continue
-            if (counts[p] < 3) continue
+            if (arms[p] < 3) continue
             val x = p % w
             val y = p / w
             for (k in 0 until 8) {
@@ -629,23 +1006,24 @@ object InkVectorizer {
 
     /**
      * Full run over [lum] (row-major 0..255, [w]×[h]): threshold (Sauvola local
-     * by default, global manual/Otsu otherwise) → denoise → radius field →
-     * skeleton → trace → simplify → filter/cap. Returns longest-first paths in
-     * source pixels, each carrying per-point pressures from the stroke radius;
-     * single-point dot paths come first so the cap never eats the i-dots.
+     * by default, global manual/Otsu otherwise, with hysteresis growth) →
+     * denoise → ruling removal → gap closing → radius field → skeleton →
+     * spur pruning → trace → simplify → filter/cap. Returns longest-first
+     * paths in source pixels, each carrying per-point pressures from the
+     * stroke radius; single-point dot paths come first so the cap never eats
+     * the i-dots.
      */
     fun vectorize(lum: IntArray, w: Int, h: Int, options: TraceOptions = TraceOptions()): List<InkPath> {
         require(lum.size == w * h) { "luminance size ${lum.size} != ${w}x$h" }
-        val grown = applyThreshold(lum, w, h, options)
+        val mask = inkMask(lum, w, h, options)
         // Degenerate input guard: more ink than paper means the threshold is
         // certainly wrong (a photo of a dark desk, a maxed-out slider). Bailing
         // here also keeps the thinner from grinding through a near-solid block.
         var inkCount = 0
-        for (b in grown) if (b) inkCount++
-        if (inkCount > options.maxInkFraction * grown.size) return emptyList()
-        val clean = if (options.denoisePx > 0) despeckle(grown, w, h, options.denoisePx) else grown
-        val dist = distanceTransform(clean, w, h)
-        val skel = thin(clean, w, h)
+        for (b in mask) if (b) inkCount++
+        if (inkCount > options.maxInkFraction * mask.size) return emptyList()
+        val dist = distanceTransform(mask, w, h)
+        val skel = pruneSpurs(thin(mask, w, h), w, h, options.spurPrunePx)
         val paths = trace(skel, w, h)
         // Reference radius: the median over skeleton pixels (robust to blobs).
         var refR = 2.0

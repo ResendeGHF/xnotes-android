@@ -845,6 +845,9 @@ class Editor(
     /** A photo just taken for "trace from camera"; drives the scan capture dialog. */
     var pendingCameraScan by mutableStateOf<PendingCameraScan?>(null)
         private set
+    /** A multi-page scan session started from inside a note; drives the scan dialog. */
+    var scanSession by mutableStateOf<ScanSession?>(null)
+        private set
     /** True while a committed import is being written off-thread; drives the "Importing…" dialog. */
     var importing by mutableStateOf(false)
         private set
@@ -1050,6 +1053,112 @@ class Editor(
             controller.singleSelectedText() != null ||
             controller.inkSelection() != null ||
             (flowText.active && !flowText.selection.normalized().collapsed)
+
+    override val singleSelectedTable get() = controller.singleSelectedTable()
+
+    override val canConvertTableHandwriting: Boolean get() = controller.tableWithCellStrokes() != null
+
+    /**
+     * Recognize the selected handwriting inside the selected table's cells and store each
+     * cell's reading as its value, erasing the consumed ink. One undoable edit.
+     */
+    override fun convertTableHandwriting() {
+        val found = controller.tableWithCellStrokes() ?: return
+        val (pi, table, strokes) = found
+        val page = state.document.pages.getOrNull(pi) ?: return
+        val live = strokes.filter { page.items.contains(it) }
+        if (live.isEmpty()) return
+        android.widget.Toast.makeText(appContext, "Reading table cells...", android.widget.Toast.LENGTH_SHORT).show()
+        autosaveScope.launch {
+            val groups = assignCells(table, live)
+            if (groups.isEmpty()) {
+                say("No handwriting inside the table cells")
+                return@launch
+            }
+            val useMathOcr = com.xnotes.platform.MathOcr.isInstalled(appContext)
+            val lang = settings.prefs.ocrLanguage
+            val values = LinkedHashMap<Pair<Int, Int>, String>()
+            var failures = 0
+            if (useMathOcr) {
+                val session = try {
+                    withContext(Dispatchers.Default) { com.xnotes.platform.MathOcr.open(appContext) }
+                } catch (e: Exception) {
+                    say("Math recognition failed: ${e.message}")
+                    return@launch
+                }
+                try {
+                    for ((cell, ss) in groups) {
+                        val box = com.xnotes.core.geometry.Rect(
+                            table.colX(cell.first), table.rowY(cell.second),
+                            table.colX(cell.first + 1) - table.colX(cell.first),
+                            table.rowY(cell.second + 1) - table.rowY(cell.second),
+                        )
+                        val latex = try {
+                            withContext(Dispatchers.Default) { session.recognize(ss, box) }
+                        } catch (e: Exception) { "" }
+                        val v = normalizeCellText(latex)
+                        if (v.isBlank()) failures++ else values[cell] = v
+                    }
+                } finally {
+                    runCatching { session.close() }
+                }
+            } else {
+                for ((cell, ss) in groups) {
+                    val latex = try {
+                        withContext(Dispatchers.IO) { com.xnotes.platform.InkMathOcr.recognize(ss, lang) }
+                    } catch (e: Exception) { "" }
+                    val v = normalizeCellText(latex)
+                    if (v.isBlank()) failures++ else values[cell] = v
+                }
+            }
+            if (values.isEmpty()) {
+                say("Could not read any table cell")
+                return@launch
+            }
+            controller.adoptTableCellValues(page, table, values, groups.values.flatten())
+            val tail = if (failures > 0) " ($failures unreadable)" else ""
+            say("Filled ${values.size} table cell${if (values.size == 1) "" else "s"}$tail")
+        }
+    }
+
+    /** LaTeX from cell handwriting, normalized to the plain form the table stores. */
+    private fun normalizeCellText(latex: String): String {
+        val converted = LatexToExpr.convertOrPass(latex).trim()
+        if (converted.isEmpty()) return ""
+        return stripOuterParens(converted)
+    }
+
+    override val singleSelectedSticky: com.xnotes.core.model.StickyNoteItem?
+        get() = if (canvasOpen) {
+            infiniteOrNull?.selection?.items?.singleOrNull() as? com.xnotes.core.model.StickyNoteItem
+        } else {
+            controller.selectedItems().singleOrNull() as? com.xnotes.core.model.StickyNoteItem
+        }
+
+    override fun editSelectedSticky() {
+        val item = singleSelectedSticky ?: return
+        if (canvasOpen) {
+            infiniteOrNull?.onStickyEditText?.invoke(item)
+        } else {
+            requestStickyEdit(item)
+        }
+    }
+
+    override fun toggleSelectedStickyCollapsed() {
+        val item = singleSelectedSticky ?: return
+        if (canvasOpen) infiniteOrNull?.toggleStickyCollapsed(item) else controller.toggleStickyCollapsed(item)
+    }
+
+    override fun setSelectedTableCells(cells: List<List<String>>) = controller.setSelectedTableCells(cells)
+
+    override fun sendSelectedTableToData() {
+        val t = controller.singleSelectedTable()
+        if (t == null || !t.hasCells()) {
+            say("Fill the table cells with numbers first")
+            return
+        }
+        onMathStudioRequest?.invoke(MathStudioRequest("DATA", "", tableCsv = tableGridToCsv(t.cellGrid())))
+    }
 
     override fun sendSelectionToMathStudio(destination: MathStudioDestination) {
         // Math boxes first (already LaTeX), then text boxes and flow markdown, OCR for ink last.
@@ -1313,6 +1422,13 @@ class Editor(
                 it.recentColors = recentColors
             }
             it.onSay = { text -> say(text) }
+            it.onStickyEditText = { item ->
+                requestStickyEdit(item)
+                true
+            }
+            it.onStickyColorDot = { item, anchor ->
+                requestStickyColor(item, anchor, onCanvas = true)
+            }
             it.view.onTwoFingerTap = { dispatchTapGesture(preferences.twoFingerTap) }
             it.view.onThreeFingerTap = { dispatchTapGesture(preferences.threeFingerTap) }
             it.view.sideButton.onClick = { at -> dispatchTapGesture(preferences.stylusButtonTap, at) }
@@ -1778,6 +1894,71 @@ class Editor(
     /** The markup whose note is being written, or null. */
     var markupNote by mutableStateOf<MarkupMenu?>(null)
         private set
+
+    /** The sticky note whose text/color is being edited in a dialog, or null. */
+    var stickyEditTarget by mutableStateOf<com.xnotes.core.model.StickyNoteItem?>(null)
+        private set
+
+    /** The sticky note whose paper color the swatch picker is open for, or null. */
+    var stickyColorTarget by mutableStateOf<StickyColorTarget?>(null)
+        private set
+
+    /** A sticky color pick in flight: the note, where its dot sits (viewport px), and which canvas. */
+    class StickyColorTarget(
+        val item: com.xnotes.core.model.StickyNoteItem,
+        val anchorViewport: com.xnotes.core.geometry.Rect,
+        val onCanvas: Boolean,
+    )
+
+    /** Open the sticky editor on [item]. */
+    fun requestStickyEdit(item: com.xnotes.core.model.StickyNoteItem) {
+        stickyEditTarget = item
+    }
+
+    /** Close the sticky editor without saving. */
+    fun dismissStickyEdit() {
+        stickyEditTarget = null
+    }
+
+    /** Open the swatch picker on [item]'s paper color, anchored at its on-note dot. */
+    fun requestStickyColor(item: com.xnotes.core.model.StickyNoteItem, anchorViewport: com.xnotes.core.geometry.Rect, onCanvas: Boolean) {
+        stickyColorTarget = StickyColorTarget(item, anchorViewport, onCanvas)
+    }
+
+    /** Close the sticky swatch picker without picking. */
+    fun dismissStickyColor() {
+        stickyColorTarget = null
+    }
+
+    /** Save the sticky swatch picker's color, recording undo. */
+    fun saveStickyColor(item: com.xnotes.core.model.StickyNoteItem, color: com.xnotes.core.model.Rgba) {
+        stickyColorTarget = null
+        if (onCanvasSticky(item)) {
+            infiniteOrNull?.recolorSticky(item, color)
+        } else {
+            controller.setStickyColorFor(item, color)
+        }
+        view.requestRender()
+    }
+
+    private fun onCanvasSticky(item: com.xnotes.core.model.StickyNoteItem): Boolean =
+        infiniteOrNull?.document?.items?.any { it === item } == true
+
+    /** Save the sticky editor's text and color, recording undo. */
+    fun saveStickyEdit(text: String, color: com.xnotes.core.model.Rgba) {
+        val item = stickyEditTarget ?: return
+        stickyEditTarget = null
+        if (onCanvasSticky(item)) {
+            val inf = infiniteOrNull ?: return
+            if (item.color != color) inf.recolorSticky(item, color)
+            inf.commitStickyText(item, text)
+            view.requestRender()
+            return
+        }
+        if (item.color != color) controller.setStickyColorFor(item, color)
+        controller.commitStickyText(item, text)
+        view.requestRender()
+    }
 
     /** What a tap lands on: [markup] on note page [page], and the tap in its page space when it is on the markup itself. */
     private class MarkupHit(val page: Int, val markup: TextMarkup, val local: Pt?)
@@ -2368,6 +2549,13 @@ class Editor(
         }
         controller.onAudioTap = { pageIndex, local -> tapAudio(pageIndex, local) }
         controller.onMathAnimTap = { pageIndex, local -> tapMathAnim(pageIndex, local) }
+        controller.onStickyEditText = { item, _ ->
+            requestStickyEdit(item)
+            true
+        }
+        controller.onStickyColorDot = { item, _, anchor ->
+            requestStickyColor(item, anchor, onCanvas = false)
+        }
         controller.onUserMovedView = { AudioPlayback.userMoved(this) }
         // Whatever is added while this note records takes the recording's moment.
         history.onPush = { command -> AudioRecording.stamp(this, command.added()) }
@@ -3369,6 +3557,41 @@ class Editor(
         // Index at once, not only on the next save, so the Graph screen sees the
         // link even if the note is closed before an autosave lands.
         state.document.path?.let { indexLinks(it, doc) }
+        state.appendToCache(page, item)
+        history.push(AddItem(page, item))
+        doc.dirty = true
+        refreshContent()
+        controller.selectPlaced(index, listOf(item))
+        view.requestRender()
+        return item
+    }
+
+    /**
+     * Place a sticky note on the page in view, centred where the view is (or at
+     * [atContent] from a long-press), expanded and selected so text/ink lands at
+     * once. Tap its × to collapse it to a small icon; tap the icon to reopen it.
+     */
+    fun insertStickyNote(
+        atContent: com.xnotes.core.geometry.Pt? = null,
+        color: com.xnotes.core.model.Rgba = com.xnotes.core.model.StickyNoteItem.DEFAULT_COLOR,
+    ): com.xnotes.core.model.StickyNoteItem? {
+        if (canvasOpen) return infinite.insertStickyNote(atContent, color)
+        val doc = state.document
+        if (doc.pages.isEmpty()) return null
+        val centre = atContent ?: state.viewportToContent(com.xnotes.core.geometry.Pt(state.viewportW / 2.0, state.viewportH / 2.0))
+        val index = (state.pageIndexAtContent(centre) ?: state.currentPageIndex()).coerceIn(0, doc.pages.lastIndex)
+        val page = doc.pages[index]
+        val cover = state.footprint(page)
+        val local = state.toPageSpace(index, centre)
+        val w = com.xnotes.core.model.StickyNoteItem.DEFAULT_WIDTH.coerceAtMost(cover.right - cover.left)
+        val h = com.xnotes.core.model.StickyNoteItem.DEFAULT_HEIGHT.coerceAtMost(cover.bottom - cover.top)
+        val x = (local.x - w / 2.0).coerceIn(cover.left, (cover.right - w).coerceAtLeast(cover.left))
+        val y = (local.y - h / 2.0).coerceIn(cover.top, (cover.bottom - h).coerceAtLeast(cover.top))
+        val item = com.xnotes.core.model.StickyNoteItem(
+            com.xnotes.core.geometry.Rect(x, y, w, h), color, collapsed = false,
+            measurer = textMeasurer,
+        )
+        page.items.add(item)
         state.appendToCache(page, item)
         history.push(AddItem(page, item))
         doc.dirty = true
@@ -5938,6 +6161,23 @@ class Editor(
     /** Drop a pending camera scan. */
     fun clearCameraScan() {
         pendingCameraScan = null
+    }
+
+    /**
+     * Start a multi-page scan session from inside a note: [target] receives the
+     * finished pages at [at] (null = default placement). Any previous session
+     * (and its staged files) is discarded first.
+     */
+    fun requestScanSession(target: Editor, at: com.xnotes.core.geometry.Pt?) {
+        clearScanSession()
+        val dir = java.io.File(appContext.cacheDir, "scan-session").apply { mkdirs() }
+        scanSession = ScanSession(target = target, at = at, dir = dir)
+    }
+
+    /** Drop the scan session, deleting every staged page photo. */
+    fun clearScanSession() {
+        scanSession?.clearFiles()
+        scanSession = null
     }
 
     /**
@@ -8616,6 +8856,22 @@ class Editor(
         }
         if (com.xnotes.platform.LatexAiKeys.get(appContext).isBlank()) return appContext.getString(R.string.latex_ai_missing_key)
         return null
+    }
+
+    /**
+     * The vision-model configuration for [aiExportBlocker]-gated calls
+     * ([com.xnotes.platform.VlmClient]): same provider, key, model and endpoint
+     * as whole-note export. Call only when [aiExportBlocker] returns null.
+     */
+    fun vlmConfig(): com.xnotes.platform.LatexAiConfig {
+        val prefs = settings.prefs
+        val provider = com.xnotes.platform.LatexAiProvider.ofId(prefs.latexAiProvider)
+        return com.xnotes.platform.LatexAiConfig(
+            provider,
+            com.xnotes.platform.LatexAiKeys.get(appContext),
+            prefs.latexAiModel,
+            prefs.latexAiBaseUrl,
+        )
     }
 
     /**

@@ -101,10 +101,21 @@ data class ToolConfig(
     val tapeMode: TapeMode = TapeMode.STRAIGHT,
     /** Tape: what is printed on it. Only used by [Tool.TAPE]. */
     val tapePattern: TapePattern = TapePattern.SOLID,
+    /** Pencil: how much paper tooth shows through, in `[0, 1]`. 0 draws the ribbon
+     *  almost solid (a soft pen); 1 leaves the grain at full strength. Only used by
+     *  [Tool.PENCIL]. Kept last so the positional constructor stays stable. */
+    val pencilGrain: Double = DEFAULT_PENCIL_GRAIN,
 ) {
     companion object {
         const val DEFAULT_MARKUP_INTENSITY = 0.9
         const val MARKUP_INTENSITY_MIN = 0.1
+
+        /** Default grain for a fresh pencil: visible tooth without breaking the line. */
+        const val DEFAULT_PENCIL_GRAIN = 0.55
+
+        /** Hard bounds the UI clamps [pencilGrain] to. */
+        const val PENCIL_GRAIN_MIN = 0.0
+        const val PENCIL_GRAIN_MAX = 1.0
     }
 }
 
@@ -119,6 +130,12 @@ object ToolDefaults {
 
     fun configFor(tool: Tool): ToolConfig = when (tool) {
         Tool.PEN -> ToolConfig(baseWidth = 3.0, pressureEnabled = true, pressureMinFactor = 0.35, directionStrength = 0.0)
+        // Pencil: a narrow graphite line with pressure on and a mid tooth, so light
+        // strokes break up and hard ones fill in. Same width range as the pen.
+        Tool.PENCIL -> ToolConfig(
+            baseWidth = 2.5, pressureEnabled = true, pressureMinFactor = 0.30,
+            directionStrength = 0.0, pencilGrain = ToolConfig.DEFAULT_PENCIL_GRAIN,
+        )
         // Dashed pen: uniform-width (pressure off), so its dashes stay even; dash/gap set the rhythm.
         Tool.DASHED -> ToolConfig(baseWidth = 3.0, pressureEnabled = false, pressureMinFactor = 1.0, directionStrength = 0.0, dashLength = 10.0, dashGap = 8.0)
         Tool.CALLIGRAPHY -> ToolConfig(baseWidth = 6.0, pressureEnabled = true, pressureMinFactor = 0.40, directionStrength = 0.60)
@@ -135,7 +152,7 @@ object ToolDefaults {
     }
 
     /** Tools whose config is persisted in settings (spec 09 §2). */
-    val persistedTools = listOf(Tool.PEN, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER, Tool.ERASER, Tool.SELECT, Tool.LASSO, Tool.MARKUP, Tool.TAPE)
+    val persistedTools = listOf(Tool.PEN, Tool.PENCIL, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER, Tool.ERASER, Tool.SELECT, Tool.LASSO, Tool.MARKUP, Tool.TAPE)
 }
 
 /**
@@ -176,6 +193,13 @@ object ToolConversions {
         Tool.HIGHLIGHTER -> 4.0..120.0
         Tool.ERASER -> 1.0..80.0
         Tool.TAPE -> TapeItem.MIN_WIDTH..TapeItem.MAX_WIDTH
+        Tool.PENCIL -> 1.0..20.0
         else -> 1.0..20.0
     }
+
+    /** GRAIN slider (0..100, higher = more paper shows through) -> [ToolConfig.pencilGrain]. */
+    fun grainToStrength(grain: Double): Double =
+        grain.coerceIn(0.0, 100.0) / 100.0
+
+    fun strengthToGrain(s: Double): Double = (s.coerceIn(0.0, 1.0)) * 100.0
 }

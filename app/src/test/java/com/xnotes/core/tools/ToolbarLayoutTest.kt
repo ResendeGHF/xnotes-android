@@ -18,7 +18,7 @@ class ToolbarLayoutTest {
         assertEquals(listOf(ToolbarItem.HOME, ToolbarItem.TITLE), d.sections[0].entries.map { it.item })
         assertEquals(
             listOf(
-                ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+                ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
             ),
             d.sections[2].entries.map { it.item },
@@ -279,6 +279,16 @@ class ToolbarLayoutTest {
         assertTrue(note.sections.flatMap { it.entries }.single { it.item == ToolbarItem.TAPE }.visible)
         val canvas = ToolbarLayout.fromRaw(listOf(listOf("wand" to true, "shape" to true)), ToolbarLayout.CANVAS_ITEMS, ToolbarLayout.CANVAS_DEFAULT)
         assertEquals(listOf(ToolbarItem.WAND, ToolbarItem.TAPE, ToolbarItem.SHAPE), canvas.items().take(3))
+    }
+
+    @Test fun missingPencilSlotsInRightAfterPenOnBothBars() {
+        // A layout stored before the pencil existed gains it beside the pen.
+        val note = ToolbarLayout.fromRaw(listOf(listOf("pen" to true, "dashed" to false, "shape" to true)))
+        val noteItems = note.items()
+        assertEquals(noteItems.indexOf(ToolbarItem.PEN) + 1, noteItems.indexOf(ToolbarItem.PENCIL))
+        assertTrue(note.sections.flatMap { it.entries }.single { it.item == ToolbarItem.PENCIL }.visible)
+        val canvas = ToolbarLayout.fromRaw(listOf(listOf("pen" to true, "shape" to true)), ToolbarLayout.CANVAS_ITEMS, ToolbarLayout.CANVAS_DEFAULT)
+        assertEquals(listOf(ToolbarItem.PEN, ToolbarItem.PENCIL), canvas.items().take(2))
     }
 
     @Test fun bothDefaultsSetTapeRightAfterTheWand() {

@@ -4,8 +4,10 @@ import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.Renderer
+import com.xnotes.core.pal.TextFlags
 import kotlin.math.max
 
 /**
@@ -20,6 +22,7 @@ class TableItem(
     rowFractions: List<Double>,
     var strokeRgba: Rgba,
     var strokeWidth: Double = 2.0,
+    cells: List<List<String>> = emptyList(),
 ) : CanvasItem, Resizable {
 
     override val kind = KIND
@@ -29,9 +32,41 @@ class TableItem(
 
     val colFractions: MutableList<Double> = colFractions.toMutableList()
     val rowFractions: MutableList<Double> = rowFractions.toMutableList()
+    /** Cell contents, rows × cols; entries outside the grid are inert leftovers of structural edits. */
+    val cells: MutableList<MutableList<String>> =
+        cells.map { it.toMutableList() }.toMutableList()
 
     val cols: Int get() = colFractions.size
     val rows: Int get() = rowFractions.size
+
+    /** Cell text at ([c], [r]), or blank when out of range. */
+    fun cell(c: Int, r: Int): String =
+        if (c in 0 until cols && r in 0 until rows) cells.getOrNull(r)?.getOrNull(c).orEmpty() else ""
+
+    /** Replace the whole grid (rows × cols); ragged input is padded, extras are dropped. */
+    fun setCells(grid: List<List<String>>) {
+        cells.clear()
+        for (r in 0 until rows) {
+            val row = MutableList(cols) { "" }
+            for (c in 0 until cols) row[c] = grid.getOrNull(r)?.getOrNull(c).orEmpty()
+            cells.add(row)
+        }
+    }
+
+    /** A rows × cols snapshot of the live region, for undo and the codec. */
+    fun cellGrid(): List<List<String>> = List(rows) { r -> List(cols) { c -> cell(c, r) } }
+
+    /** True when at least one cell holds text. */
+    fun hasCells(): Boolean = (0 until rows).any { r -> (0 until cols).any { c -> cell(c, r).isNotBlank() } }
+
+    /** Write one cell; out-of-grid writes are ignored. */
+    fun setCell(c: Int, r: Int, v: String) {
+        if (c !in 0 until cols || r !in 0 until rows) return
+        while (cells.size <= r) cells.add(MutableList(cols) { "" })
+        val row = cells[r]
+        while (row.size <= c) row.add("")
+        row[c] = v
+    }
 
     /** Absolute x of the [i]-th vertical line (0 = left edge, [cols] = right edge). */
     fun colX(i: Int): Double {
@@ -52,6 +87,23 @@ class TableItem(
         r.strokeRect(rect, pen)
         for (i in 1 until cols) r.strokePolyline(listOf(Pt(colX(i), rect.top), Pt(colX(i), rect.bottom)), pen)
         for (j in 1 until rows) r.strokePolyline(listOf(Pt(rect.left, rowY(j)), Pt(rect.right, rowY(j))), pen)
+        // Cell values, centred in their cell; numbers and short labels stay on one line.
+        val flags = TextFlags(wordWrap = false, alignLeft = false)
+        for (rj in 0 until rows) {
+            val top = rowY(rj)
+            val h = rowY(rj + 1) - top
+            if (h <= 0) continue
+            val size = (h * 0.30).coerceIn(9.0, 64.0)
+            for (ci in 0 until cols) {
+                val text = cell(ci, rj)
+                if (text.isBlank()) continue
+                val left = colX(ci)
+                val w = colX(ci + 1) - left
+                if (w <= 0) continue
+                val pad = minOf(6.0, w * 0.06)
+                r.drawText(text, Rect(left + pad, top + h * 0.10, w - pad * 2, h * 0.80), FontSpec(size), strokeRgba, flags)
+            }
+        }
     }
 
     override fun bounds(): Rect = rect.outset(strokeWidth / 2.0 + 1.0)
@@ -79,7 +131,7 @@ class TableItem(
     }
 
     override fun snapshotGeometry(): GeometrySnapshot =
-        TableSnapshot(rect, colFractions.toList(), rowFractions.toList(), strokeWidth)
+        TableSnapshot(rect, colFractions.toList(), rowFractions.toList(), strokeWidth, cellGrid())
 
     override fun restoreGeometry(snap: GeometrySnapshot) {
         if (snap !is TableSnapshot) return
@@ -87,6 +139,7 @@ class TableItem(
         colFractions.clear(); colFractions.addAll(snap.cols)
         rowFractions.clear(); rowFractions.addAll(snap.rows)
         strokeWidth = snap.strokeWidth
+        setCells(snap.cells)
     }
 
     /** Scale (and, for a rotation, re-fit upright) the box; fractions are relative, so they follow. */
@@ -108,6 +161,7 @@ class TableItem(
         val k = cols.toDouble() / (cols + 1)
         for (i in colFractions.indices) colFractions[i] = colFractions[i] * k
         colFractions.add(avg)
+        setCells(cellGrid())
     }
 
     /** Add a row of average height at the bottom, keeping the others' proportions. */
@@ -117,6 +171,7 @@ class TableItem(
         val k = rows.toDouble() / (rows + 1)
         for (i in rowFractions.indices) rowFractions[i] = rowFractions[i] * k
         rowFractions.add(avg)
+        setCells(cellGrid())
     }
 
     /** Remove the last column (keeps at least one), renormalizing the rest. */
@@ -124,6 +179,7 @@ class TableItem(
         if (cols <= 1) return
         colFractions.removeAt(colFractions.size - 1)
         renormalize(colFractions)
+        setCells(cellGrid())
     }
 
     /** Remove the last row (keeps at least one), renormalizing the rest. */
@@ -131,19 +187,45 @@ class TableItem(
         if (rows <= 1) return
         rowFractions.removeAt(rowFractions.size - 1)
         renormalize(rowFractions)
+        setCells(cellGrid())
     }
 
     /** Insert a column of average width before column [at] (0..cols), keeping the others' proportions. */
-    fun insertColumn(at: Int) = insertLine(colFractions, at)
+    fun insertColumn(at: Int) {
+        val old = cellGrid()
+        insertLine(colFractions, at)
+        val grid = old.map { it.toMutableList() }.toMutableList()
+        val idx = at.coerceIn(0, cols - 1)
+        for (row in grid) row.add(idx.coerceIn(0, row.size), "")
+        setCells(grid)
+    }
 
     /** Insert a row of average height before row [at] (0..rows), keeping the others' proportions. */
-    fun insertRow(at: Int) = insertLine(rowFractions, at)
+    fun insertRow(at: Int) {
+        val old = cellGrid()
+        insertLine(rowFractions, at)
+        val grid = old.map { it.toMutableList() }.toMutableList()
+        grid.add(at.coerceIn(0, rows - 1), MutableList(cols) { "" })
+        setCells(grid)
+    }
 
     /** Remove columns [range] (at least one column always stays), renormalizing the rest. */
-    fun removeColumns(range: IntRange) = removeLines(colFractions, range)
+    fun removeColumns(range: IntRange) {
+        val old = cellGrid()
+        val keep = old.firstOrNull()?.indices?.filter { it !in range } ?: emptyList()
+        removeLines(colFractions, range)
+        if (keep.size == cols) setCells(old.map { row -> keep.map { row.getOrElse(it) { "" } } })
+        else setCells(cellGrid())
+    }
 
     /** Remove rows [range] (at least one row always stays), renormalizing the rest. */
-    fun removeRows(range: IntRange) = removeLines(rowFractions, range)
+    fun removeRows(range: IntRange) {
+        val old = cellGrid()
+        val keep = old.indices.filter { it !in range }
+        removeLines(rowFractions, range)
+        if (keep.size == rows) setCells(keep.map { old[it] })
+        else setCells(cellGrid())
+    }
 
     /**
      * Move the far edge ([atEnd]) or the near edge of columns [first]..[last] to absolute [x]. The
@@ -267,10 +349,11 @@ class TableItem(
     }
 }
 
-/** Snapshot of a table's geometry (box + line distribution + line width) for undo. */
+/** Snapshot of a table's geometry (box + line distribution + line width + cells) for undo. */
 private data class TableSnapshot(
     val rect: Rect,
     val cols: List<Double>,
     val rows: List<Double>,
     val strokeWidth: Double,
+    val cells: List<List<String>>,
 ) : GeometrySnapshot

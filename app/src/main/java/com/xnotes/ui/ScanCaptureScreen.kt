@@ -378,10 +378,10 @@ private const val SCAN_WIDE_DP = 720
 
 /**
  * Preview + controls in one responsive block: side by side on wide screens,
- * stacked on narrow ones.
+ * stacked on narrow ones. Shared with the multi-page scan dialog.
  */
 @Composable
-private fun QuadEditorHost(
+internal fun QuadEditorHost(
     bmp: Bitmap,
     quadF: FloatArray,
     onMoveCorner: (Int, Float, Float) -> Unit,

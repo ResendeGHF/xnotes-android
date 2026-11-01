@@ -65,6 +65,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
@@ -498,10 +499,21 @@ private fun EditorScreen(
         // Which note Math Studio was opened from. Closing that note's tab closes the
         // workspace too, so a graph can never be built for a note that is no longer open.
         var mathStudioUri by remember(editor) { mutableStateOf<String?>(null) }
-        // Each note's workspace snapshot, keyed by note URI (null for a never-saved note).
+        // The pane Math Studio was opened from. A never-saved note has no URI, so its
+        // workspace is kept in that pane's live document rather than the URI-keyed map.
+        var mathStudioPane by remember(editor) { mutableStateOf<Editor?>(null) }
+        // The exact document (and canvas/paged side) the studio was opened from. A blank
+        // replacement note keeps a null URI too, so the URI alone cannot tell them apart.
+        var mathStudioDoc by remember(editor) { mutableStateOf<Any?>(null) }
+        var mathStudioCanvas by remember(editor) { mutableStateOf(false) }
+        // Each note's workspace snapshot, keyed by note URI.
         var mathStudioData by remember(editor) { mutableStateOf<Map<String?, String>>(emptyMap()) }
         fun openMathStudio() {
-            mathStudioUri = editor.active.openDocumentUri
+            val pane = editor.active
+            mathStudioPane = pane
+            mathStudioUri = pane.openDocumentUri
+            mathStudioDoc = pane.state.document
+            mathStudioCanvas = pane.canvasOpen
             mathStudioOpen = true
         }
         fun closeMathStudio() {
@@ -510,11 +522,29 @@ private fun EditorScreen(
             mathAnimSpec = null
             mathStudioRequest = null
             mathStudioUri = null
+            mathStudioPane = null
+            mathStudioDoc = null
+            mathStudioCanvas = false
+        }
+        /** Whether the note the studio was opened from is still the open note in its pane. */
+        fun isStudioNoteOpen(): Boolean {
+            val pane = mathStudioPane ?: return false
+            if (!pane.noteOpen) return false
+            val uri = mathStudioUri
+            if (pane.openDocumentUri != uri) return false
+            // A blank replacement keeps a null URI too: only the same document counts.
+            if (uri == null && (pane.canvasOpen != mathStudioCanvas || pane.state.document !== mathStudioDoc)) return false
+            return true
         }
         /** This note's stored workspace: the session map is freshest, then the live document. */
         fun studioJsonFor(uri: String?): String? {
+            if (uri == null) {
+                // A never-saved note has no URI to key on: only its own live buffer counts,
+                // so two unsaved notes never see each other's work.
+                val pane = mathStudioPane?.takeIf { it.noteOpen } ?: editor.active
+                return pane.mathStudioJson()
+            }
             mathStudioData[uri]?.let { return it }
-            if (uri == null) return null
             for (ed in listOfNotNull(editor, editor.secondary)) {
                 if (ed.noteOpen && ed.openDocumentUri == uri) return ed.mathStudioJson()
             }
@@ -522,7 +552,18 @@ private fun EditorScreen(
         }
         /** Keeps the snapshot for [mathStudioUri] in the session map and in the open document. */
         fun persistMathStudio(json: String) {
-            val uri = mathStudioUri ?: return
+            val uri = mathStudioUri
+            if (uri == null) {
+                // No URI to key the session map on: keep it in the note's own live buffer,
+                // so reopening Studio on this same note restores it. A new blank note gets
+                // a fresh document, so it still starts empty. Never write into a document
+                // that replaced the studio's note (a late persist after a tab switch).
+                val pane = mathStudioPane?.takeIf { it.noteOpen } ?: editor.active
+                if (pane.canvasOpen == mathStudioCanvas && pane.state.document === mathStudioDoc) {
+                    pane.storeMathStudioJson(json)
+                }
+                return
+            }
             val bounded = (mathStudioData - uri) + (uri to json)
             mathStudioData = if (bounded.size > 12) {
                 bounded.entries.drop(bounded.size - 12).associate { it.key to it.value }
@@ -1089,6 +1130,10 @@ private fun EditorScreen(
                 noteTabs = noteTabs.open(uri, target.openDocumentTitle, secondary)
                 return
             }
+            // The studio belongs to the note being left: close it now, while its document
+            // is still the open one, so the workspace is stored against the right note and
+            // never sits over — or persists into — the note arriving next.
+            if (mathStudioOpen && target === mathStudioPane && target.openDocumentUri != uri) closeMathStudio()
             guarded(target) { scope.launch { openTab(target, uri); Unit } }
         }
 
@@ -1142,7 +1187,7 @@ private fun EditorScreen(
                 pane.noteOpen && pane.openDocumentUri == uri
             }
             val finish = {
-                if (mathStudioUri != null && mathStudioUri == uri) closeMathStudio()
+                if ((mathStudioUri != null && mathStudioUri == uri) || (matching != null && matching === mathStudioPane)) closeMathStudio()
                 val updated = noteTabs.close(uri)
                 val replacement = when (matching?.pane) {
                     com.xnotes.ui.Pane.PRIMARY -> updated.primaryUri
@@ -1191,6 +1236,11 @@ private fun EditorScreen(
          *  [closeTab] this never prompts: deleting already discards the open buffer without asking. */
         fun closeTabsForDeletion(deletedUris: List<String>) {
             if (deletedUris.isEmpty()) return
+            // A deleted note takes its workspace with it: drop any session snapshots at or
+            // under the deleted URIs, so a later note reusing the same URI starts empty.
+            mathStudioData = mathStudioData.filterKeys { key ->
+                key == null || deletedUris.none { del -> editor.isUnderDocument(key, del) }
+            }
             val affected = noteTabs.tabs.map { it.uri }.filter { tabUri ->
                 deletedUris.any { del -> editor.isUnderDocument(tabUri, del) }
             }.toSet()
@@ -1509,7 +1559,7 @@ private fun EditorScreen(
         // Every shortcut acts on the focused pane, so the same KeyActions serve both of them.
         editor.keyActions = remember(editor) {
             Editor.KeyActions(
-                newNote = { guarded { editor.active.newNote() } },
+                newNote = { guarded { val p = editor.active; p.newNote(); if (p === mathStudioPane) closeMathStudio() } },
                 open = { backstageView = com.xnotes.ui.BackstageView.HOME; guardedAll { editor.goHomeAll() } },
                 save = { saveOrPrompt() },
                 saveAs = { launchSaveAs(editor.active) },
@@ -1776,6 +1826,7 @@ private fun EditorScreen(
                             }
                         },
                         onTakePhoto = { pane, at -> takePhoto(pane, at, null) },
+                        onScanPages = { pane, at -> editor.requestScanSession(pane, at) },
                         onShareImage = { file ->
                             runCatching { launchShare(file, file.nameWithoutExtension, "image/png") }
                                 .onFailure { editor.message = context.getString(R.string.err_share_image) }
@@ -1804,6 +1855,19 @@ private fun EditorScreen(
                     SplitHost(editor, actions)
 
                     if (mathStudioOpen) {
+                        // Backstop: whatever closes or swaps the studio's note (tab bar, an
+                        // external share, a deletion sweep) must take the workspace with it —
+                        // it must never sit over, or persist into, another note. The hooks at
+                        // the tab/new-note sites close it synchronously; this catches every
+                        // other path through snapshot notifications.
+                        LaunchedEffect(mathStudioPane) {
+                            snapshotFlow {
+                                // Subscribe to tab traffic as well, so a switch re-evaluates
+                                // even when the pane's own flags have not flipped yet.
+                                noteTabs.tabs.size
+                                isStudioNoteOpen()
+                            }.collect { alive -> if (!alive) closeMathStudio() }
+                        }
                         // Resolved once per opening: live snapshots flow back through onPersist,
                         // so recomputing this on every persist would restore echoes of our own writes.
                         val initialStudioData = remember(mathStudioOpen, mathStudioUri) { studioJsonFor(mathStudioUri) }
@@ -2157,6 +2221,8 @@ private class PaneActions(
     val onInsertCanvasImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     /** Take a photo with the camera app and place it like an inserted picture, on the canvas when [Editor.canvasOpen]. */
     val onTakePhoto: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
+    /** Start a multi-page scan session whose finished pages land like inserted pictures, on the canvas when [Editor.canvasOpen]. */
+    val onScanPages: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
     val onAddStickers: () -> Unit,
     val onInsertAudio: (Editor) -> Unit,
     val onRecordAudio: (Editor) -> Unit,
@@ -2343,6 +2409,7 @@ private fun EditorPane(
                     onOpenBackstage = actions.onOpenBackstage,
                     onInsertImage = { actions.onInsertCanvasImage(editor, null) },
                     onTakePhoto = { actions.onTakePhoto(editor, null) },
+                    onScanPages = { actions.onScanPages(editor, null) },
                     onClosePane = onClose,
                     onOpenMathStudio = actions.onOpenMathStudio,
                     onInsertAudio = { actions.onInsertAudio(editor) },
@@ -2368,9 +2435,10 @@ private fun EditorPane(
                     )
                     com.xnotes.ui.CropOverlay(canvas)
                     com.xnotes.ui.TextStyleBar(canvas)
-                    com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) })
+                    com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onScanPagesAt = { c -> actions.onScanPages(editor, c) }, onInsertStickyAt = { c -> editor.insertStickyNote(c) })
                     com.xnotes.ui.PenMenu(canvas)
                     com.xnotes.ui.CanvasDebugOverlay(canvas)
+                    com.xnotes.ui.StickyColorPopup(editor)
                     CanvasToastPill(canvas)
                 }
             }
@@ -2386,6 +2454,7 @@ private fun EditorPane(
                         onClosePane = onClose,
                         onImportTemplate = actions.onImportTemplate,
                         onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onScanPages = { actions.onScanPages(editor, null) },
                         onImagePage = { actions.onImagePage(editor) },
                         onOpenMathStudio = actions.onOpenMathStudio,
                         onInsertAudio = { actions.onInsertAudio(editor) },
@@ -2428,13 +2497,15 @@ private fun EditorPane(
                         com.xnotes.ui.ScreenshotMenu(editor, onShare = actions.onShareImage)
                         com.xnotes.ui.CropMenu(editor)
                         com.xnotes.ui.TextStyleBar(editor)
-                        com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onInsertNoteLinkAt = { c -> actions.onInsertNoteLink(editor, c) })
+                        com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onScanPagesAt = { c -> actions.onScanPages(editor, c) }, onInsertNoteLinkAt = { c -> actions.onInsertNoteLink(editor, c) }, onInsertStickyAt = { c -> editor.insertStickyNote(c) })
                         com.xnotes.ui.PenMenu(editor)
                         com.xnotes.ui.FlowEditMenu(editor)
                         com.xnotes.ui.PdfSelectionMenu(editor)
                         com.xnotes.ui.MarkupNotePeek(editor)
                         com.xnotes.ui.MarkupMenu(editor)
                         com.xnotes.ui.MarkupNoteDialog(editor)
+                        com.xnotes.ui.StickyNoteDialog(editor)
+                        com.xnotes.ui.StickyColorPopup(editor)
                         com.xnotes.ui.SlashMenu(editor)
                         com.xnotes.ui.FlowTableMenu(editor)
                         com.xnotes.ui.TableChrome(editor)

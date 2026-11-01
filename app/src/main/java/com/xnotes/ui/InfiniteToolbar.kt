@@ -24,6 +24,7 @@ import com.xnotes.ui.theme.toComposeColor
 /** Which tool a toolbar item arms, for the items that are simply a tool button. */
 private val CANVAS_TOOL_OF: Map<ToolbarItem, Tool> = mapOf(
     ToolbarItem.PEN to Tool.PEN,
+    ToolbarItem.PENCIL to Tool.PENCIL,
     ToolbarItem.DASHED to Tool.DASHED,
     ToolbarItem.CALLIGRAPHY to Tool.CALLIGRAPHY,
     ToolbarItem.SPEED to Tool.SPEED,
@@ -53,6 +54,7 @@ fun InfiniteToolbar(
     onOpenBackstage: () -> Unit,
     onInsertImage: () -> Unit = {},
     onTakePhoto: () -> Unit = {},
+    onScanPages: () -> Unit = {},
     onClosePane: (() -> Unit)? = null,
     onOpenMathStudio: () -> Unit = {},
     onInsertAudio: () -> Unit = {},
@@ -62,6 +64,7 @@ fun InfiniteToolbar(
     // a pen on either canvas rather than like a generic glyph.
     val toolIcons: Map<Tool, ImageVector> = mapOf(
         Tool.PEN to ImageVector.vectorResource(R.drawable.ic_stroke_regular),
+        Tool.PENCIL to ImageVector.vectorResource(R.drawable.ic_stroke_pencil),
         Tool.DASHED to ImageVector.vectorResource(R.drawable.ic_stroke_dashed),
         Tool.CALLIGRAPHY to ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy),
         Tool.SPEED to ImageVector.vectorResource(R.drawable.ic_stroke_speed),
@@ -143,6 +146,8 @@ fun InfiniteToolbar(
                         imageRows = listOf(
                             InsertRow(XnotesIcons.image, stringResource(R.string.insert_image_ellipsis)) { onInsertImage() },
                             InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
+                            InsertRow(XnotesIcons.traceScan, stringResource(R.string.scan_pages)) { onScanPages() },
+                            InsertRow(XnotesIcons.note, stringResource(R.string.sticky_note)) { editor.insertStickyNote() },
                         ),
                         onAudioFromFile = onInsertAudio,
                         onRecord = onRecordAudio,

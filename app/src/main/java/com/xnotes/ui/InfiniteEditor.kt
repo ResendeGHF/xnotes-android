@@ -159,6 +159,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         onAudioTap = { tapAudio(it) },
         onMathAnimTap = { tapMathAnim(it) },
         onPeelTape = { peelTape(it) },
+        onToggleSticky = { toggleStickyCollapsed(it) },
+        onStickyColorDot = { item, anchor -> onStickyColorDot?.invoke(item, anchor) },
+        onStickyEditText = { onStickyEditText?.invoke(it) == true },
         onUserMovedView = { AudioPlayback.userMoved(this) },
     )
 
@@ -996,6 +999,19 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     // Text boxes and convert-to-text are paged-note actions for now; not offered on the infinite canvas.
     override val selectionIsText: Boolean get() = false
     override fun editSelectionText() {}
+
+    override val singleSelectedSticky: com.xnotes.core.model.StickyNoteItem?
+        get() = selection.items.singleOrNull() as? com.xnotes.core.model.StickyNoteItem
+
+    override fun editSelectedSticky() {
+        val item = singleSelectedSticky ?: return
+        onStickyEditText?.invoke(item)
+    }
+
+    override fun toggleSelectedStickyCollapsed() {
+        val item = singleSelectedSticky ?: return
+        toggleStickyCollapsed(item)
+    }
 
     // Hyperlinks on items are a paged-note action for now; not offered on the infinite canvas.
     override val selectionCanLink: Boolean get() = false
@@ -1890,13 +1906,13 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      *
      * The pad has no copy of what is under it, so anything that composites against the page cannot
      * live there: a stencilled translucent pass, or a halo. Plain triangles can, and that is what
-     * a pen and a pencil are.
+     * a pen and a pencil are — the pencil's grain discards instead of blending.
      */
     private fun decideFrontInk(stroke: Stroke, parts: List<MeshPart>) {
         frontDecided = true
         // Turned off for this device, so there is no pad to consult and nothing to time against it.
         if (!pad.frontBuffering) return
-        if (parts.isEmpty() || parts.any { it.pass != InkPass.OPAQUE }) return
+        if (parts.isEmpty() || parts.any { it.pass != InkPass.OPAQUE && it.pass != InkPass.PENCIL }) return
         if (joinFrontInk()) return
         // Nothing joined, so the pad has to be wiped for this stroke, and whatever it was showing
         // has to be on the glass first. Being handed over is not that: the scene has the triangles,
@@ -2296,8 +2312,81 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         return true
     }
 
+    /**
+     * Place a sticky note in the middle of the view (or at [atContent]), expanded
+     * and selected. Tap its × to collapse it to a small icon; tap the icon to reopen it.
+     */
+    fun insertStickyNote(
+        atContent: com.xnotes.core.geometry.Pt? = null,
+        color: com.xnotes.core.model.Rgba = com.xnotes.core.model.StickyNoteItem.DEFAULT_COLOR,
+    ): com.xnotes.core.model.StickyNoteItem {
+        val centre = atContent ?: viewport.centerContent
+        // Keep the paper a comfortable size for the current view.
+        val w = (com.xnotes.core.model.StickyNoteItem.DEFAULT_WIDTH / viewport.zoom).coerceIn(
+            com.xnotes.core.model.StickyNoteItem.MIN_WIDTH, 1200.0,
+        )
+        val h = (com.xnotes.core.model.StickyNoteItem.DEFAULT_HEIGHT / viewport.zoom).coerceIn(
+            com.xnotes.core.model.StickyNoteItem.MIN_HEIGHT, 1200.0,
+        )
+        val item = com.xnotes.core.model.StickyNoteItem(
+            com.xnotes.core.geometry.Rect(centre.x - w / 2.0, centre.y - h / 2.0, w, h),
+            color, collapsed = false, measurer = textMeasurer,
+        )
+        commitItem(item)
+        selection.select(listOf(item))
+        publishOverlay()
+        return item
+    }
+
+    /** Collapse or expand [item], wherever it sits, as one undo step. */
+    fun toggleStickyCollapsed(item: com.xnotes.core.model.StickyNoteItem) {
+        val cmd = com.xnotes.core.history.SetStickyCollapsed(
+            listOf(
+                com.xnotes.core.history.SetStickyCollapsed.Entry(item, item.collapsed, !item.collapsed),
+            ),
+        )
+        cmd.redo()
+        document.itemsChanged(listOf(item))
+        history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(item)))
+        markDirty()
+        refresh()
+        publishOverlay()
+    }
+
+    /** Commit a host-edited sticky text, recording undo when it changed. */
+    fun commitStickyText(item: com.xnotes.core.model.StickyNoteItem, text: String) {
+        if (item.text == text) return
+        val cmd = com.xnotes.core.history.EditStickyText(item, item.text, text)
+        cmd.redo()
+        document.itemsChanged(listOf(item))
+        history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(item)))
+        markDirty()
+        refresh()
+        publishOverlay()
+    }
+
+    /** Recolor one sticky note's paper, recording undo. */
+    fun recolorSticky(item: com.xnotes.core.model.StickyNoteItem, color: com.xnotes.core.model.Rgba) {
+        if (item.color == color) return
+        val cmd = com.xnotes.core.history.RecolorSticky(
+            listOf(com.xnotes.core.history.RecolorSticky.Entry(item, item.color, color)),
+        )
+        cmd.redo()
+        document.itemsChanged(listOf(item))
+        history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(item)))
+        markDirty()
+        refresh()
+        publishOverlay()
+    }
+
     /** Shows a message to the user, with an optional button; the paged editor that owns this canvas sets it. */
     var onMessage: ((String, Pair<String, () -> Unit>?) -> Unit)? = null
+
+    /** Host hook to edit a sticky note's text (a dialog); true when handled. Set by the owning editor. */
+    var onStickyEditText: ((com.xnotes.core.model.StickyNoteItem) -> Boolean)? = null
+
+    /** Host hook for a sticky note's color dot: open the swatch picker at [anchorViewport]. */
+    var onStickyColorDot: ((com.xnotes.core.model.StickyNoteItem, com.xnotes.core.geometry.Rect) -> Unit)? = null
 
     override fun audioRepaint(item: com.xnotes.core.model.AudioItem) = audioChanged(item, save = false)
 
@@ -2495,6 +2584,19 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Pen up: the finished stroke joins the document, and the edit joins the undo stack. */
     private fun commitStroke(stroke: Stroke) {
+        // Ink starting inside an expanded sticky belongs to the sticky (note-local).
+        if (!wandEnabled) {
+            val start = stroke.samples.firstOrNull()
+            if (start != null) {
+                val target = document.items.lastOrNull {
+                    it is com.xnotes.core.model.StickyNoteItem && !it.collapsed && it.rect.contains(Pt(start.x, start.y))
+                } as? com.xnotes.core.model.StickyNoteItem
+                if (target != null) {
+                    commitStickyStroke(stroke, target)
+                    return
+                }
+            }
+        }
         // The commit message releases the wet buffers on the GL thread, so forget what was in them.
         val tail = wetTail
         forgetWetStroke()
@@ -2522,6 +2624,49 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         // while the pad is also showing it. Everything else about the commit happens now.
         heldItems = heldItems + stroke
         commitItem(stroke)
+        captureBehindStroke()
+    }
+
+    /** Commit a finished stroke into an expanded sticky's note-local ink. */
+    private fun commitStickyStroke(stroke: Stroke, target: com.xnotes.core.model.StickyNoteItem) {
+        forgetWetStroke()
+        val front = frontInk
+        frontInk = false
+        stroke.finished = true
+        val local = stroke.samples.map {
+            com.xnotes.core.stroke.Sample(it.x - target.rect.x, it.y - target.rect.y, it.pressure, it.t)
+        }
+        val committed = Stroke(stroke.tool, stroke.config, local, stroke.speedScale, stroke.straight, stroke.smoothScale)
+        committed.finished = true
+        val before = target.ink.map { Stroke(it) }
+        target.ink.add(committed)
+        val after = target.ink.map { Stroke(it) }
+        val cmd = com.xnotes.core.history.EditStickyInk(target, before, after)
+        if (!front) {
+            history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(target)))
+            // Like commitItem: add and clear the wet buffer in one message, so no frame
+            // shows both the wet tail and the committed mesh.
+            committingWetStroke = true
+            try {
+                document.itemsChanged(listOf(target))
+            } finally {
+                committingWetStroke = false
+            }
+            markDirty()
+            refresh()
+            return
+        }
+        pad.freeze()
+        // The tail was never settled into a run, so a stroke that joins this one has to do it.
+        handoverTail = wetTail
+        view.setUnbufferedStylus(false)
+        handoffGen++
+        // Hold the sticky, not the stroke: the pad keeps showing the ink while the scene
+        // re-meshes the paper with it, then takes the pad down once that frame is out.
+        heldItems = heldItems + target
+        history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(target)))
+        document.itemsChanged(listOf(target))
+        markDirty()
         captureBehindStroke()
     }
 

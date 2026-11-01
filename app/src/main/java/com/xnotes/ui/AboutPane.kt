@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import com.xnotes.R
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
+import com.xnotes.ui.theme.NotesBrandFont
 import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -97,10 +98,7 @@ fun AboutPane() {
             Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 16.dp, bottom = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // The angular "n" mark, drawn from the launcher-icon path so it matches the app icon.
-            NLogo(Modifier.size(72.dp), color = palette.accent.toComposeColor())
-            Spacer(Modifier.height(12.dp))
-            Text("notes", color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 24.sp)
+            Text("Notes", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 22.sp, letterSpacing = 1.2.sp)
             Spacer(Modifier.height(5.dp))
             Text(
                 "A customized fork of xnotes, a handwriting notes and sketching app for Android",

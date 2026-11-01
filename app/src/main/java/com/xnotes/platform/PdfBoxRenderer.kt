@@ -25,6 +25,7 @@ import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.pal.TextFlags
+import com.xnotes.core.stroke.PencilField
 import com.xnotes.core.pdf.GlyphPlacement
 import com.xnotes.core.pdf.LinkFinder
 import com.xnotes.core.pdf.PdfNumbers
@@ -180,6 +181,36 @@ internal class PdfBoxRenderer(
             cs.fill()
         }
     }
+
+    /**
+     * A pencil run for export: the same page-anchored field the screen and the
+     * live shader evaluate, rasterized fine and embedded as bitmaps, so print
+     * keeps the graphite instead of falling back to flat vector ink.
+     */
+    override fun fillPencil(
+        positions: DoubleArray,
+        colors: IntArray,
+        indices: IntArray,
+        ink: Rgba,
+        seed: Int,
+        tipMix: Float,
+    ) {
+        if (positions.isEmpty() || indices.isEmpty() || colors.isEmpty()) return
+        // Print at four field pixels per content px so exported grain stays crisp.
+        val px = 0.25
+        for (chunk in PencilField.render(positions, colors, indices, ink, 1.0, fieldPx = px, seed = seed, tipMix = tipMix.toDouble())) {
+            if (chunk.w <= 0 || chunk.h <= 0) continue
+            val bmp = Bitmap.createBitmap(chunk.w, chunk.h, Bitmap.Config.ARGB_8888)
+            bmp.setPixels(chunk.pixels, 0, chunk.w, 0, 0, chunk.w, chunk.h)
+            drawItemBitmap(
+                bmp,
+                Rect(chunk.left, chunk.top, chunk.w * px, chunk.h * px),
+                false,
+            )
+            bmp.recycle()
+        }
+    }
+
 
     // --- outlines ---
     override fun strokeRect(rect: Rect, pen: Pen) {

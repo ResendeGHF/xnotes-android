@@ -89,8 +89,8 @@ internal enum class Plot2DMode(val labelRes: Int) {
 
 /** One parametric curve x(t), y(t). */
 internal data class ParamCurve2D(
-    val x: String = "cos(3t)",
-    val y: String = "sin(2t)",
+    val x: String = "",
+    val y: String = "",
     val colorArgb: Int? = null,
     val visible: Boolean = true,
 )
@@ -98,10 +98,10 @@ internal data class ParamCurve2D(
 /** Everything the 2D plotter keeps: the entry lists carry each curve's colour and visibility. */
 internal class Plot2DState {
     var mode by mutableStateOf(Plot2DMode.CARTESIAN)
-    var expressions by mutableStateOf(listOf(MathEntry("sin(x)"), MathEntry("cos(x)/2")))
-    var paramCurves by mutableStateOf(listOf(ParamCurve2D(), ParamCurve2D("sin(3t)", "cos(2t)")))
-    var implicitList by mutableStateOf(listOf(MathEntry("x^2 + y^2 - 4")))
-    var complex by mutableStateOf("gamma(z)")
+    var expressions by mutableStateOf(listOf<MathEntry>())
+    var paramCurves by mutableStateOf(listOf<ParamCurve2D>())
+    var implicitList by mutableStateOf(listOf<MathEntry>())
+    var complex by mutableStateOf("")
     var polarTurns by mutableStateOf("2")
     var xMin by mutableStateOf(-10.0)
     var xMax by mutableStateOf(10.0)
@@ -117,8 +117,8 @@ internal class Plot2DState {
     fun addExpression() {
         if (expressions.size >= 6) return
         expressions = expressions + when (mode) {
-            Plot2DMode.POLAR -> MathEntry("1 + cos(theta)")
-            else -> MathEntry("x")
+            Plot2DMode.POLAR -> MathEntry("")
+            else -> MathEntry("")
         }
     }
 
@@ -133,13 +133,13 @@ internal class Plot2DState {
     }
 
     fun removeExpression(index: Int) {
-        if (expressions.size <= 1) return
+        if (index !in expressions.indices) return
         expressions = expressions.toMutableList().also { it.removeAt(index) }
     }
 
     fun addParam() {
         if (paramCurves.size >= 6) return
-        paramCurves = paramCurves + ParamCurve2D("cos(t)", "sin(t)")
+        paramCurves = paramCurves + ParamCurve2D("", "")
     }
     fun setParam(i: Int, x: String, y: String) {
         if (i !in paramCurves.indices) return
@@ -150,13 +150,13 @@ internal class Plot2DState {
         paramCurves = paramCurves.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
     }
     fun removeParam(i: Int) {
-        if (paramCurves.size <= 1) return
+        if (i !in paramCurves.indices) return
         paramCurves = paramCurves.toMutableList().also { it.removeAt(i) }
     }
 
     fun addImplicit() {
         if (implicitList.size >= 6) return
-        implicitList = implicitList + MathEntry("x^2 - y")
+        implicitList = implicitList + MathEntry("")
     }
     fun setImplicit(i: Int, text: String) {
         if (i !in implicitList.indices) return
@@ -167,7 +167,7 @@ internal class Plot2DState {
         implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
     }
     fun removeImplicit(i: Int) {
-        if (implicitList.size <= 1) return
+        if (i !in implicitList.indices) return
         implicitList = implicitList.toMutableList().also { it.removeAt(i) }
     }
 
@@ -351,10 +351,8 @@ private fun Plot2DInputs(state: Plot2DState) {
                     EntryEye(e.visible, eyeLabel) {
                         state.setExpressionStyle(index, e.colorArgb, !e.visible)
                     }
-                    if (state.expressions.size > 1) {
-                        MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
-                            state.removeExpression(index)
-                        }
+                    MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
+                        state.removeExpression(index)
                     }
                 }
             }
@@ -384,10 +382,8 @@ private fun Plot2DInputs(state: Plot2DState) {
                     EntryEye(p.visible, eyeLabel) {
                         state.setParamStyle(index, p.colorArgb, !p.visible)
                     }
-                    if (state.paramCurves.size > 1) {
-                        MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
-                            state.removeParam(index)
-                        }
+                    MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
+                        state.removeParam(index)
                     }
                 }
             }
@@ -407,10 +403,8 @@ private fun Plot2DInputs(state: Plot2DState) {
                     EntryEye(e.visible, eyeLabel) {
                         state.setImplicitStyle(index, e.colorArgb, !e.visible)
                     }
-                    if (state.implicitList.size > 1) {
-                        MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
-                            state.removeImplicit(index)
-                        }
+                    MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) {
+                        state.removeImplicit(index)
                     }
                 }
             }

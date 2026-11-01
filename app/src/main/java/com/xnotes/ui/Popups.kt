@@ -125,6 +125,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
     var glowIntensity by remember { mutableStateOf(ToolConversions.neonStrengthToIntensity(base.neonStrength).toFloat()) }
     var dashLen by remember { mutableStateOf(base.dashLength.toFloat()) }
     var gapLen by remember { mutableStateOf(base.dashGap.toFloat()) }
+    var grain by remember { mutableStateOf(ToolConversions.strengthToGrain(base.pencilGrain).toFloat()) }
     var straight by remember { mutableStateOf(base.straightLine) }
     var scale by remember { mutableStateOf(base.scale) }
     var intensity by remember { mutableStateOf(ToolConversions.highlighterAlphaToIntensity(base.highlighterAlpha).toFloat()) }
@@ -138,6 +139,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
         val sp = if (tool == Tool.SPEED) ToolConversions.speedToStrength(speed.toDouble()) else 0.0
         val tmf = if (tool == Tool.TAPER) taperTip.toDouble() / 100.0 else base.taperMinFactor
         val ha = if (tool == Tool.HIGHLIGHTER) ToolConversions.intensityToHighlighterAlpha(intensity.toDouble()) else base.highlighterAlpha
+        val gr = if (tool == Tool.PENCIL) ToolConversions.grainToStrength(grain.toDouble()) else base.pencilGrain
         editor.updateToolConfig(
             tool,
             base.copy(
@@ -156,6 +158,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 highlighterAlpha = ha,
                 highlighterInverse = inverse,
                 colorOverride = colorOverride,
+                pencilGrain = gr,
             ),
         )
     }
@@ -183,7 +186,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 }
             }
             Spacer(Modifier.size(12.dp))
-            val hasPressure = tool == Tool.PEN || tool == Tool.CALLIGRAPHY || tool == Tool.SPEED || tool == Tool.TAPER
+            val hasPressure = tool == Tool.PEN || tool == Tool.PENCIL || tool == Tool.CALLIGRAPHY || tool == Tool.SPEED || tool == Tool.TAPER
             if (hasPressure) {
                 ToggleRow(stringResource(R.string.caption_pressure), pressure) { pressure = it; emit() }
                 SliderRow(stringResource(R.string.caption_sensitivity), sensitivity, 0f..100f, enabled = pressure) { sensitivity = it; emit() }
@@ -218,9 +221,13 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 // page instead of darkening it. A multiply has nothing to darken on a dark page.
                 ToggleRow(stringResource(R.string.caption_inverse), inverse) { inverse = it; emit() }
             }
+            if (tool == Tool.PENCIL) {
+                SliderRow(stringResource(R.string.caption_grain), grain, 0f..100f) { grain = it; emit() }
+            }
             // Glow is offered on every stroke tool except the highlighter (translucent) and the
             // dashed pen (it draws a line, not a fillable ribbon, so a halo has nothing to hug).
-            if (tool.isStroke && tool != Tool.HIGHLIGHTER && tool != Tool.DASHED) {
+            // The pencil keeps its tooth instead of a halo, so it is excluded too.
+            if (tool.isStroke && tool != Tool.HIGHLIGHTER && tool != Tool.DASHED && tool != Tool.PENCIL) {
                 ToggleRow(stringResource(R.string.caption_neon), glow) { glow = it; emit() }
                 if (glow) {
                     SliderRow(stringResource(R.string.caption_glow_intensity), glowIntensity, 0f..100f) { glowIntensity = it; emit() }

@@ -99,6 +99,7 @@ fun Toolbar(
     onClosePane: (() -> Unit)? = null,
     onImportTemplate: () -> Unit = {},
     onTakePhoto: () -> Unit = {},
+    onScanPages: () -> Unit = {},
     onImagePage: () -> Unit = {},
     onOpenMathStudio: () -> Unit = {},
     onInsertAudio: () -> Unit = {},
@@ -109,6 +110,7 @@ fun Toolbar(
     // tinted at the call site like every other icon; the rest use the built-in line set.
     val toolIcons: Map<Tool, ImageVector> = mapOf(
         Tool.PEN to ImageVector.vectorResource(R.drawable.ic_stroke_regular),
+        Tool.PENCIL to ImageVector.vectorResource(R.drawable.ic_stroke_pencil),
         Tool.DASHED to ImageVector.vectorResource(R.drawable.ic_stroke_dashed),
         Tool.CALLIGRAPHY to ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy),
         Tool.SPEED to ImageVector.vectorResource(R.drawable.ic_stroke_speed),
@@ -142,6 +144,7 @@ fun Toolbar(
         onOpenBackstage = onOpenBackstage,
         onInsertImage = onInsertImage,
         onTakePhoto = onTakePhoto,
+        onScanPages = onScanPages,
         onImagePage = onImagePage,
         onAddStickers = onAddStickers,
         onToggleFullscreen = onToggleFullscreen,
@@ -211,6 +214,7 @@ private fun ToolbarItemView(
     onOpenBackstage: () -> Unit,
     onInsertImage: () -> Unit,
     onTakePhoto: () -> Unit,
+    onScanPages: () -> Unit,
     onImagePage: () -> Unit,
     onAddStickers: () -> Unit,
     onToggleFullscreen: () -> Unit,
@@ -246,7 +250,7 @@ private fun ToolbarItemView(
         ToolbarItem.SIDEBAR ->
             ToolbarIcon(XnotesIcons.sidebar, stringResource(R.string.side_panel), active = editor.sidebarVisible, shortcut = Keys.SIDEBAR) { editor.toggleSidebar() }
 
-        ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+        ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
         ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER, ToolbarItem.PAN,
         ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT, ToolbarItem.SHAPE,
         ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE, ToolbarItem.TAPE -> {
@@ -263,7 +267,7 @@ private fun ToolbarItemView(
         ToolbarItem.RULER ->
             ToolbarIcon(XnotesIcons.ruler, stringResource(R.string.tool_ruler), active = editor.rulerVisible) { editor.toggleRuler() }
 
-        ToolbarItem.IMAGE -> NoteInsertMenu(editor, onInsertImage, onTakePhoto, onImagePage, onAddStickers, onInsertAudio, onRecordAudio, onInsertNoteLink)
+        ToolbarItem.IMAGE -> NoteInsertMenu(editor, onInsertImage, onTakePhoto, onScanPages, onImagePage, onAddStickers, onInsertAudio, onRecordAudio, onInsertNoteLink)
 
         ToolbarItem.UNDO -> ToolbarIcon(XnotesIcons.undo, stringResource(R.string.undo), enabled = editor.canUndo, shortcut = Keys.UNDO) { editor.undo() }
         ToolbarItem.REDO -> ToolbarIcon(XnotesIcons.redo, stringResource(R.string.redo), enabled = editor.canRedo, shortcut = Keys.REDO) { editor.redo() }
@@ -678,6 +682,7 @@ private fun NoteInsertMenu(
     editor: Editor,
     onInsertImage: () -> Unit,
     onTakePhoto: () -> Unit,
+    onScanPages: () -> Unit,
     onImagePage: () -> Unit,
     onAddStickers: () -> Unit,
     onInsertAudio: () -> Unit,
@@ -690,9 +695,11 @@ private fun NoteInsertMenu(
         imageRows = listOf(
             InsertRow(XnotesIcons.image, stringResource(R.string.insert_image_ellipsis)) { onInsertImage() },
             InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
+            InsertRow(XnotesIcons.traceScan, stringResource(R.string.scan_pages)) { onScanPages() },
             InsertRow(XnotesIcons.paste, stringResource(R.string.paste_image)) { editor.pasteImage() },
             InsertRow(XnotesIcons.page, stringResource(R.string.image_as_page)) { onImagePage() },
             InsertRow(XnotesIcons.link, stringResource(R.string.insert_note_link)) { onInsertNoteLink() },
+            InsertRow(XnotesIcons.note, stringResource(R.string.sticky_note)) { editor.insertStickyNote() },
             InsertRow(XnotesIcons.sticker, stringResource(R.string.stickers), more = true) { stickersOpen = true },
         ),
         onAudioFromFile = onInsertAudio,

@@ -22,6 +22,7 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.ShapeLabel
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.SyncMark
 import com.xnotes.core.model.TapeItem
@@ -180,6 +181,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             is ConnectorItem -> writeConnector(j, item, ids)
             is TapeItem -> writeTape(j, item)
             is NoteLinkItem -> writeNoteLink(j, item, ids[item])
+            is StickyNoteItem -> writeSticky(j, item, ids[item])
             else -> {} // text and any unrecognized kind: not written, the canvas has none
         }
     }
@@ -251,6 +253,9 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         if (s.tool == Tool.HIGHLIGHTER) {
             j.name("highlighter_alpha").value(s.config.highlighterAlpha)
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
+        }
+        if (s.tool == Tool.PENCIL) {
+            j.name("pencil_grain").value(s.config.pencilGrain)
         }
         j.endObject()
         // Samples are almost all of a dense manifest's bytes, so they go out through [JsonWrite.samplePoint], which rounds them: 0.01
@@ -432,6 +437,67 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         if (item.rounded) j.name("rounded").value(true)
         if (item.locked) j.name("locked").value(true)
         item.group?.let { j.name("group").value(it) }
+        j.endObject()
+    }
+
+    /** A sticky note: paper box, paper color, collapsed flag, text and note-local ink. */
+    private fun writeSticky(j: JsonWrite, item: StickyNoteItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(StickyNoteItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("rect").beginArray().value(item.rect.x).value(item.rect.y).value(item.rect.w).value(item.rect.h).endArray()
+        j.name("color")
+        writeRgba(j, item.color)
+        if (item.collapsed) j.name("collapsed").value(true)
+        if (item.text.isNotEmpty()) j.name("text").value(item.text)
+        if (item.ink.isNotEmpty()) {
+            j.name("ink").beginArray()
+            for (s in item.ink) writeStickyStroke(j, s)
+            j.endArray()
+        }
+        if (item.locked) j.name("locked").value(true)
+        item.group?.let { j.name("group").value(it) }
+        j.endObject()
+    }
+
+    private fun writeStickyStroke(j: JsonWrite, s: Stroke) {
+        val withTime = s.config.speedStrength != 0.0
+        j.beginObject()
+        j.name("tool").value(s.tool.id)
+        j.name("config").beginObject()
+        j.name("base_width").value(s.config.baseWidth)
+        j.name("pressure_enabled").value(s.config.pressureEnabled)
+        j.name("pressure_min_factor").value(s.config.pressureMinFactor)
+        j.name("direction_strength").value(s.config.directionStrength)
+        j.name("rgba")
+        writeRgba(j, s.config.rgba)
+        if (s.config.speedStrength != 0.0) j.name("speed_strength").value(s.config.speedStrength)
+        if (s.config.taperEnabled) {
+            j.name("taper_enabled").value(true)
+            j.name("taper_min_factor").value(s.config.taperMinFactor)
+        }
+        if (s.config.neon) {
+            j.name("neon").value(true)
+            j.name("neon_strength").value(s.config.neonStrength)
+        }
+        if (s.tool == Tool.DASHED) {
+            j.name("dash_length").value(s.config.dashLength)
+            j.name("dash_gap").value(s.config.dashGap)
+        }
+        if (s.tool == Tool.HIGHLIGHTER) {
+            j.name("highlighter_alpha").value(s.config.highlighterAlpha)
+            if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
+        }
+        if (s.tool == Tool.PENCIL) {
+            j.name("pencil_grain").value(s.config.pencilGrain)
+        }
+        j.endObject()
+        j.name("samples").beginArray()
+        for (sm in s.samples) j.samplePoint(sm.x, sm.y, sm.pressure, if (withTime) sm.t else null)
+        j.endArray()
+        if (withTime) j.name("speed_scale").value(s.speedScale)
+        if (s.smoothScale != 1.0) j.name("smooth_scale").value(s.smoothScale)
+        if (s.straight) j.name("straight").value(true)
         j.endObject()
     }
 
@@ -828,6 +894,9 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var notePages: List<Int>? = null
         var linkColor: Rgba? = null
         var linkRounded = false
+        var text = ""
+        var collapsed = false
+        var stickyInk: MutableList<Stroke>? = null
     }
 
     /** Stroke config fields as written; null = absent, so defaults resolve exactly as before. */
@@ -846,6 +915,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var dashGap: Double? = null
         var highlighterAlpha: Double? = null
         var highlighterInverse: Boolean? = null
+        var pencilGrain: Double? = null
     }
 
     private fun parseItem(p: JsonPull, items: MutableList<CanvasItem>, pending: MutableList<Pending>, glue: GlueRead) {
@@ -913,6 +983,9 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "pages" -> s.notePages = intListOrNull(p)
                 "color" -> s.linkColor = rgbaOrNull(p)
                 "rounded" -> s.linkRounded = boolOr(p, false)
+                "text" -> s.text = stringOr(p, "")
+                "collapsed" -> s.collapsed = boolOr(p, false)
+                "ink" -> s.stickyInk = parseStickyInk(p)
                 else -> p.skipValue()
             }
         }
@@ -944,6 +1017,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             }
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
             NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
+            StickyNoteItem.KIND -> buildSticky(s)?.let { items.add(it) }
             else -> {} // text and any unrecognized kind: skipped (forgiving)
         }
         if (items.size > before) glue.named(items[before], s.id)
@@ -979,6 +1053,81 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         )
     }
 
+    private fun buildSticky(s: ItemScratch): StickyNoteItem? {
+        val rect = s.rect ?: return null
+        if (!(rect.w.isFinite() && rect.h.isFinite() && rect.w > 0.0 && rect.h > 0.0)) return null
+        return StickyNoteItem(
+            rect = rect,
+            color = s.linkColor ?: StickyNoteItem.DEFAULT_COLOR,
+            collapsed = s.collapsed,
+            text = s.text,
+            ink = (s.stickyInk ?: mutableListOf()).mapTo(mutableListOf()) { Stroke(it) },
+            measurer = textMeasurer,
+        )
+    }
+
+    private fun parseStickyInk(p: JsonPull): MutableList<Stroke>? {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return null
+        }
+        val out = mutableListOf<Stroke>()
+        p.beginArray()
+        while (p.hasNext()) parseStickyStroke(p)?.let { out.add(it) }
+        p.endArray()
+        return out
+    }
+
+    private fun parseStickyStroke(p: JsonPull): Stroke? {
+        if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+            p.skipValue()
+            return null
+        }
+        var tool: String? = null
+        var config: ConfigScratch? = null
+        var samples: RawSamples? = null
+        var speedScale = 1.0
+        var smoothScale = 1.0
+        var straight = false
+        p.beginObject()
+        while (p.hasNext()) {
+            when (p.nextName()) {
+                "tool" -> tool = stringOr(p, "")
+                "config" -> config = parseConfig(p)
+                "samples" -> samples = parseSamples(p)
+                "speed_scale" -> speedScale = doubleOr(p, 1.0)
+                "smooth_scale" -> smoothScale = doubleOr(p, 1.0)
+                "straight" -> straight = boolOr(p, false)
+                else -> p.skipValue()
+            }
+        }
+        p.endObject()
+        val t = Tool.fromId(tool) ?: return null
+        val c = config
+        val def = ToolConfig()
+        val cfg = ToolConfig(
+            baseWidth = c?.baseWidth ?: def.baseWidth,
+            pressureEnabled = c?.pressureEnabled ?: def.pressureEnabled,
+            pressureMinFactor = c?.pressureMinFactor ?: def.pressureMinFactor,
+            directionStrength = c?.directionStrength ?: def.directionStrength,
+            rgba = c?.rgba ?: def.rgba,
+            speedStrength = c?.speedStrength ?: def.speedStrength,
+            taperEnabled = c?.taperEnabled ?: def.taperEnabled,
+            taperMinFactor = c?.taperMinFactor ?: ToolDefaults.LEGACY_TAPER_TIP,
+            neon = c?.neon ?: def.neon,
+            neonStrength = c?.neonStrength ?: def.neonStrength,
+            dashLength = c?.dashLength ?: def.dashLength,
+            dashGap = c?.dashGap ?: def.dashGap,
+            highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
+            highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
+            pencilGrain = c?.pencilGrain ?: def.pencilGrain,
+        )
+        val stroke = Stroke(t, cfg, emptyList(), speedScale, straight, smoothScale)
+        samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
+        if (stroke.isEmpty) return null
+        return stroke
+    }
+
     private fun buildStroke(s: ItemScratch): Stroke {
         val tool = Tool.fromId(s.tool) ?: Tool.PEN
         val c = s.config
@@ -998,6 +1147,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
+            pencilGrain = c?.pencilGrain ?: def.pencilGrain,
         )
         val stroke = Stroke(tool, config, emptyList(), s.speedScale, s.straight, s.smoothScale)
         s.samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
@@ -1206,6 +1356,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "dash_gap" -> c.dashGap = doubleOrNull(p)
                 "highlighter_alpha" -> c.highlighterAlpha = doubleOrNull(p)
                 "highlighter_inverse" -> c.highlighterInverse = boolOrNull(p)
+                "pencil_grain" -> c.pencilGrain = doubleOrNull(p)
                 else -> p.skipValue()
             }
         }

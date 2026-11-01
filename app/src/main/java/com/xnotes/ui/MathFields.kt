@@ -70,15 +70,15 @@ internal enum class FieldMode(val labelRes: Int) {
     VECTOR_3D(R.string.math_field_vector_3d),
 }
 
-internal data class Vec2Field(val p: String = "-y", val q: String = "x", val colorArgb: Int? = null, val visible: Boolean = true)
-internal data class Vec3Field(val p: String = "-y", val q: String = "x", val r: String = "0.35z", val colorArgb: Int? = null, val visible: Boolean = true)
+internal data class Vec2Field(val p: String = "", val q: String = "", val colorArgb: Int? = null, val visible: Boolean = true)
+internal data class Vec3Field(val p: String = "", val q: String = "", val r: String = "", val colorArgb: Int? = null, val visible: Boolean = true)
 
 internal class FieldState {
     var mode by mutableStateOf(FieldMode.SCALAR_2D)
-    var scalar2List by mutableStateOf(listOf(MathEntry("sin(x) * cos(y)")))
-    var vector2List by mutableStateOf(listOf(Vec2Field()))
-    var scalar3List by mutableStateOf(listOf(MathEntry("exp(-(x^2 + y^2 + z^2))")))
-    var vector3List by mutableStateOf(listOf(Vec3Field()))
+    var scalar2List by mutableStateOf(listOf<MathEntry>())
+    var vector2List by mutableStateOf(listOf<Vec2Field>())
+    var scalar3List by mutableStateOf(listOf<MathEntry>())
+    var vector3List by mutableStateOf(listOf<Vec3Field>())
     var xRange by mutableStateOf("5")
     var yRange by mutableStateOf("5")
     var zRange by mutableStateOf("3")
@@ -91,14 +91,14 @@ internal class FieldState {
     var level by mutableFloatStateOf(0.55f)
     /** When true the field is sampled only along a curve (2D) or surface (3D) instead of the grid. */
     var usePath2D by mutableStateOf(false)
-    var pathX2 by mutableStateOf("cos(s)")
-    var pathY2 by mutableStateOf("sin(s)")
+    var pathX2 by mutableStateOf("")
+    var pathY2 by mutableStateOf("")
     var pathS0 by mutableStateOf("0")
     var pathS1 by mutableStateOf("6.28")
     var usePath3D by mutableStateOf(false)
-    var surfX3 by mutableStateOf("sin(u)*cos(v)")
-    var surfY3 by mutableStateOf("sin(u)*sin(v)")
-    var surfZ3 by mutableStateOf("cos(u)")
+    var surfX3 by mutableStateOf("")
+    var surfY3 by mutableStateOf("")
+    var surfZ3 by mutableStateOf("")
     var surfU0 by mutableStateOf("-3.14")
     var surfU1 by mutableStateOf("3.14")
     var probeX by mutableStateOf("0.5")
@@ -116,26 +116,26 @@ internal class FieldState {
     }
     fun addEntry() {
         when (mode) {
-            FieldMode.SCALAR_2D -> if (scalar2List.size < 4) scalar2List += MathEntry("x^2 - y^2")
-            FieldMode.VECTOR_2D -> if (vector2List.size < 4) vector2List += Vec2Field("y", "-x")
-            FieldMode.SCALAR_3D -> if (scalar3List.size < 4) scalar3List += MathEntry("x^2 + y^2 - z")
-            FieldMode.VECTOR_3D -> if (vector3List.size < 4) vector3List += Vec3Field("z", "x", "y")
+            FieldMode.SCALAR_2D -> if (scalar2List.size < 4) scalar2List += MathEntry("")
+            FieldMode.VECTOR_2D -> if (vector2List.size < 4) vector2List += Vec2Field("", "")
+            FieldMode.SCALAR_3D -> if (scalar3List.size < 4) scalar3List += MathEntry("")
+            FieldMode.VECTOR_3D -> if (vector3List.size < 4) vector3List += Vec3Field("", "", "")
         }
     }
     fun removeEntry(i: Int) {
         when (mode) {
-            FieldMode.SCALAR_2D -> if (scalar2List.size > 1) scalar2List = scalar2List.toMutableList().also { it.removeAt(i) }
-            FieldMode.VECTOR_2D -> if (vector2List.size > 1) vector2List = vector2List.toMutableList().also { it.removeAt(i) }
-            FieldMode.SCALAR_3D -> if (scalar3List.size > 1) scalar3List = scalar3List.toMutableList().also { it.removeAt(i) }
-            FieldMode.VECTOR_3D -> if (vector3List.size > 1) vector3List = vector3List.toMutableList().also { it.removeAt(i) }
+            FieldMode.SCALAR_2D -> if (i in scalar2List.indices) scalar2List = scalar2List.toMutableList().also { it.removeAt(i) }
+            FieldMode.VECTOR_2D -> if (i in vector2List.indices) vector2List = vector2List.toMutableList().also { it.removeAt(i) }
+            FieldMode.SCALAR_3D -> if (i in scalar3List.indices) scalar3List = scalar3List.toMutableList().also { it.removeAt(i) }
+            FieldMode.VECTOR_3D -> if (i in vector3List.indices) vector3List = vector3List.toMutableList().also { it.removeAt(i) }
         }
     }
     fun setEntryStyle(i: Int, colorArgb: Int?, visible: Boolean) {
         when (mode) {
-            FieldMode.SCALAR_2D -> scalar2List = scalar2List.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            FieldMode.VECTOR_2D -> vector2List = vector2List.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            FieldMode.SCALAR_3D -> scalar3List = scalar3List.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            FieldMode.VECTOR_3D -> vector3List = vector3List.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            FieldMode.SCALAR_2D -> if (i in scalar2List.indices) scalar2List = scalar2List.toMutableList().also { list -> list[i] = list[i].copy(colorArgb = colorArgb, visible = visible) }
+            FieldMode.VECTOR_2D -> if (i in vector2List.indices) vector2List = vector2List.toMutableList().also { list -> list[i] = list[i].copy(colorArgb = colorArgb, visible = visible) }
+            FieldMode.SCALAR_3D -> if (i in scalar3List.indices) scalar3List = scalar3List.toMutableList().also { list -> list[i] = list[i].copy(colorArgb = colorArgb, visible = visible) }
+            FieldMode.VECTOR_3D -> if (i in vector3List.indices) vector3List = vector3List.toMutableList().also { list -> list[i] = list[i].copy(colorArgb = colorArgb, visible = visible) }
         }
     }
     fun center(): Triple<Double, Double, Double> = Triple(
@@ -333,7 +333,7 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                             EntryEye(e.visible, eyeLabel) {
                                 state.setEntryStyle(i, e.colorArgb, !e.visible)
                             }
-                            if (state.scalar2List.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
+                            MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
                         }
                     }
                     MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addEntry() }
@@ -349,7 +349,7 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                             EntryEye(v.visible, eyeLabel) {
                                 state.setEntryStyle(i, v.colorArgb, !v.visible)
                             }
-                            if (state.vector2List.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
+                            MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
                         }
                     }
                     MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addEntry() }
@@ -364,7 +364,7 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                             EntryEye(e.visible, eyeLabel) {
                                 state.setEntryStyle(i, e.colorArgb, !e.visible)
                             }
-                            if (state.scalar3List.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
+                            MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
                         }
                     }
                     MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addEntry() }
@@ -381,7 +381,7 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                             EntryEye(v.visible, eyeLabel) {
                                 state.setEntryStyle(i, v.colorArgb, !v.visible)
                             }
-                            if (state.vector3List.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
+                            MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeEntry(i) }
                         }
                     }
                     MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addEntry() }

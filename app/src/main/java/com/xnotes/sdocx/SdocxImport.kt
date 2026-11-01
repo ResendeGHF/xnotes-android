@@ -15,7 +15,9 @@ import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.ShapeLabel
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
+import com.xnotes.core.model.TableItem
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextStyle
 import com.xnotes.core.pal.FontFace
@@ -37,17 +39,17 @@ import kotlin.math.roundToInt
  *
  * Covers pages, strokes (+ colors/widths, including type-15 development
  * strokes and single-tap dots), raster images (page objects,
- * page-background and note-body photos, one page each for the latter),
- * single-PDF backgrounds, text boxes (+ shape labels), basic shapes and
- * straight lines (as editable shapes), free outlines (as polygon/polyline
- * shapes) and voice memos (as audio pills, any container sniffed by magic).
+ * page-background and note-body photos), single-PDF backgrounds, text boxes
+ * (+ shape labels), basic shapes and straight lines (as editable shapes),
+ * free outlines (as polygon/polyline shapes), tables (type-22 page objects
+ * and note-body tables, with cell values), sticky memos (nested `.sdocx`
+ * sub-notes as [StickyNoteItem]) and voice memos (as audio pills, any
+ * container sniffed by magic).
  *
- * Deliberately dropped: tables (no validated samples exist for Samsung's
- * type-22 page objects; xnotes grids still export as strokes), fills on
- * imported shapes (outlines only), text rotation (boxes land upright),
- * mixed per-range styling (collapses to whole-box bold/italic), custom fonts
- * (Samsung's font names map to the sans face), video/painting/sticker media
- * and containers' hidden layers.
+ * Deliberately dropped: fills on imported shapes (outlines only), text
+ * rotation (boxes land upright), mixed per-range styling (collapses to
+ * whole-box bold/italic), custom fonts (Samsung's font names map to the sans
+ * face), video/painting media and containers' hidden layers.
  */
 object SdocxImport {
     fun toDocument(
@@ -60,6 +62,9 @@ object SdocxImport {
     ): Document? {
         if (sdocx.pages.isEmpty()) return null
         val doc = Document(dpi = dpi)
+        if (!sdocx.title.isNullOrBlank()) {
+            doc.displayName = sdocx.title
+        }
 
         // Single-PDF case: the media referenced by the most pages wins. Pages
         // referencing any other PDF import as plain pages (strokes preserved).
@@ -127,12 +132,19 @@ object SdocxImport {
             for (v in spage.voices) {
                 toVoice(v, sdocx, imageDir, nextRid++, dpi, textMeasurer)?.let { page.items.add(it) }
             }
+            for (t in spage.tables) {
+                toTable(t, w, h, textMeasurer, flowCoords = false)?.let { page.items.add(it) }
+            }
 
             // Drop fully-empty shells (attachment collapses, trailing blanks) but keep
-            // pattern-only pages: they are real content. Keep at least one page overall.
+            // pattern-only pages and meaningfully-tinted pages: they are real
+            // content. The default paper tint alone is not meaningful. Keep at
+            // least one page overall.
             val hasPdf = page.pdfPage != null
-            val hasStyle = spage.backgroundColorArgb != null || pattern != "none"
-            if (page.items.isEmpty() && !hasPdf && !hasStyle) continue
+            val defaultBg = 0xFFFCFCFC.toInt()
+            val hasMeaningfulStyle = pattern != "none" ||
+                (spage.backgroundColorArgb != null && spage.backgroundColorArgb != defaultBg)
+            if (page.items.isEmpty() && !hasPdf && !hasMeaningfulStyle) continue
             doc.pages.add(page)
         }
 
@@ -153,6 +165,24 @@ object SdocxImport {
                 target.items.add(item)
             }
         }
+
+        // Tables pasted into Samsung text (note.note body) land like body photos:
+        // fit-and-clamp into the page, reusing empty pages first.
+        if (sdocx.bodyTables.isNotEmpty()) {
+            val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
+                ?: sdocx.pages.firstOrNull()?.let {
+                    Pair(saneDim(it.width, fallbackW), saneDim(it.height, fallbackH))
+                }
+                ?: Pair(fallbackW, fallbackH)
+            for (t in sdocx.bodyTables) {
+                val item = toTable(t, sized.first, sized.second, textMeasurer, flowCoords = true) ?: continue
+                val target = doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null }
+                    ?: Page(sized.first, sized.second).also { doc.pages.add(it) }
+                target.items.add(item)
+            }
+        }
+
+        importStickyMemos(sdocx, doc, textMeasurer)
 
         if (doc.pages.isEmpty()) {
             // All shells: keep one page so the note is never page-less.
@@ -236,18 +266,16 @@ object SdocxImport {
         imageCodec: ImageCodec,
     ): ImageItem? {
         try {
-            // Explicit bind id first; it must resolve to real image bytes.
-            // A scanned id that points nowhere (or to non-image bytes) means
-            // "no photo here", not "use some other photo".
+            // Explicit bind id first; on failure fall through to a scan of any
+            // decodable image so a stale id never drops a real photo.
             im.mediaId?.let { id ->
                 val entry = doc.mediaByBindId[id]
                 val bytes = entry?.bytes
                 if (bytes != null && bytes.isNotEmpty()) {
                     imageItemFromBytes(bytes, entry?.fileName ?: "", im.bbox, imageDir, imageCodec)?.let { return it }
                 }
-                if (entry != null) return null
             }
-            // No bind id (or unknown id): fall back to any media bytes that
+            // No (or unresolvable) bind id: fall back to any media bytes that
             // actually decode as an image, regardless of file extension.
             for (entry in doc.mediaByBindId.values + doc.mediaByFileName.values) {
                 val bytes = entry.bytes ?: continue
@@ -607,18 +635,42 @@ object SdocxImport {
         measurer: TextMeasurer,
     ): AudioItem? {
         try {
-            if (v.mediaId == null) return null
-            val entry = doc.mediaByBindId[v.mediaId] ?: return null
-            val bytes = entry.bytes ?: return null
-            if (bytes.isEmpty()) return null
-            // Samsung voice memos may use extensions outside the known audio
-            // set (or none at all); sniff the payload instead of trusting the
-            // name so real memos are never dropped by a suffix check.
-            val lower = entry.fileName.lowercase()
-            var ext = lower.substringAfterLast('.', "").takeIf { it.length in 1..5 }
-            val sniffed = sniffAudioExt(bytes)
-            if (sniffed != null) ext = sniffed
-            if (ext == null) ext = "m4a"
+            // Explicit id first with a sniff check; on failure fall through to
+            // any audio payload so renamed or mis-indexed memos still import.
+            v.mediaId?.let { id ->
+                val entry = doc.mediaByBindId[id]
+                val bytes = entry?.bytes
+                if (bytes != null && bytes.isNotEmpty()) {
+                    audioExtFor(bytes, entry?.fileName ?: "")?.let { ext ->
+                        return@toVoice audioItemFor(bytes, ext, v, imageDir, rid, dpi, measurer)
+                    }
+                }
+            }
+            // Fallback: any audio payload (sniffed or named like audio).
+            for (entry in doc.mediaByBindId.values + doc.mediaByFileName.values) {
+                val bytes = entry.bytes ?: continue
+                if (bytes.isEmpty()) continue
+                val ext = audioExtFor(bytes, entry.fileName) ?: continue
+                // Skip non-audio names when the payload does not sniff as audio.
+                if (sniffAudioExt(bytes) == null && !looksLikeAudioName(entry.fileName) && !entry.isAudio) continue
+                return audioItemFor(bytes, ext, v, imageDir, rid, dpi, measurer)
+            }
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun audioItemFor(
+        bytes: ByteArray,
+        ext: String,
+        v: SdocxVoice,
+        imageDir: File,
+        rid: Int,
+        dpi: Int,
+        measurer: TextMeasurer,
+    ): AudioItem? {
+        return try {
             val file = File.createTempFile("sdocx-aud", ".$ext", imageDir)
             file.writeBytes(bytes)
             val audio = AudioData(file, ext, v.durationMs, ByteArray(0))
@@ -630,9 +682,405 @@ object SdocxImport {
                 AudioItem.boxAt(Pt((v.bbox.left + v.bbox.right) / 2.0, (v.bbox.top + v.bbox.bottom) / 2.0), dpi)
             }
             val name = v.title.ifEmpty { "Voice memo" }
-            return AudioItem(audio, rect, name, rid, measurer)
+            AudioItem(audio, rect, name, rid, measurer)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Extension (no dot) for [bytes] named [fileName]; `.dat`/`.bin` count as `m4a`. */
+    private fun audioExtFor(bytes: ByteArray, fileName: String): String? {
+        sniffAudioExt(bytes)?.let { return it }
+        val lower = fileName.lowercase()
+        val ext = lower.substringAfterLast('.', "").takeIf { '.' in lower && it.length in 1..5 } ?: run {
+            // Extension-less `.dat`-style names still decode as m4a audio.
+            if (lower.endsWith(".dat") || lower.endsWith(".bin")) return "m4a"
+            return null
+        }
+        if (ext == "dat" || ext == "bin") return "m4a"
+        return if (isKnownAudioExt(ext)) ext else null
+    }
+
+    fun isKnownAudioExt(ext: String): Boolean {
+        val e = ext.lowercase().trimStart('.')
+        return e == "m4a" || e == "mp3" || e == "wav" || e == "ogg" || e == "3gp" || e == "amr"
+    }
+
+    fun looksLikeAudioName(name: String): Boolean {
+        val lower = name.lowercase()
+        if (!lower.contains('.')) return false
+        val ext = lower.substringAfterLast('.', "")
+        if (ext.length !in 1..5) return false
+        return isKnownAudioExt(ext) || ext == "dat" || ext == "bin"
+    }
+
+    // --- tables ---
+
+    /**
+     * A Samsung grid as an editable [TableItem]. Page tables keep their stored
+     * box (sanitized and clamped); body tables ([flowCoords]) are fit-and-
+     * clamped like body photos because text-flow coordinates are meaningless
+     * on the page. Cell texts are trimmed to 2000 chars.
+     */
+    fun toTable(
+        t: SdocxTable,
+        pageW: Double,
+        pageH: Double,
+        measurer: TextMeasurer,
+        flowCoords: Boolean = false,
+    ): TableItem? {
+        try {
+            if (t.columnWidths.isEmpty() || t.rows.isEmpty()) return null
+            if (!(pageW > 0) || !(pageH > 0) || !pageW.isFinite() || !pageH.isFinite()) return null
+            val cols = t.columnWidths.size.coerceIn(1, TableItem.MAX_LINES)
+            val rowsN = t.rows.size.coerceIn(1, TableItem.MAX_LINES)
+
+            var w = t.bbox.width.takeIf { it.isFinite() && it > 0 && it <= 10000 } ?: 0.0
+            var h = t.bbox.height.takeIf { it.isFinite() && it > 0 && it <= 10000 } ?: 0.0
+            var left = t.bbox.left.takeIf { it.isFinite() } ?: 0.0
+            var top = t.bbox.top.takeIf { it.isFinite() } ?: 0.0
+            val colSum = t.columnWidths.filter { it.isFinite() && it > 0 }.sum()
+            var rowSum = 0.0
+            for (r in t.rows) {
+                val rh = r.height.takeIf { it.isFinite() && it > 0 } ?: 0.0
+                rowSum += rh
+            }
+            if (!(w > 0)) w = if (colSum > 0) colSum else 400.0
+            if (!(h > 0)) h = if (rowSum > 0) rowSum else 200.0
+
+            if (flowCoords) {
+                // Fit-and-clamp like body images: shrink oversized tables,
+                // then clamp into the page; default origin 40,40.
+                if (!left.isFinite()) left = 40.0
+                if (!top.isFinite()) top = 40.0
+                // When the stored origin is far outside the page (text-flow
+                // coords), fall back to the default origin.
+                if (left < -pageW || left > 2 * pageW) left = 40.0
+                if (top < -pageH || top > 2 * pageH) top = 40.0
+                val scale = minOf(1.0, pageW / w, pageH / h)
+                if (scale.isFinite() && scale > 0 && scale < 1.0) {
+                    w *= scale
+                    h *= scale
+                }
+                if (w > pageW) w = pageW
+                if (h > pageH) h = pageH
+                left = left.coerceIn(0.0, (pageW - w).coerceAtLeast(0.0))
+                top = top.coerceIn(0.0, (pageH - h).coerceAtLeast(0.0))
+                if (!(left.isFinite())) left = 40.0.coerceIn(0.0, (pageW - w).coerceAtLeast(0.0))
+                if (!(top.isFinite())) top = 40.0.coerceIn(0.0, (pageH - h).coerceAtLeast(0.0))
+            } else {
+                if (!left.isFinite()) left = 0.0
+                if (!top.isFinite()) top = 0.0
+                if (w > pageW) w = pageW
+                if (h > pageH) h = pageH
+                left = left.coerceIn(0.0, (pageW - w).coerceAtLeast(0.0))
+                top = top.coerceIn(0.0, (pageH - h).coerceAtLeast(0.0))
+            }
+            if (!(w > 0) || !(h > 0) || !w.isFinite() || !h.isFinite()) return null
+
+            val rect = Rect(left, top, w, h)
+            val item = TableItem.create(rect, cols, rowsN, Rgba(20, 20, 20, 255), 2.0)
+
+            // Replace even fractions with the stored proportions.
+            try {
+                val totalW = t.columnWidths.filter { it.isFinite() && it > 0 }.sum()
+                if (totalW > 0) {
+                    item.colFractions.clear()
+                    for (i in 0 until cols) {
+                        val src = t.columnWidths.getOrNull(i)?.takeIf { it.isFinite() && it > 0 } ?: (totalW / cols)
+                        item.colFractions.add(src / totalW)
+                    }
+                    val s = item.colFractions.sum()
+                    if (s > 0) for (i in item.colFractions.indices) item.colFractions[i] = item.colFractions[i] / s
+                }
+                var totalH = 0.0
+                for (r in t.rows) totalH += r.height.takeIf { it.isFinite() && it > 0 } ?: 0.0
+                if (totalH > 0) {
+                    item.rowFractions.clear()
+                    for (i in 0 until rowsN) {
+                        val src = t.rows.getOrNull(i)?.height?.takeIf { it.isFinite() && it > 0 } ?: (totalH / rowsN)
+                        item.rowFractions.add(src / totalH)
+                    }
+                    val s = item.rowFractions.sum()
+                    if (s > 0) for (i in item.rowFractions.indices) item.rowFractions[i] = item.rowFractions[i] / s
+                }
+            } catch (_: Exception) {
+            }
+
+            // Cell texts via reflection so a tree without the cell feature
+            // still compiles; trimmed to 2000 chars.
+            for ((ri, row) in t.rows.withIndex()) {
+                if (ri >= rowsN) break
+                for (cell in row.cells) {
+                    try {
+                        val c = cell.col.coerceIn(0, cols - 1)
+                        val txt = cell.text.trim().take(2000)
+                        if (txt.isEmpty()) continue
+                        setTableCell(item, c, ri, txt)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            return item
         } catch (_: Exception) {
             return null
+        }
+    }
+
+    private fun setTableCell(item: TableItem, c: Int, r: Int, text: String) {
+        try {
+            item.setCell(c, r, text)
+        } catch (_: Exception) {
+        }
+    }
+
+    // --- sticky memos (.sdocx attachments) ---
+
+    /**
+     * Sticker sub-notes (`.sdocx` media): each inner note's ink+text becomes a
+     * 300×300 [StickyNoteItem] on the first empty page (else a new page sized
+     * like the first). Falls back to a `TextItem("Sticky")` plus regular
+     * strokes. Never throws.
+     */
+    private fun importStickyMemos(
+        sdocx: SdocxDocument,
+        doc: Document,
+        measurer: TextMeasurer,
+    ) {
+        try {
+            val entries = (sdocx.mediaByBindId.values + sdocx.mediaByFileName.values)
+                .distinctBy { it.fileName.lowercase() }
+                .filter { it.fileName.lowercase().endsWith(".sdocx") && it.bytes != null && it.bytes!!.isNotEmpty() }
+            if (entries.isEmpty()) return
+            for (entry in entries) {
+                try {
+                    val bytes = entry.bytes ?: continue
+                    if (bytes.isEmpty()) continue
+                    val innerEntries = try {
+                        unzipEntries(bytes)
+                    } catch (_: Exception) {
+                        continue
+                    }
+                    val inner = try {
+                        SdocxParser.parseArchive(innerEntries)
+                    } catch (_: Exception) {
+                        continue
+                    }
+                    val strokes = ArrayList<Stroke>()
+                    val texts = ArrayList<String>()
+                    for (page in inner.pages) {
+                        for (s in page.strokes) {
+                            try {
+                                toStroke(s)?.let { strokes.add(it) }
+                            } catch (_: Exception) {
+                            }
+                        }
+                        for (tb in page.textBoxes) {
+                            try {
+                                if (tb.text.isNotBlank()) texts.add(tb.text)
+                            } catch (_: Exception) {
+                            }
+                        }
+                        for (sh in page.shapes) {
+                            try {
+                                val label = sh.label
+                                if (label != null && label.text.isNotBlank()) texts.add(label.text)
+                            } catch (_: Exception) {
+                            }
+                        }
+                        for (t in page.tables) {
+                            try {
+                                for (row in t.rows) for (cell in row.cells) {
+                                    if (cell.text.isNotBlank()) texts.add(cell.text)
+                                }
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    // Inner note-body tables (text-flow) also contribute their values.
+                    try {
+                        for (t in inner.bodyTables) {
+                            for (row in t.rows) for (cell in row.cells) {
+                                if (cell.text.isNotBlank()) texts.add(cell.text)
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                    if (strokes.isEmpty() && texts.isEmpty()) continue
+                    val combined = texts.joinToString("\n").trim().take(2000)
+
+                    // Fit ink into 300×300 sticky: translate bbox to origin,
+                    // scale to fit avail 276×240, offset 12,42.
+                    val fittedInk: List<Stroke> = try {
+                        fitStickyInk(strokes)
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+
+                    val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
+                        ?: sdocx.pages.firstOrNull()?.let { Pair(it.width, it.height) }
+                        ?: Pair(1440.0, 2036.0)
+                    val target = doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null }
+                        ?: Page(sized.first, sized.second).also { doc.pages.add(it) }
+                    val stickyW = 300.0
+                    val stickyH = 300.0
+                    val sx = 40.0.coerceIn(0.0, (target.width - stickyW).coerceAtLeast(0.0))
+                    val sy = 40.0.coerceIn(0.0, (target.height - stickyH).coerceAtLeast(0.0))
+                    val rect = Rect(sx, sy, stickyW, stickyH)
+
+                    val created = try {
+                        StickyNoteItem(rect, StickyNoteItem.DEFAULT_COLOR, false, combined, ArrayList(fittedInk), measurer)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (created != null) {
+                        target.items.add(created)
+                    } else {
+                        // Fallback: regular text + strokes when the sticky class is missing.
+                        try {
+                            val label = if (combined.isNotBlank()) combined else "Sticky"
+                            val ti = TextItem(
+                                Pt(rect.x, rect.y),
+                                rect.w,
+                                0.0,
+                                label,
+                                Rgba(20, 20, 20, 255),
+                                13.0,
+                                com.xnotes.core.pal.FontFace.SANS,
+                                measurer,
+                            )
+                            target.items.add(ti)
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            // Offset fitted (sticky-local) ink onto the page.
+                            for (s in fittedInk) {
+                                try {
+                                    if (s.sampleCount < 2) continue
+                                    val samples = ArrayList<com.xnotes.core.stroke.Sample>(s.sampleCount)
+                                    for (i in 0 until s.sampleCount) {
+                                        val t = try {
+                                            s.tAt(i)
+                                        } catch (_: Exception) {
+                                            0.0
+                                        }
+                                        samples.add(
+                                            com.xnotes.core.stroke.Sample(
+                                                s.xAt(i) + rect.x,
+                                                s.yAt(i) + rect.y,
+                                                s.pAt(i),
+                                                t,
+                                            ),
+                                        )
+                                    }
+                                    val c = Stroke(s.tool, s.config.copy(), emptyList(), s.speedScale, s.straight, s.smoothScale)
+                                    c.setSamples(samples)
+                                    c.finished = true
+                                    target.items.add(c)
+                                } catch (_: Exception) {
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (_: Exception) {
+                    continue
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unzipEntries(bytes: ByteArray): Map<String, ByteArray> {
+        val out = HashMap<String, ByteArray>()
+        try {
+            java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(bytes)).use { zis ->
+                var e = zis.nextEntry
+                while (e != null) {
+                    if (!e.isDirectory) {
+                        out[e.name] = zis.readBytes()
+                    }
+                    zis.closeEntry()
+                    e = zis.nextEntry
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    /** Fit strokes into a 300×300 sticky's ink area (276×240 at 12,42). */
+    private fun fitStickyInk(strokes: List<Stroke>): List<Stroke> {
+        if (strokes.isEmpty()) return emptyList()
+        var minX = Double.POSITIVE_INFINITY
+        var minY = Double.POSITIVE_INFINITY
+        var maxX = Double.NEGATIVE_INFINITY
+        var maxY = Double.NEGATIVE_INFINITY
+        for (s in strokes) {
+            for (i in 0 until s.sampleCount) {
+                val x = s.xAt(i)
+                val y = s.yAt(i)
+                if (!x.isFinite() || !y.isFinite()) continue
+                if (x < minX) minX = x
+                if (y < minY) minY = y
+                if (x > maxX) maxX = x
+                if (y > maxY) maxY = y
+            }
+        }
+        if (!minX.isFinite() || !minY.isFinite() || !maxX.isFinite() || !maxY.isFinite()) return emptyList()
+        var bw = maxX - minX
+        var bh = maxY - minY
+        if (!(bw > 0)) bw = 1.0
+        if (!(bh > 0)) bh = 1.0
+        val availW = 276.0
+        val availH = 240.0
+        var scale = minOf(availW / bw, availH / bh)
+        if (!scale.isFinite() || scale <= 0) scale = 1.0
+        // Shrink huge ink, keep tiny ink readable: allow growing up to 2×.
+        scale = scale.coerceIn(0.05, 2.0)
+        val out = ArrayList<Stroke>(strokes.size)
+        for (s in strokes) {
+            try {
+                if (s.sampleCount < 2) continue
+                val samples = ArrayList<com.xnotes.core.stroke.Sample>(s.sampleCount)
+                for (i in 0 until s.sampleCount) {
+                    val x = s.xAt(i)
+                    val y = s.yAt(i)
+                    if (!x.isFinite() || !y.isFinite()) continue
+                    val t = try {
+                        s.tAt(i)
+                    } catch (_: Exception) {
+                        0.0
+                    }
+                    val nx = (x - minX) * scale + 12.0
+                    val ny = (y - minY) * scale + 42.0
+                    samples.add(com.xnotes.core.stroke.Sample(nx, ny, s.pAt(i), t))
+                }
+                if (samples.size < 2) continue
+                val c = Stroke(s.tool, s.config.copy(), emptyList(), s.speedScale, s.straight, s.smoothScale)
+                c.setSamples(samples)
+                c.finished = true
+                out.add(c)
+            } catch (_: Exception) {
+            }
+        }
+        return out
+    }
+
+    /**
+     * Create a sticky note directly (no reflection): yellow paper, expanded,
+     * with [text] and note-local [ink]. Never throws.
+     */
+    private fun createStickyReflective(
+        rect: Rect,
+        text: String,
+        ink: List<Stroke>,
+        measurer: TextMeasurer,
+    ): CanvasItem? {
+        return try {
+            StickyNoteItem(rect, StickyNoteItem.DEFAULT_COLOR, false, text, ArrayList(ink), measurer)
+        } catch (_: Exception) {
+            null
         }
     }
 }

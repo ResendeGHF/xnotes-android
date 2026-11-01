@@ -1,5 +1,6 @@
 package com.xnotes.platform
 
+import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
@@ -20,6 +21,8 @@ import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.pal.TextFlags
+import com.xnotes.core.stroke.PencilField
+import com.xnotes.core.stroke.PencilGrain
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 
@@ -174,6 +177,59 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         val end = from + count
         fillPaint.color = color.toArgb()
         val path = Path().apply { fillType = Path.FillType.WINDING }
+        appendRibbon(path, centers, radii, from, end)
+        for (i in from until end) {
+            val r = radii[i]
+            if (r > 0f) path.addCircle(centers[2 * i], centers[2 * i + 1], r, Path.Direction.CW)
+        }
+        canvas.drawPath(path, fillPaint)
+    }
+
+    /**
+     * A pencil run as rasterized graphite: the tessellated ribbon shaded by the
+     * page-anchored field both renderers share, so the committed stroke is the
+     * live texture rather than stamped dots. Tiles the run so no bitmap grows
+     * without bound; the union path is exact because coverage is a pure
+     * function of page position.
+     */
+    override fun fillPencil(
+        positions: DoubleArray,
+        colors: IntArray,
+        indices: IntArray,
+        ink: Rgba,
+        seed: Int,
+        tipMix: Float,
+    ) {
+        if (positions.isEmpty() || indices.isEmpty() || colors.isEmpty()) return
+        // LOD from the canvas scale, like the GL zoom fade: full grain at
+        // normal zoom, averaged out when minified.
+        val q = PencilGrain.lodQuality(avgScale.toDouble())
+        for (chunk in PencilField.render(positions, colors, indices, ink, q, seed = seed, tipMix = tipMix.toDouble())) {
+            if (chunk.w <= 0 || chunk.h <= 0) continue
+            val bmp = Bitmap.createBitmap(chunk.w, chunk.h, Bitmap.Config.ARGB_8888)
+            bmp.setPixels(chunk.pixels, 0, chunk.w, 0, 0, chunk.w, chunk.h)
+            canvas.drawBitmap(
+                bmp,
+                null,
+                RectF(
+                    chunk.left.toFloat(), chunk.top.toFloat(),
+                    (chunk.left + chunk.w * PencilField.FIELD_PX).toFloat(),
+                    (chunk.top + chunk.h * PencilField.FIELD_PX).toFloat(),
+                ),
+                bitmapPaint,
+            )
+            // A software canvas consumed the pixels synchronously; a hardware
+            // canvas may still reference the bitmap, so only it is recycled.
+            if (!canvas.isHardwareAccelerated) bmp.recycle()
+        }
+    }
+
+    /**
+     * The swept-disc ribbon quads over `[from, end)`, wound consistently so
+     * overlapping pieces union under WINDING (the [Geometry.ribbonQuad] math
+     * inlined, so a dense page allocates nothing per point).
+     */
+    private fun appendRibbon(path: Path, centers: FloatArray, radii: FloatArray, from: Int, end: Int) {
         for (i in from until end - 1) {
             val x0 = centers[2 * i]
             val y0 = centers[2 * i + 1]
@@ -209,11 +265,6 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             }
             path.close()
         }
-        for (i in from until end) {
-            val r = radii[i]
-            if (r > 0f) path.addCircle(centers[2 * i], centers[2 * i + 1], r, Path.Direction.CW)
-        }
-        canvas.drawPath(path, fillPaint)
     }
 
     // The blur radius is a page-space length: the canvas scale grows it with zoom,

@@ -44,6 +44,10 @@ object MathCatalog {
         f("mod", "Elementary", "mod(a, b)", "Remainder of a divided by b.", "rem"),
         f("hypot", "Elementary", "hypot(x, y)", "Euclidean length √(x²+y²)."),
         f("clamp", "Elementary", "clamp(x, lo, hi)", "Restrict x to the interval [lo, hi]."),
+        f("rand", "Random", "rand()", "Uniform random number in [0, 1).", "random", "uniform"),
+        f("randint", "Random", "randint(a, b)", "Uniform random integer a ≤ n ≤ b; randint(n) gives 0 ≤ n < n."),
+        f("randn", "Random", "randn()", "Standard-normal random number (mean 0, variance 1).", "randnormal", "gauss"),
+        f("randseed", "Random", "randseed(n)", "Reseed the generator so sequences repeat; returns n.", "srand", "seed"),
         f("sqrt", "Elementary", "sqrt(x)", "Square root; complex for negative real arguments."),
         f("cbrt", "Elementary", "cbrt(x)", "Real cube root."),
         f("root", "Elementary", "root(x, n)", "The n-th root; complex when needed."),
@@ -53,6 +57,12 @@ object MathCatalog {
         f("log2", "Elementary", "log2(x)", "Base-2 logarithm."),
         f("logn", "Elementary", "logn(x, b)", "Logarithm to base b.", "logb"),
         f("sinc", "Elementary", "sinc(x)", "sin(x)/x, with sinc(0)=1."),
+
+        // Complex numbers
+        f("re", "Complex numbers", "re(z)", "Real part of z.", "real"),
+        f("im", "Complex numbers", "im(z)", "Imaginary part of z.", "imag"),
+        f("arg", "Complex numbers", "arg(z)", "Argument (phase) of z in radians.", "phase"),
+        f("conj", "Complex numbers", "conj(z)", "Complex conjugate of z.", "conjugate"),
 
         // Trigonometric and hyperbolic functions
         f("sin", "Trigonometry", "sin(x)", "Sine. Angle mode applies to the argument."),
@@ -128,12 +138,18 @@ object MathCatalog {
         f("ellipticK", "Elliptic & orthogonal", "ellipticK(m)", "Complete elliptic integral K(m), parameter m."),
         f("ellipticE", "Elliptic & orthogonal", "ellipticE(m)", "Complete elliptic integral E(m), parameter m."),
         f("ellipticPi", "Elliptic & orthogonal", "ellipticPi(n, m)", "Complete elliptic integral Π(n,m)."),
-        f("legendreP", "Elliptic & orthogonal", "legendreP(n, x)", "Legendre polynomial Pₙ(x)."),
+        f("legendreP", "Elliptic & orthogonal", "legendreP(n, x)", "Legendre polynomial Pₙ(x); n must be an integer.", "legendre"),
         f("legendreQ", "Elliptic & orthogonal", "legendreQ(n, x)", "Legendre function Qₙ(x)."),
+        f("assocLegendre", "Elliptic & orthogonal", "assocLegendre(n, m, x)", "Associated Legendre Pₙᵐ(x), Condon–Shortley phase; |m| ≤ n.", "associatedlegendre"),
         f("hermite", "Elliptic & orthogonal", "hermite(n, x)", "Physicists' Hermite polynomial Hₙ(x)."),
         f("laguerre", "Elliptic & orthogonal", "laguerre(n, x)", "Laguerre polynomial Lₙ(x)."),
-        f("chebyshevT", "Elliptic & orthogonal", "chebyshevT(n, x)", "Chebyshev polynomial Tₙ(x)."),
-        f("chebyshevU", "Elliptic & orthogonal", "chebyshevU(n, x)", "Chebyshev polynomial Uₙ(x)."),
+        f("genLaguerre", "Elliptic & orthogonal", "genLaguerre(n, a, x)", "Generalized Laguerre polynomial Lₙ⁽ᵃ⁾(x).", "laguerrel"),
+        f("chebyshevT", "Elliptic & orthogonal", "chebyshevT(n, x)", "Chebyshev polynomial Tₙ(x).", "chebt"),
+        f("chebyshevU", "Elliptic & orthogonal", "chebyshevU(n, x)", "Chebyshev polynomial Uₙ(x).", "chebu"),
+
+        // Spherical harmonics
+        f("spherharm", "Spherical harmonics", "spherharm(l, m, θ, φ)", "Complex spherical harmonic Yₗᵐ; angles in radians."),
+        f("sphreal", "Spherical harmonics", "sphreal(l, m, θ, φ)", "Real (tesseral) harmonic: plot r = sphreal(l, m, θ, φ) for lobes; sums build multipoles."),
 
         // Number theory and combinatorics
         f("gcd", "Number theory", "gcd(a, b)", "Greatest common divisor."),

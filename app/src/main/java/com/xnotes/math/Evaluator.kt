@@ -48,6 +48,30 @@ class EvalScope(val angle: AngleMode = AngleMode.RADIANS) {
  */
 object Evaluator {
 
+    /** Shared generator behind rand()/randint()/randn(); reseeded by randseed(n). */
+    private val rng = java.util.Random()
+    @Volatile private var randnSpare: Double? = null
+
+    @Synchronized
+    fun reseedRandom(seed: Long) {
+        rng.setSeed(seed)
+        randnSpare = null
+    }
+
+    @Synchronized
+    private fun nextUniform(): Double = rng.nextDouble()
+
+    @Synchronized
+    private fun nextGaussian(): Double {
+        randnSpare?.let { s -> randnSpare = null; return s }
+        var u1: Double
+        do { u1 = rng.nextDouble() } while (u1 <= 0.0)
+        val u2 = rng.nextDouble()
+        val r = sqrt(-2.0 * ln(u1))
+        randnSpare = r * sin(2.0 * PI * u2)
+        return r * cos(2.0 * PI * u2)
+    }
+
     fun evaluate(expr: Expr, scope: EvalScope = EvalScope()): Complex = when (expr) {
         is Expr.Num -> Complex.real(expr.value)
         is Expr.Var -> resolve(expr.name, scope)
@@ -220,6 +244,26 @@ object Evaluator {
                 if (old == null) scope.vars.remove(variable) else scope.vars[variable] = old
                 Complex.real(result)
             }
+            "spherharm" -> {
+                // Complex spherical harmonic Y_l^m(θ, φ); angles are always in radians.
+                requireArgs(name, args, 4)
+                val l = degreeArg(evaluate(args[0], scope), "spherharm degree")
+                val m = intArg(evaluate(args[1], scope), "spherharm order")
+                if (abs(m) > l) return Complex.ZERO
+                val theta = evaluate(args[2], scope).realValue()
+                val phi = evaluate(args[3], scope).realValue()
+                Special.sphHarm(l, m, theta, phi)
+            }
+            "sphreal" -> {
+                // Real (tesseral) spherical harmonic: the plottable form, used as a 3D radius.
+                requireArgs(name, args, 4)
+                val l = degreeArg(evaluate(args[0], scope), "sphreal degree")
+                val m = intArg(evaluate(args[1], scope), "sphreal order")
+                if (abs(m) > l) return Complex.ZERO
+                val theta = evaluate(args[2], scope).realValue()
+                val phi = evaluate(args[3], scope).realValue()
+                Complex.real(Special.sphHarmReal(l, m, theta, phi))
+            }
             else -> normalCall(name, args, scope)
         }
     }
@@ -233,6 +277,10 @@ object Evaluator {
         val invRad = if (scope.angle == AngleMode.DEGREES) 180.0 / PI else 1.0
         return when (name.lowercase()) {
             "abs", "absval" -> Complex.real(x.abs())
+            "re", "real" -> Complex.real(x.re)
+            "im", "imag" -> Complex.real(x.im)
+            "arg", "phase" -> Complex.real(atan2(x.im, x.re))
+            "conj", "conjugate" -> x.conj()
             "sign", "sgn" -> Complex.real(x.realValue().sign)
             "floor" -> Complex.real(floor(x.realValue()))
             "ceil", "ceiling" -> Complex.real(ceil(x.realValue()))
@@ -241,6 +289,20 @@ object Evaluator {
             "frac" -> { val r = x.realValue(); Complex.real(r - floor(r)) }
             "min" -> Complex.real(v.minOfOrNull { it.realValue() } ?: Double.NaN)
             "max" -> Complex.real(v.maxOfOrNull { it.realValue() } ?: Double.NaN)
+            "rand", "random", "uniform" -> Complex.real(nextUniform())
+            "randint" -> {
+                val lo: Long; val hi: Long
+                if (v.size >= 2) { lo = x.realValue().toLong(); hi = y.realValue().toLong() }
+                else { lo = 0L; hi = x.realValue().toLong() - 1L }
+                if (hi < lo) throw EvalException("randint needs lo <= hi")
+                Complex.real((lo + (nextUniform() * (hi - lo + 1).toDouble()).toLong()).toDouble())
+            }
+            "randn", "randnormal", "gauss" -> Complex.real(nextGaussian())
+            "randseed", "srand", "seed" -> {
+                val s = x.realValue().toLong()
+                reseedRandom(s)
+                Complex.real(s.toDouble())
+            }
             "mod", "rem" -> { val a = x.realValue(); val b = y.realValue(); Complex.real(if (b == 0.0) Double.NaN else a - b * floor(a / b)) }
             "hypot" -> Complex.real(hypot(x.realValue(), y.realValue()))
             "clamp" -> Complex.real(x.realValue().coerceIn(y.realValue(), z.realValue()))
@@ -354,18 +416,22 @@ object Evaluator {
             "elliptick" -> Complex.real(Special.ellipticK(x.realValue()))
             "elliptice" -> Complex.real(Special.ellipticE(x.realValue()))
             "ellipticpi" -> Complex.real(Special.ellipticPi(x.realValue(), y.realValue()))
-            "legendrep" -> Complex.real(Special.legendreP(x.realValue().toInt(), y.realValue()))
-            "legendreq" -> Complex.real(Special.legendreQ(x.realValue().toInt(), y.realValue()))
-            "hermite" -> Complex.real(Special.hermite(x.realValue().toInt(), y.realValue()))
-            "laguerre" -> Complex.real(Special.laguerre(x.realValue().toInt(), y.realValue()))
-            "chebyshevt" -> Complex.real(Special.chebyshevT(x.realValue().toInt(), y.realValue()))
-            "chebyshevu" -> Complex.real(Special.chebyshevU(x.realValue().toInt(), y.realValue()))
-            "laguerrel" -> Complex.real(Special.laguerre(x.realValue().toInt(), y.realValue(), z.realValue()))
-            "associatedlegendre" -> Complex.real(Special.associatedLegendreP(x.realValue().toInt(), y.realValue().toInt(), z.realValue()))
-            "gegenbauer" -> Complex.real(Special.gegenbauer(x.realValue().toInt(), y.realValue(), z.realValue()))
+            "legendrep", "legendre" -> Complex.real(Special.legendreP(degreeArg(x, "legendre"), y.realValue()))
+            "legendreq" -> Complex.real(Special.legendreQ(degreeArg(x, "legendreq"), y.realValue()))
+            "hermite" -> Complex.real(Special.hermite(degreeArg(x, "hermite"), y.realValue()))
+            "laguerre" -> Complex.real(Special.laguerre(degreeArg(x, "laguerre"), y.realValue()))
+            "chebyshevt", "chebt" -> Complex.real(Special.chebyshevT(degreeArg(x, "chebyshevT"), y.realValue()))
+            "chebyshevu", "chebu" -> Complex.real(Special.chebyshevU(degreeArg(x, "chebyshevU"), y.realValue()))
+            "laguerrel", "genlaguerre" -> Complex.real(Special.laguerre(degreeArg(x, "laguerre"), y.realValue(), z.realValue()))
+            "associatedlegendre", "assoclegendre" -> {
+                val n = degreeArg(x, "associatedLegendre")
+                val m = intArg(y, "associatedLegendre order")
+                Complex.real(Special.associatedLegendreP(n, m, z.realValue()))
+            }
+            "gegenbauer" -> Complex.real(Special.gegenbauer(degreeArg(x, "gegenbauer"), y.realValue(), z.realValue()))
             "jacobi" -> Complex.real(
                 Special.jacobi(
-                    x.realValue().toInt(),
+                    degreeArg(x, "jacobi"),
                     y.realValue(),
                     z.realValue(),
                     v.getOrElse(3) { Complex.ZERO }.realValue(),
@@ -453,6 +519,24 @@ object Evaluator {
     private fun Double.roundToIntOrThrow(what: String): Int {
         if (!isFinite() || abs(this) > 1e7) throw EvalException("Bad $what")
         return round(this).toInt()
+    }
+
+    /** An integer degree/order: silent truncation (2.9 → 2) would pick the wrong polynomial. */
+    private fun degreeArg(v: Complex, what: String, max: Int = 1000): Int {
+        val r = v.realValue()
+        if (!r.isFinite() || abs(r - round(r)) > 1e-9 || r < 0 || r > max) {
+            throw EvalException("$what needs an integer degree 0..$max")
+        }
+        return r.toInt()
+    }
+
+    /** An integer that may be negative (magnetic numbers, offsets). */
+    private fun intArg(v: Complex, what: String, min: Int = Int.MIN_VALUE, max: Int = Int.MAX_VALUE): Int {
+        val r = v.realValue()
+        if (!r.isFinite() || abs(r - round(r)) > 1e-9 || r < min || r > max) {
+            throw EvalException("$what needs an integer")
+        }
+        return r.toInt()
     }
 
     /** Physical and mathematical constants, resolved after user variables. */

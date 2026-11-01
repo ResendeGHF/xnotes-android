@@ -56,6 +56,9 @@ data class DrawStyle(val color: Rgba, val width: Double) {
                 item.strokeRgba = color
                 item.strokeWidth = width
             }
+            is StickyNoteItem -> {
+                item.color = color
+            }
             else -> Unit
         }
     }
@@ -72,11 +75,15 @@ data class DrawStyle(val color: Rgba, val width: Double) {
             is ConnectorItem -> DrawStyle(item.strokeRgba, item.strokeWidth)
             is TableItem -> DrawStyle(item.strokeRgba, item.strokeWidth)
             is TapeItem -> DrawStyle(item.rgba, item.shape.width)
+            is StickyNoteItem -> DrawStyle(item.color, STICKY_WIDTH)
             else -> null
         }
 
         /** Settable width range for a restyle, wide enough to span every drawing tool's own range. */
         const val MIN_WIDTH = 1.0
         const val MAX_WIDTH = 80.0
+
+        /** Dummy width carried for sticky paper (only its color is restyled). */
+        const val STICKY_WIDTH = 12.0
     }
 }

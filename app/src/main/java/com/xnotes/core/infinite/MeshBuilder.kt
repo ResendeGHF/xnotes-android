@@ -1,6 +1,7 @@
 package com.xnotes.core.infinite
 
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.stroke.PencilGrain
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -23,6 +24,13 @@ internal class MeshBuilder(vertexHint: Int = 64, indexHint: Int = 96) {
     private var vertexCount = 0
     private var indexCount = 0
 
+    /**
+     * Per-vertex packed ARGB, present only when every vertex was given one (the
+     * pencil's tooth). Null otherwise, so plain ink pays nothing for the channel
+     * and [build] returns a uniform-colour mesh as before.
+     */
+    private var col: IntArray? = null
+
     val isEmpty: Boolean get() = indexCount == 0
 
     /**
@@ -39,11 +47,37 @@ internal class MeshBuilder(vertexHint: Int = 64, indexHint: Int = 96) {
         if (2 * vertexCount + 2 > pos.size) {
             pos = pos.copyOf(pos.size * 2)
             off = off.copyOf(off.size * 2)
+            col?.let { col = it.copyOf(pos.size / 2) }
         }
         pos[2 * vertexCount] = x
         pos[2 * vertexCount + 1] = y
         off[2 * vertexCount] = ox
         off[2 * vertexCount + 1] = oy
+        return vertexCount++
+    }
+
+    /**
+     * A vertex carrying its own packed ARGB (the pencil's per-point tooth). May not
+     * be mixed with the plain [vertex] on one builder: the first coloured vertex
+     * starts the channel, and plain vertices afterwards would leave holes in it.
+     * Every pencil mesh colours all of its vertices, so the channel is complete.
+     */
+    fun vertexColored(x: Double, y: Double, ox: Double, oy: Double, argb: Int): Int {
+        if (2 * vertexCount + 2 > pos.size) {
+            pos = pos.copyOf(pos.size * 2)
+            off = off.copyOf(off.size * 2)
+            col = (col ?: IntArray(pos.size / 4)).copyOf(pos.size / 2)
+        }
+        var c = col
+        if (c == null) {
+            c = IntArray(pos.size / 2)
+            col = c
+        }
+        pos[2 * vertexCount] = x
+        pos[2 * vertexCount + 1] = y
+        off[2 * vertexCount] = ox
+        off[2 * vertexCount + 1] = oy
+        c[vertexCount] = argb
         return vertexCount++
     }
 
@@ -57,9 +91,31 @@ internal class MeshBuilder(vertexHint: Int = 64, indexHint: Int = 96) {
 
     /** A filled disc as a triangle fan, cut fine enough to stay within [tolerance] of true. */
     fun circle(cx: Double, cy: Double, radius: Double, tolerance: Double) {
+        circleInternal(cx, cy, radius, tolerance, null)
+    }
+
+    /** A filled disc whose every vertex carries [argb] (the pencil's tooth). */
+    fun circleColored(cx: Double, cy: Double, radius: Double, tolerance: Double, argb: Int) {
+        circleInternal(cx, cy, radius, tolerance, argb)
+    }
+
+    /**
+     * A pencil vertex: the graphite density in alpha, the across-ribbon edge in
+     * red (see [PencilGrain.packVertex]). Rails and disc rings pass edge (true);
+     * ribbon centres and disc hubs pass centre (false).
+     */
+    fun vertexPencil(x: Double, y: Double, ox: Double, oy: Double, density: Double, edge: Boolean = true): Int =
+        vertexColored(x, y, ox, oy, PencilGrain.packVertex(edge, density))
+
+    /**
+     * A pencil disc as a triangle fan: the hub at the centre (edge 0) and the ring
+     * on the rim (edge 1), so the fragment grain fades radially exactly as it does
+     * across the ribbon body.
+     */
+    fun circlePencil(cx: Double, cy: Double, radius: Double, tolerance: Double, density: Double) {
         if (radius <= 0.0) return
         val segments = circleSegments(radius, tolerance)
-        val centre = vertex(cx, cy)
+        val hub = vertexPencil(cx, cy, 0.0, 0.0, density, edge = false)
         val step = 2.0 * PI / segments
         var first = -1
         var prev = -1
@@ -67,9 +123,29 @@ internal class MeshBuilder(vertexHint: Int = 64, indexHint: Int = 96) {
             val a = k * step
             val dx = radius * cos(a)
             val dy = radius * sin(a)
-            val v = vertex(cx + dx, cy + dy, dx, dy)
-            if (first < 0) first = v else triangle(centre, prev, v)
+            val v = vertexPencil(cx + dx, cy + dy, dx, dy, density)
+            if (first < 0) first = v else triangle(hub, prev, v)
             prev = v
+        }
+        if (first >= 0 && prev != first) triangle(hub, prev, first)
+    }
+
+    private fun circleInternal(cx: Double, cy: Double, radius: Double, tolerance: Double, argb: Int?) {
+        if (radius <= 0.0) return
+        val segments = circleSegments(radius, tolerance)
+        fun v(x: Double, y: Double, ox: Double, oy: Double): Int =
+            if (argb == null) vertex(x, y, ox, oy) else vertexColored(x, y, ox, oy, argb)
+        val centre = v(cx, cy, 0.0, 0.0)
+        val step = 2.0 * PI / segments
+        var first = -1
+        var prev = -1
+        for (k in 0 until segments) {
+            val a = k * step
+            val dx = radius * cos(a)
+            val dy = radius * sin(a)
+            val vv = v(cx + dx, cy + dy, dx, dy)
+            if (first < 0) first = vv else triangle(centre, prev, vv)
+            prev = vv
         }
         if (first >= 0 && prev != first) triangle(centre, prev, first)
     }
@@ -214,7 +290,12 @@ internal class MeshBuilder(vertexHint: Int = 64, indexHint: Int = 96) {
     }
 
     fun build(): MeshData =
-        MeshData(pos.copyOf(2 * vertexCount), off.copyOf(2 * vertexCount), idx.copyOf(indexCount))
+        MeshData(
+            pos.copyOf(2 * vertexCount),
+            off.copyOf(2 * vertexCount),
+            idx.copyOf(indexCount),
+            col?.copyOf(vertexCount),
+        )
 
     private fun isEar(points: List<Pt>, live: List<Int>, prev: Int, cur: Int, next: Int): Boolean {
         val a = points[prev]

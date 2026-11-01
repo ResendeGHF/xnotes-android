@@ -28,6 +28,12 @@ object TraceDocument {
      * way). Every path becomes an editable pressure-sensitive pen stroke in [ink]
      * — single-point paths become dots — so the note keeps the weight of the
      * original pen; [inkWidthPx] is the typical stroke's width in page px.
+     *
+     * Traced strokes carry `smoothScale = 0`: the pen engine's position low-pass
+     * would otherwise pull every short fragment's ends toward its middle (a
+     * 2px stub shrinks to nearly half), opening hairline gaps between the
+     * segments of one letter. The paths are already RDP-simplified centrelines,
+     * so they render exactly as traced (as vector outlines do).
      */
     fun build(
         pages: List<TracedPage>,
@@ -63,7 +69,7 @@ object TraceDocument {
                 // One sample still draws: the engine renders it as a filled dot,
                 // which is what an i-dot or a period becomes.
                 if (samples.isEmpty()) continue
-                val stroke = Stroke(Tool.PEN, config)
+                val stroke = Stroke(Tool.PEN, config, smoothScale = 0.0)
                 stroke.setSamples(samples)
                 stroke.finished = true
                 stroke.trimToSize()

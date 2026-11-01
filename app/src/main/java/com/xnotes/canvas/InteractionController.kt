@@ -18,7 +18,12 @@ import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.EraseItems
 import com.xnotes.core.history.History
 import com.xnotes.core.history.LockItems
+import com.xnotes.core.history.SetStickyCollapsed
+import com.xnotes.core.history.EditStickyText
+import com.xnotes.core.history.EditStickyInk
+import com.xnotes.core.history.RecolorSticky
 import com.xnotes.core.history.EditLabel
+import com.xnotes.core.history.EditTableCells
 import com.xnotes.core.history.EditText
 import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.RefillShapes
@@ -50,6 +55,7 @@ import com.xnotes.core.model.EraseRule
 import com.xnotes.core.model.AudioItem
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.NoteLinkItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.RectHandle
 import com.xnotes.core.model.Resizable
@@ -130,6 +136,9 @@ data class EditingField(
     val rotation: Double = 0.0,
     /** Every line centred, as a shape's label sets. */
     val centred: Boolean = false,
+    /** Opaque backdrop for the field: sticky notes keep their paper in the cache and the
+     *  field covers the old words with it while typing (text boxes lift out instead). */
+    val fill: Rgba? = null,
     val bold: Boolean = false,
     val italic: Boolean = false,
     val underline: Boolean = false,
@@ -360,9 +369,8 @@ class InteractionController(
     private var panFromPenButton = false // a side-button pan parks where the pen lifted: no glide
     private var downStoppedFling = false // this touch landed on a moving glide, so its lift isn't a dismiss tap
     private var panMayCommitText = false // pan begun off an open text box: a tap commits it, a drag scrolls
-    private var downView: CanvasState.ViewSnapshot? = null // the view as this touch went down, put back if Android takes the touch back
-    /** The view as the current pinch went down (second finger landed). A rejected palm finger
-     *  only undoes the pinch it joined, never the legitimate pan that came before it. */
+    private var downView: CanvasState.ViewSnapshot? = null // retained; cancelled gestures keep the view, never rewind to it
+    /** Retained; a rejected finger no longer rewinds the pinch it joined, so the view never jumps. */
     private var pinchStartView: CanvasState.ViewSnapshot? = null
     private var touchTakenBack = false // Android took back a finger of this touch, so the rest of it is ignored
     // Framework singletons, created lazily on first use (always a gesture on the main thread) so
@@ -515,6 +523,18 @@ class InteractionController(
     private val tapePath = ArrayList<Pt>()           // a freehand band's path so far, page space
     private var tapeReach = 0.0                      // farthest the drag has gone from the press, page px
 
+    // STICKY NOTE (a collapsible paper square holding text + note-local ink)
+    /** The expanded sticky the live stroke is being drawn into, or null for page ink. */
+    private var stickyDrawTarget: StickyNoteItem? = null
+    private var stickyDrawPage = -1
+    private var stickyDrawBefore: List<Stroke>? = null
+    /** First-touch ink snapshots for stickies an erase gesture touches, for one undo step. */
+    private val eraseStickySnapshots = linkedMapOf<StickyNoteItem, List<Stroke>>()
+    /** Host hook to edit a sticky's text (shows a dialog); true when handled. */
+    var onStickyEditText: ((item: StickyNoteItem, pageIndex: Int) -> Boolean)? = null
+    /** Host hook for the sticky's color dot: open the swatch picker at [anchorViewport]. */
+    var onStickyColorDot: ((item: StickyNoteItem, pageIndex: Int, anchorViewport: Rect) -> Unit)? = null
+
     // RESIZE
     private var resizeItem: CanvasItem? = null
     private var resizeHandle: HandleId? = null
@@ -598,8 +618,8 @@ class InteractionController(
     private var editingPageIndex = -1
     val editingItem: TextItem? get() = editingText
 
-    /** True while a text box or a shape's label is open in the overlay. */
-    val isEditingText: Boolean get() = editingText != null || editingLabel != null
+    /** True while a text box, a sticky note or a shape's label is open in the overlay. */
+    val isEditingText: Boolean get() = editingText != null || editingLabel != null || editingSticky != null
 
     /** True while a shape's label is open in the overlay. */
     val isEditingLabel: Boolean get() = editingLabel != null
@@ -609,6 +629,11 @@ class InteractionController(
     private var editingLabel: Labelled? = null
     private var labelPageIndex = -1
     private var labelBefore: ShapeLabel? = null
+
+    // STICKY EDITING (a sticky note's text, typed in the same overlay a text box uses)
+    private var editingSticky: StickyNoteItem? = null
+    private var editingStickyOldText = ""
+    private var editingStickyPage = -1
 
     // DOUBLE TAP (a shape's label)
     private var tapCandidate = false
@@ -760,29 +785,30 @@ class InteractionController(
 
     private fun movingView(): Boolean = mode == PointerMode.PAN || mode == PointerMode.PINCH
 
-    /** Android took this touch back, as its palm rejection does with a resting hand: drop the
-     *  gesture, and put back a view it scrolled or zoomed, since the hand never meant to. */
+    /** Android took this touch back (palm rejection, a stylus coming into proximity, or a
+     *  synthetic cancel): drop the gesture but keep the view where it is. Rewinding to [downView]
+     *  here would discard an intentional pan/zoom the moment the pen approaches — the "pan jumps
+     *  back" bug — so a cancelled gesture commits what it did so far rather than undoing it. */
     private fun takeBackTouch() {
         tapCandidate = false
-        val movedView = movingView()
         abortGesture()
-        if (movedView) downView?.let { state.restoreView(it); onViewChanged() }
         pinchStartView = null
         requestRender()
     }
 
     /**
      * One finger of a pan/pinch was rejected as a palm (ACTION_POINTER_UP with FLAG_CANCELED):
-     * undo only what the pinch did since that finger landed, then carry on with the finger(s)
-     * still down. Rewinding the whole touch to [downView] here would also discard the legitimate
-     * pan from before the palm landed — the "pan jumps back" bug.
+     * keep what the pinch did so far and carry on with the finger(s) still down. Rewinding the
+     * pinch (or the whole touch to [downView]) would discard legitimate work the moment the
+     * stylus approaches, so nothing is reverted and no jump can happen.
      */
     private fun handleCancelledPointerUp(e: MotionEvent) {
         if (mode != PointerMode.PINCH) {
             handlePointerUp(e)
             return
         }
-        pinchStartView?.let { state.restoreView(it); onViewChanged() }
+        // Keep the pinch's progress: restoring [pinchStartView] would jump the zoom/scroll back
+        // the moment the stylus approaches while pinching.
         pinchStartView = null
         val remaining = (0 until e.pointerCount).filter { it != e.actionIndex }
         if (remaining.size >= 2) {
@@ -941,7 +967,7 @@ class InteractionController(
         // prior tool), a drag scrolls the page with the edit kept live (decided in handleUp's PAN
         // branch). A stylus / side-button / eraser press commits now and proceeds as usual. A Text
         // press never spawns a new box on the same gesture (that double-create was a bug).
-        if (editingText != null || editingLabel != null) {
+        if (editingText != null || editingLabel != null || editingSticky != null) {
             if (toolType == MotionEvent.TOOL_TYPE_FINGER && (effectiveTool == Tool.TEXT_BOX || editingLabel != null)) {
                 panMayCommitText = true
                 beginPan(vx, vy)
@@ -1260,6 +1286,10 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content)
         val local = pageIndex?.let { state.toPageSpace(it, content) }
         if (pageIndex != null && local != null) {
+            // A collapsed sticky's icon (or an expanded one's ×) toggles before anything else.
+            if (stickyToggleAt(pageIndex, local)) return true
+            // The expanded paper's color dot cycles the paper before links do.
+            if (stickyColorTapAt(pageIndex, local)) return true
             // A tape lies over whatever else the tap could reach, so it takes the tap first.
             if (peelTapeAt(pageIndex, local)) return true
             if (onItemLinkTap?.invoke(pageIndex, local) == true) return true
@@ -1277,6 +1307,20 @@ class InteractionController(
 
     private fun beginDraw(content: Pt, pressure: Double, drawTool: Tool, timeMs: Long, downViewport: Pt) {
         val pageIndex = state.pageIndexAtContent(content) ?: return
+        // A pen press on a collapsed icon expands it (or on an expanded × collapses it)
+        // instead of starting a stroke.
+        if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return
+        // Ink starting inside an expanded sticky belongs to the sticky (note-local).
+        stickyDrawTarget = null
+        stickyDrawPage = -1
+        stickyDrawBefore = null
+        stickyAt(pageIndex, state.toPageSpace(pageIndex, content))
+            ?.takeIf { !it.collapsed && !it.locked && it.rect.contains(state.toPageSpace(pageIndex, content)) }
+            ?.let {
+                stickyDrawTarget = it
+                stickyDrawPage = pageIndex
+                stickyDrawBefore = it.ink.map { s -> Stroke(s) }
+            }
         // Reaching here with a live selection means the press landed off it (on it the stylus would
         // have grabbed it): dismiss it. A bare tap that only dismissed is dropped in endDraw.
         strokeDismissedSelection = hasSelection
@@ -1484,6 +1528,31 @@ class InteractionController(
         return AddItem(page, stroke)
     }
 
+    /** Commit a finished stroke into an expanded sticky's note-local ink. */
+    private fun fileStickyStroke(stroke: Stroke, target: StickyNoteItem, pageIndex: Int, before: List<Stroke>) {
+        simplifyForCommit(stroke)
+        // Page-local samples become note-local.
+        val local = stroke.samples.map { Sample(it.x - target.rect.x, it.y - target.rect.y, it.pressure, it.t) }
+        val committed = Stroke(stroke.tool, stroke.config, local, stroke.speedScale, stroke.straight, stroke.smoothScale)
+        committed.finished = true
+        val page = state.document.pages.getOrNull(pageIndex)
+        target.ink.add(committed)
+        val after = target.ink.map { Stroke(it) }
+        history.push(EditStickyInk(target, before, after))
+        state.document.dirty = true
+        if (page != null) {
+            // The front buffer still shows this stroke: hold it out of the cache like a
+            // finished page stroke, so the frame never draws it twice. The settle paints
+            // the sticky (now holding the ink) over the cache once the pad lets go.
+            if (frontInk?.hold(target, page) != true) {
+                if (!state.repairRegion(page, target.paintBounds().outset(REPAIR_PAD))) state.invalidatePage(page)
+            }
+        }
+        onContentChanged()
+        stickyDrawTarget = null
+        stickyDrawBefore = null
+    }
+
     private fun endDraw(e: MotionEvent) {
         // Drop the dwell timer before the final sample so the lift can't re-arm or fire a snap.
         cancelDwell()
@@ -1504,9 +1573,20 @@ class InteractionController(
             stroke.finished = true
             when {
                 // A bare tap whose only job was to dismiss the selection: drop the dot it would leave.
-                strokeDismissedSelection && tapCandidate -> Unit
+                strokeDismissedSelection && tapCandidate -> {
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
+                }
                 // A bare tap on tape peels it back or covers it again, and leaves no dot.
-                tapCandidate && e.eventTime - tapDownTime < LONG_PRESS_MS && peelTapeAt(pi, Pt(stroke.xAt(0), stroke.yAt(0))) -> Unit
+                tapCandidate && e.eventTime - tapDownTime < LONG_PRESS_MS && peelTapeAt(pi, Pt(stroke.xAt(0), stroke.yAt(0))) -> {
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
+                }
+                // A bare tap on a sticky's color dot cycles the paper, and leaves no dot.
+                tapCandidate && e.eventTime - tapDownTime < LONG_PRESS_MS && stickyColorTapAt(pi, Pt(stroke.xAt(0), stroke.yAt(0))) -> {
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
+                }
                 wandMode && stroke.tool.isStroke -> {
                     // Disappearing ink: held ephemerally, never committed to the model/undo/cache/save.
                     // A stroke drawn mid-fade cancels the fade and re-solidifies the whole held batch.
@@ -1515,8 +1595,14 @@ class InteractionController(
                     stopFade()
                     fadeAlpha = 1.0
                     scheduleFade()
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
                 }
-                scribbleErase(stroke, pi) -> Unit
+                scribbleErase(stroke, pi) -> {
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
+                }
+                stickyDrawTarget != null && pi == stickyDrawPage -> fileStickyStroke(stroke, stickyDrawTarget!!, stickyDrawPage, stickyDrawBefore ?: emptyList())
                 else -> pushStrokeEdit(fileStroke(stroke, pi))
             }
         }
@@ -1526,6 +1612,9 @@ class InteractionController(
         strokeDismissedSelection = false
         liveStroke = null
         strokePageIndex = null
+        stickyDrawTarget = null
+        stickyDrawBefore = null
+        stickyDrawPage = -1
         snapEngaged = false
         snapRunStartEdge = null
         snapCurrentEdge = null
@@ -1695,6 +1784,7 @@ class InteractionController(
         eraseSnapshots.clear()
         eraseMarkups.clear()
         eraseUnfilled.clear()
+        eraseStickySnapshots.clear()
         mode = PointerMode.ERASE
         eraseAt(vx, vy)
     }
@@ -1715,6 +1805,13 @@ class InteractionController(
             val local = state.toPageSpace(pi, content)
             val cx = local.x
             val cy = local.y
+            // Note-local ink of expanded stickies erases before page ink does.
+            val stickyDirty = eraseStickyInk(page, cx, cy, radius)
+            if (stickyDirty != null) {
+                val rect = stickyDirty.outset(REPAIR_PAD)
+                if (!state.repairRegion(page, rect)) state.invalidatePage(page)
+                changed = true
+            }
             val dirty = if (area) eraseAreaFromPage(page, cx, cy, radius)
             else eraseStrokesFromPage(page, cx, cy, radius)
             if (dirty != null) {
@@ -1827,6 +1924,11 @@ class InteractionController(
         } else if (eraseRemovals.isNotEmpty()) {
             cmds += EraseItems(eraseRemovals.toList())
         }
+        // Sticky note-local ink erased this gesture, one entry per note.
+        for ((item, before) in eraseStickySnapshots) {
+            val after = item.ink.map { Stroke(it) }
+            cmds += EditStickyInk(item, before, after)
+        }
         cmds += eraseMarkups
         if (cmds.isNotEmpty()) {
             history.push(cmds.singleOrNull() ?: CompositeCommand(cmds))
@@ -1837,6 +1939,7 @@ class InteractionController(
         eraseSnapshots.clear()
         eraseMarkups.clear()
         eraseUnfilled.clear()
+        eraseStickySnapshots.clear()
         eraserCursor = null
         mode = PointerMode.IDLE
         requestRender()
@@ -1885,6 +1988,8 @@ class InteractionController(
      *  shape that keeps its aspect). */
     private fun selectionResizeHandles(): List<ResizeHandle> {
         if (singleSelectedTable() != null) return emptyList()
+        // A collapsed sticky is a fixed-size icon: no resize handles until expanded.
+        if ((selection.singleOrNull()?.item as? StickyNoteItem)?.collapsed == true) return emptyList()
         val endpoint = singleEndpointShape()
         if (endpoint != null) return endpointHandles(endpoint)
         val all = selectionChromeBox()?.let { ResizeMath.obbHandles(it) } ?: return emptyList()
@@ -2061,6 +2166,10 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content)
         if (pageIndex != null) {
             val local = state.toPageSpace(pageIndex, content)
+            // A sticky's × collapses it; a collapsed icon expands on tap.
+            if (stickyToggleAt(pageIndex, local)) return
+            // The expanded paper's color dot cycles the paper.
+            if (stickyColorTapAt(pageIndex, local)) return
             val hit = state.document.pages[pageIndex].items.lastOrNull { !it.locked && it.contains(local) }
             if (hit != null) {
                 if (selection.none { it.item === hit }) setSelection(listOf(Selected(pageIndex, hit)))
@@ -2275,6 +2384,17 @@ class InteractionController(
                     r.x, r.y,
                     r.w.coerceAtLeast(NoteLinkItem.MIN_WIDTH),
                     r.h.coerceAtLeast(NoteLinkItem.MIN_HEIGHT),
+                )
+                item.setGeometry(RectHandle(r))
+            }
+            is StickyNoteItem -> {
+                // Collapsed stickies resize their paper; the icon follows the top-left.
+                val target = if (item.collapsed) item.rect else item.rect
+                var r = ResizeMath.resizeImage(target, handle, local)
+                r = com.xnotes.core.geometry.Rect(
+                    r.x, r.y,
+                    r.w.coerceAtLeast(StickyNoteItem.MIN_WIDTH),
+                    r.h.coerceAtLeast(StickyNoteItem.MIN_HEIGHT),
                 )
                 item.setGeometry(RectHandle(r))
             }
@@ -3124,6 +3244,158 @@ class InteractionController(
         return true
     }
 
+    // --- STICKY NOTE ---
+
+    /** The topmost sticky on page [pi] containing page point [local], or null. */
+    private fun stickyAt(pi: Int, local: Pt): StickyNoteItem? =
+        state.document.pages.getOrNull(pi)?.items?.lastOrNull {
+            it is StickyNoteItem && !it.locked && it.contains(local)
+        } as? StickyNoteItem
+
+    /**
+     * Toggle a sticky at page point [local] on page [pi]: a collapsed icon expands, the
+     * expanded paper's × collapses. True when a toggle happened (the tap is consumed).
+     */
+    private fun stickyToggleAt(pi: Int, local: Pt): Boolean {
+        val item = stickyAt(pi, local) ?: return false
+        val page = state.document.pages[pi]
+        // Repair the union of both states: collapsing leaves the paper's pixels behind
+        // if only the icon is repainted, and expanding leaves the icon's.
+        val was = item.paintBounds()
+        if (item.collapsed) {
+            val before = item.collapsed
+            item.collapsed = false
+            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, false))))
+            state.document.dirty = true
+            repairRegion(page, was.union(item.paintBounds()))
+            onContentChanged()
+            requestRender()
+            return true
+        }
+        if (item.isCollapseHit(local)) {
+            val before = item.collapsed
+            item.collapsed = true
+            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, true))))
+            state.document.dirty = true
+            repairRegion(page, was.union(item.paintBounds()))
+            onContentChanged()
+            requestRender()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * The paper-color dot of the expanded sticky at page point [local] on page [pi]:
+     * open the swatch picker there. True when a dot took the tap.
+     */
+    private fun stickyColorTapAt(pi: Int, local: Pt): Boolean {
+        val item = stickyAt(pi, local)?.takeIf { !it.collapsed && it.isColorHit(local) } ?: return false
+        val cb = onStickyColorDot ?: return false
+        val hit = item.colorHit()
+        val tl = state.contentToViewport(state.fromPageSpace(pi, Pt(hit.x, hit.y)))
+        cb(item, pi, Rect(tl.x, tl.y, hit.w * state.zoom, hit.h * state.zoom))
+        return true
+    }
+
+    /** Place a fresh sticky note centred on content point [content], selected, as one undo step. */
+    fun placeStickyNoteAt(content: Pt, color: Rgba = StickyNoteItem.DEFAULT_COLOR): StickyNoteItem? {
+        val (pi, local) = state.pagePointAt(content) ?: return null
+        val page = state.document.pages.getOrNull(pi) ?: return null
+        val rect = Rect(local.x - StickyNoteItem.DEFAULT_WIDTH / 2.0, local.y - StickyNoteItem.DEFAULT_HEIGHT / 2.0,
+            StickyNoteItem.DEFAULT_WIDTH, StickyNoteItem.DEFAULT_HEIGHT)
+        val item = StickyNoteItem(rect, color, collapsed = false, measurer = textMeasurer)
+        page.items.add(item)
+        history.push(AddItem(page, item))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        setSelection(listOf(Selected(pi, item)))
+        refreshSelectionMenu()
+        onContentChanged()
+        requestRender()
+        return item
+    }
+
+    /** Collapse or expand [item], wherever it sits, as one undo step. */
+    fun toggleStickyCollapsed(item: StickyNoteItem) {
+        val page = state.document.pages.firstOrNull { p -> p.items.any { it === item } } ?: return
+        val next = !item.collapsed
+        val before = item.collapsed
+        item.collapsed = next
+        history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, next))))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Recolor the sticky notes among the current selection. */
+    fun setStickyColor(color: Rgba) {
+        val stickies = selection.mapNotNull { it.item as? StickyNoteItem }
+        if (stickies.isEmpty()) return
+        val entries = RecolorSticky.of(stickies, color)
+        if (entries.isEmpty()) return
+        for (e in entries) e.item.color = e.after
+        history.push(RecolorSticky(entries))
+        state.document.dirty = true
+        val locate = { item: CanvasItem -> state.document.pages.firstOrNull { p -> p.items.any { it === item } } }
+        for (e in entries) locate(e.item)?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Recolor one sticky note (the editor dialog), wherever it sits. */
+    fun setStickyColorFor(item: StickyNoteItem, color: Rgba) {
+        if (item.color == color) return
+        val before = item.color
+        item.color = color
+        history.push(RecolorSticky(listOf(RecolorSticky.Entry(item, before, color))))
+        state.document.dirty = true
+        state.document.pages.firstOrNull { p -> p.items.any { it === item } }?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Ask the host to edit [item]'s text (a dialog); falls back to selecting it. */
+    fun editStickyText(item: StickyNoteItem) {
+        val pi = state.document.pages.indexOfFirst { p -> p.items.any { it === item } }
+        if (pi < 0) return
+        if (onStickyEditText?.invoke(item, pi) != true) {
+            setSelection(listOf(Selected(pi, item)))
+            refreshSelectionMenu()
+        }
+    }
+
+    /** Commit a host-edited sticky text, recording undo when it changed. */
+    fun commitStickyText(item: StickyNoteItem, text: String) {
+        if (item.text == text) return
+        val old = item.text
+        item.text = text
+        history.push(EditStickyText(item, old, text))
+        state.document.dirty = true
+        state.document.pages.firstOrNull { p -> p.items.any { it === item } }?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Erase the note-local ink of expanded stickies the eraser circle touches; the repaint region, or null. */
+    private fun eraseStickyInk(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
+        var dirty: Rect? = null
+        for (item in page.items) {
+            if (item !is StickyNoteItem || item.collapsed || item.ink.isEmpty()) continue
+            // Circle in note-local coordinates.
+            val lx = cx - item.rect.x
+            val ly = cy - item.rect.y
+            val hit = item.ink.filter { it.intersectsCircle(lx, ly, radius) }
+            if (hit.isEmpty()) continue
+            if (!eraseStickySnapshots.containsKey(item)) eraseStickySnapshots[item] = item.ink.map { Stroke(it) }
+            for (h in hit) item.ink.remove(h)
+            val b = item.paintBounds()
+            dirty = dirty?.union(b) ?: b
+        }
+        return dirty
+    }
+
     /** Select the topmost shape on page [pi] whose outline or fill is under page point [local], if any. */
     private fun selectShapeAt(pi: Int, local: Pt) {
         val reach = OUTLINE_GRAB / state.zoom
@@ -3374,6 +3646,16 @@ class InteractionController(
     private fun beginTextBoxGesture(content: Pt) {
         val pi = state.pageIndexAtContent(content) ?: return
         val local = state.toPageSpace(pi, content)
+        // Tapping an expanded sticky types into the sticky instead of starting a box.
+        stickyAt(pi, local)?.takeIf { !it.collapsed }?.let {
+            when {
+                it.isCollapseHit(local) -> stickyToggleAt(pi, local)
+                it.isColorHit(local) -> stickyColorTapAt(pi, local)
+                else -> startStickyEdit(it, pi)
+            }
+            mode = PointerMode.IDLE
+            return
+        }
         val page = state.document.pages[pi]
         val existing = page.items.lastOrNull { it is TextItem && it.contains(local) } as? TextItem
         if (existing != null) {
@@ -3447,12 +3729,31 @@ class InteractionController(
         requestRender()
     }
 
+    /** Open the in-place editor on [item]'s text (the paper stays cached under an opaque field). */
+    private fun startStickyEdit(item: StickyNoteItem, pi: Int) {
+        commitTextEdit()
+        editingSticky = item
+        editingStickyOldText = item.text
+        editingStickyPage = pi
+        onTextEditStart(editingField())
+        requestRender()
+    }
+
+    /** Repaint a sticky note's region in place after an edit, like the text-box smart path. */
+    private fun repairStickyRegion(page: Page, item: StickyNoteItem) {
+        if (!state.repairRegion(page, item.paintBounds().outset(REPAIR_PAD))) state.invalidatePage(page)
+    }
+
     /** Keep the model in sync with the live editor field (for auto-grow / commit). */
     fun updateEditingText(text: String) {
         editingLabel?.let { shape ->
             shape.label = shape.label?.withText(text)
             // The lines stay centred on the shape, so the field moves as they wrap.
             onTextEditStart(editingField())
+            return
+        }
+        editingSticky?.let {
+            it.text = text
             return
         }
         editingText?.text = text
@@ -3465,7 +3766,7 @@ class InteractionController(
      * finger, as in [extendPan]. A plain drag with no fling/overscroll.
      */
     fun panWhileEditing(dxFinger: Double, dyFinger: Double) {
-        if (editingText == null && editingLabel == null) return
+        if (editingText == null && editingLabel == null && editingSticky == null) return
         state.scrollBy(-dxFinger, -dyFinger)
         onViewChanged()
         requestRender()
@@ -3474,6 +3775,24 @@ class InteractionController(
     /** Current on-screen geometry of the editor field, or null when not editing. */
     fun editingField(): EditingField? {
         editingLabel?.let { return labelField(it) }
+        editingSticky?.let { sticky ->
+            if (state.pageRects.getOrNull(editingStickyPage) == null) return null
+            val box = sticky.textBox()
+            val topLeft = state.contentToViewport(state.fromPageSpace(editingStickyPage, Pt(box.x, box.y)))
+            return EditingField(
+                x = topLeft.x,
+                y = topLeft.y,
+                width = box.w,
+                height = box.h,
+                fontPx = StickyNoteItem.TEXT_SIZE * com.xnotes.platform.AndroidText.POINTS_TO_PX,
+                zoom = state.zoom,
+                face = com.xnotes.core.pal.FontFace.SANS,
+                rgba = sticky.textColor(),
+                text = sticky.text,
+                rotation = state.rotationDeg.toDouble(),
+                fill = sticky.paperColor(),
+            )
+        }
         val item = editingText ?: return null
         if (state.pageRects.getOrNull(editingPageIndex) == null) return null
         // Anchor at the box's page-space top-left corner; a rotated view spins the overlay
@@ -3506,6 +3825,29 @@ class InteractionController(
      */
     fun commitTextEdit(finalText: String? = null, restoreTool: Boolean = false) {
         if (editingLabel != null) return commitLabelEdit(finalText)
+        editingSticky?.let { sticky ->
+            finalText?.let { sticky.text = it }
+            val pi = editingStickyPage
+            val page = state.document.pages.getOrNull(pi)
+            // An empty note stays a note: only a change is recorded, never a deletion.
+            if (page != null && sticky.text != editingStickyOldText) {
+                history.push(EditStickyText(sticky, editingStickyOldText, sticky.text))
+                state.document.dirty = true
+                onContentChanged()
+            }
+            editingSticky = null
+            editingStickyOldText = ""
+            editingStickyPage = -1
+            page?.let { repairStickyRegion(it, sticky) }
+            onTextEditEnd()
+            requestRender()
+            if (restoreTool) {
+                val back = toolBeforeText
+                toolBeforeText = null
+                if (back != null && back != Tool.TEXT_BOX && tool == Tool.TEXT_BOX) setTool(back)
+            }
+            return
+        }
         val item = editingText ?: return
         finalText?.let { item.text = it }
         val pi = editingPageIndex
@@ -4153,6 +4495,32 @@ class InteractionController(
     /** Select just [item] on [pageIndex] (used right after inserting a table). */
     fun selectSingle(pageIndex: Int, item: CanvasItem) = setSelection(listOf(Selected(pageIndex, item)))
 
+    /** The single selected table plus the selected strokes on its page, for cell handwriting readout. */
+    fun tableWithCellStrokes(): Triple<Int, TableItem, List<Stroke>>? {
+        val tableSel = selection.mapNotNull { s -> (s.item as? TableItem)?.let { s.pageIndex to it } }.singleOrNull() ?: return null
+        val strokes = selection.filter { it.pageIndex == tableSel.first }.mapNotNull { it.item as? Stroke }
+        if (strokes.isEmpty()) return null
+        return Triple(tableSel.first, tableSel.second, strokes)
+    }
+
+    /** Write recognized cell values and erase the consumed handwriting as one undoable edit. */
+    fun adoptTableCellValues(page: Page, table: TableItem, values: Map<Pair<Int, Int>, String>, consumed: List<Stroke>) {
+        val before = table.snapshotGeometry()
+        for ((cell, v) in values) table.setCell(cell.first, cell.second, v)
+        val after = table.snapshotGeometry()
+        val removals = consumed.filter { page.items.contains(it) }.map { page to it }
+        for ((_, item) in removals) page.items.remove(item)
+        val cmds = ArrayList<Command>()
+        if (after != before) cmds.add(TransformItems(listOf(table), listOf(before), listOf(after)))
+        if (removals.isNotEmpty()) cmds.add(EraseItems(removals))
+        if (cmds.isEmpty()) return
+        history.push(if (cmds.size == 1) cmds[0] else CompositeCommand(cmds))
+        state.document.dirty = true
+        onContentChanged()
+        refreshSelectionMenu()
+        requestRender()
+    }
+
     /** The single selected table, or null. */
     fun singleSelectedTable(): TableItem? = selection.singleOrNull()?.item as? TableItem
 
@@ -4189,6 +4557,27 @@ class InteractionController(
         refreshSelectionMenu()
         requestRender()
         return true
+    }
+
+    /** Replace the single selected table's cell grid as one undoable edit. */
+    fun setSelectedTableCells(cells: List<List<String>>) {
+        val t = singleSelectedTable() ?: return
+        val before = t.snapshotGeometry()
+        // The dialog may add or drop rows/columns: resize the grid first so every
+        // saved cell lands in a real cell, then fill the values.
+        val needC = cells.maxOfOrNull { it.size }?.coerceIn(1, TableItem.MAX_LINES) ?: t.cols
+        val needR = cells.size.coerceIn(1, TableItem.MAX_LINES)
+        t.setColumns(needC)
+        t.setRows(needR)
+        t.setCells(cells)
+        val after = t.snapshotGeometry()
+        if (after == before) return
+        history.push(TransformItems(listOf(t), listOf(before), listOf(after)))
+        state.document.dirty = true
+        selObb = selectionBox()
+        onContentChanged()
+        refreshSelectionMenu()
+        requestRender()
     }
 
     /** Reopen the editor on the single selected text box (from the selection menu Edit action). */

@@ -132,8 +132,8 @@ class SdocxTest {
 
             val parsed = SdocxParser.parseArchive(entries)
             assertEquals(1, parsed.pages.size)
-            // 3 strokes exported, all should import. Without a note.note string
-            // table the pen names are unresolved (null); colors/widths survive.
+            // 3 strokes exported, all should import. Pen names now resolve
+            // via the note.note string table, so tools round-trip.
             assertEquals(3, parsed.pages[0].strokes.size)
             assertEquals(1, parsed.pages[0].templateType)
 
@@ -143,9 +143,9 @@ class SdocxTest {
             assertNotNull(back)
             assertEquals(1, back!!.pages.size)
             assertEquals(3, back.pages[0].items.filterIsInstance<Stroke>().size)
-            // Calligraphy collapses to PEN without pen names; highlighter survives via alpha.
+            // Pen ids preserve tools; highlighter also survives via alpha.
             val tools = back.pages[0].items.filterIsInstance<Stroke>().map { it.tool }
-            assertEquals(listOf(Tool.PEN, Tool.HIGHLIGHTER, Tool.PEN), tools)
+            assertEquals(listOf(Tool.PEN, Tool.HIGHLIGHTER, Tool.CALLIGRAPHY), tools)
         } finally {
             tmp.deleteRecursively()
         }

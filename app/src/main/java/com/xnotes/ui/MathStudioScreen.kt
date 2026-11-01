@@ -39,6 +39,7 @@ import androidx.compose.material.icons.outlined.ScatterPlot
 import androidx.compose.material.icons.outlined.Science
 import androidx.compose.material.icons.outlined.Straighten
 import androidx.compose.material.icons.outlined.Summarize
+import androidx.compose.material.icons.outlined.TableChart
 import androidx.compose.material.icons.outlined.ViewInAr
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -95,6 +96,7 @@ internal enum class MathTab(val labelRes: Int, val icon: ImageVector) {
     GRAPH_3D(R.string.math_tab_graph3d, Icons.Outlined.ViewInAr),
     FIELDS(R.string.math_tab_fields, Icons.Outlined.ScatterPlot),
     CALCULUS(R.string.math_tab_calculus, Icons.Outlined.Insights),
+    DATA(R.string.math_tab_data, Icons.Outlined.TableChart),
     SYMBOLIC(R.string.math_tab_symbolic, Icons.Outlined.Functions),
     UNITS(R.string.math_tab_units, Icons.Outlined.Straighten),
     CATALOG(R.string.math_tab_catalog, Icons.AutoMirrored.Outlined.MenuBook),
@@ -205,7 +207,7 @@ internal class CalculatorState {
 /**
  * A canvas selection's expression, opened in Math Studio at [tab] (a [MathTab] name).
  */
-data class MathStudioRequest(val tab: String, val expression: String)
+data class MathStudioRequest(val tab: String, val expression: String, val tableCsv: String? = null)
 
 /**
  * The full-screen maths workspace opened from a note or a canvas: calculator, 2D and 3D plots,
@@ -235,9 +237,10 @@ internal fun MathStudioScreen(
     val calculus = remember { CalculusState() }
     val symbolic = remember { SymbolicState() }
     val units = remember { UnitState() }
+    val data = remember { DataState() }
 
     fun snapshotNow(): String = MathStudioData.capture(
-        tabName, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units,
+        tabName, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units, data,
     )
 
     // Every exit path funnels through here so the note's workspace is stored before it closes.
@@ -269,7 +272,7 @@ internal fun MathStudioScreen(
         if (initialData != null && initialData != appliedData) {
             appliedData = initialData
             val tab = MathStudioData.restore(
-                initialData, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units,
+                initialData, calculator, solver, plot2d, plot3d, fields, calculus, symbolic, units, data,
             )
             if (tab != null) tabName = tab
         }
@@ -289,7 +292,7 @@ internal fun MathStudioScreen(
     LaunchedEffect(initialRequest) {
         if (initialRequest != null && initialRequest != appliedRequest) {
             appliedRequest = initialRequest
-            applyMathStudioRequest(initialRequest, plot2d, plot3d, symbolic, solver)
+            applyMathStudioRequest(initialRequest, plot2d, plot3d, symbolic, solver, data)
             tabName = initialRequest.tab
         }
     }
@@ -344,6 +347,7 @@ internal fun MathStudioScreen(
                 MathTab.GRAPH_3D -> Plot3DPane(plot3d, onInsertGraph)
                 MathTab.FIELDS -> FieldPane(fields, onInsertGraph)
                 MathTab.CALCULUS -> CalculusPane(calculus)
+                MathTab.DATA -> DataPane(data, onInsertGraph)
                 MathTab.SYMBOLIC -> SymbolicPane(symbolic)
                 MathTab.UNITS -> UnitPane(units, onTakeResult = { v ->
                     val text = Numbers.format(v)
@@ -367,7 +371,12 @@ private val PLOT_HEAD_R = Regex("^\\s*r\\s*=(.+)$", RegexOption.DOT_MATCHES_ALL)
  * calculators. Equations keep their meaning: `y = …`/`f(x) = …` plot the right-hand side,
  * while `x`/`y` equations with no named head land in the implicit plotter.
  */
-private fun applyMathStudioRequest(req: MathStudioRequest, plot2d: Plot2DState, plot3d: Plot3DState, symbolic: SymbolicState, solver: SolverState) {
+private fun applyMathStudioRequest(req: MathStudioRequest, plot2d: Plot2DState, plot3d: Plot3DState, symbolic: SymbolicState, solver: SolverState, data: DataState) {
+    if (req.tab == MathTab.DATA.name) {
+        val csv = req.tableCsv?.takeIf { it.isNotBlank() } ?: req.expression
+        if (csv.isNotBlank()) data.importCsv(csv, DataImportMode.TABLE, "Table")
+        return
+    }
     val expr = req.expression.trim()
     if (expr.isEmpty()) return
     when (req.tab) {
@@ -394,13 +403,16 @@ private fun applyMathStudioRequest(req: MathStudioRequest, plot2d: Plot2DState, 
             val head = polar ?: PLOT_HEAD_Y.matchEntire(expr)
             if (head != null) {
                 plot2d.mode = if (polar != null) Plot2DMode.POLAR else Plot2DMode.CARTESIAN
-                plot2d.setExpression(0, head.groupValues[1].trim().ifEmpty { expr })
+                val body = head.groupValues[1].trim().ifEmpty { expr }
+                plot2d.expressions = if (plot2d.expressions.isEmpty()) listOf(MathEntry(body))
+                    else plot2d.expressions.toMutableList().also { it[0] = it[0].copy(text = body) }
             } else if ('=' in expr && ('x' in expr || 'y' in expr)) {
                 plot2d.mode = Plot2DMode.IMPLICIT
                 plot2d.implicitList = listOf(MathEntry(expr))
             } else {
                 plot2d.mode = Plot2DMode.CARTESIAN
-                plot2d.setExpression(0, expr)
+                plot2d.expressions = if (plot2d.expressions.isEmpty()) listOf(MathEntry(expr))
+                    else plot2d.expressions.toMutableList().also { it[0] = it[0].copy(text = expr) }
             }
         }
         MathTab.GRAPH_3D.name -> {
@@ -716,6 +728,11 @@ private val CALC_ROWS: List<List<CalcKey>> = listOf(
         CalcKey("tanh", "tanh(", KeyKind.FUNCTION), CalcKey("√", "sqrt(", KeyKind.FUNCTION),
         CalcKey("x²", "^2", KeyKind.FUNCTION), CalcKey("xʸ", "^", KeyKind.FUNCTION),
         CalcKey("1/x", "1/(", KeyKind.FUNCTION),
+    ),
+    listOf(
+        CalcKey("rand", "rand()", KeyKind.FUNCTION), CalcKey("randint", "randint(", KeyKind.FUNCTION),
+        CalcKey("randn", "randn()", KeyKind.FUNCTION), CalcKey("n!", "!", KeyKind.OPERATOR),
+        CalcKey("%", "%", KeyKind.OPERATOR),
     ),
     listOf(
         CalcKey("(", "(", KeyKind.OPERATOR), CalcKey(")", ")", KeyKind.OPERATOR),

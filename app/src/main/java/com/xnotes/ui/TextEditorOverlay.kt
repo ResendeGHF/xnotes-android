@@ -1,5 +1,6 @@
 package com.xnotes.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -17,6 +18,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -172,9 +174,12 @@ fun TextEditorOverlay(editor: TextEditHost, field: EditingField) {
                 )
                 .widthIn(min = widthDp, max = widthDp)
                 .heightIn(min = heightDp)
-                // No fill: the edited box is lifted out of the ink cache, so a transparent field lets the
-                // page/PDF underneath show through while typing (true WYSIWYG). The border marks the
-                // bounds; its width is pre-divided so it stays 1dp after the layer scale.
+                // No fill, unless the field carries its own paper: the edited box is lifted out of
+                // the ink cache, so a transparent field lets the page/PDF underneath show through
+                // while typing (true WYSIWYG). A sticky note stays cached and the field covers the
+                // old words with the paper colour instead. The border marks the bounds; its width
+                // is pre-divided so it stays 1dp after the layer scale.
+                .background(field.fill?.toComposeColor() ?: Color.Transparent)
                 .border(Dp(1f / z), editor.editAccent.toComposeColor())
                 .focusRequester(focusRequester)
                 .onGloballyPositioned { coords = it }

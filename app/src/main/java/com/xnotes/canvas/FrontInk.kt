@@ -195,13 +195,16 @@ class FrontInk(
      * from the tool.
      *
      * The pad has no copy of what is under it, so anything that composites against the page cannot
-     * live there. Plain triangles can, and that is what a pen and a pencil are.
+     * live there. Plain triangles can, and that is what a pen and a pencil are: the pencil's
+     * field blends instead of punching holes, but its triangles never overlap, so it
+     * unions exactly like opaque ink.
      */
     private fun decide(stroke: Stroke, pageIndex: Int) {
         decided = true
         // Turned off for this device, so there is no pad to consult and nothing to time against it.
         if (!pad.frontBuffering) return
-        if (ItemMesher.passFor(stroke) != InkPass.OPAQUE) return
+        val pass = ItemMesher.passFor(stroke)
+        if (pass != InkPass.OPAQUE && pass != InkPass.PENCIL) return
         // A rotated view is a rotation, and the ink shader has room for a scroll and a zoom.
         if (state.rotationDeg != 0) return
         val page = state.document.pages.getOrNull(pageIndex) ?: return

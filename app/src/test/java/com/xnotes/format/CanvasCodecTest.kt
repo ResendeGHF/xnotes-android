@@ -277,7 +277,7 @@ class CanvasCodecTest {
 
     @Test fun everyStrokeToolRoundTrips() {
         val doc = InfiniteDocument()
-        val tools = listOf(Tool.PEN, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER)
+        val tools = listOf(Tool.PEN, Tool.PENCIL, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER)
         for (t in tools) {
             doc.add(
                 Stroke(
@@ -290,18 +290,45 @@ class CanvasCodecTest {
         }
         val back = roundTrip(doc)
         assertEquals(tools, back.items.map { (it as Stroke).tool })
-        val speed = back.items[3] as Stroke
+        val speed = back.items[4] as Stroke
         assertEquals(2.5, speed.speedScale, 1e-9)
         assertEquals(16.0, speed.samples[1].t, 1e-9) // times only survive for the speed pen
         assertEquals(0.0, (back.items[0] as Stroke).samples[1].t, 1e-9)
-        val taper = back.items[4] as Stroke
+        val taper = back.items[5] as Stroke
         assertTrue(taper.config.taperEnabled)
         assertEquals(ToolDefaults.DEFAULT_TAPER_TIP, taper.config.taperMinFactor, 1e-9)
-        val hl = back.items[5] as Stroke
+        val hl = back.items[6] as Stroke
         assertEquals(0.90, hl.config.highlighterAlpha, 1e-9)
-        val dashed = back.items[1] as Stroke
+        val dashed = back.items[2] as Stroke
         assertEquals(10.0, dashed.config.dashLength, 1e-9)
         assertEquals(8.0, dashed.config.dashGap, 1e-9)
+        val pencil = back.items[1] as Stroke
+        assertEquals(ToolConfig.DEFAULT_PENCIL_GRAIN, pencil.config.pencilGrain, 1e-9)
+    }
+
+    @Test fun pencilGrainRoundTripsAndStaysPencilOnly() {
+        val doc = InfiniteDocument()
+        doc.add(
+            Stroke(
+                Tool.PENCIL,
+                ToolDefaults.configFor(Tool.PENCIL).copy(pencilGrain = 0.8),
+                mutableListOf(Sample(0.0, 0.0, 0.2), Sample(12.0, 4.0, 0.9)),
+            ),
+        )
+        doc.add(
+            Stroke(
+                Tool.PEN,
+                ToolDefaults.configFor(Tool.PEN),
+                mutableListOf(Sample(0.0, 0.0, 1.0), Sample(12.0, 4.0, 1.0)),
+            ),
+        )
+        val text = manifestText(doc)
+        assertTrue(text.contains("\"pencil_grain\""))
+        val back = roundTrip(doc)
+        assertEquals(0.8, (back.items[0] as Stroke).config.pencilGrain, 1e-9)
+        assertEquals(Tool.PENCIL, (back.items[0] as Stroke).tool)
+        // A pen stroke never carries the field: byte-stable output for existing ink.
+        assertEquals(ToolConfig.DEFAULT_PENCIL_GRAIN, (back.items[1] as Stroke).config.pencilGrain, 1e-9)
     }
 
     @Test fun neonAndStraightSurvive() {

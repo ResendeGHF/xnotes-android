@@ -8,6 +8,7 @@ import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TableItem
 import com.xnotes.core.model.TextItem
@@ -29,12 +30,15 @@ import kotlin.math.roundToInt
 /**
  * Writes an xnotes [Document] as a Samsung Notes `.sdocx` (ZIP) bundle.
  *
- * Covers pages, vector strokes (uncompressed), raster images, a single
- * embedded PDF, shapes/tables/connectors (flattened to pen strokes) and
- * plain text (native text boxes with color, size, bold, italic, underline,
- * strike and alignment), plus the `note.note`, `pageIdInfo.dat` and
- * `end_tag.bin` records (with identity hashes, page footers and the appended
- * end tag) that Samsung Notes requires to open the file.
+ * Covers pages, vector strokes (uncompressed, Samsung-compatible frames),
+ * raster images (native image fills with outline paths), a single embedded
+ * PDF, shapes/tables/connectors (flattened to pen strokes, tables also carry
+ * their cell values as native text boxes) and plain text (native text boxes
+ * with color, size, bold, italic, underline, strike and alignment, including
+ * table cells, shape labels and sticky-note text), plus the `note.note`
+ * (title + pen table), `pageIdInfo.dat` and `end_tag.bin` records (with
+ * identity hashes, page footers and the appended end tag) that Samsung Notes
+ * requires to open the file.
  *
  * Deliberately dropped: fills (shapes export as outlines only), neon glow,
  * glyph-art shapes, audio pills and tape (both are non-printing in xnotes —
@@ -102,14 +106,58 @@ object SdocxExport {
         // Page records (data + hash for the manifest).
         val pageRecords = ArrayList<Triple<String, ByteArray, ByteArray>>()
         val pages = if (doc.pages.isEmpty()) listOf(Page(1440.0, 2036.0)) else doc.pages
+
+        // Distinct Samsung pen short names across all ink (including flattened
+        // shapes/tables/connectors and sticky ink) so every stroke's pen ids
+        // resolve through note.note's string table instead of dangling.
+        val penShorts = LinkedHashSet<String>()
+        fun collectTool(tool: Tool) {
+            try {
+                penShorts.add(SdocxMapping.toolToSamsungPen(tool))
+            } catch (_: Exception) {
+            }
+        }
+        for (page in pages) {
+            for (item in page.items) {
+                when (item) {
+                    is Stroke -> collectTool(item.tool)
+                    is ShapeItem, is TableItem, is ConnectorItem -> {
+                        try {
+                            for (s in shapeStrokes(item)) collectTool(s.tool)
+                        } catch (_: Exception) {
+                            collectTool(Tool.PEN)
+                        }
+                    }
+                    else -> {
+                        if (item.kind == "sticky") {
+                            try {
+                                for (s in stickyInkOf(item)) collectTool(s.tool)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        val penIdByShort = HashMap<String, Int>()
+        val penEntries = ArrayList<Pair<Int, String>>()
+        var nextPenId = 0
+        for (short in penShorts) {
+            penIdByShort[short] = nextPenId
+            penEntries.add(nextPenId to "com.samsung.android.sdk.pen.pen.preload.$short")
+            nextPenId++
+        }
+        val advancedId = nextPenId
+        penEntries.add(advancedId to "9;")
+
         for (page in pages) {
             val uuid = UUID.randomUUID().toString()
-            val (bytes, hash) = buildPage(page, doc, uuid, pdfBindId, imageBindByItem, now)
+            val (bytes, hash) = buildPage(page, doc, uuid, pdfBindId, imageBindByItem, penIdByShort, advancedId, now)
             pageRecords.add(Triple(uuid, bytes, hash))
         }
 
         val mediaInfo = buildMediaManifest(media, now)
-        val noteData = buildNoteFile(pages, now)
+        val noteData = buildNoteFile(pages, now, doc.title, penEntries)
         val noteHash = sha256(noteData.dropLast(32).toByteArray())
         val pageManifest = buildPageManifest(noteHash, pageRecords.map { Pair(it.first, it.third) })
         val endTag = buildEndTag(pages, now)
@@ -257,29 +305,79 @@ object SdocxExport {
         return w.bytes()
     }
 
-    /** Minimal note.note Samsung Notes accepts: empty title/body + pen table. */
-    private fun buildNoteFile(pages: List<Page>, now: Long): ByteArray {
+    /**
+     * A note.note title/body text object (base + shape-base + shape-text +
+     * tail) carrying [text] via [textCommonBytes] with a zero bbox. Matches
+     * Samsung writers: base v4000 with 2/4-byte masks and 8-byte flex,
+     * base6 with 0C fields and 39-byte flex, shape with 45-byte fixed and
+     * 4-byte masks, tail with 2-byte fields.
+     */
+    private fun buildNoteTextBlob(text: String, now: Long, pageW: Int = 1440): ByteArray {
+        val safe = if (text.length > MAX_TEXT_UNITS) text.substring(0, MAX_TEXT_UNITS) else text
+        val flex = textCommonBytes(
+            safe,
+            Rgba(0, 0, 0, 255).toArgb(),
+            14f,
+            bold = false,
+            italic = false,
+            underline = false,
+            strike = false,
+            alignValue = 0,
+        )
+        val bbox = doubleArrayOf(0.0, 0.0, 0.0, 0.0)
+        val objectId = UUID.randomUUID().toString()
+        val base6 = base6FrameForText()
+        val shapeFixed = shapeFixedForText(bbox)
+        val shape = writeFrame(
+            7,
+            SdocxMask(byteArrayOf(0x04)),
+            SdocxMask(byteArrayOf(0x01, 0x00, 0x00, 0x00)),
+            shapeFixed,
+            flex,
+        )
+        val tail = writeFrame(
+            2,
+            SdocxMask(byteArrayOf(0x00)),
+            SdocxMask(byteArrayOf(0x00, 0x00)),
+            ByteArray(0),
+            ByteArray(0),
+        )
+        val out = ByteArrayOutputStream()
+        out.write(baseFrameForNote(bbox, pageW = pageW, objectId = objectId))
+        out.write(base6)
+        out.write(shape)
+        out.write(tail)
+        return out.toByteArray()
+    }
+
+    /** Minimal note.note Samsung Notes accepts: empty body + pen table. */
+    private fun buildNoteFile(
+        pages: List<Page>,
+        now: Long,
+        title: String,
+        penEntries: List<Pair<Int, String>>,
+    ): ByteArray {
         val width = pages.maxOfOrNull { it.width.roundToInt() }?.coerceIn(200, 5000) ?: 1113
         val height = (pages.sumOf { it.height.roundToInt().coerceIn(200, 5000) }) + 8
-        val titleObj = patchTextObjectBase(EMPTY_TITLE_TEMPLATE, UUID.randomUUID().toString(), now)
-        val bodyObj = patchTextObjectBase(EMPTY_BODY_TEMPLATE, UUID.randomUUID().toString(), now)
+        val titleObj = buildNoteTextBlob(title, now, pageW = width)
+        val bodyObj = buildNoteTextBlob("", now, pageW = width)
 
         val data = SdocxWriter()
         data.writeBytes(ByteArray(4)) // flexible offset placeholder
         data.writeU8(4)
-        data.writeU32(0x00000008) // header flags
+        data.writeU32(0x00000000) // header flags (no lat/lon, matches Samsung writers)
         data.writeU8(4)
         data.writeU32(0x000C8E80) // property flags
-        data.writeU32(4000) // format version
+        data.writeU32(5400) // format version (matches Samsung writers)
         data.writeUtf16U16("") // note id (empty tolerated)
-        data.writeU32(5) // file revision
+        data.writeU32(2) // file revision (matches Samsung writers)
         data.writeI64(now)
         data.writeI64(now)
         data.writeU32(width.toLong())
         data.writeU32(height.toLong())
         data.writeU32(0) // page horizontal padding
         data.writeU32(8) // page vertical padding
-        data.writeU32(4000) // min format version
+        data.writeU32(5400) // min format version
         data.writeU32(titleObj.size.toLong())
         data.writeBytes(titleObj)
         data.writeU32(bodyObj.size.toLong())
@@ -297,14 +395,7 @@ object SdocxExport {
         out.writeI32(0)
         out.writeI32(-1)
         out.writeI64(0)
-        out.writeBytes(
-            buildStringIdBlock(
-                listOf(
-                    0 to "com.samsung.android.sdk.pen.pen.preload.FountainPen",
-                    1 to "18;0;100;",
-                ),
-            ),
-        )
+        out.writeBytes(buildStringIdBlock(penEntries))
         out.writeI32(0)
         out.writeBytes(CURRENT_PEN_INFO)
         out.writeI32(2)
@@ -370,6 +461,8 @@ object SdocxExport {
         uuid: String,
         pdfBindId: Int?,
         imageBindByItem: Map<ImageItem, Int>,
+        penIdByShort: Map<String, Int>,
+        advancedId: Int,
         now: Long,
     ): Pair<ByteArray, ByteArray> {
         val width = page.width.roundToInt().coerceIn(200, 5000)
@@ -379,27 +472,63 @@ object SdocxExport {
         val objects = ArrayList<Pair<ByteArray, ByteArray>>()
         for (item in page.items) {
             when (item) {
-                is Stroke -> buildStrokeObject(item, now)?.let { objects.add(it) }
+                is Stroke -> buildStrokeObject(item, now, penIdByShort, advancedId, width, height)?.let { objects.add(it) }
                 is ImageItem -> {
                     val bindId = imageBindByItem[item] ?: continue
-                    buildImageObject(item, bindId, now)?.let { objects.add(it) }
+                    buildImageObject(item, bindId, now, width, height)?.let { objects.add(it) }
                 }
                 // Shapes, tables and connectors have no native counterpart in
                 // the writer: flatten their outlines to pen strokes (the user's
                 // requested approach), so the ink still opens in Samsung Notes.
-                is ShapeItem, is TableItem, is ConnectorItem ->
-                    shapeStrokes(item).forEach { buildStrokeObject(it, now)?.let { o -> objects.add(o) } }
+                is ShapeItem, is TableItem, is ConnectorItem -> {
+                    shapeStrokes(item).forEach { buildStrokeObject(it, now, penIdByShort, advancedId, width, height)?.let { o -> objects.add(o) } }
+                    if (item is TableItem) {
+                        for (te in tableCellExports(item)) {
+                            buildTextObject(te, now, width, height)?.let { objects.add(it) }
+                        }
+                    }
+                }
                 // Text (boxes and shape labels) goes out as native text boxes.
-                is TextItem -> buildTextObject(textExportOf(item), now)?.let { objects.add(it) }
-                // Audio pills and tape never print (see CanvasItem.exported),
-                // matching the PDF export: skipped.
-                else -> Unit
+                is TextItem -> buildTextObject(textExportOf(item), now, width, height)?.let { objects.add(it) }
+                // Sticky notes have no native counterpart: export their text as
+                // a text box and their ink as offset pen strokes.
+                else -> {
+                    if (item.kind == "sticky" || item is StickyNoteItem) {
+                        try {
+                            val txt = stickyTextOf(item)
+                            val r = stickyRectOf(item)
+                            if (!txt.isNullOrBlank() && r != null && r.w > 0 && r.h > 0) {
+                                val te = TextExport(
+                                    r,
+                                    txt,
+                                    Rgba(0, 0, 0, 255),
+                                    13.0,
+                                    bold = false,
+                                    italic = false,
+                                    underline = false,
+                                    strike = false,
+                                    align = HAlign.LEFT,
+                                )
+                                buildTextObject(te, now, width, height)?.let { objects.add(it) }
+                            }
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            for (s in stickyStrokesForExport(item)) {
+                                buildStrokeObject(s, now, penIdByShort, advancedId, width, height)?.let { objects.add(it) }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                    // Audio pills and tape never print (see CanvasItem.exported),
+                    // matching the PDF export: skipped.
+                }
             }
         }
         // Shape labels ride along as text boxes of their own.
         for (item in page.items) {
             if (item is ShapeItem) {
-                labelExportOf(item)?.let { buildTextObject(it, now)?.let { o -> objects.add(o) } }
+                labelExportOf(item)?.let { buildTextObject(it, now, width, height)?.let { o -> objects.add(o) } }
             }
         }
 
@@ -438,7 +567,22 @@ object SdocxExport {
                         val r = item.bounds()
                         feed(r.x, r.y, r.x + r.w, r.y + r.h)
                     }
-                    else -> Unit
+                    is ShapeItem, is TableItem, is ConnectorItem -> {
+                        try {
+                            val r = item.bounds()
+                            feed(r.x, r.y, r.x + r.w, r.y + r.h)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    else -> {
+                        if (item.kind == "sticky") {
+                            try {
+                                val r = item.bounds()
+                                feed(r.x, r.y, r.x + r.w, r.y + r.h)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
                 }
             }
             if (minX <= maxX && minY <= maxY) {
@@ -563,6 +707,110 @@ object SdocxExport {
         if (!(box.w > 0) || !(box.h > 0)) return null
         val st = label.style
         return TextExport(box, label.text, st.rgba, st.pointSize, st.bold, st.italic, st.underline, st.strike, st.align)
+    }
+
+    /**
+     * Each non-blank table cell as a text box (direct [TableItem.cell] access).
+     */
+    private fun tableCellExports(t: TableItem): List<TextExport> {
+        try {
+            val out = ArrayList<TextExport>()
+            for (c in 0 until t.cols) {
+                for (r in 0 until t.rows) {
+                    val txt = try {
+                        t.cell(c, r)
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    if (txt.isBlank()) continue
+                    val x0 = t.colX(c)
+                    val x1 = t.colX(c + 1)
+                    val y0 = t.rowY(r)
+                    val y1 = t.rowY(r + 1)
+                    if (!(x1 > x0) || !(y1 > y0)) continue
+                    out.add(
+                        TextExport(
+                            Rect(x0, y0, x1 - x0, y1 - y0),
+                            txt,
+                            Rgba(0, 0, 0, 255),
+                            13.0,
+                            bold = false,
+                            italic = false,
+                            underline = false,
+                            strike = false,
+                            align = HAlign.LEFT,
+                        ),
+                    )
+                }
+            }
+            return out
+        } catch (_: Exception) {
+            return emptyList()
+        }
+    }
+
+    // --- sticky notes (direct StickyNoteItem, no reflection) ---
+
+    private fun stickyRectOf(item: com.xnotes.core.model.CanvasItem): Rect? {
+        return try {
+            if (item is StickyNoteItem) item.rect else item.bounds()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun stickyTextOf(item: com.xnotes.core.model.CanvasItem): String? {
+        return try {
+            if (item is StickyNoteItem) item.text.takeIf { it.isNotBlank() } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun stickyInkOf(item: com.xnotes.core.model.CanvasItem): List<Stroke> {
+        return try {
+            if (item is StickyNoteItem) item.ink.toList() else emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun stickyStrokesForExport(item: com.xnotes.core.model.CanvasItem): List<Stroke> {
+        val ink = try {
+            stickyInkOf(item)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (ink.isEmpty()) return emptyList()
+        val origin = try {
+            stickyRectOf(item)
+        } catch (_: Exception) {
+            null
+        } ?: return ink
+        val ox = origin.x
+        val oy = origin.y
+        if (ox == 0.0 && oy == 0.0) return ink
+        val out = ArrayList<Stroke>(ink.size)
+        for (s in ink) {
+            try {
+                if (s.sampleCount < 2) continue
+                val samples = ArrayList<com.xnotes.core.stroke.Sample>(s.sampleCount)
+                for (i in 0 until s.sampleCount) {
+                    val t = try {
+                        s.tAt(i)
+                    } catch (_: Exception) {
+                        0.0
+                    }
+                    samples.add(com.xnotes.core.stroke.Sample(s.xAt(i) + ox, s.yAt(i) + oy, s.pAt(i), t))
+                }
+                val c = Stroke(s.tool, s.config.copy(), emptyList(), s.speedScale, s.straight, s.smoothScale)
+                c.setSamples(samples)
+                c.finished = true
+                out.add(c)
+            } catch (_: Exception) {
+            }
+        }
+        return out
     }
 
     /**
@@ -818,7 +1066,7 @@ object SdocxExport {
         return flex.bytes()
     }
 
-    private fun buildTextObject(t: TextExport, now: Long): Pair<ByteArray, ByteArray>? {
+    private fun buildTextObject(t: TextExport, now: Long, pageW: Int = 1440, pageH: Int = 2036): Pair<ByteArray, ByteArray>? {
         try {
             if (t.text.isEmpty() || t.text.length > MAX_TEXT_UNITS) return null
             val r = t.rect
@@ -834,19 +1082,25 @@ object SdocxExport {
             val flex = textCommonBytes(t.text, t.rgba.toArgb(), t.pointSize.toFloat(),
                 t.bold, t.italic, t.underline, t.strike, alignValue)
 
-            // Empty shape-base: no magnets or connections.
-            val base6Fixed = SdocxWriter()
-            base6Fixed.writeU32(0)
-            base6Fixed.writeU32(4)
-            base6Fixed.writeU32(0)
-            base6Fixed.writeU8(0)
-            val base6 = writeFrame(6, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x00)), base6Fixed.bytes(), ByteArray(0))
-            val shape = writeFrame(7, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x01)), ByteArray(0), flex)
-            val tail = writeFrame(2, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x00)), ByteArray(0), ByteArray(0))
+            val base6 = base6FrameForText()
+            val shape = writeFrame(
+                7,
+                SdocxMask(byteArrayOf(0x04)),
+                SdocxMask(byteArrayOf(0x01, 0x00, 0x00, 0x00)),
+                shapeFixedForText(bbox),
+                flex,
+            )
+            val tail = writeFrame(
+                2,
+                SdocxMask(byteArrayOf(0x00)),
+                SdocxMask(byteArrayOf(0x00, 0x00)),
+                ByteArray(0),
+                ByteArray(0),
+            )
 
             val objectId = UUID.randomUUID().toString()
             val payload = SdocxWriter()
-            payload.writeBytes(baseFrame(bbox, now = now, objectId = objectId))
+            payload.writeBytes(baseFrameForPage(bbox, now = now, objectId = objectId, pageW = pageW, pageH = pageH))
             payload.writeBytes(base6)
             payload.writeBytes(shape)
             payload.writeBytes(tail)
@@ -909,29 +1163,180 @@ object SdocxExport {
     }
 
     private fun baseFrame(bbox: DoubleArray, rotation: Double? = null, now: Long = System.currentTimeMillis() * 1000L, objectId: String? = null): ByteArray {
+        // Legacy entry point: delegates to the page variant with default
+        // Samsung page size (kept for tests building synthetic frames).
+        return baseFrameForPage(bbox, rotation = rotation, now = now, objectId = objectId, pageW = 1440, pageH = 2036)
+    }
+
+    /** Base frame (kind 0) for page objects: v4000, BF01 props, 4-byte fields, 16/21-byte flex. */
+    private fun baseFrameForPage(
+        bbox: DoubleArray,
+        rotation: Double? = null,
+        now: Long = System.currentTimeMillis() * 1000L,
+        objectId: String? = null,
+        pageW: Int = 1440,
+        pageH: Int = 2036,
+        forImage: Boolean = false,
+    ): ByteArray {
         val fixed = SdocxWriter()
-        fixed.writeU32(1) // format version
+        fixed.writeU32(4000) // format version (matches Samsung writers)
         fixed.writeUtf8U16(objectId ?: UUID.randomUUID().toString())
         fixed.writeI64(now)
         for (v in bbox) fixed.writeF64(v)
         fixed.writeI32(0) // replay timestamp
         fixed.writeU8(0) // resize mode: free
-        val props = SdocxMask(byteArrayOf(0x0E)) // selectable + movable + visible
-        val fields: SdocxMask
-        val flex: ByteArray
-        if (rotation != null && rotation.isFinite() && rotation != 0.0) {
-            fields = SdocxMask(byteArrayOf(0x01))
-            val fw = SdocxWriter()
-            fw.writeF32(rotation.toFloat())
-            flex = fw.bytes()
+        // Props BF01 (selectable + movable + visible + ...), matches Samsung.
+        val props = SdocxMask(byteArrayOf(0xBF.toByte(), 0x01))
+        // Fields: strokes/text 00600000 (bits13,14), images 00E01000 (bits13,14,15,20).
+        // Rotation (bit0) is not used by xnotes export (boxes land upright).
+        val fields = if (forImage) {
+            SdocxMask(byteArrayOf(0x00, 0xE0.toByte(), 0x10, 0x00))
         } else {
-            fields = SdocxMask(byteArrayOf(0x00))
-            flex = ByteArray(0)
+            SdocxMask(byteArrayOf(0x00, 0x60, 0x00, 0x00))
         }
+        val flexW = SdocxWriter()
+        flexW.writeI64(now)
+        flexW.writeU32(pageW.toLong())
+        flexW.writeU32(pageH.toLong())
+        var flex = flexW.bytes()
+        if (forImage) {
+            // Extra 5 bytes observed on Samsung image objects: U32(2) + U8(0).
+            val extra = SdocxWriter()
+            extra.writeU32(2)
+            extra.writeU8(0)
+            flex = flex + extra.bytes()
+        }
+        // Rotation is not exported (text rotation is dropped); if a caller
+        // passes one, it is ignored because the field layout above has no
+        // bit0 slot. This matches the previous behaviour of landing upright.
         return writeFrame(0, props, fields, fixed.bytes(), flex)
     }
 
-    private fun buildStrokeObject(stroke: Stroke, now: Long): Pair<ByteArray, ByteArray>? {
+    /** Base frame (kind 0) for note.title/body blobs: v4000, BF01, 00400000, 8-byte flex. */
+    private fun baseFrameForNote(
+        bbox: DoubleArray,
+        pageW: Int = 1440,
+        objectId: String? = null,
+    ): ByteArray {
+        val fixed = SdocxWriter()
+        fixed.writeU32(4000)
+        fixed.writeUtf8U16(objectId ?: UUID.randomUUID().toString())
+        fixed.writeI64(samsungNow())
+        for (v in bbox) fixed.writeF64(v)
+        fixed.writeI32(0)
+        fixed.writeU8(0)
+        val props = SdocxMask(byteArrayOf(0xBF.toByte(), 0x01))
+        val fields = SdocxMask(byteArrayOf(0x00, 0x40, 0x00, 0x00)) // bit14 only
+        val flexW = SdocxWriter()
+        flexW.writeU32(pageW.toLong())
+        flexW.writeU32(0)
+        return writeFrame(0, props, fields, fixed.bytes(), flexW.bytes())
+    }
+
+    /** Shape-base (kind 6) for text/image: 13-byte fixed, 0C fields, 39-byte flex template. */
+    private fun base6FrameForText(): ByteArray {
+        val fixed = SdocxWriter()
+        fixed.writeU32(0) // magnetic count
+        fixed.writeU32(4) // connection block size
+        fixed.writeU32(0) // connection count
+        fixed.writeU8(0) // reserved
+        val flex = byteArrayOf(
+            0x13.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x01.toByte(), 0x00.toByte(), 0x02.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0xFF.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x0C.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+        )
+        return writeFrame(
+            6,
+            SdocxMask(byteArrayOf(0x00)),
+            SdocxMask(byteArrayOf(0x0C)),
+            fixed.bytes(),
+            flex,
+        )
+    }
+
+    /** Shape-base (kind 6) for images: 77-byte fixed with 4 edge magnets, 0C fields, 39-byte flex. */
+    private fun base6FrameForImage(bbox: DoubleArray): ByteArray {
+        val l = bbox[0]; val t = bbox[1]; val r = bbox[2]; val b = bbox[3]
+        val cx = (l + r) / 2.0
+        val cy = (t + b) / 2.0
+        val fixed = SdocxWriter()
+        fixed.writeU32(4) // 4 edge magnets (top/right/bottom/left centers)
+        fixed.writeF64(cx); fixed.writeF64(t)
+        fixed.writeF64(r); fixed.writeF64(cy)
+        fixed.writeF64(cx); fixed.writeF64(b)
+        fixed.writeF64(l); fixed.writeF64(cy)
+        fixed.writeU32(4) // connection block size
+        fixed.writeU32(0) // connection count
+        fixed.writeU8(0) // reserved
+        val flex = byteArrayOf(
+            0x13.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x01.toByte(), 0x00.toByte(), 0x02.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0xFF.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x0C.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+        )
+        return writeFrame(
+            6,
+            SdocxMask(byteArrayOf(0x00)),
+            SdocxMask(byteArrayOf(0x0C)),
+            fixed.bytes(),
+            flex,
+        )
+    }
+
+    /** 45-byte shape fixed for text boxes: type 4 + bbox + rotation 0 + empty path. */
+    private fun shapeFixedForText(bbox: DoubleArray): ByteArray {
+        val w = SdocxWriter()
+        w.writeU32(4) // rectangle template
+        for (v in bbox) w.writeF64(v)
+        w.writeF32(0f) // rotation
+        w.writeU32(0) // path size
+        w.writeU8(0) // control point count
+        return w.bytes()
+    }
+
+    /** 118-byte shape fixed for images: type 4 + bbox + rotation 0 + rectangle path. */
+    private fun shapeFixedForImage(bbox: DoubleArray): ByteArray {
+        val w = SdocxWriter()
+        w.writeU32(4)
+        for (v in bbox) w.writeF64(v)
+        w.writeF32(0f)
+        // Rectangle outline path: move + 3 lines + close (73 bytes).
+        val l = bbox[0]; val t = bbox[1]; val r = bbox[2]; val b = bbox[3]
+        val path = SdocxWriter()
+        path.writeU32(5) // verb count
+        path.writeU8(1); path.writeF64(l); path.writeF64(t) // move
+        path.writeU8(2); path.writeF64(r); path.writeF64(t) // line
+        path.writeU8(2); path.writeF64(r); path.writeF64(b) // line
+        path.writeU8(2); path.writeF64(l); path.writeF64(b) // line
+        path.writeU8(6) // close
+        val pathBytes = path.bytes()
+        w.writeU32(pathBytes.size.toLong())
+        w.writeBytes(pathBytes)
+        w.writeU8(0) // control point count
+        return w.bytes()
+    }
+
+    private fun buildStrokeObject(
+        stroke: Stroke,
+        now: Long,
+        penIdByShort: Map<String, Int>,
+        advancedId: Int,
+        pageW: Int = 1440,
+        pageH: Int = 2036,
+    ): Pair<ByteArray, ByteArray>? {
         try {
             val n = stroke.sampleCount
             if (n < 2 || n > 65535) return null
@@ -951,9 +1356,10 @@ object SdocxExport {
             val half = stroke.config.baseWidth / 2.0 + 1.0
             val bbox = doubleArrayOf(minX - half, minY - half, maxX + half, maxY + half)
 
-            // Stroke frame (uncompressed, no stylus channels). No pen-name ids:
-            // without a note.note string table they would dangle, so every stroke
-            // is plain ballpoint/highlighter keyed only by color + width.
+            // Stroke frame (uncompressed, no stylus channels) with pen-name
+            // ids resolving through note.note's string table: without them
+            // Samsung Notes shows blank ink. Masks are 2/4-byte like Samsung
+            // writers (props without compressed bit, fields bits 0,1,2,3,7).
             val fixed = SdocxWriter()
             fixed.writeU16(n)
             for (i in 0 until n) {
@@ -965,8 +1371,8 @@ object SdocxExport {
             }
             for (i in 0 until n) fixed.writeI32(0) // timestamps
             fixed.writeU16(1) // tool/input type
-            val props = SdocxMask(byteArrayOf(0x00)) // uncompressed
-            val fields = SdocxMask(byteArrayOf(0x0C)) // bits 2,3: color + size only
+            val props = SdocxMask(byteArrayOf(0x30, 0x04)) // uncompressed, no stylus, like Samsung
+            val fields = SdocxMask(byteArrayOf(0x8F.toByte(), 0x00, 0x00, 0x00)) // bits 0,1,2,3,7
             val flex = SdocxWriter()
             var argb = stroke.renderColor.toArgb()
             // Highlighters must stay translucent (alpha < 200) so the importer's
@@ -975,13 +1381,22 @@ object SdocxExport {
                 val a = (argb ushr 24) and 0xFF
                 if (a >= 200) argb = (199 shl 24) or (argb and 0x00FFFFFF)
             }
+            val short = try {
+                SdocxMapping.toolToSamsungPen(stroke.tool)
+            } catch (_: Exception) {
+                "InkPen2"
+            }
+            val penId = penIdByShort[short] ?: penIdByShort.values.firstOrNull() ?: 0
+            flex.writeI32(penId) // legacy pen-name id
+            flex.writeI32(advancedId) // advanced setting id
             flex.writeU32(argb.toLong() and 0xFFFFFFFFL)
             flex.writeF32(stroke.config.baseWidth.toFloat())
+            flex.writeI32(penId) // pen-name id
             val strokeFrame = writeFrame(1, props, fields, fixed.bytes(), flex.bytes())
 
             val objectId = UUID.randomUUID().toString()
             val payload = SdocxWriter()
-            payload.writeBytes(baseFrame(bbox, now = now, objectId = objectId))
+            payload.writeBytes(baseFrameForPage(bbox, now = now, objectId = objectId, pageW = pageW, pageH = pageH))
             payload.writeBytes(strokeFrame)
             return Pair(wrapObject(1, payload.bytes(), objectId, now), identityHash(objectId, now))
         } catch (_: Exception) {
@@ -989,27 +1404,18 @@ object SdocxExport {
         }
     }
 
-    private fun buildImageObject(item: ImageItem, bindId: Int, now: Long): Pair<ByteArray, ByteArray>? {
+    private fun buildImageObject(item: ImageItem, bindId: Int, now: Long, pageW: Int = 1440, pageH: Int = 2036): Pair<ByteArray, ByteArray>? {
         try {
             val r = item.rect
             if (!(r.w > 0) || !(r.h > 0) || !r.w.isFinite() || !r.h.isFinite()) return null
             val bbox = doubleArrayOf(r.x, r.y, r.x + r.w, r.y + r.h)
 
-            // Shape base (kind 6): no magnets, no connections.
-            val base6Fixed = SdocxWriter()
-            base6Fixed.writeU32(0) // magnetic count
-            base6Fixed.writeU32(4) // connection block size
-            base6Fixed.writeU32(0) // connection count
-            base6Fixed.writeU8(0) // reserved
-            val base6 = writeFrame(6, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x00)), base6Fixed.bytes(), ByteArray(0))
+            // Shape base (kind 6) with edge magnets, like Samsung image objects.
+            val base6 = base6FrameForImage(bbox)
 
-            // Shape (kind 7): rectangle type 4 with an image fill.
-            val shapeFixed = SdocxWriter()
-            shapeFixed.writeU32(4) // shape type
-            for (v in bbox) shapeFixed.writeF64(v)
-            shapeFixed.writeF32(0f) // rotation
-            shapeFixed.writeU32(0) // path size
-            shapeFixed.writeU8(0) // control point count
+            // Shape (kind 7): rectangle type 4 with an image fill and
+            // rectangle outline path, like Samsung writers.
+            val shapeFixed = shapeFixedForImage(bbox)
             val fill = SdocxWriter()
             fill.writeU8(0) // fill mode: stretch
             fill.writeI32(bindId)
@@ -1027,14 +1433,26 @@ object SdocxExport {
             shapeFlex.writeU32(fillBytes.size.toLong())
             shapeFlex.writeU8(2) // fill kind: image
             shapeFlex.writeBytes(fillBytes)
-            val shape = writeFrame(7, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x20)), shapeFixed.bytes(), shapeFlex.bytes())
+            val shape = writeFrame(
+                7,
+                SdocxMask(byteArrayOf(0x00)),
+                SdocxMask(byteArrayOf(0x20, 0x00, 0x00, 0x00)),
+                shapeFixed,
+                shapeFlex.bytes(),
+            )
 
-            // Tail (kind 3): no settings.
-            val tail = writeFrame(3, SdocxMask(byteArrayOf(0x00)), SdocxMask(byteArrayOf(0x00)), ByteArray(0), ByteArray(0))
+            // Tail (kind 3): 4-byte empty fields like Samsung image objects.
+            val tail = writeFrame(
+                3,
+                SdocxMask(byteArrayOf(0x00)),
+                SdocxMask(byteArrayOf(0x00, 0x00, 0x00, 0x00)),
+                ByteArray(0),
+                ByteArray(0),
+            )
 
             val objectId = UUID.randomUUID().toString()
             val payload = SdocxWriter()
-            payload.writeBytes(baseFrame(bbox, now = now, objectId = objectId))
+            payload.writeBytes(baseFrameForPage(bbox, now = now, objectId = objectId, pageW = pageW, pageH = pageH, forImage = true))
             payload.writeBytes(base6)
             payload.writeBytes(shape)
             payload.writeBytes(tail)

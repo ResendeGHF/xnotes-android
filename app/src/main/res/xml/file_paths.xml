@@ -6,4 +6,6 @@
     <cache-path name="clipboard" path="clipboard/" />
     <!-- The camera app writes a photo taken for Insert here; it is read in and deleted. -->
     <cache-path name="camera" path="camera/" />
+    <!-- Multi-page Scan sessions stage camera photos here; TakePicture needs a content URI for them. -->
+    <cache-path name="scan" path="scan-session/" />
 </paths>

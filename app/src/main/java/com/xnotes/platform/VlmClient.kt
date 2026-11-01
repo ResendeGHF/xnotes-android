@@ -82,17 +82,32 @@ object VlmClient {
             VlmFormat.LATEX -> VlmLatex.promptFor(pageIndex, pageCount)
             VlmFormat.MARKDOWN -> VlmMarkdown.promptFor(pageIndex, pageCount)
         }
-        val raw = when (config.provider) {
-            LatexAiProvider.GEMINI -> callGemini(png, prompt, config)
-            LatexAiProvider.ANTHROPIC -> callAnthropic(png, prompt, config)
-            // Custom endpoints speak the OpenAI chat-completions format by contract.
-            LatexAiProvider.OPENAI, LatexAiProvider.CUSTOM -> callOpenAi(png, prompt, config)
-        }
+        val raw = callProvider(png, prompt, config, maxTokens = 4096)
         return when (format) {
             VlmFormat.LATEX -> VlmLatex.sanitize(raw)
             VlmFormat.MARKDOWN -> VlmMarkdown.sanitize(raw)
         }
     }
+
+    /**
+     * Ask the model anything ([prompt]) about one image ([png] bytes) and
+     * return its raw text. The trace auto-tuner uses this with a JSON
+     * contract; parsing stays with the caller. Blocks on HTTP; call off the
+     * main thread. Throws with the provider's own message on failure.
+     */
+    fun askRaw(png: ByteArray, prompt: String, config: LatexAiConfig, maxTokens: Int = 1024): String {
+        if (config.apiKey.isBlank() && LatexAiConfig.needsApiKey(config.provider)) throw IllegalStateException("missing API key")
+        return callProvider(png, prompt, config, maxTokens)
+    }
+
+    /** Shared transport: prompt + image to whichever provider [config] names. */
+    private fun callProvider(png: ByteArray, prompt: String, config: LatexAiConfig, maxTokens: Int): String =
+        when (config.provider) {
+            LatexAiProvider.GEMINI -> callGemini(png, prompt, config, maxTokens)
+            LatexAiProvider.ANTHROPIC -> callAnthropic(png, prompt, config, maxTokens)
+            // Custom endpoints speak the OpenAI chat-completions format by contract.
+            LatexAiProvider.OPENAI, LatexAiProvider.CUSTOM -> callOpenAi(png, prompt, config, maxTokens)
+        }
 
     private fun base64(png: ByteArray): String =
         android.util.Base64.encodeToString(png, android.util.Base64.NO_WRAP)
@@ -130,7 +145,7 @@ object VlmClient {
         return if (!msg.isNullOrEmpty()) "$msg (HTTP $code)" else "request failed (HTTP $code)"
     }
 
-    private fun callGemini(png: ByteArray, prompt: String, config: LatexAiConfig): String {
+    private fun callGemini(png: ByteArray, prompt: String, config: LatexAiConfig, maxTokens: Int): String {
         val model = config.model.ifBlank { LatexAiConfig.defaultModel(LatexAiProvider.GEMINI) }
         val base = config.baseUrl.ifBlank { LatexAiConfig.defaultBaseUrl(LatexAiProvider.GEMINI) }.trimEnd('/')
         val body = JSONObject()
@@ -140,7 +155,7 @@ object VlmClient {
                     .put("mime_type", "image/png")
                     .put("data", base64(png)))))))
             .put("generationConfig", JSONObject()
-                .put("maxOutputTokens", 4096)
+                .put("maxOutputTokens", maxTokens)
                 .put("temperature", 0.1))
         val res = post("$base/models/$model:generateContent?key=${config.apiKey}", emptyMap(), body)
         val parts = res.optJSONArray("candidates")
@@ -151,13 +166,13 @@ object VlmClient {
         }
     }
 
-    private fun callOpenAi(png: ByteArray, prompt: String, config: LatexAiConfig): String {
+    private fun callOpenAi(png: ByteArray, prompt: String, config: LatexAiConfig, maxTokens: Int): String {
         val model = config.model.ifBlank { LatexAiConfig.defaultModel(LatexAiProvider.OPENAI) }
         val base = config.baseUrl.ifBlank { LatexAiConfig.defaultBaseUrl(LatexAiProvider.OPENAI) }.trimEnd('/')
         val body = JSONObject()
             .put("model", model)
             .put("temperature", 0.1)
-            .put("max_tokens", 4096)
+            .put("max_tokens", maxTokens)
             .put("messages", JSONArray().put(JSONObject()
                 .put("role", "user")
                 .put("content", JSONArray()
@@ -179,12 +194,12 @@ object VlmClient {
         }
     }
 
-    private fun callAnthropic(png: ByteArray, prompt: String, config: LatexAiConfig): String {
+    private fun callAnthropic(png: ByteArray, prompt: String, config: LatexAiConfig, maxTokens: Int): String {
         val model = config.model.ifBlank { LatexAiConfig.defaultModel(LatexAiProvider.ANTHROPIC) }
         val base = config.baseUrl.ifBlank { LatexAiConfig.defaultBaseUrl(LatexAiProvider.ANTHROPIC) }.trimEnd('/')
         val body = JSONObject()
             .put("model", model)
-            .put("max_tokens", 4096)
+            .put("max_tokens", maxTokens)
             .put("messages", JSONArray().put(JSONObject()
                 .put("role", "user")
                 .put("content", JSONArray()

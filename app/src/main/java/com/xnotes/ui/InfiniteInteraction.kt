@@ -29,6 +29,7 @@ import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Labelled
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TapeItem
 import com.xnotes.core.model.TapeMode
@@ -134,6 +135,12 @@ class InfiniteInteraction(
     private val onMathAnimTap: (Pt) -> Boolean = { false },
     /** Peel this tape back, or cover it again: a look, never an edit. */
     private val onPeelTape: (TapeItem) -> Unit = {},
+    /** Collapse or expand this sticky note (tap its icon or its ×). */
+    private val onToggleSticky: (StickyNoteItem) -> Unit = {},
+    /** This sticky note's color dot: open the swatch picker at [anchorViewport]. */
+    private val onStickyColorDot: (StickyNoteItem, Rect) -> Unit = { _, _ -> },
+    /** Edit this sticky note's text (a dialog); true when handled. */
+    private val onStickyEditText: (StickyNoteItem) -> Boolean = { false },
     /** The view was panned or pinched by hand, as distinct from moved by the app. */
     private val onUserMovedView: () -> Unit = {},
 ) {
@@ -350,12 +357,11 @@ class InfiniteInteraction(
     private var pinchInitZoom = 1.0
     private var pinchAnchorContent = Pt.ZERO
 
-    // The view as this touch went down, put back if Android takes the touch back (see takeBackTouch).
+    // Retained; cancelled gestures keep the view, never rewind to the touch-down view.
     private var downScroll = Pt.ZERO
     private var downZoom = 1.0
 
-    /** The view as the current pinch went down. A rejected palm finger only undoes the pinch
-     *  it joined, never the legitimate pan that came before it. */
+    /** Retained; a rejected finger no longer rewinds the pinch it joined, so the view never jumps. */
     private var pinchStartScroll = Pt.ZERO
     private var pinchStartZoom = 1.0
 
@@ -403,35 +409,28 @@ class InfiniteInteraction(
 
     private fun movingView(): Boolean = mode == CanvasPointerMode.PAN || mode == CanvasPointerMode.PINCH
 
-    /** Android took this touch back, as its palm rejection does with a resting hand: drop the
-     *  gesture, and put back a view it scrolled or zoomed, as the paged canvas does. */
+    /** Android took this touch back (palm rejection, a stylus coming into proximity, or a
+     *  synthetic cancel): drop the gesture but keep the view where it is. Rewinding to the
+     *  touch-down view would discard an intentional pan/zoom the moment the pen approaches,
+     *  so a cancelled gesture commits what it did so far rather than undoing it. */
     private fun takeBackTouch() {
         tapCandidate = false
-        val movedView = movingView()
         abortGesture()
-        if (movedView) {
-            viewport.zoom = downZoom
-            viewport.scrollX = downScroll.x
-            viewport.scrollY = downScroll.y
-            onViewChanged()
-            requestRender()
-        }
+        requestRender()
     }
 
     /**
-     * One finger of a pan/pinch was rejected as a palm: undo only what the pinch did since that
-     * finger landed, then carry on with the finger still down. Rewinding the whole touch to the
-     * touch-down view would also discard the legitimate pan from before the palm landed.
+     * One finger of a pan/pinch was rejected as a palm: keep what the pinch did so far, then
+     * carry on with the finger still down. Nothing is reverted, so approaching the stylus
+     * can never make the view jump.
      */
     private fun handleCancelledPointerUp(e: MotionEvent) {
         if (mode != CanvasPointerMode.PINCH) {
             handlePointerUp(e)
             return
         }
-        viewport.zoom = pinchStartZoom
-        viewport.scrollX = pinchStartScroll.x
-        viewport.scrollY = pinchStartScroll.y
-        onViewChanged()
+        // Keep the pinch's progress: restoring the pinch-start view would jump the zoom/scroll
+        // back the moment the stylus approaches while pinching.
         val remaining = (0 until e.pointerCount).filter { it != e.actionIndex }
         if (remaining.size >= 2) {
             val a = Pt(e.getX(remaining[0]).toDouble(), e.getY(remaining[0]).toDouble())
@@ -872,6 +871,9 @@ class InfiniteInteraction(
     // --- drawing ---
 
     private fun beginDraw(vx: Double, vy: Double, drawTool: Tool, e: MotionEvent) {
+        val at = viewport.viewportToContent(Pt(vx, vy))
+        // A pen press on a collapsed icon expands it (or on an expanded × collapses it).
+        if (stickyToggleAt(at)) return
         val base = configFor(drawTool)
         // SCALE off: divide the width by the draw-time zoom so the stroke keeps a constant
         // on-screen thickness whatever zoom it was drawn at. Baked in, so it is ordinary ink after.
@@ -979,7 +981,13 @@ class InfiniteInteraction(
         // So does a bare tap on tape, which peels it back or covers it again.
         val tapeTap = !dismissTap && stroke != null && !stroke.isEmpty && tapCandidate &&
             e.eventTime - tapDownTime < InteractionController.LONG_PRESS_MS && peelTapeAt(Pt(stroke.xAt(0), stroke.yAt(0)))
-        if (stroke == null || stroke.isEmpty || dismissTap || tapeTap) {
+        // So does a bare tap on a collapsed sticky (expand) or an expanded × (collapse).
+        val stickyTap = !dismissTap && !tapeTap && stroke != null && !stroke.isEmpty && tapCandidate &&
+            e.eventTime - tapDownTime < InteractionController.LONG_PRESS_MS && stickyToggleAt(Pt(stroke.xAt(0), stroke.yAt(0)))
+        // So does a bare tap on a sticky's color dot, which cycles the paper.
+        val stickyColorTap = !dismissTap && !tapeTap && !stickyTap && stroke != null && !stroke.isEmpty && tapCandidate &&
+            e.eventTime - tapDownTime < InteractionController.LONG_PRESS_MS && stickyColorTapAt(Pt(stroke.xAt(0), stroke.yAt(0)))
+        if (stroke == null || stroke.isEmpty || dismissTap || tapeTap || stickyTap || stickyColorTap) {
             onWetStroke(null)
             return
         }
@@ -1174,6 +1182,10 @@ class InfiniteInteraction(
         val sel = selection() ?: return
         val at = viewport.viewportToContent(Pt(vx, vy))
         setInteractive(false, false)
+        // A sticky's × collapses it; a collapsed icon expands on tap.
+        if (stickyToggleAt(at)) return
+        // The expanded paper's color dot cycles the paper.
+        if (stickyColorTapAt(at)) return
         // A press on a handle or the grip transforms; inside the box it moves; anywhere else
         // starts a fresh band, which is what makes an empty patch of canvas deselect.
         if (tryGrabSelection(sel, at)) return
@@ -1196,6 +1208,8 @@ class InfiniteInteraction(
 
     /** A finger tap with the select tool picks the item under it; a drag still pans. */
     private fun tapSelect(at: Pt): Boolean {
+        if (stickyToggleAt(at)) return true
+        if (stickyColorTapAt(at)) return true
         val sel = selection() ?: return false
         val slop = TAP_SLOP_PX / viewport.zoom
         val hit = grabbableAt(at)
@@ -1684,6 +1698,14 @@ class InfiniteInteraction(
 
     private fun beginTextBox(vx: Double, vy: Double) {
         val at = viewport.viewportToContent(Pt(vx, vy))
+        // Tapping an expanded sticky edits its text instead of starting a box.
+        stickyAt(at)?.takeIf { !it.collapsed }?.let {
+            if (it.isCollapseHit(at)) stickyToggleAt(at)
+            else if (it.isColorHit(at)) stickyColorTapAt(at)
+            else onStickyEditText(it)
+            mode = CanvasPointerMode.IDLE
+            return
+        }
         if (onEditTextBoxAt(at)) {
             mode = CanvasPointerMode.IDLE
             return
@@ -1846,6 +1868,39 @@ class InfiniteInteraction(
     private fun peelTapeAt(at: Pt): Boolean {
         val tape = tapeAt(at) ?: return false
         onPeelTape(tape)
+        return true
+    }
+
+    /** The topmost sticky containing [at], or null. */
+    private fun stickyAt(at: Pt): StickyNoteItem? {
+        val pad = TAP_SLOP_PX / viewport.zoom
+        return itemsIn(Rect(at.x - pad, at.y - pad, pad * 2, pad * 2))
+            .lastOrNull { it is StickyNoteItem && !it.locked && it.contains(at) } as? StickyNoteItem
+    }
+
+    /**
+     * Toggle a sticky at [at]: a collapsed icon expands, the expanded paper's ×
+     * collapses. True when a toggle happened (the tap is consumed).
+     */
+    private fun stickyToggleAt(at: Pt): Boolean {
+        val item = stickyAt(at) ?: return false
+        if (item.collapsed) {
+            onToggleSticky(item)
+            return true
+        }
+        if (item.isCollapseHit(at)) {
+            onToggleSticky(item)
+            return true
+        }
+        return false
+    }
+
+    /** The paper-color dot of the expanded sticky at [at]: open the swatch picker; false when none. */
+    private fun stickyColorTapAt(at: Pt): Boolean {
+        val item = stickyAt(at)?.takeIf { !it.collapsed && it.isColorHit(at) } ?: return false
+        val hit = item.colorHit()
+        val tl = viewport.contentToViewport(Pt(hit.x, hit.y))
+        onStickyColorDot(item, Rect(tl.x, tl.y, hit.w * viewport.zoom, hit.h * viewport.zoom))
         return true
     }
 

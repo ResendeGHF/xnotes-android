@@ -15,6 +15,7 @@ import com.xnotes.core.infinite.MeshPart
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.stroke.PencilGrain
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.floor
@@ -48,6 +49,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val glow: GlowSpec? = null,
         /** A covered tape's body, which the highlights beneath it are drawn round. */
         val covers: Boolean = false,
+        /** A pencil run's grain seed and tip mix (see [drawPencil]). */
+        val pencil: PencilGrain.PencilParams? = null,
     )
 
     /** A highlight held back to composite last, and the bodies of the covered tape laid over it since. */
@@ -456,6 +459,16 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                             runCount = part.slice.indexCount
                         }
                     }
+                    InkPass.PENCIL -> {
+                        // Grain in the fragment shader, one call per run with the ink
+                        // as a uniform: the mesh never overlaps, so alpha unions
+                        // like opaque ink and runs join seamlessly.
+                        flushRun(runStart, runCount)
+                        runStart = -1
+                        runCount = 0
+                        drawPencil(program, store, part)
+                        rebind(program, frame, camChunkX, camChunkY)
+                    }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO -> {
                         flushRun(runStart, runCount)
                         runStart = -1
@@ -557,6 +570,12 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                     InkPass.OPAQUE -> {
                         store.drawRange(part.slice.indexOffset, part.slice.indexCount)
                         lastDrawCalls++
+                    }
+                    InkPass.PENCIL -> {
+                        drawPencil(program, store, part)
+                        applyView(program, frame, camChunkX, camChunkY, liftAt)
+                        store.bindForDraw(contextGen)
+                        store.bindAttributes(program)
                     }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO, InkPass.MULTIPLY, InkPass.SCREEN -> {
                         drawMasked(
@@ -709,6 +728,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             flush()
             if (part.pass == InkPass.GLOW) {
                 drawGlow(program, buffer, wetRecord(), part, frame, camChunkX, camChunkY)
+            } else if (part.pass == InkPass.PENCIL) {
+                drawPencil(program, buffer, part)
             } else {
                 drawMasked(
                     buffer, part.slice, wetBounds, part.coverColor, part.coverAlpha,
@@ -893,6 +914,24 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         program.setWidthScale(1.0)
         program.clearOverride()
         lastDrawCalls += 2
+    }
+
+    /**
+     * A pencil run: the ink colour as a uniform override (the vertex bytes carry
+     * density/edge, not colour) with the grain branch on, seeded and tip-mixed
+     * per stroke. The mesh never overlaps, so alpha unions like opaque ink and
+     * a run baked now and the tail over it never seam.
+     */
+    private fun drawPencil(program: InkShader, from: GeometryStore, part: Part) {
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        program.setOverride(part.coverColor)
+        program.setPencil(true)
+        program.setPencilParams(part.pencil?.seed ?: 0, part.pencil?.tipMix ?: 0f)
+        from.drawRange(part.slice.indexOffset, part.slice.indexCount)
+        program.setPencil(false)
+        program.clearOverride()
+        lastDrawCalls++
     }
 
     private fun drawGlow(
@@ -1172,7 +1211,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             // which is what stops its own overlaps from compounding.
             val baked = if (part.pass == InkPass.OPAQUE) part.color else part.color.withAlpha(255)
             val slice = store.put(part.mesh, baked) ?: continue
-            parts.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, part.covers))
+            parts.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, part.covers, part.pencil))
         }
         if (parts.isEmpty() && edit.image == null && edit.textBitmap == null) return
         val record = Record(edit.item, parts, edit.bounds, previousZ ?: nextZ++, edit.image,
@@ -1223,7 +1262,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             // which is what stops its own overlaps from compounding.
             val baked = if (part.pass == InkPass.OPAQUE) part.color else part.color.withAlpha(255)
             val slice = into.put(part.mesh, baked) ?: continue
-            built.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow))
+            built.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, pencil = part.pencil))
         }
         return built
     }

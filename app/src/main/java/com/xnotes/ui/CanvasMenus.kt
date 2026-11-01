@@ -43,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -89,6 +90,7 @@ enum class MathStudioDestination(val tab: String) {
     SOLVER("SOLVER"),
     PLOT_2D("GRAPH_2D"),
     PLOT_3D("GRAPH_3D"),
+    DATA("DATA"),
 }
 
 /**
@@ -177,6 +179,21 @@ interface SelectionMenuHost : SwatchHost {
     /** Extract the selection's expression (OCR for ink) and open Math Studio at [destination] with it. */
     fun sendSelectionToMathStudio(destination: MathStudioDestination)
 
+    /** The single selected table, or null (backs the table cell editor and Data-lab export). */
+    val singleSelectedTable: com.xnotes.core.model.TableItem? get() = null
+
+    /** Replace the selected table's cell grid as one undoable edit. */
+    fun setSelectedTableCells(cells: List<List<String>>) {}
+
+    /** Send the selected table's cells to the Data lab as a new dataset. */
+    fun sendSelectedTableToData() {}
+
+    /** True when a table plus handwriting on its page are selected (backs cell readout). */
+    val canConvertTableHandwriting: Boolean get() = false
+
+    /** Recognize the selected handwriting inside the selected table's cells and store it as values. */
+    fun convertTableHandwriting() {}
+
     /** The colour and width of every selected stroke/shape, for the restyle popup to open on. */
     fun selectionStyles(): List<DrawStyle>
 
@@ -250,6 +267,15 @@ interface SelectionMenuHost : SwatchHost {
 
     /** Put that picture in crop mode, the frame standing over it. */
     fun startCrop()
+
+    /** The single selected sticky note, or null (backs the sticky edit/collapse actions). */
+    val singleSelectedSticky: com.xnotes.core.model.StickyNoteItem? get() = null
+
+    /** Open the editor on the selected sticky note's text. */
+    fun editSelectedSticky() {}
+
+    /** Collapse or expand the selected sticky note. */
+    fun toggleSelectedStickyCollapsed() {}
 }
 
 /**
@@ -275,6 +301,7 @@ fun SelectionMenu(
     var functionDialogOpen by remember { mutableStateOf(false) }
     var mathDialogOpen by remember { mutableStateOf(false) }
     var mathSendOpen by remember { mutableStateOf(false) }
+    var tableCellsOpen by remember { mutableStateOf(false) }
     var renamingAudio by remember { mutableStateOf<com.xnotes.core.model.AudioItem?>(null) }
 
     val audio = host.selectedAudio()
@@ -398,6 +425,32 @@ fun SelectionMenu(
                             onClick = { overflowOpen = false; mathSendOpen = true },
                         )
                     }
+                    if (host.singleSelectedTable != null) {
+                        DropdownMenuItem(
+                            text = { Text("Edit table cells") },
+                            onClick = { overflowOpen = false; tableCellsOpen = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Send table to Data lab") },
+                            onClick = { overflowOpen = false; host.sendSelectedTableToData() },
+                        )
+                        if (host.canConvertTableHandwriting) {
+                            DropdownMenuItem(
+                                text = { Text("Read cell values") },
+                                onClick = { overflowOpen = false; host.convertTableHandwriting() },
+                            )
+                        }
+                    }
+                    host.singleSelectedSticky?.let { sticky ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.sticky_note_edit)) },
+                            onClick = { overflowOpen = false; host.editSelectedSticky() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(if (sticky.collapsed) R.string.sticky_note_expand else R.string.sticky_note_collapse)) },
+                            onClick = { overflowOpen = false; host.toggleSelectedStickyCollapsed() },
+                        )
+                    }
                     if (host.selectionCanLink) {
                         DropdownMenuItem(
                             text = { Text(if (host.selectionLink != null) "Edit link" else "Add link") },
@@ -487,6 +540,17 @@ fun SelectionMenu(
                         onPick = { mathSendOpen = false; host.sendSelectionToMathStudio(it) },
                         onDismiss = { mathSendOpen = false },
                     )
+                }
+                val table = host.singleSelectedTable
+                if (tableCellsOpen && table != null) {
+                    key(table) {
+                        TableCellEditor(
+                            table = table,
+                            onConfirm = { host.setSelectedTableCells(it); tableCellsOpen = false },
+                            onSendToData = { host.sendSelectedTableToData(); tableCellsOpen = false },
+                            onDismiss = { tableCellsOpen = false },
+                        )
+                    }
                 }
                 renamingAudio?.let { item ->
                     AudioNameDialog(item.name, onConfirm = { renamingAudio = null; host.renameSelectedAudio(it) }) { renamingAudio = null }
@@ -1092,7 +1156,9 @@ fun LongPressMenu(
     host: LongPressMenuHost,
     onInsertImageAt: (com.xnotes.core.geometry.Pt) -> Unit,
     onTakePhotoAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
+    onScanPagesAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
     onInsertNoteLinkAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
+    onInsertStickyAt: (com.xnotes.core.geometry.Pt) -> Unit = {},
 ) {
     val target = host.contextMenu ?: return
     val density = LocalDensity.current
@@ -1124,8 +1190,14 @@ fun LongPressMenu(
             DropdownMenuItem(text = { Text(stringResource(R.string.take_photo)) }, onClick = {
                 onTakePhotoAt(target.content); host.dismissContextMenu()
             })
+            DropdownMenuItem(text = { Text(stringResource(R.string.scan_pages)) }, onClick = {
+                onScanPagesAt(target.content); host.dismissContextMenu()
+            })
             DropdownMenuItem(text = { Text(stringResource(R.string.insert_note_link)) }, onClick = {
                 onInsertNoteLinkAt(target.content); host.dismissContextMenu()
+            })
+            DropdownMenuItem(text = { Text(stringResource(R.string.sticky_note)) }, onClick = {
+                onInsertStickyAt(target.content); host.dismissContextMenu()
             })
         }
     }

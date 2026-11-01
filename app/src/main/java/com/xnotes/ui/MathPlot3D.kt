@@ -55,6 +55,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
@@ -81,21 +82,21 @@ internal enum class ComplexComponent(val labelRes: Int) {
 }
 
 internal data class Param3D(
-    val x: String = "sin(u)*cos(v)",
-    val y: String = "sin(u)*sin(v)",
-    val z: String = "cos(u)",
+    val x: String = "",
+    val y: String = "",
+    val z: String = "",
     val colorArgb: Int? = null,
     val visible: Boolean = true,
 )
 
 internal class Plot3DState {
     var mode by mutableStateOf(SurfaceMode.CARTESIAN)
-    var cartesianList by mutableStateOf(listOf(MathEntry("sin(sqrt(x^2 + y^2))")))
-    var cylList by mutableStateOf(listOf(MathEntry("2 + cos(3*th)")))
-    var sphList by mutableStateOf(listOf(MathEntry("3")))
-    var paramList by mutableStateOf(listOf(Param3D()))
-    var implicitList by mutableStateOf(listOf(MathEntry("x^2 + y^2 + z^2 - 4")))
-    var complexExpression by mutableStateOf("gamma(z)")
+    var cartesianList by mutableStateOf(listOf<MathEntry>())
+    var cylList by mutableStateOf(listOf<MathEntry>())
+    var sphList by mutableStateOf(listOf<MathEntry>())
+    var paramList by mutableStateOf(listOf<Param3D>())
+    var implicitList by mutableStateOf(listOf<MathEntry>())
+    var complexExpression by mutableStateOf("")
     var component by mutableStateOf(ComplexComponent.MAGNITUDE)
     /** Explicit plot domain per axis: every mode samples and draws inside this box. */
     var xMin by mutableStateOf(-5.0)
@@ -118,31 +119,31 @@ internal class Plot3DState {
 
     fun addFor(mode: SurfaceMode) {
         when (mode) {
-            SurfaceMode.CARTESIAN -> if (cartesianList.size < 4) cartesianList += MathEntry("x^2/8 - y^2/8")
-            SurfaceMode.CYLINDRICAL -> if (cylList.size < 4) cylList += MathEntry("2 + 0.5*sin(4*th)")
-            SurfaceMode.SPHERICAL -> if (sphList.size < 4) sphList += MathEntry("3 + sin(4*th)*cos(3*ph)")
-            SurfaceMode.PARAMETRIC -> if (paramList.size < 4) paramList += Param3D("cos(u)*cos(v)", "cos(u)*sin(v)", "sin(u)")
-            SurfaceMode.IMPLICIT -> if (implicitList.size < 4) implicitList += MathEntry("x^2 + y^2 - z")
+            SurfaceMode.CARTESIAN -> if (cartesianList.size < 4) cartesianList += MathEntry("")
+            SurfaceMode.CYLINDRICAL -> if (cylList.size < 4) cylList += MathEntry("")
+            SurfaceMode.SPHERICAL -> if (sphList.size < 4) sphList += MathEntry("")
+            SurfaceMode.PARAMETRIC -> if (paramList.size < 4) paramList += Param3D("", "", "")
+            SurfaceMode.IMPLICIT -> if (implicitList.size < 4) implicitList += MathEntry("")
             SurfaceMode.COMPLEX -> Unit
         }
     }
     fun removeAt(mode: SurfaceMode, i: Int) {
         when (mode) {
-            SurfaceMode.CARTESIAN -> if (cartesianList.size > 1) cartesianList = cartesianList.toMutableList().also { it.removeAt(i) }
-            SurfaceMode.CYLINDRICAL -> if (cylList.size > 1) cylList = cylList.toMutableList().also { it.removeAt(i) }
-            SurfaceMode.SPHERICAL -> if (sphList.size > 1) sphList = sphList.toMutableList().also { it.removeAt(i) }
-            SurfaceMode.PARAMETRIC -> if (paramList.size > 1) paramList = paramList.toMutableList().also { it.removeAt(i) }
-            SurfaceMode.IMPLICIT -> if (implicitList.size > 1) implicitList = implicitList.toMutableList().also { it.removeAt(i) }
+            SurfaceMode.CARTESIAN -> if (i in cartesianList.indices) cartesianList = cartesianList.toMutableList().also { it.removeAt(i) }
+            SurfaceMode.CYLINDRICAL -> if (i in cylList.indices) cylList = cylList.toMutableList().also { it.removeAt(i) }
+            SurfaceMode.SPHERICAL -> if (i in sphList.indices) sphList = sphList.toMutableList().also { it.removeAt(i) }
+            SurfaceMode.PARAMETRIC -> if (i in paramList.indices) paramList = paramList.toMutableList().also { it.removeAt(i) }
+            SurfaceMode.IMPLICIT -> if (i in implicitList.indices) implicitList = implicitList.toMutableList().also { it.removeAt(i) }
             SurfaceMode.COMPLEX -> Unit
         }
     }
     fun setStyle(mode: SurfaceMode, i: Int, colorArgb: Int?, visible: Boolean) {
         when (mode) {
-            SurfaceMode.CARTESIAN -> cartesianList = cartesianList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            SurfaceMode.CYLINDRICAL -> cylList = cylList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            SurfaceMode.SPHERICAL -> sphList = sphList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            SurfaceMode.PARAMETRIC -> paramList = paramList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
-            SurfaceMode.IMPLICIT -> implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            SurfaceMode.CARTESIAN -> if (i in cartesianList.indices) cartesianList = cartesianList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            SurfaceMode.CYLINDRICAL -> if (i in cylList.indices) cylList = cylList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            SurfaceMode.SPHERICAL -> if (i in sphList.indices) sphList = sphList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            SurfaceMode.PARAMETRIC -> if (i in paramList.indices) paramList = paramList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
+            SurfaceMode.IMPLICIT -> if (i in implicitList.indices) implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(colorArgb = colorArgb, visible = visible) }
             SurfaceMode.COMPLEX -> Unit
         }
     }
@@ -207,7 +208,7 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
         selected = state.mode.name,
         onSelect = { state.mode = SurfaceMode.valueOf(it) },
         legend = legend.map { it.first to it.second },
-        ramp = if (lo != null && hi != null) Numbers.tick(lo) to Numbers.tick(hi) else null,
+        ramp = if (complex && lo != null && hi != null) Numbers.tick(lo) to Numbers.tick(hi) else null,
         caption = if (complex) stringResource(state.component.labelRes) else if (animOn) "t=${"%.3f".format(state.anim.tCurrent)} (insert captures current frame)" else null,
         showGrid = state.showGrid,
         onToggleGrid = { state.showGrid = !state.showGrid },
@@ -289,7 +290,7 @@ private fun Plot3DInputs(state: Plot3DState) {
                 EntryEye(e.visible, eyeLabel) {
                     state.setStyle(state.mode, i, e.colorArgb, !e.visible)
                 }
-                if (items.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
+                MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -316,7 +317,7 @@ private fun Plot3DInputs(state: Plot3DState) {
                     EntryEye(p.visible, eyeLabel) {
                         state.setStyle(state.mode, i, p.colorArgb, !p.visible)
                     }
-                    if (state.paramList.size > 1) MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
+                    MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     MathTextField(p.x, { v -> state.paramList = state.paramList.toMutableList().also { list -> list[i] = p.copy(x = v) } }, "x", Modifier.weight(1f))
@@ -378,7 +379,7 @@ private fun SurfaceView(state: Plot3DState, modifier: Modifier = Modifier) {
     val tOn = state.anim.enabled && state.mode != SurfaceMode.COMPLEX
     LaunchedEffect(exprKey, state.mode, state.component, domainKey, nKey, tKey, tOn, state.anim.shareT) {
         val snap = buildSnap(state)
-        val data = withContext(Dispatchers.Default) { computeMeshes(snap) }
+        val data = withContext(Dispatchers.Default) { computeMeshes(snap, theme.series) }
         meshes = data
         state.valueLo = data?.lo
         state.valueHi = data?.hi
@@ -408,19 +409,29 @@ private fun SurfaceView(state: Plot3DState, modifier: Modifier = Modifier) {
 }
 
 private suspend fun exportSurface(snap: Plot3DSnap, theme: GraphTheme, title: String, heightLabel: String, component: String): ByteArray? = try {
-    val data = computeMeshes(snap) ?: return null
+    val data = computeMeshes(snap, theme.series) ?: return null
     val bmp = rasterMeshes(data, snap, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme)
     fun shownExprs(): List<String> = snap.exprs.filter { it.visible }.map { it.text }
     fun shownParams(): List<Param3D> = snap.params.filter { it.visible }
-    val label = when (snap.mode) {
-        SurfaceMode.CARTESIAN -> shownExprs().mapIndexed { i, e -> "z${i + 1}=$e" }.joinToString("  ")
-        SurfaceMode.CYLINDRICAL -> shownExprs().mapIndexed { i, e -> "r${i + 1}=$e" }.joinToString("  ")
-        SurfaceMode.SPHERICAL -> shownExprs().mapIndexed { i, e -> "ρ${i + 1}=$e" }.joinToString("  ")
-        SurfaceMode.PARAMETRIC -> shownParams().mapIndexed { i, _ -> "P${i + 1}(u,v)" }.joinToString("  ")
-        SurfaceMode.IMPLICIT -> shownExprs().mapIndexed { i, e -> "f${i + 1}=$e" }.joinToString("  ")
-        SurfaceMode.COMPLEX -> "f(z) = ${snap.exprs.firstOrNull()?.text}"
+    val names: List<String> = when (snap.mode) {
+        SurfaceMode.CARTESIAN -> shownExprs().mapIndexed { i, e -> "z${i + 1}=$e" }
+        SurfaceMode.CYLINDRICAL -> shownExprs().mapIndexed { i, e -> "r${i + 1}=$e" }
+        SurfaceMode.SPHERICAL -> shownExprs().mapIndexed { i, e -> "ρ${i + 1}=$e" }
+        SurfaceMode.PARAMETRIC -> shownParams().mapIndexed { i, _ -> "P${i + 1}(u,v)" }
+        SurfaceMode.IMPLICIT -> shownExprs().mapIndexed { i, e -> "f${i + 1}=$e" }
+        SurfaceMode.COMPLEX -> listOf("f(z) = ${snap.exprs.firstOrNull()?.text}")
     }
-    val legend = listOf(ExportLegend("$label    $heightLabel  ${Numbers.tick(data.lo)} → ${Numbers.tick(data.hi)}", theme.series[0], ramp = true))
+    val label = names.joinToString("  ")
+    // One swatch per plotted entry; the height ramp only for the complex field surface.
+    val meshCols: List<Int> = data.meshes.map { it.colorArgb ?: theme.series[0] } +
+        data.clouds.map { it.colorArgb ?: theme.series[0] }
+    val legend = if (snap.mode == SurfaceMode.COMPLEX) {
+        listOf(ExportLegend("$label    $heightLabel  ${Numbers.tick(data.lo)} → ${Numbers.tick(data.hi)}", theme.series[0], ramp = true))
+    } else {
+        names.mapIndexed { i, name ->
+            ExportLegend(name, meshCols.getOrElse(i) { theme.series[i % theme.series.size] })
+        }
+    }
     val foot = buildString {
         append("x ∈ [${Numbers.tick(snap.x0)}, ${Numbers.tick(snap.x1)}]    y ∈ [${Numbers.tick(snap.y0)}, ${Numbers.tick(snap.y1)}]    z ∈ [${Numbers.tick(snap.z0)}, ${Numbers.tick(snap.z1)}]")
         if (snap.t != null) append("    t=${Numbers.tick(snap.t)}")
@@ -440,7 +451,7 @@ private suspend fun exportSurfaceAnimation(base: Plot3DSnap, theme: GraphTheme, 
     for (t in ts) {
         coroutineContext.ensureActive()
         val snap = small.copy(t = t, animRange = AnimSnap(range.lo, range.hi, range.steps, t, range.shareT), shareT = range.shareT)
-        val data = computeMeshes(snap) ?: continue
+        val data = computeMeshes(snap, theme.series) ?: continue
         frames += rasterMeshes(data, snap, snap.quat, snap.zoom, fw, fh, theme) to "t=${Numbers.tick(t)}"
     }
     if (frames.isEmpty()) return null
@@ -449,19 +460,24 @@ private suspend fun exportSurfaceAnimation(base: Plot3DSnap, theme: GraphTheme, 
 } catch (cancelled: CancellationException) { throw cancelled } catch (_: Throwable) { null }
 }
 
-private suspend fun computeMeshes(snap: Plot3DSnap): MeshSet? {
+private suspend fun computeMeshes(snap: Plot3DSnap, series: List<Int>): MeshSet? {
     val meshes = ArrayList<Mesh>(); val clouds = ArrayList<Cloud3>()
     val allVals = ArrayList<Double>()
     suspend fun addMesh(m: Mesh?) { if (m != null) { meshes += m; for (row in m.vals) for (v in row) if (v.isFinite()) allVals += v } }
+    val complex = snap.mode == SurfaceMode.COMPLEX
+    var si = 0
+    // Non-field surfaces wear their entry colour (custom or series); the height ramp is
+    // reserved for the complex component surface, which really is a scalar field.
+    fun resolve(custom: Int?): Int? = custom ?: if (complex || series.isEmpty()) null else series[si++ % series.size]
     when (snap.mode) {
-        SurfaceMode.CARTESIAN -> for (e in snap.exprs) { if (e.visible) addMesh(cartesianMesh(e.text, snap, e.colorArgb)) }
-        SurfaceMode.CYLINDRICAL -> for (e in snap.exprs) { if (e.visible) addMesh(cylindricalMesh(e.text, snap, e.colorArgb)) }
-        SurfaceMode.SPHERICAL -> for (e in snap.exprs) { if (e.visible) addMesh(sphericalMesh(e.text, snap, e.colorArgb)) }
-        SurfaceMode.PARAMETRIC -> for (p in snap.params) { if (p.visible) addMesh(parametricMesh(p, snap, p.colorArgb)) }
+        SurfaceMode.CARTESIAN -> for (e in snap.exprs) { if (e.visible) addMesh(cartesianMesh(e.text, snap, resolve(e.colorArgb))) }
+        SurfaceMode.CYLINDRICAL -> for (e in snap.exprs) { if (e.visible) addMesh(cylindricalMesh(e.text, snap, resolve(e.colorArgb))) }
+        SurfaceMode.SPHERICAL -> for (e in snap.exprs) { if (e.visible) addMesh(sphericalMesh(e.text, snap, resolve(e.colorArgb))) }
+        SurfaceMode.PARAMETRIC -> for (p in snap.params) { if (p.visible) addMesh(parametricMesh(p, snap, resolve(p.colorArgb))) }
         SurfaceMode.COMPLEX -> for (e in snap.exprs) { addMesh(complexMesh(e.text, snap, e.colorArgb)) }
         SurfaceMode.IMPLICIT -> for (e in snap.exprs) {
             if (!e.visible) continue
-            val c = implicitCloud(e.text, snap, e.colorArgb)
+            val c = implicitCloud(e.text, snap, resolve(e.colorArgb))
             if (c != null) { clouds += c; allVals += c.vals.filter { it.isFinite() } }
         }
     }
@@ -647,8 +663,13 @@ private suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zo
         { x, y, z -> quatProject(x, y, z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm) },
         quat, cxm, cym, czm, xH, yH, zH, w, h, theme, snap.showGrid,
     )
-    // Light in view space.
-    val lx = 0.45; val ly = 0.55; val lz = 0.7
+    // Sun in view space: ambient floor plus a two-sided diffuse term from the true
+    // world-space facet normal, with a soft specular lobe for readable ridges.
+    val m = quat.matrix()
+    val llen = sqrt(0.45 * 0.45 + 0.55 * 0.55 + 0.7 * 0.7)
+    val lx = 0.45 / llen; val ly = 0.55 / llen; val lz = 0.7 / llen
+    val hlen = sqrt(lx * lx + ly * ly + (lz + 1.0) * (lz + 1.0))
+    val hx = lx / hlen; val hy = ly / hlen; val hz = (lz + 1.0) / hlen
     data class Cell(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val x2: Float, val y2: Float, val x3: Float, val y3: Float, val depth: Float, val color: Int)
     val cells = ArrayList<Cell>()
     val span = (data.hi - data.lo).coerceAtLeast(1e-12)
@@ -667,14 +688,24 @@ private suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zo
                 val avg = (mesh.vals[ri][ci] + mesh.vals[ri][ci + 1] + mesh.vals[ri + 1][ci + 1] + mesh.vals[ri + 1][ci]) / 4.0
                 if (!avg.isFinite()) continue
                 val t = ((avg - data.lo) / span).coerceIn(0.0, 1.0)
-                // Normal from screen-space edges for Lambert shading.
-                val ax = px[ri][ci + 1] - px[ri][ci]; val ay = py[ri][ci + 1] - py[ri][ci]
-                val bx = px[ri + 1][ci] - px[ri][ci]; val by = py[ri + 1][ci] - py[ri][ci]
-                var nz = ax * by - ay * bx
-                nz = if (nz == 0f) 1f else abs(nz)
-                val norm = sqrt((ax * ax + ay * ay + 1f).toDouble()) * sqrt((bx * bx + by * by + 1f).toDouble())
-                val shade = (0.68 + 0.32 * (nz.toDouble() / norm).coerceIn(0.0, 1.0))
-                val lit = (0.72 + 0.28 * shade)
+                // World-space facet normal from the u/v edges, then into view space.
+                val a = mesh.pts[ri][ci]; val b = mesh.pts[ri][ci + 1]; val d = mesh.pts[ri + 1][ci]
+                val ux = b.x - a.x; val uy = b.y - a.y; val uz = b.z - a.z
+                val vx = d.x - a.x; val vy = d.y - a.y; val vz = d.z - a.z
+                var nx = uy * vz - uz * vy; var ny = uz * vx - ux * vz; var nz = ux * vy - uy * vx
+                val nl = sqrt(nx * nx + ny * ny + nz * nz)
+                val lit = if (!nl.isFinite() || nl <= 1e-12) {
+                    0.85
+                } else {
+                    nx /= nl; ny /= nl; nz /= nl
+                    val vx0 = m[0] * nx + m[1] * ny + m[2] * nz
+                    val vy0 = m[3] * nx + m[4] * ny + m[5] * nz
+                    val vz0 = m[6] * nx + m[7] * ny + m[8] * nz
+                    val diff = abs(vx0 * lx + vy0 * ly + vz0 * lz)
+                    val facing = vx0 * hx + vy0 * hy + vz0 * hz
+                    val spec = if (facing > 0) facing.pow(28.0) * 0.28 else 0.0
+                    (0.60 + 0.40 * diff + spec).coerceIn(0.55, 1.22)
+                }
                 val base = mesh.colorArgb ?: heightArgb(t)
                 val col = android.graphics.Color.rgb(
                     (android.graphics.Color.red(base) * lit).toInt().coerceIn(0, 255),

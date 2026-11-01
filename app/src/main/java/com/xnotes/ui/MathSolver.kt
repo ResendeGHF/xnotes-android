@@ -52,6 +52,7 @@ import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlin.math.max
+import kotlin.math.sqrt
 
 /** One operation of the advanced calculator: numeric evaluation/solving or symbolic rewriting. */
 internal enum class SolverOp(val label: String) {
@@ -65,6 +66,7 @@ internal enum class SolverOp(val label: String) {
     TAYLOR("Taylor"),
     SOLVE("Solve"),
     ODE("ODE"),
+    MONTECARLO("Monte Carlo"),
 }
 
 /** How an operation that exists both ways runs: legacy behaviour, exact form, or quadrature. */
@@ -86,6 +88,8 @@ internal class SolverState {
     var y0 by mutableStateOf("1")
     var odeMethod by mutableStateOf(OdeMethod.RK45.name)
     var method by mutableStateOf(SolverMethod.AUTO)
+    var samples by mutableStateOf("100000")
+    var seed by mutableStateOf("1")
     var title by mutableStateOf("")
     var result by mutableStateOf("")
     var detail by mutableStateOf<String?>(null)
@@ -114,6 +118,8 @@ internal class SolverState {
         "to" -> to
         "order" -> order
         "y0" -> y0
+        "samples" -> samples
+        "seed" -> seed
         else -> null
     }
 
@@ -125,6 +131,8 @@ internal class SolverState {
             "to" -> to = text
             "order" -> order = text
             "y0" -> y0 = text
+            "samples" -> samples = text
+            "seed" -> seed = text
         }
     }
 
@@ -369,6 +377,43 @@ internal fun runSolver(state: SolverState) {
                 )
                 state.odePoints = points
             }
+            SolverOp.MONTECARLO -> {
+                val a = state.finiteNumber(state.from, "lower bound")
+                val b = state.finiteNumber(state.to, "upper bound")
+                if (!(a < b)) throw EvalException("Need lower bound < upper bound")
+                val n = state.samples.toIntOrNull()?.coerceIn(100, 5_000_000) ?: 100000
+                val seed = state.seed.toLongOrNull() ?: 1L
+                val rng = java.util.Random(seed)
+                var mean = 0.0
+                var m2 = 0.0
+                var count = 0L
+                var skipped = 0L
+                val trace = ArrayList<SamplePoint>()
+                val traceEvery = maxOf(1, n / 400)
+                var guard = 0
+                while (count < n && guard < n * 10 + 1000) {
+                    guard++
+                    val x = a + (b - a) * rng.nextDouble()
+                    val fx = f(x)
+                    if (!fx.isFinite()) { skipped++; continue }
+                    count++
+                    val delta = fx - mean
+                    mean += delta / count
+                    m2 += delta * (fx - mean)
+                    if (count % traceEvery == 0L) trace += SamplePoint(count.toDouble(), (b - a) * mean)
+                }
+                if (count < 100) throw EvalException("f is not finite on [a, b] (skipped $skipped samples)")
+                val estimate = (b - a) * mean
+                val variance = if (count > 1) m2 / (count - 1) else 0.0
+                val stderr = (b - a) * sqrt(maxOf(0.0, variance) / count)
+                state.ok(
+                    "MC ∫ d$v",
+                    "${Numbers.format(estimate)} ± ${Numbers.format(stderr)}",
+                    Numbers.format(estimate),
+                    "$count samples  ·  seed $seed" + (if (skipped > 0) "  ·  $skipped non-finite skipped" else ""),
+                )
+                if (trace.isNotEmpty()) state.odePoints = trace
+            }
         }
     } catch (e: Exception) {
         state.error = e.message ?: e.javaClass.simpleName
@@ -441,6 +486,17 @@ internal fun SolverPane(state: SolverState, onInsertResult: (String) -> Unit) {
                             MathTextField(state.y0, { state.y0 = it }, "y₀", Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "y0" })
                             MathTextField(state.to, { state.to = it }, "x₁", Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "to" })
                         }
+                        SolverOp.MONTECARLO -> {
+                            MathTextField(state.from, { state.from = it }, stringResource(R.string.math_from), Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "from" })
+                            MathTextField(state.to, { state.to = it }, stringResource(R.string.math_to), Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "to" })
+                        }
+                    }
+                }
+                if (state.op == SolverOp.MONTECARLO) {
+                    Spacer(Modifier.height(5.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        MathTextField(state.samples, { state.samples = it.filter(Char::isDigit) }, stringResource(R.string.math_samples), Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "samples" })
+                        MathTextField(state.seed, { state.seed = it.filter { c -> c.isDigit() || c == '-' } }, stringResource(R.string.math_seed), Modifier.weight(1f).onFocusChanged { if (it.isFocused) state.focusKey = "seed" })
                     }
                 }
                 if (state.op == SolverOp.SOLVE) {

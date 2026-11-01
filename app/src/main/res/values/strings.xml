@@ -4,6 +4,7 @@
 
     <!-- Tools and toolbar items -->
     <string name="tool_pen">Pen</string>
+    <string name="tool_pencil">Pencil</string>
     <string name="tool_dashed">Dashed</string>
     <string name="tool_calligraphy">Calligraphy</string>
     <string name="tool_speed">Speed</string>
@@ -78,6 +79,7 @@
     <string name="caption_dash">Dash</string>
     <string name="caption_gap">Gap</string>
     <string name="caption_intensity">Intensity</string>
+    <string name="caption_grain">Grain</string>
     <string name="caption_straight_line">Straight line</string>
     <string name="caption_inverse">Inverse</string>
     <string name="caption_neon">Neon</string>
@@ -493,6 +495,7 @@
     <!-- Home screen and explorer -->
     <string name="collapse_sidebar">Collapse sidebar</string>
     <string name="home">Home</string>
+    <string name="browse">Browse</string>
     <string name="new_note">New note</string>
     <string name="new_note_in">New note in %1$s</string>
     <string name="close_new_note">Close without creating</string>
@@ -1303,6 +1306,18 @@
     <string name="scan_filter_gray">Grey</string>
     <string name="scan_filter_ink">Ink</string>
     <string name="scan_filter_hint">Applied when the scan is saved as a note.</string>
+    <string name="scan_filter_enhanced">Enhanced</string>
+    <string name="scan_add_photo">Add photo</string>
+    <string name="scan_crop">Crop</string>
+    <string name="scan_delete">Delete</string>
+    <string name="scan_empty">No pages yet — add a photo to start scanning.</string>
+    <string name="scan_import">Import</string>
+    <string name="scan_insert">Insert</string>
+    <string name="scan_inserted">Scan inserted</string>
+    <string name="scan_inserting">Inserting scan…</string>
+    <string name="scan_pages">Scan pages</string>
+    <string name="scan_pages_title">Scan pages</string>
+    <string name="scan_preview">Preview</string>
     <string name="trace_scan_title">Trace scan into strokes</string>
     <string name="trace_section_paper">Paper position</string>
     <string name="trace_section_filters">Filters</string>
@@ -1325,6 +1340,12 @@
     <string name="trace_invert">Light ink on dark</string>
     <string name="trace_invert_hint">Turn on for whiteboard photos or dark paper, where the ink is lighter than the page.</string>
     <string name="trace_cleanup">Speckle cleanup</string>
+    <string name="trace_content">Content</string>
+    <string name="trace_content_hand">Handwriting</string>
+    <string name="trace_content_print">Printed text</string>
+    <string name="trace_content_hint">Printed text keeps neighbouring letters separate; handwriting bridges faint pen lifts so cursive stays connected.</string>
+    <string name="trace_remove_lines">Remove paper lines</string>
+    <string name="trace_remove_lines_hint">Erases full-width ruled lines so handwriting traces as continuous strokes. Turn off to keep long lines in diagrams.</string>
     <string name="trace_stroke_width">Stroke width</string>
     <string name="trace_ink_colour">Ink colour</string>
     <string name="trace_note_name">Note name</string>
@@ -1338,6 +1359,15 @@
     <string name="trace_too_big">This image is too complex to trace — try a tighter crop, a smaller page, or more cleanup.</string>
     <string name="trace_working">Tracing…</string>
     <string name="trace_nothing_found">No ink found with these settings. Lower the threshold or check Invert.</string>
+    <string name="trace_ai_applied">Applied: %1$s</string>
+    <string name="trace_ai_failed">AI tuning failed</string>
+    <string name="trace_ai_hint">Tune with AI</string>
+    <string name="trace_ai_off">Off</string>
+    <string name="trace_ai_on">On</string>
+    <string name="trace_ai_tune">Tune</string>
+    <string name="trace_ai_tuning">Tuning…</string>
+    <string name="trace_ai_page_badge">AI settings saved for page %1$d</string>
+    <string name="trace_ai_page_reset">Use global settings</string>
     <string name="kind_read_only_file">Read-only file</string>
     <string name="kind_read_only_files">Read-only files</string>
     <string name="kind_no_read_only_files">No read-only files here.</string>
@@ -1391,6 +1421,42 @@
     <string name="math_tab_symbolic">Symbolic</string>
     <string name="math_tab_units">Units</string>
     <string name="math_tab_catalog">Reference</string>
+    <string name="math_tab_data">Data lab</string>
+    <string name="math_data_titles">Titles</string>
+    <string name="math_data_title">Plot title</string>
+    <string name="math_data_xlabel">X label</string>
+    <string name="math_data_ylabel">Y label</string>
+    <string name="math_data_palette">Colour palette</string>
+    <string name="math_data_fit_domain">Fit view to data</string>
+    <string name="math_data_scales">Scales &amp; ticks</string>
+    <string name="math_data_xscale">X scale</string>
+    <string name="math_data_yscale">Y scale</string>
+    <string name="math_data_ticks">Tick target</string>
+    <string name="math_data_tangents">Tangents</string>
+    <string name="math_data_count">Max count</string>
+    <string name="math_data_tangent_hint">Straight-line tangents of the fitted (or drawn) curve, at up to N points inside the range. Blank range means the data range.</string>
+    <string name="math_data_series">Data series</string>
+    <string name="math_data_add">Add series</string>
+    <string name="math_data_paste">Paste</string>
+    <string name="math_data_name">Series</string>
+    <string name="math_data_line">Line</string>
+    <string name="math_data_points">Points</string>
+    <string name="math_data_errors">Err bars</string>
+    <string name="math_data_fill">Fill</string>
+    <string name="math_data_spline">Spline</string>
+    <string name="math_data_tangent_short">Tan</string>
+    <string name="math_data_fit">Fit</string>
+    <string name="math_data_degree">Degree</string>
+    <string name="math_data_smooth">Smooth</string>
+    <string name="math_data_window">Window</string>
+    <string name="math_data_points_btn">Points</string>
+    <string name="math_data_nopoints">No numeric points yet — paste data or send a table.</string>
+    <string name="math_data_nodata">Nothing to draw — add data, widen the domain, or use a linear scale.</string>
+    <string name="math_data_empty">Nothing to plot yet. Paste columns of numbers or send a canvas table to the Data lab.</string>
+    <string name="math_data_paste_title">Paste data</string>
+    <string name="math_data_paste_hint">One point per line: “x y” or “x y [xerr] [yerr]”, comma/semicolon/tab/space separated. “Column pairs” turns every two columns into a series.</string>
+    <string name="math_data_replace">Replace all series</string>
+    <string name="math_data_import">Import</string>
 
     <string name="math_expression">Expression</string>
     <string name="math_evaluate">Evaluate</string>
@@ -1425,6 +1491,8 @@
     <string name="math_left">Left</string>
     <string name="math_right">Right</string>
     <string name="math_guess">Guess</string>
+    <string name="math_samples">Samples</string>
+    <string name="math_seed">Seed</string>
     <string name="math_bracket_from">Bracket from</string>
     <string name="math_bracket_to">Bracket to</string>
     <string name="math_no_convergence">did not converge</string>
@@ -1544,6 +1612,11 @@
 
     <string name="note_link">Note link</string>
     <string name="insert_note_link">Insert note link…</string>
+    <string name="sticky_note">Sticky note</string>
+    <string name="sticky_note_text_hint">Write on the sticky note…</string>
+    <string name="sticky_note_edit">Edit sticky note</string>
+    <string name="sticky_note_collapse">Collapse</string>
+    <string name="sticky_note_expand">Expand</string>
     <string name="note_link_display_name">Label shown on canvas</string>
     <string name="note_link_target">Linked note</string>
     <string name="note_link_this_note">Link within this note</string>

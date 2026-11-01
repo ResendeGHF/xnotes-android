@@ -130,6 +130,25 @@ class SdocxVoice(
     val durationMs: Int,
 )
 
+/** A decoded Samsung table cell: text in column [col] (rowSpan/colSpan merged into neighbours). */
+class SdocxTableCell(
+    val col: Int,
+    val text: String,
+)
+
+/** One table row: its height in Samsung page coordinates plus its cells. */
+class SdocxTableRow(
+    val height: Double,
+    val cells: List<SdocxTableCell>,
+)
+
+/** A decoded Samsung table (type 22): grid geometry plus cell texts. */
+class SdocxTable(
+    val bbox: SdocxRect,
+    val columnWidths: List<Double>,
+    val rows: List<SdocxTableRow>,
+)
+
 /** One parsed `.page` record. */
 class SdocxPage(
     val uuid: String,
@@ -143,6 +162,7 @@ class SdocxPage(
     val shapes: List<SdocxShape> = emptyList(),
     val lines: List<SdocxLine> = emptyList(),
     val voices: List<SdocxVoice> = emptyList(),
+    val tables: List<SdocxTable> = emptyList(),
     val templateUri: String? = null,
     val templateType: Int? = null,
     val backgroundImageId: Int? = null,
@@ -152,7 +172,8 @@ class SdocxPage(
 ) {
     val isEmpty: Boolean
         get() = strokes.isEmpty() && images.isEmpty() && pdfPapers.isEmpty() &&
-            textBoxes.isEmpty() && shapes.isEmpty() && lines.isEmpty() && voices.isEmpty()
+            textBoxes.isEmpty() && shapes.isEmpty() && lines.isEmpty() && voices.isEmpty() &&
+            tables.isEmpty()
 }
 
 /** Whole document in Samsung page order (`pageIdInfo.dat`). */
@@ -169,4 +190,6 @@ class SdocxDocument(
      * so they travel separately. Bboxes are in note text-flow coordinates.
      */
     val bodyImages: List<SdocxImage> = emptyList(),
+    /** Tables embedded in `note.note`'s title/body text (object spans of type 22). */
+    val bodyTables: List<SdocxTable> = emptyList(),
 )

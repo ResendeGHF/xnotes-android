@@ -856,14 +856,14 @@ internal fun OrbitState.setView(view: GraphView) {
     }
 }
 
-/** Floating semi-transparent X / Y / Z / ISO buttons over a 3D plot. */
+/** Floating semi-transparent X / Y / Z / ISO buttons over a 3D plot, top-right so the legend never covers them. */
 @Composable
 internal fun BoxScope.ViewPresetButtons(orbit: OrbitState) {
     val palette = LocalPalette.current
     Row(
         Modifier
-            .align(Alignment.BottomEnd)
-            .padding(10.dp)
+            .align(Alignment.TopEnd)
+            .padding(top = 46.dp, end = 10.dp)
             .clip(RoundedCornerShape(18.dp))
             .background(palette.panel.toComposeColor().copy(alpha = 0.78f))
             .padding(horizontal = 3.dp, vertical = 2.dp),
