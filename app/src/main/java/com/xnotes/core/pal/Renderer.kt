@@ -4,8 +4,12 @@ import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.model.Document
 import com.xnotes.core.model.ImageData
+import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.resolvedInvertColors
+import com.xnotes.core.model.resolvedInvertImages
 import com.xnotes.core.vector.PathFlattener
 import com.xnotes.core.vector.VectorContour
 
@@ -86,7 +90,6 @@ interface Renderer {
     // --- transform / clip stack ---
     fun save()
     fun restore()
-
     /**
      * Rotate the coordinate system clockwise by [degrees] — always a multiple of 90
      * (the rotated-page view), so implementations stay exact and axis-aligned. The
@@ -181,39 +184,82 @@ interface Renderer {
     }
 
     /**
-     * Fill a pencil run: the swept ribbon as a triangle mesh (see
-     * [com.xnotes.core.infinite.StrokeTessellator.tessellatePencil]) carrying
-     * per-vertex density/edge control bytes, shaded by the page-anchored
-     * graphite field. The mesh never self-overlaps, so compositing unions
-     * exactly like opaque ink and overlapping runs repaint identically.
-     * [seed] decorrelates the grain per stroke and [tipMix] fades the coarse
-     * bands for fine tips; both must match the live GL uniforms for the
-     * committed stroke to be the live texture.
-     * The default fills the silhouette flat, for backends without a rasterizer.
+     * Fill a pencil run as ONE union path: the swept ribbon quads over
+     * [from, from+count) with [radii] scaled by [radiusScale] about the
+     * centreline, plus round discs exactly where the run truly needs them.
+     *
+     * A single path paints every pixel exactly once, so one call never
+     * double-darkens — not at folds, caps or joins:
+     * - end discs only when [capStart]/[capEnd] (the run touches the stroke's
+     *   own first/last point; a single-point run is one such disc);
+     * - join discs only for stations strictly inside the run that turn harder
+     *   than [RIBBON_JOIN_DISC_ANGLE].
+     * Quads share whole edges exactly like the pen's, so neighbouring runs
+     * butt-join with no gap. The default fills piece by piece (a flat
+     * fallback); anti-aliasing backends override to emit one path.
+     *
+     * [overwrite]: draw replacing instead of compositing (Porter-Duff SRC).
+     * The stroke paints its bands inside an isolating layer: where bands
+     * cross at a fold the later band wins instead of compounding, so folds
+     * never darken. Backends without an overwrite mode ignore the flag. The
+     * default fills piece by piece (a flat fallback).
+     *
+     * [endJoin]: the run's last station turns hard on the full ribbon (a
+     * bake-then-tail seam), so it gets its own join disc even though it is
+     * not the stroke's end: the next run starts past it and draws none.
+     *
+     * [ox]/[oy] shift the sampled grain into page space (sticky paper offset
+     * added to the note-local geometry) without moving anything, so a note's
+     * committed ink wears the same tooth as the live page stroke. Backends
+     * without a grain phase ignore them.
+     *
+     * [density]: graphite fraction in `[0, 1]` — how much of the run is
+     * opaque grain rather than paper. Backends with stipple tiles threshold
+     * the shared field at this level; without one, it doubles as the fill
+     * alpha (a print-safe average of the same tooth).
+     *
+     * [shade]: grain colour mix in `[0, 1]` — 1 is the full ink colour, lower
+     * mixes toward white for lighter graphite. Stipple backends tint their
+     * grains with it; others fold it into the fill alpha.
      */
-    fun fillPencil(
-        positions: DoubleArray,
-        colors: IntArray,
-        indices: IntArray,
-        ink: Rgba,
-        seed: Int = 0,
-        tipMix: Float = 0f,
+    fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float = 1f,
+        capStart: Boolean = true,
+        capEnd: Boolean = true,
+        overwrite: Boolean = false,
+        endJoin: Boolean = false,
+        ox: Double = 0.0,
+        oy: Double = 0.0,
+        density: Double = 1.0,
+        shade: Double = 1.0,
+        grainSize: Double = 1.0,
     ) {
-        var t = 0
-        while (t + 2 < indices.size) {
-            val a = indices[t] * 2
-            val b = indices[t + 1] * 2
-            val c = indices[t + 2] * 2
-            fillPolygon(
-                listOf(
-                    Pt(positions[a], positions[a + 1]),
-                    Pt(positions[b], positions[b + 1]),
-                    Pt(positions[c], positions[c + 1]),
-                ),
-                ink,
-            )
-            t += 3
+        if (count <= 0) return
+        fun pt(i: Int) = Pt(centers[2 * i].toDouble(), centers[2 * i + 1].toDouble())
+        fun r(i: Int) = radii[i].toDouble() * radiusScale
+        val end = from + count
+        if (count == 1) {
+            if ((capStart || capEnd) && r(from) > 0.0) fillCircle(pt(from), r(from), color)
+            return
         }
+        for (i in from until end - 1) {
+            if (r(i) <= 0.0 && r(i + 1) <= 0.0) continue
+            val q = Geometry.ribbonQuad(pt(i), r(i), pt(i + 1), r(i + 1))
+            if (q.size >= 3) fillPolygon(q, color, FillRule.NONZERO)
+        }
+        if (capStart && r(from) > 0.0) fillCircle(pt(from), r(from), color)
+        if (capEnd && r(end - 1) > 0.0) fillCircle(pt(end - 1), r(end - 1), color)
+        for (i in ribbonJoinStations(centers, from, count)) {
+            if (r(i) > 0.0) fillCircle(pt(i), r(i), color)
+        }
+        // A hard turn exactly on the run's last station (a bake-then-tail
+        // seam): the next run starts past it, so this run owns its disc.
+        if (endJoin && !capEnd && r(end - 1) > 0.0) fillCircle(pt(end - 1), r(end - 1), color)
     }
 
     // --- outlines (cosmetic for chrome, page-space for shapes) ---
@@ -298,6 +344,16 @@ interface Renderer {
      */
     val writesText: Boolean get() = false
 
+    /**
+     * When true, placed images ([drawImage]) and plain raster blits ([drawRaster]) paint
+     * lightness-inverted: the "invert images" half of the color-inversion display mode. Backends
+     * without image content ignore it. [drawRasterBlended] (highlighter compositing) and
+     * wrapping decorators forward or bypass it explicitly, never applying it twice.
+     */
+    var invertImageContent: Boolean
+        get() = false
+        set(_) {}
+
     /** What the drawing from here to [endMark] is. Only a structure-recording backend cares. */
     fun beginMark(mark: Mark) {}
 
@@ -356,6 +412,169 @@ interface Renderer {
 /** Content px a curve may stray when a backend without real paths flattens one. */
 private const val PATH_FALLBACK_TOLERANCE = 0.1
 
+/**
+ * Turn angle, in radians, past which a ribbon station gets its own join disc
+ * in [Renderer.fillRibbonUnion]. Matches the GL tessellator's own threshold
+ * ([com.xnotes.core.infinite.StrokeTessellator.JOIN_DISC_ANGLE]) so the
+ * vector silhouette and the live mesh agree.
+ */
+const val RIBBON_JOIN_DISC_ANGLE = 0.18
+
+/** Turn angle at station [i] of packed interleaved [centers], in radians. */
+fun ribbonJoinTurn(centers: FloatArray, i: Int): Double {
+    val ux = centers[2 * i].toDouble() - centers[2 * i - 2].toDouble()
+    val uy = centers[2 * i + 1].toDouble() - centers[2 * i - 1].toDouble()
+    val vx = centers[2 * i + 2].toDouble() - centers[2 * i].toDouble()
+    val vy = centers[2 * i + 3].toDouble() - centers[2 * i + 1].toDouble()
+    if (kotlin.math.hypot(ux, uy) < 1e-9 || kotlin.math.hypot(vx, vy) < 1e-9) return kotlin.math.PI
+    return kotlin.math.abs(kotlin.math.atan2(ux * vy - uy * vx, ux * vx + uy * vy))
+}
+
+/**
+ * Slice-local stations of `[from, from+count)` that turn hard enough for
+ * their own join disc, in `[1, count-2]`: the ends never qualify (a station
+ * needs both neighbours in the slice to measure a turn). Turns ACCUMULATE
+ * along the run and reset at every disc, so a long gentle curve still gets
+ * discs before its outer edge can notch — dense samples make any single
+ * station's turn tiny even when the ribbon bends hard overall. Pure function
+ * of the slice, so unit tests pin the bounds the backends share.
+ */
+fun ribbonJoinStations(centers: FloatArray, from: Int, count: Int): List<Int> {
+    if (count < 3) return emptyList()
+    val end = from + count
+    val out = ArrayList<Int>()
+    var acc = 0.0
+    for (i in from + 1 until end - 1) {
+        acc += ribbonJoinTurn(centers, i)
+        if (acc > RIBBON_JOIN_DISC_ANGLE) {
+            out.add(i)
+            acc = 0.0
+        }
+    }
+    return out
+}
+
 /** Packed interleaved x,y → [Pt] list, for the default (non-hot) packed-primitive fallbacks. */
 private fun unpackPts(pts: FloatArray): List<Pt> =
     List(pts.size / 2) { Pt(pts[2 * it].toDouble(), pts[2 * it + 1].toDouble()) }
+
+/**
+ * A [Renderer] that paints everything through [next] with its colours lightness-inverted
+ * (alpha untouched): the canvas color-inversion display mode and its PDF export.
+ *
+ * Vector ink, fills, ruling and text go through inverted; placed images are forwarded
+ * untouched — the underlying renderer inverts those itself only when its own
+ * image-inversion flag ([Renderer.invertImageContent]) is set, which is how "invert images"
+ * stays optional while every other colour always inverts. Pre-rasterized effect bitmaps handed back via
+ * [drawRaster]/[drawRasterBlended] are already inverted at raster time, so they too
+ * forward untouched.
+ */
+class InvertingRenderer(private val next: Renderer) : Renderer {
+    override fun save() = next.save()
+    override fun restore() = next.restore()
+    override fun rotate(degrees: Double) = next.rotate(degrees)
+    override fun saveLayerAlpha(bounds: Rect, alpha: Double) = next.saveLayerAlpha(bounds, alpha)
+    override fun saveLayerBlended(bounds: Rect, alpha: Double, blend: BlendMode) =
+        next.saveLayerBlended(bounds, alpha, blend)
+    override fun translate(dx: Double, dy: Double) = next.translate(dx, dy)
+    override fun scale(sx: Double, sy: Double) = next.scale(sx, sy)
+    override fun clipRect(rect: Rect) = next.clipRect(rect)
+    override fun clipPolygon(points: List<Pt>) = next.clipPolygon(points)
+    override fun clear() = next.clear()
+
+    override fun fillBackground(rect: Rect, color: Rgba) = next.fillBackground(rect, color.inverted())
+    override fun fillRect(rect: Rect, color: Rgba) = next.fillRect(rect, color.inverted())
+    override fun fillPolygon(points: List<Pt>, color: Rgba, rule: FillRule) =
+        next.fillPolygon(points, color.inverted(), rule)
+    override fun fillCircle(center: Pt, radius: Double, color: Rgba) =
+        next.fillCircle(center, radius, color.inverted())
+    override fun fillEllipse(center: Pt, rx: Double, ry: Double, color: Rgba) =
+        next.fillEllipse(center, rx, ry, color.inverted())
+    override fun fillPolygonGlow(pts: FloatArray, color: Rgba, rule: FillRule, blurRadius: Double, inner: Boolean) =
+        next.fillPolygonGlow(pts, color.inverted(), rule, blurRadius, inner)
+    override fun fillCircleGlow(center: Pt, radius: Double, color: Rgba, blurRadius: Double, inner: Boolean) =
+        next.fillCircleGlow(center, radius, color.inverted(), blurRadius, inner)
+    override fun fillDiskRibbon(centers: FloatArray, radii: FloatArray, from: Int, count: Int, color: Rgba) =
+        next.fillDiskRibbon(centers, radii, from, count, color.inverted())
+    override fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float,
+        capStart: Boolean,
+        capEnd: Boolean,
+        overwrite: Boolean,
+        endJoin: Boolean,
+        ox: Double,
+        oy: Double,
+        density: Double,
+        shade: Double,
+        grainSize: Double,
+    ) = next.fillRibbonUnion(
+        centers, radii, from, count, color.inverted(), radiusScale,
+        capStart, capEnd, overwrite, endJoin, ox, oy, density, shade, grainSize,
+    )
+
+    override fun strokeRect(rect: Rect, pen: Pen) = next.strokeRect(rect, pen.inverted())
+    override fun strokePolyline(points: List<Pt>, pen: Pen) = next.strokePolyline(points, pen.inverted())
+    override fun strokePolygon(points: List<Pt>, pen: Pen) = next.strokePolygon(points, pen.inverted())
+    override fun strokeEllipse(center: Pt, rx: Double, ry: Double, pen: Pen) =
+        next.strokeEllipse(center, rx, ry, pen.inverted())
+    override fun fillPath(contours: List<VectorContour>, color: Rgba, rule: FillRule) =
+        next.fillPath(contours, color.inverted(), rule)
+    override fun strokePath(contours: List<VectorContour>, pen: Pen) =
+        next.strokePath(contours, pen.inverted())
+
+    override fun drawRaster(raster: RasterSurface, dest: Rect, src: Rect?) = next.drawRaster(raster, dest, src)
+    override fun drawRasterBlended(raster: RasterSurface, dest: Rect, alpha: Double, blend: BlendMode, src: Rect?) =
+        next.drawRasterBlended(raster, dest, alpha, blend, src)
+    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double, flip: Flip, part: Rect?) =
+        next.drawImage(image, dest, orientation, angle, flip, part)
+
+    override fun drawText(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags) =
+        next.drawText(text, rect, font, color.inverted(), flags)
+    override fun drawTextTurned(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags, angle: Double) =
+        next.drawTextTurned(text, rect, font, color.inverted(), flags, angle)
+    override fun drawTextRun(text: String, x: Double, baseline: Double, font: FontSpec, color: Rgba) =
+        next.drawTextRun(text, x, baseline, font, color.inverted())
+
+    override val writesText: Boolean get() = next.writesText
+    override var invertImageContent: Boolean
+        get() = next.invertImageContent
+        set(value) {
+            next.invertImageContent = value
+        }
+    override fun beginMark(mark: Mark) = next.beginMark(mark)
+    override fun endMark() = next.endMark()
+    override fun drawBullet(center: Pt, radius: Double, baseline: Double, font: FontSpec, color: Rgba) =
+        next.drawBullet(center, radius, baseline, font, color.inverted())
+    override fun drawCheckbox(box: Rect, stroke: Double, checked: Boolean, baseline: Double, font: FontSpec, color: Rgba) =
+        next.drawCheckbox(box, stroke, checked, baseline, font, color.inverted())
+    override fun drawMath(latex: String, x: Double, baseline: Double, sizePt: Double, color: Rgba, display: Boolean): Boolean =
+        next.drawMath(latex, x, baseline, sizePt, color.inverted(), display)
+    override fun drawMathPending(latex: String, sizePt: Double, display: Boolean, box: Rect, color: Rgba) =
+        next.drawMathPending(latex, sizePt, display, box, color.inverted())
+
+    private fun Pen.inverted(): Pen = copy(color = color.inverted())
+}
+
+/**
+ * [this] prepared for painting [page] of [doc] under the note's color-inversion mode:
+ * image/raster inversion armed, and vector/ruling/text colours lightness-inverted, when the page
+ * is inverted. Pre-inverted bitmaps (effect rasters, finished cache surfaces) and the
+ * highlighter composite always go through an unflagged, unwrapped renderer, so nothing
+ * inverts twice. Call [clearPageInvert] after painting through a renderer shared with
+ * other pages. Pure platform-wise, so the shared engine and the app use the same one.
+ */
+fun Renderer.forInvertedPage(doc: Document, page: Page): Renderer {
+    val invert = page.resolvedInvertColors(doc)
+    invertImageContent = invert && page.resolvedInvertImages(doc)
+    return if (invert) InvertingRenderer(this) else this
+}
+
+/** Clear the image/raster inversion [forInvertedPage] may have armed on shared [this]. */
+fun Renderer.clearPageInvert() {
+    invertImageContent = false
+}

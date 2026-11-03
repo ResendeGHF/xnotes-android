@@ -35,6 +35,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -52,10 +53,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,8 +75,12 @@ import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.delay
 import java.io.ByteArrayOutputStream
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.PI
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /** One labelled swatch baked into an exported graph. [ramp] draws the height scale instead of a dot. */
@@ -78,16 +88,28 @@ internal class ExportLegend(
     val label: String,
     val color: Int,
     val ramp: Boolean = false,
+    /** Gradient stops for a ramp swatch; null keeps the legacy Jet ramp. */
+    val rampStops: List<Long>? = null,
 )
 
 /**
  * One plotted equation with its display overrides. [colorArgb] null means the automatic series
  * colour; [visible] false hides the entry without deleting it.
+ *
+ * Per-entry domain, blank = use the pane's global view. The primary pair [domA0]/[domA1] is the
+ * sampling interval of the entry's own coordinate — x for cartesian curves, θ for polar,
+ * the region's x for implicit — intersected with the global view. The secondary pair
+ * [domB0]/[domB1] is the second coordinate where one applies: a y value clip for cartesian
+ * curves, an r clip for polar curves, the region's y for implicit curves.
  */
 internal data class MathEntry(
     val text: String = "",
     val colorArgb: Int? = null,
     val visible: Boolean = true,
+    val domA0: String = "",
+    val domA1: String = "",
+    val domB0: String = "",
+    val domB1: String = "",
 )
 
 /** Fixed palette offered by the per-entry colour picker. */
@@ -124,6 +146,9 @@ internal class Polyline(val xy: DoubleArray)
 
 internal const val EXPORT_PLOT_W = 1200
 internal const val EXPORT_PLOT_H = 760
+
+/** Live view raster cap: high enough to look sharp on phones, low enough to stay fluid. */
+internal const val LIVE_CAP = 960
 
 @Composable
 internal fun rememberGraphTheme(): GraphTheme {
@@ -169,12 +194,16 @@ internal fun GraphWorkspace(
     onSelect: (String) -> Unit,
     legend: List<Pair<String, Color>>,
     ramp: Pair<String, String>? = null,
+    /** Gradient stops for the ramp swatch; null keeps the legacy Jet ramp. */
+    rampStops: List<Color>? = null,
     caption: String? = null,
     showGrid: Boolean? = null,
     onToggleGrid: (() -> Unit)? = null,
     onReset: () -> Unit,
     inserting: Boolean,
     onInsert: () -> Unit,
+    /** Disabled (greyed out) while the current pane holds nothing plottable. */
+    insertEnabled: Boolean = true,
     animInsertLabel: String? = null,
     animInserting: Boolean = false,
     onInsertAnim: (() -> Unit)? = null,
@@ -201,10 +230,10 @@ internal fun GraphWorkspace(
                 MathIconButton(Icons.Outlined.Refresh, stringResource(R.string.math_reset_view), onClick = onReset)
                 Spacer(Modifier.width(2.dp))
                 if (animInsertLabel != null && onInsertAnim != null) {
-                    InsertAnimButton(animInserting, animInsertLabel, onInsertAnim)
+                    InsertAnimButton(animInserting, animInsertLabel, onInsertAnim, insertEnabled)
                     Spacer(Modifier.width(6.dp))
                 }
-                InsertGraphButton(inserting, onInsert)
+                InsertGraphButton(inserting, onInsert, insertEnabled)
             }
             Spacer(Modifier.height(6.dp))
             if (wide) {
@@ -212,6 +241,7 @@ internal fun GraphWorkspace(
                     PlotFrame(
                         legend = legend,
                         ramp = ramp,
+                        rampStops = rampStops,
                         caption = caption,
                         modifier = Modifier.weight(1f).fillMaxSize(),
                         plot = plot,
@@ -231,7 +261,7 @@ internal fun GraphWorkspace(
                         .weight(1f)
                         .fillMaxWidth(),
                 ) {
-                    PlotFrame(legend = legend, ramp = ramp, caption = caption, modifier = Modifier.fillMaxSize(), plot = plot)
+                    PlotFrame(legend = legend, ramp = ramp, rampStops = rampStops, caption = caption, modifier = Modifier.fillMaxSize(), plot = plot)
                 }
                 if (status != null) {
                     Spacer(Modifier.height(4.dp))
@@ -260,6 +290,7 @@ internal fun GraphWorkspace(
 private fun PlotFrame(
     legend: List<Pair<String, Color>>,
     ramp: Pair<String, String>?,
+    rampStops: List<Color>? = null,
     caption: String?,
     modifier: Modifier = Modifier,
     plot: @Composable BoxScope.() -> Unit,
@@ -285,7 +316,7 @@ private fun PlotFrame(
                 if (legend.isNotEmpty()) PlotLegend(legend)
                 if (ramp != null) {
                     Spacer(Modifier.height(3.dp))
-                    RampRow(ramp.first, ramp.second)
+                    RampRow(ramp.first, ramp.second, rampStops)
                 }
                 if (caption != null) {
                     Text(
@@ -302,8 +333,15 @@ private fun PlotFrame(
 }
 
 @Composable
-private fun RampRow(low: String, high: String) {
+private fun RampRow(low: String, high: String, stops: List<Color>? = null) {
     val palette = LocalPalette.current
+    val gradient = stops ?: listOf(
+        heightColor(0.0),
+        heightColor(0.25),
+        heightColor(0.5),
+        heightColor(0.75),
+        heightColor(1.0),
+    )
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(low, color = palette.textDim.toComposeColor(), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
         Box(
@@ -312,15 +350,7 @@ private fun RampRow(low: String, high: String) {
                 .height(8.dp)
                 .clip(RoundedCornerShape(4.dp))
                 .background(
-                    Brush.horizontalGradient(
-                        listOf(
-                            heightColor(0.0),
-                            heightColor(0.25),
-                            heightColor(0.5),
-                            heightColor(0.75),
-                            heightColor(1.0),
-                        ),
-                    ),
+                    Brush.horizontalGradient(gradient),
                 ),
         )
         Text(high, color = palette.textDim.toComposeColor(), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
@@ -328,22 +358,23 @@ private fun RampRow(low: String, high: String) {
 }
 
 @Composable
-private fun InsertAnimButton(inserting: Boolean, label: String, onClick: () -> Unit) {
+private fun InsertAnimButton(inserting: Boolean, label: String, onClick: () -> Unit, enabled: Boolean = true) {
     val palette = LocalPalette.current
     val busyLabel = stringResource(R.string.math_3d_computing)
+    val active = enabled && !inserting
     Row(
         Modifier
             .height(34.dp)
             .clip(RoundedCornerShape(9.dp))
-            .border(1.dp, palette.accent.toComposeColor(), RoundedCornerShape(9.dp))
-            .clickable(enabled = !inserting, onClick = onClick)
+            .border(1.dp, (if (enabled) palette.accent else palette.disabled).toComposeColor(), RoundedCornerShape(9.dp))
+            .clickable(enabled = active, onClick = onClick)
             .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(
             if (inserting) busyLabel else label,
-            color = palette.accent.toComposeColor(),
+            color = (if (active) palette.accent else palette.disabled).toComposeColor(),
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
@@ -394,15 +425,16 @@ internal fun animFrameTs(lo: Double, hi: Double, steps: Int, maxFrames: Int = 12
 }
 
 @Composable
-private fun InsertGraphButton(inserting: Boolean, onClick: () -> Unit) {
+private fun InsertGraphButton(inserting: Boolean, onClick: () -> Unit, enabled: Boolean = true) {
     val palette = LocalPalette.current
     val label = stringResource(if (inserting) R.string.math_3d_computing else R.string.math_insert_graph)
+    val active = enabled && !inserting
     Row(
         Modifier
             .height(34.dp)
             .clip(RoundedCornerShape(9.dp))
-            .background(if (inserting) palette.surfaceHi.toComposeColor() else palette.accent.toComposeColor())
-            .clickable(enabled = !inserting, onClick = onClick)
+            .background((if (active) palette.accent else palette.surfaceHi).toComposeColor())
+            .clickable(enabled = active, onClick = onClick)
             .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -410,12 +442,12 @@ private fun InsertGraphButton(inserting: Boolean, onClick: () -> Unit) {
         Icon(
             Icons.Outlined.AddPhotoAlternate,
             contentDescription = null,
-            tint = (if (inserting) palette.disabled else palette.onAccent).toComposeColor(),
+            tint = (if (active) palette.onAccent else palette.disabled).toComposeColor(),
             modifier = Modifier.size(16.dp),
         )
         Text(
             label,
-            color = (if (inserting) palette.disabled else palette.onAccent).toComposeColor(),
+            color = (if (active) palette.onAccent else palette.disabled).toComposeColor(),
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
@@ -456,6 +488,116 @@ internal fun CommittedSlider(
 
 internal fun windowFootnote(xMin: Double, xMax: Double, yMin: Double, yMax: Double): String =
     "x ∈ [${Numbers.tick(xMin)}, ${Numbers.tick(xMax)}]    y ∈ [${Numbers.tick(yMin)}, ${Numbers.tick(yMax)}]"
+
+/**
+ * Intersect an optional per-entry interval [e0]..[e1] (blank side = unset) with the global
+ * view interval [g0]..[g1]. Unparseable or non-finite sides fall back to the view; a reversed
+ * entry is swapped. Returns null when the intersection is empty or the view is degenerate,
+ * in which case the entry samples nothing.
+ */
+internal fun entryRange(e0: String, e1: String, g0: Double, g1: Double): Pair<Double, Double>? {
+    if (!g0.isFinite() || !g1.isFinite()) return null
+    val glo = minOf(g0, g1); val ghi = maxOf(g0, g1)
+    if (glo >= ghi) return null
+    var a = e0.toDoubleOrNull()?.takeIf { it.isFinite() } ?: glo
+    var b = e1.toDoubleOrNull()?.takeIf { it.isFinite() } ?: ghi
+    if (a > b) {
+        val t = a; a = b; b = t
+    }
+    val lo = maxOf(a, glo); val hi = minOf(b, ghi)
+    if (lo >= hi) return null
+    return lo to hi
+}
+
+/**
+ * Optional per-entry clip pair: both sides must parse to finite numbers, otherwise there is
+ * no clipping. Values outside the clip read as gaps, like non-finite samples.
+ */
+internal fun entryClip(e0: String, e1: String): Pair<Double, Double>? {
+    val a = e0.toDoubleOrNull()?.takeIf { it.isFinite() } ?: return null
+    val b = e1.toDoubleOrNull()?.takeIf { it.isFinite() } ?: return null
+    return minOf(a, b) to maxOf(a, b)
+}
+
+/** Compact "[lo, hi]" suffix for legend and export footnotes; null when no domain is set. */
+internal fun entryDomainLabel(e: MathEntry): String? {
+    val a0 = e.domA0.toDoubleOrNull()?.takeIf { it.isFinite() }
+    val a1 = e.domA1.toDoubleOrNull()?.takeIf { it.isFinite() }
+    if (a0 == null && a1 == null) return null
+    return "[${a0?.let { Numbers.tick(it) } ?: "…"}, ${a1?.let { Numbers.tick(it) } ?: "…"}]"
+}
+
+/**
+ * Resolve a vector arrow/surface colour: an explicit per-entry colour first, then the
+ * magnitude ramp for a lone entry when colouring by value is on, else the series colour.
+ */
+internal fun vectorEntryColor(custom: Int?, singleEntry: Boolean, colorByValue: Boolean, pal: FieldPalette, t: Double, series: Int): Int =
+    custom ?: if (singleEntry && colorByValue) fieldRampArgb(pal, t.coerceIn(0.0, 1.0)) else series
+
+internal fun emptyPlotFrame(w: Int, h: Int, theme: GraphTheme): Bitmap {
+    val bmp = Bitmap.createBitmap(w.coerceIn(2, 1400), h.coerceIn(2, 1400), Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bmp)
+    canvas.drawColor(theme.paper)
+    return bmp
+}
+
+/**
+ * Live cartesian grid + axes + tick labels, drawn in Compose from the current (possibly still
+ * settling) centre and range so it tracks pan/zoom instantly. Mirrors [drawPlotFrame]'s
+ * styling; the sample bitmap underneath carries field art only.
+ */
+internal fun DrawScope.drawLiveFieldGrid(
+    xMin: Double,
+    xMax: Double,
+    yMin: Double,
+    yMax: Double,
+    grid: Color,
+    axis: Color,
+    textStyle: TextStyle,
+    measurer: TextMeasurer,
+) {
+    if (!(xMax > xMin && yMax > yMin)) return
+    if (!xMin.isFinite() || !xMax.isFinite() || !yMin.isFinite() || !yMax.isFinite()) return
+    fun sx(x: Double): Float = ((x - xMin) / (xMax - xMin) * size.width).toFloat()
+    fun sy(y: Double): Float = ((yMax - y) / (yMax - yMin) * size.height).toFloat()
+    val stepX = niceStep(xMax - xMin, maxOf(2, (size.width / 90f).toInt()))
+    val stepY = niceStep(yMax - yMin, maxOf(2, (size.height / 70f).toInt()))
+    var gx = floor(xMin / stepX) * stepX
+    var guard = 0
+    while (gx <= xMax && guard++ < 40) {
+        drawLine(grid.copy(alpha = 0.45f), Offset(sx(gx), 0f), Offset(sx(gx), size.height), strokeWidth = 1f)
+        gx += stepX
+    }
+    var gy = floor(yMin / stepY) * stepY
+    guard = 0
+    while (gy <= yMax && guard++ < 40) {
+        drawLine(grid.copy(alpha = 0.45f), Offset(0f, sy(gy)), Offset(size.width, sy(gy)), strokeWidth = 1f)
+        gy += stepY
+    }
+    if (0.0 in yMin..yMax) drawLine(axis.copy(alpha = 0.85f), Offset(0f, sy(0.0)), Offset(size.width, sy(0.0)), strokeWidth = 1.4f)
+    if (0.0 in xMin..xMax) drawLine(axis.copy(alpha = 0.85f), Offset(sx(0.0), 0f), Offset(sx(0.0), size.height), strokeWidth = 1.4f)
+    val labelY = if (0.0 in yMin..yMax) sy(0.0) else size.height - 4f
+    gx = floor(xMin / stepX) * stepX
+    guard = 0
+    while (gx <= xMax && guard++ < 12) {
+        if (abs(gx) > stepX * 1e-6) {
+            val layout = measurer.measure(com.xnotes.math.Numbers.tick(gx), textStyle)
+            val ty = (if (labelY > size.height - 16f) labelY - layout.size.height - 2f else labelY + 2f)
+                .coerceIn(0f, size.height - layout.size.height)
+            drawText(layout, topLeft = Offset(sx(gx) + 2f, ty))
+        }
+        gx += stepX
+    }
+    var gy2 = floor(yMin / stepY) * stepY
+    guard = 0
+    while (gy2 <= yMax && guard++ < 12) {
+        if (abs(gy2) > stepY * 1e-6) {
+            val layout = measurer.measure(com.xnotes.math.Numbers.tick(gy2), textStyle)
+            drawText(layout, topLeft = Offset(4f, (sy(gy2) - layout.size.height - 2f).coerceIn(0f, size.height - layout.size.height)))
+        }
+        gy2 += stepY
+    }
+}
 
 internal fun drawPlotFrame(
     canvas: android.graphics.Canvas,
@@ -512,6 +654,65 @@ internal fun drawPlotFrame(
     }
     if (0.0 in yMin..yMax) canvas.drawLine(0f, sy(0.0), w.toFloat(), sy(0.0), axisPaint)
     if (0.0 in xMin..xMax) canvas.drawLine(sx(0.0), 0f, sx(0.0), h.toFloat(), axisPaint)
+}
+
+/**
+ * Polar counterpart to [drawPlotFrame]: concentric range rings with radial labels plus
+ * spokes, so exported polar plots carry the same coordinate-matched grid as the screen.
+ */
+internal fun drawPolarPlotFrame(
+    canvas: android.graphics.Canvas,
+    w: Int,
+    h: Int,
+    xMin: Double,
+    xMax: Double,
+    yMin: Double,
+    yMax: Double,
+    theme: GraphTheme,
+    grid: Boolean,
+) {
+    val xSpan = (xMax - xMin).takeIf { it.isFinite() && abs(it) > 1e-15 } ?: return
+    val ySpan = (yMax - yMin).takeIf { it.isFinite() && abs(it) > 1e-15 } ?: return
+    fun sx(x: Double) = ((x - xMin) / xSpan * w).toFloat()
+    fun sy(y: Double) = ((yMax - y) / ySpan * h).toFloat()
+    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.4f; alpha = 90 }
+    val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.axis; strokeWidth = 2.2f }
+    val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = theme.dim
+        textSize = 22f
+        typeface = Typeface.MONOSPACE
+    }
+    val cx = sx(0.0); val cy = sy(0.0)
+    if (grid) {
+        val maxR = max(
+            max(kotlin.math.hypot(xMin, yMin), kotlin.math.hypot(xMin, yMax)),
+            max(kotlin.math.hypot(xMax, yMin), kotlin.math.hypot(xMax, yMax)),
+        )
+        if (maxR.isFinite() && maxR > 0.0) {
+            val stepR = niceStep(maxR, max(2, min(w, h) / 90))
+            var r = stepR
+            var guard = 0
+            while (r <= maxR && guard++ < 40) {
+                val rp = (r / xSpan * w).toFloat()
+                canvas.drawCircle(cx, cy, rp, gridPaint)
+                val label = Numbers.tick(r)
+                if (cx + rp + 4f + label.length * 13f < w) canvas.drawText(label, cx + rp + 4f, cy + 20f, text)
+                r += stepR
+            }
+            val diag = kotlin.math.hypot(w.toDouble(), h.toDouble()).toFloat()
+            var k = 0
+            while (k < 12 && guard++ < 60) {
+                val a = k * PI / 12.0
+                val dx = (kotlin.math.cos(a) * diag).toFloat()
+                val dy = (-kotlin.math.sin(a) * diag).toFloat()
+                canvas.drawLine(cx - dx, cy - dy, cx + dx, cy + dy, gridPaint)
+                k++
+            }
+        }
+    }
+    canvas.drawLine(0f, cy, w.toFloat(), cy, axisPaint)
+    canvas.drawLine(cx, 0f, cx, h.toFloat(), axisPaint)
+    canvas.drawText("0", cx - 18f, cy + 22f, text)
 }
 
 internal fun drawPolylines(
@@ -615,9 +816,10 @@ internal fun writeGraphPng(
         val mid = y + layout.height / 2f
         val textLeft = if (item.ramp) {
             val bar = android.graphics.RectF(pad.toFloat(), mid - 9f, (pad + 132).toFloat(), mid + 9f)
+            val stops = item.rampStops ?: listOf(heightArgb(0.0), heightArgb(0.25), heightArgb(0.5), heightArgb(0.75), heightArgb(1.0))
             swatch.shader = LinearGradient(
                 bar.left, bar.centerY(), bar.right, bar.centerY(),
-                intArrayOf(heightArgb(0.0), heightArgb(0.25), heightArgb(0.5), heightArgb(0.75), heightArgb(1.0)),
+                stops.map { it.toInt() }.toIntArray(),
                 null,
                 Shader.TileMode.CLAMP,
             )
@@ -647,6 +849,62 @@ internal fun writeGraphPng(
 }
 
 internal fun heightArgb(t: Double): Int = heightColor(t).toArgb()
+
+/**
+ * Matplotlib-style colour maps for scalar and vector fields, sampled as piecewise-linear
+ * ramps over their stops. JET matches the legacy height ramp exactly, so it stays the default
+ * and nothing already saved changes appearance.
+ */
+internal enum class FieldPalette(val title: String, val stops: List<Long>) {
+    JET(
+        "Jet",
+        listOf(0xFF2E5AAC, 0xFF2C9BB5, 0xFF4BAE62, 0xFFD8B33C, 0xFFC74B3A),
+    ),
+    VIRIDIS(
+        "Viridis",
+        listOf(0xFF440154, 0xFF482878, 0xFF3E4989, 0xFF31688E, 0xFF26828E, 0xFF35B779, 0xFF6ECE58, 0xFFB8DE29, 0xFFFDE725),
+    ),
+    PLASMA(
+        "Plasma",
+        listOf(0xFF0D0887, 0xFF41049D, 0xFF6A00A8, 0xFF8F0DA4, 0xFFB12A90, 0xFFCC4778, 0xFFE16462, 0xFFF2844B, 0xFFFCA636, 0xFFFCFFA4),
+    ),
+    INFERNO(
+        "Inferno",
+        listOf(0xFF000004, 0xFF1B0C41, 0xFF4A0C6B, 0xFF781C6D, 0xFFA52C60, 0xFFCF4446, 0xFFED6925, 0xFFFB9B06, 0xFFF7D13D, 0xFFFCFFA4),
+    ),
+    MAGMA(
+        "Magma",
+        listOf(0xFF000004, 0xFF180F3D, 0xFF440F76, 0xFF721F81, 0xFF9E2F7F, 0xFFCD4678, 0xFFEE6A5B, 0xFFFB9B06, 0xFFFACA2D, 0xFFFCFFA4),
+    ),
+    CIVIDIS(
+        "Cividis",
+        listOf(0xFF00224E, 0xFF1F4E5F, 0xFF515B60, 0xFF7D7A65, 0xFFB7AD6B, 0xFFFDE725),
+    ),
+    TURBO(
+        "Turbo",
+        listOf(0xFF30123B, 0xFF466BE3, 0xFF1AE4B6, 0xFFA4FC3C, 0xFFFB8022, 0xFF7A0403),
+    ),
+    COOLWARM(
+        "CoolWarm",
+        listOf(0xFF3B4CC0, 0xFF7B9FF3, 0xFFD2D9F0, 0xFFF0D9D2, 0xFFF39393, 0xFFB40426),
+    ),
+}
+
+/** Piecewise-linear colour-map lookup, the same maths as the legacy height ramp. */
+internal fun fieldRampColor(pal: FieldPalette, t: Double): androidx.compose.ui.graphics.Color {
+    val stops = pal.stops.map { androidx.compose.ui.graphics.Color(it) }
+    val x = t.coerceIn(0.0, 1.0) * (stops.size - 1)
+    val i = x.toInt().coerceIn(0, stops.size - 2)
+    val f = (x - i).toFloat()
+    val a = stops[i]; val b = stops[i + 1]
+    return androidx.compose.ui.graphics.Color(a.red + (b.red - a.red) * f, a.green + (b.green - a.green) * f, a.blue + (b.blue - a.blue) * f, 1f)
+}
+
+internal fun fieldRampArgb(pal: FieldPalette, t: Double): Int = fieldRampColor(pal, t).toArgb()
+
+/** Gradient stops for a legend ramp swatch in the palette's colours. */
+internal fun FieldPalette.swatch(): List<androidx.compose.ui.graphics.Color> =
+    listOf(fieldRampColor(this, 0.0), fieldRampColor(this, 0.25), fieldRampColor(this, 0.5), fieldRampColor(this, 0.75), fieldRampColor(this, 1.0))
 
 internal fun Rgba.packed(): Int = android.graphics.Color.argb(a, r, g, b)
 
@@ -778,6 +1036,65 @@ internal fun EntryEye(visible: Boolean, description: String, onToggle: () -> Uni
     }
 }
 
+/** Small toolbar button that expands an entry's per-entry domain editor below its row. */
+@Composable
+internal fun EntryDomainToggle(expanded: Boolean, description: String, onToggle: () -> Unit) {
+    val palette = LocalPalette.current
+    Box(
+        Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onToggle),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Outlined.Tune,
+            contentDescription = description,
+            tint = (if (expanded) palette.accent else palette.textDim).toComposeColor(),
+            modifier = Modifier.size(19.dp),
+        )
+    }
+}
+
+/**
+ * Expandable per-entry domain editor: compact number rows under the entry. [labels] name the
+ * primary pair (the entry's own coordinate: x, θ, t, u…) and the secondary pair (a clip or a
+ * second coordinate); hidden entirely unless [expanded].
+ */
+@Composable
+internal fun EntryDomainEditor(
+    expanded: Boolean,
+    a0: String,
+    a1: String,
+    b0: String,
+    b1: String,
+    onA0: (String) -> Unit,
+    onA1: (String) -> Unit,
+    onB0: (String) -> Unit,
+    onB1: (String) -> Unit,
+    labelA0: String,
+    labelA1: String,
+    labelB0: String,
+    labelB1: String,
+    showSecondary: Boolean,
+) {
+    if (!expanded) return
+    val filter = { s: String -> s.filter { c -> c.isDigit() || c == '.' || c == '-' } }
+    Column(Modifier.fillMaxWidth()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+            MathTextField(a0, { onA0(filter(it)) }, labelA0, Modifier.weight(1f))
+            MathTextField(a1, { onA1(filter(it)) }, labelA1, Modifier.weight(1f))
+        }
+        if (showSecondary) {
+            Spacer(Modifier.height(3.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+                MathTextField(b0, { onB0(filter(it)) }, labelB0, Modifier.weight(1f))
+                MathTextField(b1, { onB1(filter(it)) }, labelB1, Modifier.weight(1f))
+            }
+        }
+    }
+}
+
 // ------------------------------------------------- numeric domain fields
 
 /**
@@ -840,8 +1157,13 @@ internal fun quatFromMatrix(m: DoubleArray): Quat {
 }
 
 /** The default isometric tilt, shared by reset and the ISO preset. */
+/**
+ * Isometric preset: camera in the (+,+,+) octant, x and y spreading left from the
+ * vertical z axis. Mirrors the old (-,-,+) default, whose positive ends pointed away
+ * from the viewer.
+ */
 internal fun isoQuat(): Quat =
-    Quat.axisAngle(1.0, 0.0, 0.0, -0.46).times(Quat.axisAngle(0.0, 0.0, 1.0, 0.72))
+    Quat.axisAngle(1.0, 0.0, 0.0, -0.46).times(Quat.axisAngle(0.0, 0.0, 1.0, 0.72 + PI))
 
 /**
  * Points the camera down an axis or back to isometric. Looking from +x/+y keeps z up;
@@ -898,6 +1220,40 @@ internal const val AXIS_Z_COLOR = 0xFF4E9BE6.toInt()
  * labelled grid on the three faces turned away from the camera, so intersections stay readable
  * while orbiting. [proj] maps world points to pixels.
  */
+/** The 8 domain-box corners in the same order the back-face grids expect. */
+internal fun boxCorners(
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    cx: Double, cy: Double, cz: Double,
+    hx: Double, hy: Double, hz: Double,
+): List<Triple<Float, Float, Float>> {
+    val corners = ArrayList<Triple<Float, Float, Float>>(8)
+    for (sz in listOf(-1.0, 1.0)) for (sy in listOf(-1.0, 1.0)) for (sx in listOf(-1.0, 1.0)) {
+        corners += proj(cx + sx * hx, cy + sy * hy, cz + sz * hz)
+    }
+    return corners
+}
+
+private val BOX_EDGES = listOf(0 to 1, 1 to 3, 3 to 2, 2 to 0, 4 to 5, 5 to 7, 7 to 6, 6 to 4, 0 to 4, 1 to 5, 2 to 6, 3 to 7)
+
+/**
+ * The 12 domain-box edges, drawn after the meshes so the frame stays readable over
+ * the data. Same geometry as the frame pass, without axes or labels.
+ */
+internal fun drawBoxEdges(
+    canvas: android.graphics.Canvas,
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    cx: Double, cy: Double, cz: Double,
+    hx: Double, hy: Double, hz: Double,
+    theme: GraphTheme,
+) {
+    if (!(hx.isFinite() && hy.isFinite() && hz.isFinite()) || hx <= 0 || hy <= 0 || hz <= 0) return
+    val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 2.2f; alpha = 200 }
+    val corners = boxCorners(proj, cx, cy, cz, hx, hy, hz)
+    for ((a, b) in BOX_EDGES) {
+        canvas.drawLine(corners[a].first, corners[a].second, corners[b].first, corners[b].second, edge)
+    }
+}
+
 internal fun drawQuatSpaceFrame(
     canvas: android.graphics.Canvas,
     proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
@@ -907,15 +1263,13 @@ internal fun drawQuatSpaceFrame(
     w: Int, h: Int,
     theme: GraphTheme,
     showGrid: Boolean,
+    mode: SurfaceMode = SurfaceMode.CARTESIAN,
 ) {
     if (!(hx.isFinite() && hy.isFinite() && hz.isFinite()) || hx <= 0 || hy <= 0 || hz <= 0) return
     val m = quat.matrix()
-    val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.8f; alpha = 150 }
-    val corners = ArrayList<Triple<Float, Float, Float>>(8)
-    for (sz in listOf(-1.0, 1.0)) for (sy in listOf(-1.0, 1.0)) for (sx in listOf(-1.0, 1.0)) {
-        corners += proj(cx + sx * hx, cy + sy * hy, cz + sz * hz)
-    }
-    for ((a, b) in listOf(0 to 1, 1 to 3, 3 to 2, 2 to 0, 4 to 5, 5 to 7, 7 to 6, 6 to 4, 0 to 4, 1 to 5, 2 to 6, 3 to 7)) {
+    val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 2.2f; alpha = 200 }
+    val corners = boxCorners(proj, cx, cy, cz, hx, hy, hz)
+    for ((a, b) in BOX_EDGES) {
         canvas.drawLine(corners[a].first, corners[a].second, corners[b].first, corners[b].second, edge)
     }
     // Coloured axes from the box centre.
@@ -923,7 +1277,7 @@ internal fun drawQuatSpaceFrame(
         textSize = (min(w, h) * 0.045f).coerceIn(16f, 34f)
         typeface = Typeface.MONOSPACE
     }
-    val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 2.6f; alpha = 220 }
+    val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 3.0f; alpha = 255 }
     val o = proj(cx, cy, cz)
     val axes = listOf(
         Triple(proj(cx + hx * 0.92, cy, cz), "x", AXIS_X_COLOR),
@@ -937,15 +1291,137 @@ internal fun drawQuatSpaceFrame(
         canvas.drawText(name, end.first + 5f, end.second + 6f, labelPaint)
     }
     if (!showGrid) return
-    // The grid lives on the three back faces: the min or max face whose outward normal
-    // points away from the viewer (view-space depth shrinking along it).
-    val backX = if (m[6] > 0) cx - hx else cx + hx
-    val backY = if (m[7] > 0) cy - hy else cy + hy
-    val backZ = if (m[8] > 0) cz - hz else cz + hz
-    // (fixed value, first varying axis lo/hi, second varying axis lo/hi)
-    drawGridFace(canvas, proj, 0, backX, cy - hy, cy + hy, cz - hz, cz + hz, w, h, theme)
-    drawGridFace(canvas, proj, 1, backY, cx - hx, cx + hx, cz - hz, cz + hz, w, h, theme)
-    drawGridFace(canvas, proj, 2, backZ, cx - hx, cx + hx, cy - hy, cy + hy, w, h, theme)
+    val placed = ArrayList<android.graphics.RectF>()
+    when (mode) {
+        SurfaceMode.CYLINDRICAL -> drawCylindricalGrid(canvas, proj, cx, cy, cz, hx, hy, hz, w, h, theme)
+        SurfaceMode.SPHERICAL -> drawSphericalGrid(canvas, proj, cx, cy, cz, hx, hy, hz, w, h, theme)
+        else -> {
+            // The grid lives on the three back faces: the min or max face whose outward normal
+            // points away from the viewer (view-space depth shrinking along it).
+            val backX = if (m[6] > 0) cx - hx else cx + hx
+            val backY = if (m[7] > 0) cy - hy else cy + hy
+            val backZ = if (m[8] > 0) cz - hz else cz + hz
+            // (fixed value, first varying axis lo/hi, second varying axis lo/hi)
+            drawGridFace(canvas, proj, 0, backX, cy - hy, cy + hy, cz - hz, cz + hz, w, h, theme, placed)
+            drawGridFace(canvas, proj, 1, backY, cx - hx, cx + hx, cz - hz, cz + hz, w, h, theme, placed)
+            drawGridFace(canvas, proj, 2, backZ, cx - hx, cx + hx, cy - hy, cy + hy, w, h, theme, placed)
+        }
+    }
+}
+
+/**
+ * Cylindrical coordinate grid: concentric range rings in the z = [cz] plane with radial labels,
+ * 24 spokes through the centre, and stacked outer rings up the z axis — the same picture the
+ * cylindrical plotter samples in.
+ */
+private fun drawCylindricalGrid(
+    canvas: android.graphics.Canvas,
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    cx: Double, cy: Double, cz: Double,
+    hx: Double, hy: Double, hz: Double,
+    w: Int, h: Int,
+    theme: GraphTheme,
+) {
+    val rMax = max(hx, hy)
+    if (!rMax.isFinite() || rMax <= 0 || !hz.isFinite() || hz <= 0) return
+    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.5f; alpha = 160; style = Paint.Style.STROKE }
+    val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = theme.dim
+        textSize = (min(w, h) * 0.032f).coerceIn(13f, 26f)
+        typeface = Typeface.MONOSPACE
+    }
+    val path = android.graphics.Path()
+    fun ring(r: Double, z: Double, paint: Paint) {
+        paint.style = Paint.Style.STROKE
+        path.rewind()
+        for (i in 0..96) {
+            val a = i / 96.0 * 2.0 * PI
+            val p = proj(cx + r * cos(a), cy + r * sin(a), z)
+            if (i == 0) path.moveTo(p.first, p.second) else path.lineTo(p.first, p.second)
+        }
+        canvas.drawPath(path, paint)
+    }
+    val rStep = niceStep(rMax, 5)
+    var r = rStep
+    var guard = 0
+    while (r <= rMax && guard++ < 14) {
+        ring(r, cz, gridPaint)
+        val at = proj(cx + r, cy, cz)
+        canvas.drawText(Numbers.tick(r), at.first + 3f, at.second - 3f, textPaint)
+        r += rStep
+    }
+    var k = 0
+    while (k < 24 && guard++ < 48) {
+        val a = k / 24.0 * 2.0 * PI
+        val p0 = proj(cx - rMax * cos(a), cy - rMax * sin(a), cz)
+        val p1 = proj(cx + rMax * cos(a), cy + rMax * sin(a), cz)
+        canvas.drawLine(p0.first, p0.second, p1.first, p1.second, gridPaint)
+        k++
+    }
+    val dimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.2f; alpha = 70 }
+    val zStep = niceStep(hz, 3)
+    var z = cz + zStep
+    guard = 0
+    while (z <= cz + hz && guard++ < 6) {
+        ring(rMax, z, dimPaint)
+        ring(rMax, 2 * cz - z, dimPaint)
+        z += zStep
+    }
+}
+
+/**
+ * Spherical coordinate grid: range rings in the three central planes with radial labels and
+ * spokes from the centre in the xy and xz planes.
+ */
+private fun drawSphericalGrid(
+    canvas: android.graphics.Canvas,
+    proj: (Double, Double, Double) -> Triple<Float, Float, Float>,
+    cx: Double, cy: Double, cz: Double,
+    hx: Double, hy: Double, hz: Double,
+    w: Int, h: Int,
+    theme: GraphTheme,
+) {
+    val rMax = max(max(hx, hy), hz)
+    if (!rMax.isFinite() || rMax <= 0) return
+    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.5f; alpha = 160; style = Paint.Style.STROKE }
+    val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = theme.dim
+        textSize = (min(w, h) * 0.032f).coerceIn(13f, 26f)
+        typeface = Typeface.MONOSPACE
+    }
+    val path = android.graphics.Path()
+    fun ring(plane: Int, r: Double) {
+        path.rewind()
+        for (i in 0..96) {
+            val a = i / 96.0 * 2.0 * PI
+            val p = when (plane) {
+                0 -> proj(cx + r * cos(a), cy + r * sin(a), cz)
+                1 -> proj(cx + r * cos(a), cy, cz + r * sin(a))
+                else -> proj(cx, cy + r * cos(a), cz + r * sin(a))
+            }
+            if (i == 0) path.moveTo(p.first, p.second) else path.lineTo(p.first, p.second)
+        }
+        canvas.drawPath(path, gridPaint)
+    }
+    val rStep = niceStep(rMax, 5)
+    var r = rStep
+    var guard = 0
+    while (r <= rMax && guard++ < 14) {
+        ring(0, r); ring(1, r); ring(2, r)
+        val at = proj(cx + r, cy, cz)
+        canvas.drawText(Numbers.tick(r), at.first + 3f, at.second - 3f, textPaint)
+        r += rStep
+    }
+    var k = 0
+    while (k < 12 && guard++ < 48) {
+        val a = k / 12.0 * 2.0 * PI
+        val px = proj(rMax * cos(a), 0.0, 0.0)
+        val ox = proj(0.0, 0.0, 0.0)
+        canvas.drawLine(ox.first, ox.second, px.first, px.second, gridPaint)
+        val pz = proj(rMax * cos(a), 0.0, rMax * sin(a))
+        canvas.drawLine(ox.first, ox.second, pz.first, pz.second, gridPaint)
+        k++
+    }
 }
 
 /** One gridded back face: [fixed] is the frozen axis (0=x, 1=y, 2=z), the grid spans [u0,u1]×[v0,v1]. */
@@ -958,6 +1434,7 @@ private fun drawGridFace(
     v0: Double, v1: Double,
     w: Int, h: Int,
     theme: GraphTheme,
+    placed: MutableList<android.graphics.RectF>? = null,
 ) {
     val uSpan = abs(u1 - u0); val vSpan = abs(v1 - v0)
     if (!uSpan.isFinite() || !vSpan.isFinite() || uSpan <= 0 || vSpan <= 0) return
@@ -966,11 +1443,19 @@ private fun drawGridFace(
         1 -> Triple(u, fixedValue, v)
         else -> Triple(u, v, fixedValue)
     }
-    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.2f; alpha = 120 }
+    val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = theme.grid; strokeWidth = 1.5f; alpha = 160 }
     val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = theme.dim
         textSize = (min(w, h) * 0.032f).coerceIn(13f, 26f)
         typeface = Typeface.MONOSPACE
+    }
+    fun labelAt(text: String, x: Float, y: Float) {
+        val tw = textPaint.measureText(text)
+        val th = textPaint.textSize
+        val box = android.graphics.RectF(x - 5f, y - th - 5f, x + tw + 5f, y + 5f)
+        if (placed?.any { android.graphics.RectF.intersects(it, box) } == true) return
+        placed?.add(box)
+        canvas.drawText(text, x, y, textPaint)
     }
     fun draw(u: Double, v: Double): Triple<Float, Float, Float> {
         val (x, y, z) = point(u, v)
@@ -980,13 +1465,14 @@ private fun drawGridFace(
     val vStep = niceStep(vSpan, 5)
     // Lines of constant u span v; lines of constant v span u. Each line is labelled
     // with its tick value at whichever end is nearer the viewer, so numbers stay readable.
+    // Labels that would pile onto an already-placed one are skipped.
     var u = kotlin.math.floor(u0 / uStep) * uStep
     var guard = 0
     while (u <= u1 && guard++ < 14) {
         val a = draw(u, v0); val b = draw(u, v1)
         canvas.drawLine(a.first, a.second, b.first, b.second, gridPaint)
         val at = if (a.third >= b.third) a else b
-        canvas.drawText(Numbers.tick(u), at.first + 3f, at.second - 3f, textPaint)
+        labelAt(Numbers.tick(u), at.first + 3f, at.second - 3f)
         u += uStep
     }
     var v = kotlin.math.floor(v0 / vStep) * vStep
@@ -995,7 +1481,7 @@ private fun drawGridFace(
         val a = draw(u0, v); val b = draw(u1, v)
         canvas.drawLine(a.first, a.second, b.first, b.second, gridPaint)
         val at = if (a.third >= b.third) a else b
-        canvas.drawText(Numbers.tick(v), at.first + 3f, at.second - 3f, textPaint)
+        labelAt(Numbers.tick(v), at.first + 3f, at.second - 3f)
         v += vStep
     }
 }

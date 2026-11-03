@@ -414,6 +414,25 @@ object OverlayTessellator {
     /** The light core that makes a vertex dot read as a point rather than a handle. */
     val DOT_CORE = Rgba(255, 255, 255, 255)
 
+    /**
+     * The same parts moved by ([dx], [dy]): positions copied and shifted, everything else shared.
+     * Only valid for a rigid translation (a settled selection being moved): the spine offsets ride
+     * the vertices unchanged and the indices address the same vertices. The copy keeps the posted
+     * mesh immutable while the next sample shifts again.
+     */
+    fun translated(parts: List<MeshPart>, dx: Double, dy: Double): List<MeshPart> {
+        if (dx == 0.0 && dy == 0.0) return parts
+        return parts.map { part ->
+            val m = part.mesh
+            val pos = m.positions.copyOf()
+            for (i in pos.indices step 2) {
+                pos[i] += dx
+                pos[i + 1] += dy
+            }
+            MeshPart(MeshData(pos, m.offsets, m.indices, m.colors), part.color, part.pass, part.glow, part.covers, part.pencil)
+        }
+    }
+
     fun selectionBounds(box: Obb, zoom: Double): Rect {
         val pad = (GRIP_ARM_PX + GRIP_PX + HANDLE_PX) / maxOf(zoom, 1e-9)
         var acc = Rect.bounding(box.corners())

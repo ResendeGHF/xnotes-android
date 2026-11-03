@@ -100,12 +100,20 @@ class InfiniteInteraction(
     private val selection: () -> CanvasSelection? = { null },
     /** Items the selection may be drawn from, culled to a rect. */
     private val itemsIn: (Rect) -> List<CanvasItem> = { emptyList() },
+    /**
+     * Items culled to a rect, in no particular order. For consumers that treat the result as an
+     * unordered candidate set (scribble, glue targets, connector routing): skips the z-order
+     * sort. Defaults to [itemsIn] so existing hosts keep working unchanged.
+     */
+    private val itemsInUnsorted: (Rect) -> List<CanvasItem> = { itemsIn(it) },
     /** The selection or its overlay changed: rebuild the chrome geometry. */
     private val onSelectionChanged: () -> Unit = {},
     /** A finished selection drag: push its single undo command. */
     private val onCommitSelection: (com.xnotes.core.history.Command?) -> Unit = {},
     /** Draw [items] displaced by the drag so far, rather than moving them. An empty list ends it. */
     private val onLiftSelection: (List<CanvasItem>, LiftTransform) -> Unit = { _, _ -> },
+    /** Move the already-lifted drag to [at] without re-publishing its item list. */
+    private val onLiftAt: (LiftTransform) -> Unit = {},
     /** Raster previews for lone editable text; UI geometry stays untouched until release. */
     private val onTextResizeStart: (ShapeItem) -> Unit = {},
     private val onTextResizeMove: (Affine) -> Unit = {},
@@ -242,6 +250,8 @@ class InfiniteInteraction(
     private var grabHandle: HandleId? = null
     private var moveAnchor = Pt.ZERO
     private var movedBy = Pt.ZERO
+    /** Items the current move drag lifts, fixed at press time so each sample skips the filter. */
+    private var moveLift: List<CanvasItem> = emptyList()
 
     // Where a handle or the rotate grip is being dragged to, and whether the renderer is doing the
     // work. Ink, shapes and placed SVGs map faithfully in the shader, since all three are triangles.
@@ -313,6 +323,8 @@ class InfiniteInteraction(
 
     // The stroke being drawn, live until the pen lifts.
     private var liveStroke: Stroke? = null
+    /** The expanded sticky the live stroke started in, if any: its ink is clamped to the paper. */
+    private var stickyLiveTarget: StickyNoteItem? = null
     private var drawingPointerId = -1
     private var drawingIsStylus = false
     /** True while the live gesture's down-pointer was a pen tip, so its samples take the offset. */
@@ -528,6 +540,8 @@ class InfiniteInteraction(
         dismissPressAt = null
         panVel = Pt.ZERO
         liveStroke = null
+        stickyLiveTarget = null
+        moveLift = emptyList()
         endLift()
         onWetStroke(null)
         onLiftSelection(emptyList(), LiftTransform.NONE)
@@ -846,6 +860,7 @@ class InfiniteInteraction(
         if (mode == CanvasPointerMode.MOVE) {
             selection()?.previewMove(0.0, 0.0)
             selection()?.unfollow()
+            moveLift = emptyList()
             onLiftSelection(emptyList(), LiftTransform.NONE)
             onSelectionChanged()
         }
@@ -874,6 +889,9 @@ class InfiniteInteraction(
         val at = viewport.viewportToContent(Pt(vx, vy))
         // A pen press on a collapsed icon expands it (or on an expanded × collapses it).
         if (stickyToggleAt(at)) return
+        // Ink starting inside an expanded sticky belongs to the note: clamp it to the paper
+        // so the live preview never spills onto the canvas.
+        stickyLiveTarget = stickyAt(at)?.takeIf { !it.collapsed && !it.locked && it.rect.contains(at) }
         val base = configFor(drawTool)
         // SCALE off: divide the width by the draw-time zoom so the stroke keeps a constant
         // on-screen thickness whatever zoom it was drawn at. Baked in, so it is ordinary ink after.
@@ -948,7 +966,15 @@ class InfiniteInteraction(
 
     private fun addStrokePoint(vx: Double, vy: Double, pressure: Double, timeMs: Long, force: Boolean) {
         val stroke = liveStroke ?: return
-        val p = viewport.viewportToContent(Pt(vx, vy))
+        val raw = viewport.viewportToContent(Pt(vx, vy))
+        // Clamp sticky ink to the paper so the live preview never spills onto the canvas.
+        val target = stickyLiveTarget
+        val p = if (target != null) {
+            Pt(
+                raw.x.coerceIn(target.rect.left, target.rect.right),
+                raw.y.coerceIn(target.rect.top, target.rect.bottom),
+            )
+        } else raw
         val t = (timeMs - strokeStartTimeMs).toDouble()
         if (stroke.straight) {
             stroke.setStraightEnd(Sample(p.x, p.y, pressure.coerceIn(0.0, 1.0), t))
@@ -975,6 +1001,7 @@ class InfiniteInteraction(
         )
         val stroke = liveStroke
         liveStroke = null
+        stickyLiveTarget = null
         // A bare tap whose only job was to dismiss the selection drops the dot it would leave.
         val dismissTap = strokeDismissedSelection && tapCandidate
         strokeDismissedSelection = false
@@ -1009,7 +1036,9 @@ class InfiniteInteraction(
         val passes = Scribble.passes(path, dpPerUnit) ?: return false
         val radius = stroke.config.baseWidth / 2.0 + Scribble.TOUCH_DP / dpPerUnit
         // Images, text and anything locked are spared, as the eraser spares them; a scribble is ink, so it takes only lines.
-        val candidates = itemsIn(Rect.bounding(path).outset(radius)).filter { EraseRule.erasable(it) }
+        // Order-independent: Scribble.taken collects every candidate the path touches, and the
+        // commit captures each taken item's own z slot.
+        val candidates = itemsInUnsorted(Rect.bounding(path).outset(radius)).filter { EraseRule.erasable(it) }
         val taken = Scribble.taken(passes, radius, candidates) { c, x, y, r -> EraseRule.touchesLine(c, x, y, r) }
         if (taken.isEmpty()) return false
         onWetStroke(null)
@@ -1083,6 +1112,7 @@ class InfiniteInteraction(
         selection()?.clear()
         bandRect = null
         lassoPoints.clear()
+        moveLift = emptyList()
         onLiftSelection(emptyList(), LiftTransform.NONE)
         onSelectionChanged()
         requestRender()
@@ -1228,7 +1258,8 @@ class InfiniteInteraction(
         moveAnchor = at
         movedBy = Pt.ZERO
         mode = CanvasPointerMode.MOVE
-        onLiftSelection(liftedOf(sel), LiftTransform.NONE)
+        moveLift = liftedOf(sel)
+        onLiftSelection(moveLift, LiftTransform.NONE)
     }
 
     /** What a move hands the renderer to offset: everything that moves whole, not what bends to stay joined. */
@@ -1312,7 +1343,7 @@ class InfiniteInteraction(
         sel.previewMove(movedBy.x, movedBy.y)
         val shift = Affine.translateBy(movedBy.x, movedBy.y)
         sel.followShown(shift, shift)
-        onLiftSelection(liftedOf(sel), LiftTransform.shift(movedBy.x, movedBy.y))
+        onLiftAt(LiftTransform.shift(movedBy.x, movedBy.y))
         onSelectionChanged()
         requestRender()
     }
@@ -1322,6 +1353,7 @@ class InfiniteInteraction(
         val sel = selection() ?: return
         sel.moveLive(movedBy.x, movedBy.y)
         if (movedBy != Pt.ZERO) sel.loneConnector?.letGo()
+        moveLift = emptyList()
         onLiftSelection(emptyList(), LiftTransform.NONE)
         onCommitSelection(sel.buildCommand(movedOnly = true, dx = movedBy.x, dy = movedBy.y))
         onSelectionChanged()
@@ -1388,7 +1420,7 @@ class InfiniteInteraction(
                 val textTop = onlyText.toPage(Pt(onlyText.box.centerX, onlyText.box.top))
                 com.xnotes.core.infinite.fixedSizeTextLift(textTop, map)
             } else LiftTransform.of(map, sel.transformPivot ?: Pt.ZERO)
-            onLiftSelection(liftItems, lift)
+            onLiftAt(lift)
         } else {
             sel.resizeLive(handle, at, transformMargin)
         }
@@ -1405,7 +1437,7 @@ class InfiniteInteraction(
             val swept = sel.previewRotate(at)
             val turn = Affine.rotateAbout(sel.transformPivot ?: Pt.ZERO, swept)
             sel.followShown(turn, turn)
-            onLiftSelection(liftItems, LiftTransform.turn(sel.transformPivot ?: Pt.ZERO, swept))
+            onLiftAt(LiftTransform.turn(sel.transformPivot ?: Pt.ZERO, swept))
         } else {
             sel.rotateLive(at)
         }
@@ -1573,7 +1605,7 @@ class InfiniteInteraction(
         val margin = routeMargin()
         val c = edit.connector
         val area = Glue.routeArea(c.start.at, c.end.at, margin).union(Glue.routeArea(at, at, margin))
-        edit.drag(at, itemsIn(area), reach, margin)
+        edit.drag(at, itemsInUnsorted(area), reach, margin)
         jointFollow.follow(Affine.IDENTITY)
         connectHot = listOfNotNull(edit.hot?.point?.at)
         selection()?.itemChanged(c)
@@ -1924,7 +1956,7 @@ class InfiniteInteraction(
 
     /** The glue targets near [at], for a pen within [reach] of their points. */
     private fun glueTargetsNear(at: Pt, reach: Double): List<CanvasItem> =
-        itemsIn(Rect(at.x - reach, at.y - reach, 2 * reach, 2 * reach))
+        itemsInUnsorted(Rect(at.x - reach, at.y - reach, 2 * reach, 2 * reach))
 
     /** The connection point within reach of [at], if a connector would glue there. */
     private fun glueHitAt(at: Pt): Glue.Hit? {
@@ -1943,7 +1975,8 @@ class InfiniteInteraction(
         if (!marking) return emptyList()
         val out = ArrayList<Pt>()
         val drawing = connectorDraft?.connector ?: jointEdit?.connector
-        for (item in itemsIn(viewport.visibleContentRect())) {
+        // Order-independent: every connection point becomes one cross, whatever order they come in.
+        for (item in itemsInUnsorted(viewport.visibleContentRect())) {
             if (item === drawing) continue
             for (cp in Glue.points(item)) out += cp.at
             if (out.size > MAX_MARKS) return emptyList()
@@ -1984,7 +2017,7 @@ class InfiniteInteraction(
         val reach = OverlayTessellator.DOT_TOUCH_PX / viewport.zoom
         val margin = routeMargin()
         val area = Glue.routeArea(draft.connector.start.at, at, margin).union(Rect(at.x - reach, at.y - reach, 2 * reach, 2 * reach))
-        draft.drag(at, itemsIn(area), reach, margin)
+        draft.drag(at, itemsInUnsorted(area), reach, margin)
         connectHot = listOfNotNull(draft.connector.start.takeIf { it.glued }?.at, draft.hot?.point?.at)
         onPendingShape(draft.connector)
         requestRender()
@@ -2045,6 +2078,7 @@ class InfiniteInteraction(
         // The stroke was never committed, so dropping it makes the wet ink vanish the moment it
         // snaps; the eventual pen up then commits nothing.
         liveStroke = null
+        stickyLiveTarget = null
         onWetStroke(null)
         dwellEligible = false
         cancelDwell()
@@ -2085,17 +2119,31 @@ class InfiniteInteraction(
     private fun extendErase(e: MotionEvent) {
         val idx = e.findPointerIndex(drawingPointerId)
         if (idx < 0) return
-        // The historical points matter here as much as when drawing: a fast sweep that only sampled
-        // the newest event would skip over strokes between one frame and the next.
+        // One spatial query for the whole event: the historical points matter here as much as
+        // when drawing (a fast sweep that only sampled the newest event would skip over strokes
+        // between one frame and the next), and each of them used to pay its own query and sort.
+        val pts = ArrayList<Pt>(e.historySize + 1)
         for (h in 0 until e.historySize) {
-            val hp = calLive(
-                e.getHistoricalX(idx, h).toDouble(),
-                e.getHistoricalY(idx, h).toDouble(),
+            pts.add(
+                calLive(
+                    e.getHistoricalX(idx, h).toDouble(),
+                    e.getHistoricalY(idx, h).toDouble(),
+                ),
             )
-            eraseAt(hp.x, hp.y)
         }
-        val cp = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
-        eraseAt(cp.x, cp.y)
+        pts.add(calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble()))
+        erasePointsAt(pts)
+    }
+
+    private fun erasePointsAt(viewportPts: List<Pt>) {
+        val session = eraseSession ?: return
+        if (viewportPts.isEmpty()) return
+        val radius = eraserRadius()
+        val last = viewportPts.last()
+        onEraserCursor(Pt(last.x, last.y), radius * viewport.zoom)
+        val contents = viewportPts.map { viewport.viewportToContent(it) }
+        session.erasePoints(contents, radius, areaErase())
+        requestRender()
     }
 
     private fun eraseAt(vx: Double, vy: Double) {
@@ -2117,11 +2165,17 @@ class InfiniteInteraction(
     /** Drop the wet stroke without committing it, when a second finger turns the gesture into a zoom. */
     private fun abandonStroke() {
         liveStroke = null
+        stickyLiveTarget = null
         onWetStroke(null)
     }
 
-    /** Shed the samples the ribbon does not need, at the tolerance the draw zoom justifies. */
+    /** Shed the samples the ribbon does not need, at the tolerance the draw zoom justifies.
+     *  The pencil never reduces, so the committed stroke is the live texture. */
     private fun simplifyForCommit(stroke: Stroke) {
+        if (stroke.tool == com.xnotes.core.tools.Tool.PENCIL) {
+            stroke.trimToSize()
+            return
+        }
         if (StrokeSimplify.enabled && !stroke.straight) {
             val eps = (InteractionController.SIMPLIFY_EPS / viewport.zoom)
                 .coerceAtMost(InteractionController.SIMPLIFY_EPS)

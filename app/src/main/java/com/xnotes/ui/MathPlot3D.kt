@@ -1,6 +1,7 @@
 package com.xnotes.ui
 
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -35,6 +36,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.IntSize
@@ -87,6 +89,11 @@ internal data class Param3D(
     val z: String = "",
     val colorArgb: Int? = null,
     val visible: Boolean = true,
+    /** Per-surface parameter window u ∈ [u0, u1], v ∈ [v0, v1]; blank sides use the domain box. */
+    val u0: String = "",
+    val u1: String = "",
+    val v0: String = "",
+    val v1: String = "",
 )
 
 internal class Plot3DState {
@@ -105,6 +112,8 @@ internal class Plot3DState {
     var yMax by mutableStateOf(5.0)
     var zMin by mutableStateOf(-5.0)
     var zMax by mutableStateOf(5.0)
+    /** When true pinch zooms the camera; when false it grows the box. */
+    var lockDomain by mutableStateOf(true)
     var showGrid by mutableStateOf(true)
     var resolution by mutableFloatStateOf(40f)
     val orbit: OrbitState = OrbitState()
@@ -115,6 +124,43 @@ internal class Plot3DState {
     fun resetView() {
         orbit.reset()
         xMin = -5.0; xMax = 5.0; yMin = -5.0; yMax = 5.0; zMin = -5.0; zMax = 5.0
+    }
+
+    /** Shift the box so its midpoint lands on [v], preserving widths. */
+    fun shiftCenterX(v: Double) {
+        if (!v.isFinite()) return
+        val dx = v - (xMin + xMax) / 2
+        xMin += dx; xMax += dx
+    }
+
+    /** Shift the box so its midpoint lands on [v], preserving widths. */
+    fun shiftCenterY(v: Double) {
+        if (!v.isFinite()) return
+        val dy = v - (yMin + yMax) / 2
+        yMin += dy; yMax += dy
+    }
+
+    /** Shift the box so its midpoint lands on [v], preserving widths. */
+    fun shiftCenterZ(v: Double) {
+        if (!v.isFinite()) return
+        val dz = v - (zMin + zMax) / 2
+        zMin += dz; zMax += dz
+    }
+
+    /**
+     * Grow/shrink the box around its centre (unlocked pinch zoom): a factor above one
+     * zooms in, below one zooms out and reveals more domain.
+     */
+    fun zoomDomain(factor: Float) {
+        if (!factor.isFinite() || factor <= 0f) return
+        val f = factor.toDouble()
+        val wx = ((xMax - xMin) / f).coerceIn(1e-3, 1e4)
+        val wy = ((yMax - yMin) / f).coerceIn(1e-3, 1e4)
+        val wz = ((zMax - zMin) / f).coerceIn(1e-3, 1e4)
+        val cx = (xMin + xMax) / 2; val cy = (yMin + yMax) / 2; val cz = (zMin + zMax) / 2
+        xMin = cx - wx / 2; xMax = cx + wx / 2
+        yMin = cy - wy / 2; yMax = cy + wy / 2
+        zMin = cz - wz / 2; zMax = cz + wz / 2
     }
 
     fun addFor(mode: SurfaceMode) {
@@ -147,12 +193,38 @@ internal class Plot3DState {
             SurfaceMode.COMPLEX -> Unit
         }
     }
+    /** Per-entry domain for MathEntry lists: primary pair [a0]/[a1], secondary [b0]/[b1]. */
+    fun setEntryDomain(mode: SurfaceMode, i: Int, a0: String, a1: String, b0: String, b1: String) {
+        when (mode) {
+            SurfaceMode.CARTESIAN -> if (i in cartesianList.indices) cartesianList = cartesianList.toMutableList().also { it[i] = it[i].copy(domA0 = a0, domA1 = a1, domB0 = b0, domB1 = b1) }
+            SurfaceMode.CYLINDRICAL -> if (i in cylList.indices) cylList = cylList.toMutableList().also { it[i] = it[i].copy(domA0 = a0, domA1 = a1, domB0 = b0, domB1 = b1) }
+            SurfaceMode.SPHERICAL -> if (i in sphList.indices) sphList = sphList.toMutableList().also { it[i] = it[i].copy(domA0 = a0, domA1 = a1, domB0 = b0, domB1 = b1) }
+            SurfaceMode.PARAMETRIC -> Unit
+            SurfaceMode.IMPLICIT -> if (i in implicitList.indices) implicitList = implicitList.toMutableList().also { it[i] = it[i].copy(domA0 = a0, domA1 = a1, domB0 = b0, domB1 = b1) }
+            SurfaceMode.COMPLEX -> Unit
+        }
+    }
+    /** Per-surface parameter window u ∈ [u0, u1], v ∈ [v0, v1]. */
+    fun setParamDomain(i: Int, u0: String, u1: String, v0: String, v1: String) {
+        if (i !in paramList.indices) return
+        paramList = paramList.toMutableList().also { it[i] = it[i].copy(u0 = u0, u1 = u1, v0 = v0, v1 = v1) }
+    }
+
+    /** Whether the current mode holds anything to draw: no function means an empty grid, not a spinner. */
+    fun hasContent(): Boolean = when (mode) {
+        SurfaceMode.CARTESIAN -> cartesianList.any { it.visible && it.text.isNotBlank() }
+        SurfaceMode.CYLINDRICAL -> cylList.any { it.visible && it.text.isNotBlank() }
+        SurfaceMode.SPHERICAL -> sphList.any { it.visible && it.text.isNotBlank() }
+        SurfaceMode.PARAMETRIC -> paramList.any { it.visible && (it.x.isNotBlank() || it.y.isNotBlank() || it.z.isNotBlank()) }
+        SurfaceMode.IMPLICIT -> implicitList.any { it.visible && it.text.isNotBlank() }
+        SurfaceMode.COMPLEX -> complexExpression.isNotBlank()
+    }
 }
 
-private data class Vec3(val x: Double, val y: Double, val z: Double)
-private class Mesh(val pts: Array<Array<Vec3>>, val vals: Array<DoubleArray>, val colorArgb: Int? = null)
-private class Cloud3(val pts: List<Vec3>, val vals: List<Double>, val lo: Double, val hi: Double, val colorArgb: Int? = null)
-private class MeshSet(val meshes: List<Mesh>, val clouds: List<Cloud3>, val lo: Double, val hi: Double)
+internal data class Vec3(val x: Double, val y: Double, val z: Double)
+internal class Mesh(val pts: Array<Array<Vec3>>, val vals: Array<DoubleArray>, val colorArgb: Int? = null)
+internal class Cloud3(val pts: List<Vec3>, val vals: List<Double>, val lo: Double, val hi: Double, val colorArgb: Int? = null)
+internal class MeshSet(val meshes: List<Mesh>, val clouds: List<Cloud3>, val lo: Double, val hi: Double)
 
 internal data class Plot3DSnap(
     val mode: SurfaceMode,
@@ -172,6 +244,7 @@ internal data class Plot3DSnap(
     val shareT: Boolean,
     val animRange: AnimSnap?,
     val showGrid: Boolean = true,
+    val lock: Boolean = true,
 )
 
 @Composable
@@ -190,11 +263,11 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
     fun effectiveColor(index: Int, custom: Int?): androidx.compose.ui.graphics.Color =
         custom?.let { androidx.compose.ui.graphics.Color(it) } ?: colors[index % colors.size]
     val legend: List<Triple<String, androidx.compose.ui.graphics.Color, Int>> = when (state.mode) {
-        SurfaceMode.CARTESIAN -> state.cartesianList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("z${i + 1} = ${e.text.ifBlank { "—" }}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
-        SurfaceMode.CYLINDRICAL -> state.cylList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("r${i + 1} = ${e.text.ifBlank { "—" }}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
-        SurfaceMode.SPHERICAL -> state.sphList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("ρ${i + 1} = ${e.text.ifBlank { "—" }}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
-        SurfaceMode.PARAMETRIC -> state.paramList.mapIndexedNotNull { i, _ -> val p = state.paramList[i]; if (!p.visible) null else Triple("P${i + 1}(u,v)", effectiveColor(i, p.colorArgb), p.colorArgb ?: colors[i % colors.size].toArgb()) }
-        SurfaceMode.IMPLICIT -> state.implicitList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("${e.text.ifBlank { "—" }} = 0", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
+        SurfaceMode.CARTESIAN -> state.cartesianList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("z${i + 1} = ${e.text.ifBlank { "—" }}${entryDomainLabel(e)?.let { "  $it" } ?: ""}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
+        SurfaceMode.CYLINDRICAL -> state.cylList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("r${i + 1} = ${e.text.ifBlank { "—" }}${entryDomainLabel(e)?.let { "  $it" } ?: ""}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
+        SurfaceMode.SPHERICAL -> state.sphList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("ρ${i + 1} = ${e.text.ifBlank { "—" }}${entryDomainLabel(e)?.let { "  $it" } ?: ""}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
+        SurfaceMode.PARAMETRIC -> state.paramList.mapIndexedNotNull { i, _ -> val p = state.paramList[i]; if (!p.visible) null else Triple("P${i + 1}(u,v)${paramDomainLabel(p, state.xMin, state.xMax, state.yMin, state.yMax)}", effectiveColor(i, p.colorArgb), p.colorArgb ?: colors[i % colors.size].toArgb()) }
+        SurfaceMode.IMPLICIT -> state.implicitList.mapIndexedNotNull { i, e -> if (!e.visible) null else Triple("${e.text.ifBlank { "—" }} = 0${entryDomainLabel(e)?.let { "  $it" } ?: ""}", effectiveColor(i, e.colorArgb), e.colorArgb ?: colors[i % colors.size].toArgb()) }
         SurfaceMode.COMPLEX -> listOf(Triple("f(z) = ${state.complexExpression.ifBlank { "—" }}", palette.accent.toComposeColor(), palette.accent.packed()))
     } + if (state.anim.enabled && !complex) listOf(Triple("t=${"%.3f".format(state.anim.tCurrent)}", palette.textDim.toComposeColor(), palette.textDim.packed())) else emptyList()
     val lo = state.valueLo
@@ -203,6 +276,10 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
     val animLabel = stringResource(R.string.math_insert_animation)
     var animInserting by remember { mutableStateOf(false) }
     val animOn = state.anim.enabled && !complex
+    // Animation export needs a valid global t range; without one it would fail to build.
+    val animLo = state.anim.tMinStr.toDoubleOrNull()
+    val animHi = state.anim.tMaxStr.toDoubleOrNull()
+    val animRangeOk = animLo != null && animHi != null && animLo.isFinite() && animHi.isFinite() && animLo != animHi
     GraphWorkspace(
         modes = SurfaceMode.entries.map { it.name to stringResource(it.labelRes) },
         selected = state.mode.name,
@@ -214,6 +291,7 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
         onToggleGrid = { state.showGrid = !state.showGrid },
         onReset = state::resetView,
         inserting = inserting,
+        insertEnabled = state.hasContent(),
         onInsert = {
             if (inserting) return@GraphWorkspace
             val snap = buildSnap(state)
@@ -224,7 +302,7 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
                 if (bytes == null) failed = true else onInsert(bytes)
             }
         },
-        animInsertLabel = if (animOn) animLabel else null,
+        animInsertLabel = if (animOn && animRangeOk) animLabel else null,
         animInserting = animInserting,
         onInsertAnim = if (animOn) ({
             if (animInserting || inserting) return@GraphWorkspace
@@ -243,7 +321,16 @@ internal fun Plot3DPane(state: Plot3DState, onInsert: (ByteArray) -> Unit) {
     )
 }
 
-private fun buildSnap(state: Plot3DState): Plot3DSnap {
+/** Compact per-surface window suffix for parametric legends; empty when unset. */
+private fun paramDomainLabel(p: Param3D, x0: Double, x1: Double, y0: Double, y1: Double): String {
+    val u = if (p.u0.isBlank() && p.u1.isBlank()) null
+        else entryRange(p.u0, p.u1, x0, x1)?.let { (lo, hi) -> "  [${Numbers.tick(lo)}, ${Numbers.tick(hi)}]" }
+    val v = if (p.v0.isBlank() && p.v1.isBlank()) null
+        else entryRange(p.v0, p.v1, y0, y1)?.let { (lo, hi) -> "  [${Numbers.tick(lo)}, ${Numbers.tick(hi)}]" }
+    return (u ?: "") + (v ?: "")
+}
+
+internal fun buildSnap(state: Plot3DState): Plot3DSnap {
     val complex = state.mode == SurfaceMode.COMPLEX
     val exprs = when (state.mode) {
         SurfaceMode.CARTESIAN -> state.cartesianList
@@ -268,7 +355,7 @@ private fun buildSnap(state: Plot3DState): Plot3DSnap {
     return Plot3DSnap(state.mode, exprs, state.paramList.toList(), state.component,
         x0, x1, y0, y1, z0, z1,
         state.resolution.toInt().coerceIn(14, 72),
-        state.orbit.quat, state.orbit.zoom, t, state.anim.shareT, animRange, state.showGrid)
+        state.orbit.quat, state.orbit.zoom, t, state.anim.shareT, animRange, state.showGrid, state.lockDomain)
 }
 
 @Composable
@@ -277,11 +364,25 @@ private fun Plot3DInputs(state: Plot3DState) {
     val colors = mathPlotColors()
     val eyeLabel = stringResource(R.string.math_toggle_visibility)
     val colorLabel = stringResource(R.string.math_pick_color)
+    val domainLabel = stringResource(R.string.math_domain_entry)
+    var openDomains by remember { mutableStateOf(setOf<String>()) }
+    fun toggleDom(key: String) {
+        openDomains = if (key in openDomains) openDomains - key else openDomains + key
+    }
     fun effectiveColor(index: Int, custom: Int?): androidx.compose.ui.graphics.Color =
         custom?.let { androidx.compose.ui.graphics.Color(it) } ?: colors[index % colors.size]
     @Composable
-    fun listEditor(items: List<MathEntry>, set: (Int, String) -> Unit, label: (Int) -> String) {
+    fun listEditor(
+        items: List<MathEntry>,
+        set: (Int, String) -> Unit,
+        label: (Int) -> String,
+        labelA0: String,
+        labelA1: String,
+        labelB0: String,
+        labelB1: String,
+    ) {
         items.forEachIndexed { i, e ->
+            val domKey = "${state.mode.name}:$i"
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 EntryColorDot(e.colorArgb, effectiveColor(i, e.colorArgb), colorLabel) {
                     state.setStyle(state.mode, i, it, e.visible)
@@ -290,25 +391,51 @@ private fun Plot3DInputs(state: Plot3DState) {
                 EntryEye(e.visible, eyeLabel) {
                     state.setStyle(state.mode, i, e.colorArgb, !e.visible)
                 }
+                EntryDomainToggle(domKey in openDomains, domainLabel) { toggleDom(domKey) }
                 MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
             }
+            EntryDomainEditor(
+                expanded = domKey in openDomains,
+                a0 = e.domA0, a1 = e.domA1, b0 = e.domB0, b1 = e.domB1,
+                onA0 = { state.setEntryDomain(state.mode, i, it, e.domA1, e.domB0, e.domB1) },
+                onA1 = { state.setEntryDomain(state.mode, i, e.domA0, it, e.domB0, e.domB1) },
+                onB0 = { state.setEntryDomain(state.mode, i, e.domA0, e.domA1, it, e.domB1) },
+                onB1 = { state.setEntryDomain(state.mode, i, e.domA0, e.domA1, e.domB0, it) },
+                labelA0 = labelA0, labelA1 = labelA1, labelB0 = labelB0, labelB1 = labelB1,
+                showSecondary = true,
+            )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addFor(state.mode) }
         }
     }
+    val xMinLabel = stringResource(R.string.math_x_min)
+    val xMaxLabel = stringResource(R.string.math_x_max)
+    val yMinLabel = stringResource(R.string.math_y_min)
+    val yMaxLabel = stringResource(R.string.math_y_max)
+    val thMinLabel = stringResource(R.string.math_theta_min)
+    val thMaxLabel = stringResource(R.string.math_theta_max)
+    val zMinLabel = stringResource(R.string.math_z_min)
+    val zMaxLabel = stringResource(R.string.math_z_max)
+    val phiMinLabel = stringResource(R.string.math_phi_min)
+    val phiMaxLabel = stringResource(R.string.math_phi_max)
     when (state.mode) {
-        SurfaceMode.CARTESIAN -> listEditor(state.cartesianList, { i, v -> state.cartesianList = state.cartesianList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "z${it + 1}(x,y)" })
+        SurfaceMode.CARTESIAN -> listEditor(state.cartesianList, { i, v -> state.cartesianList = state.cartesianList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "z${it + 1}(x,y)" }, xMinLabel, xMaxLabel, yMinLabel, yMaxLabel)
         SurfaceMode.CYLINDRICAL -> {
-            listEditor(state.cylList, { i, v -> state.cylList = state.cylList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "r${it + 1}(θ,z)" })
+            listEditor(state.cylList, { i, v -> state.cylList = state.cylList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "r${it + 1}(θ,z)" }, thMinLabel, thMaxLabel, zMinLabel, zMaxLabel)
             MathHint(stringResource(R.string.math_3d_hint_cylindrical))
         }
         SurfaceMode.SPHERICAL -> {
-            listEditor(state.sphList, { i, v -> state.sphList = state.sphList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "ρ${it + 1}(θ,φ)" })
+            listEditor(state.sphList, { i, v -> state.sphList = state.sphList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "ρ${it + 1}(θ,φ)" }, thMinLabel, thMaxLabel, phiMinLabel, phiMaxLabel)
             MathHint(stringResource(R.string.math_3d_hint_spherical))
         }
         SurfaceMode.PARAMETRIC -> {
+            val uMinLabel = stringResource(R.string.math_u_min)
+            val uMaxLabel = stringResource(R.string.math_u_max)
+            val vMinLabel = stringResource(R.string.math_v_min)
+            val vMaxLabel = stringResource(R.string.math_v_max)
             state.paramList.forEachIndexed { i, p ->
+                val domKey = "PARAMETRIC:$i"
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     EntryColorDot(p.colorArgb, effectiveColor(i, p.colorArgb), colorLabel) {
                         state.setStyle(state.mode, i, it, p.visible)
@@ -317,6 +444,7 @@ private fun Plot3DInputs(state: Plot3DState) {
                     EntryEye(p.visible, eyeLabel) {
                         state.setStyle(state.mode, i, p.colorArgb, !p.visible)
                     }
+                    EntryDomainToggle(domKey in openDomains, domainLabel) { toggleDom(domKey) }
                     MathIconButton(Icons.Outlined.Close, stringResource(R.string.math_remove), tint = palette.textDim.toComposeColor()) { state.removeAt(state.mode, i) }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -324,10 +452,20 @@ private fun Plot3DInputs(state: Plot3DState) {
                     MathTextField(p.y, { v -> state.paramList = state.paramList.toMutableList().also { list -> list[i] = p.copy(y = v) } }, "y", Modifier.weight(1f))
                     MathTextField(p.z, { v -> state.paramList = state.paramList.toMutableList().also { list -> list[i] = p.copy(z = v) } }, "z", Modifier.weight(1f))
                 }
+                EntryDomainEditor(
+                    expanded = domKey in openDomains,
+                    a0 = p.u0, a1 = p.u1, b0 = p.v0, b1 = p.v1,
+                    onA0 = { state.setParamDomain(i, it, p.u1, p.v0, p.v1) },
+                    onA1 = { state.setParamDomain(i, p.u0, it, p.v0, p.v1) },
+                    onB0 = { state.setParamDomain(i, p.u0, p.u1, it, p.v1) },
+                    onB1 = { state.setParamDomain(i, p.u0, p.u1, p.v0, it) },
+                    labelA0 = uMinLabel, labelA1 = uMaxLabel, labelB0 = vMinLabel, labelB1 = vMaxLabel,
+                    showSecondary = true,
+                )
             }
             MathSecondaryButton(stringResource(R.string.math_2d_add)) { state.addFor(state.mode) }
         }
-        SurfaceMode.IMPLICIT -> listEditor(state.implicitList, { i, v -> state.implicitList = state.implicitList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "f${it + 1}(x,y,z)=0" })
+        SurfaceMode.IMPLICIT -> listEditor(state.implicitList, { i, v -> state.implicitList = state.implicitList.toMutableList().also { it[i] = it[i].copy(text = v) } }, { "f${it + 1}(x,y,z)=0" }, xMinLabel, xMaxLabel, yMinLabel, yMaxLabel)
         SurfaceMode.COMPLEX -> {
             MathTextField(state.complexExpression, { state.complexExpression = it }, stringResource(R.string.math_3d_complex_function), Modifier.fillMaxWidth())
             MathToolSelector(ComplexComponent.entries.map { it.name to stringResource(it.labelRes) }, state.component.name) { state.component = ComplexComponent.valueOf(it) }
@@ -362,6 +500,16 @@ private fun Plot3DDomain(state: Plot3DState) {
             DomainField(state.zMin, { state.zMin = it }, stringResource(R.string.math_z_min), Modifier.weight(1f))
             DomainField(state.zMax, { state.zMax = it }, stringResource(R.string.math_z_max), Modifier.weight(1f))
         }
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            DomainField((state.xMin + state.xMax) / 2, { state.shiftCenterX(it) }, "cx", Modifier.weight(1f))
+            DomainField((state.yMin + state.yMax) / 2, { state.shiftCenterY(it) }, "cy", Modifier.weight(1f))
+            DomainField((state.zMin + state.zMax) / 2, { state.shiftCenterZ(it) }, "cz", Modifier.weight(1f))
+        }
+        Spacer(Modifier.height(4.dp))
+        MathChip(stringResource(R.string.math_domain_lock), selected = state.lockDomain) {
+            state.lockDomain = !state.lockDomain
+        }
     }
 }
 
@@ -369,10 +517,12 @@ private fun Plot3DDomain(state: Plot3DState) {
 private fun SurfaceView(state: Plot3DState, modifier: Modifier = Modifier) {
     val theme = rememberGraphTheme()
     var meshes by remember { mutableStateOf<MeshSet?>(null) }
-    var frame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var view by remember { mutableStateOf(IntSize(1, 1)) }
-    fun styleOf(e: MathEntry) = e.text + "" + (e.colorArgb?.toString() ?: "") + "" + (if (e.visible) "1" else "0")
-    val exprKey = rememberSettled(listOf(state.cartesianList, state.cylList, state.sphList, state.implicitList).flatten().map(::styleOf).joinToString("") + state.complexExpression + state.paramList.map { it.x + "" + it.y + "" + it.z + "" + (it.colorArgb?.toString() ?: "") + "" + (if (it.visible) "1" else "0") }.joinToString(""), 200)
+    val densityDp = LocalDensity.current.density
+    fun styleOf(e: MathEntry) = e.text + "" + (e.colorArgb?.toString() ?: "") + "" + (if (e.visible) "1" else "0") +
+        "" + e.domA0 + "" + e.domA1 + "" + e.domB0 + "" + e.domB1
+    val exprKey = rememberSettled(listOf(state.cartesianList, state.cylList, state.sphList, state.implicitList).flatten().map(::styleOf).joinToString("") + state.complexExpression + state.paramList.map { it.x + "" + it.y + "" + it.z + "" + (it.colorArgb?.toString() ?: "") + "" + (if (it.visible) "1" else "0") +
+        "" + it.u0 + "" + it.u1 + "" + it.v0 + "" + it.v1 }.joinToString(""), 200)
     val domainKey = rememberSettled(state.xMin.toString() + "|" + state.xMax + "|" + state.yMin + "|" + state.yMax + "|" + state.zMin + "|" + state.zMax + "|" + state.showGrid, 200)
     val nKey = state.resolution.toInt().coerceIn(14, 72)
     val tKey = state.anim.tCurrent
@@ -384,25 +534,45 @@ private fun SurfaceView(state: Plot3DState, modifier: Modifier = Modifier) {
         state.valueLo = data?.lo
         state.valueHi = data?.hi
     }
+    // Layer 1 (live): grid + axes + labels, re-rendered on every orbit and domain change.
+    var gridFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    LaunchedEffect(view, theme, state.mode, state.showGrid,
+        state.xMin, state.xMax, state.yMin, state.yMax, state.zMin, state.zMax) {
+        snapshotFlow { Triple(state.orbit.quat, state.orbit.zoom, state.mode) }.conflate().collect { (q, z, _) ->
+            val (w, h) = cappedSize(view.width, view.height, LIVE_CAP)
+            val snap = buildSnap(state)
+            gridFrame = withContext(Dispatchers.Default) { rasterEmptyFrame(snap, q, z, w, h, theme) }.asImageBitmap()
+            kotlinx.coroutines.delay(28)
+        }
+    }
+    // Layer 2 (debounced): the sampled surface, transparent so the live grid shows through.
+    var meshFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     LaunchedEffect(meshes, view, theme) {
         val data = meshes
-        if (data == null) { frame = null; return@LaunchedEffect }
+        if (data == null) {
+            meshFrame = null
+            return@LaunchedEffect
+        }
         snapshotFlow { Triple(state.orbit.quat, state.orbit.zoom, state.mode) }.conflate().collect { (q, z, _) ->
-            val (w, h) = cappedSize(view.width, view.height, 640)
+            val (w, h) = cappedSize(view.width, view.height, LIVE_CAP)
             val snap = buildSnap(state)
-            val bmp = withContext(Dispatchers.Default) { rasterMeshes(data, snap, q, z, w, h, theme) }
-            frame = bmp.asImageBitmap()
+            val bmp = withContext(Dispatchers.Default) { rasterMeshes(data, snap, q, z, w, h, theme, frame = false) }
+            meshFrame = bmp.asImageBitmap()
             kotlinx.coroutines.delay(28)
         }
     }
     Box(modifier.clipToBounds().onSizeChanged { view = it }.pointerInput(Unit) {
         detectTransformGestures { _, pan, zoom, _ ->
-            state.orbit.drag(pan.x, pan.y)
-            state.orbit.zoom = (state.orbit.zoom * zoom).coerceIn(0.35f, 4f)
+            // Rotate xor zoom per gesture (never both): single-finger drags orbit,
+            // pinches zoom, like the reference plotter.
+            if (abs(zoom - 1f) < 0.002f) state.orbit.drag(pan.x, pan.y, densityDp)
+            else if (state.lockDomain) state.orbit.zoom = (state.orbit.zoom * zoom).coerceIn(0.35f, 4f)
+            else state.zoomDomain(zoom)
         }
     }) {
-        frame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
-        if (frame == null) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
+        gridFrame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+        meshFrame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+        if (gridFrame == null && state.hasContent()) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
         ViewPresetButtons(state.orbit)
         if (state.mode != SurfaceMode.COMPLEX) AnimPlayOverlay(state.anim)
     }
@@ -434,11 +604,36 @@ private suspend fun exportSurface(snap: Plot3DSnap, theme: GraphTheme, title: St
     }
     val foot = buildString {
         append("x ∈ [${Numbers.tick(snap.x0)}, ${Numbers.tick(snap.x1)}]    y ∈ [${Numbers.tick(snap.y0)}, ${Numbers.tick(snap.y1)}]    z ∈ [${Numbers.tick(snap.z0)}, ${Numbers.tick(snap.z1)}]")
+        when (snap.mode) {
+            SurfaceMode.CARTESIAN -> snap.exprs.forEachIndexed { i, e ->
+                entryDomainLabel(e)?.let { append("    z${i + 1} x∈$it") }
+            }
+            SurfaceMode.CYLINDRICAL -> snap.exprs.forEachIndexed { i, e ->
+                entryDomainLabel(e)?.let { append("    r${i + 1} θ∈$it") }
+            }
+            SurfaceMode.SPHERICAL -> snap.exprs.forEachIndexed { i, e ->
+                entryDomainLabel(e)?.let { append("    ρ${i + 1} θ∈$it") }
+            }
+            SurfaceMode.PARAMETRIC -> snap.params.forEachIndexed { i, p ->
+                val u = if (p.u0.isBlank() && p.u1.isBlank()) null
+                    else entryRange(p.u0, p.u1, snap.x0, snap.x1)?.let { (lo, hi) -> "u∈[${Numbers.tick(lo)}, ${Numbers.tick(hi)}]" }
+                val v = if (p.v0.isBlank() && p.v1.isBlank()) null
+                    else entryRange(p.v0, p.v1, snap.y0, snap.y1)?.let { (lo, hi) -> "v∈[${Numbers.tick(lo)}, ${Numbers.tick(hi)}]" }
+                if (u != null || v != null) append("    P${i + 1} " + listOfNotNull(u, v).joinToString(" "))
+            }
+            SurfaceMode.IMPLICIT -> snap.exprs.forEachIndexed { i, e ->
+                entryDomainLabel(e)?.let { append("    f${i + 1} x∈$it") }
+            }
+            else -> Unit
+        }
         if (snap.t != null) append("    t=${Numbers.tick(snap.t)}")
         if (component.isNotEmpty() && snap.mode == SurfaceMode.COMPLEX) append("    ").append(component)
     }
     writeGraphPng(bmp, title, legend, foot, theme)
-} catch (cancelled: CancellationException) { throw cancelled } catch (_: Throwable) { null }
+} catch (cancelled: CancellationException) { throw cancelled } catch (t: Throwable) {
+    Log.e("MathStudio", "exportSurface failed", t)
+    null
+}
 
 private suspend fun exportSurfaceAnimation(base: Plot3DSnap, theme: GraphTheme, title: String, legend: List<ExportLegend>): ByteArray? {
     return try {
@@ -457,10 +652,13 @@ private suspend fun exportSurfaceAnimation(base: Plot3DSnap, theme: GraphTheme, 
     if (frames.isEmpty()) return null
     val foot = "x ∈ [${Numbers.tick(base.x0)}, ${Numbers.tick(base.x1)}] y ∈ [${Numbers.tick(base.y0)}, ${Numbers.tick(base.y1)}] z ∈ [${Numbers.tick(base.z0)}, ${Numbers.tick(base.z1)}]    frames=${ts.size} t∈[${Numbers.tick(minOf(range.lo, range.hi))}, ${Numbers.tick(maxOf(range.lo, range.hi))}]"
     buildAnimationPng(frames, title, legend, foot, theme, specJson = MathAnimSpec.capture3D(base)?.toJson())
-} catch (cancelled: CancellationException) { throw cancelled } catch (_: Throwable) { null }
+} catch (cancelled: CancellationException) { throw cancelled } catch (t: Throwable) {
+    Log.e("MathStudio", "exportSurfaceAnimation failed", t)
+    null
+}
 }
 
-private suspend fun computeMeshes(snap: Plot3DSnap, series: List<Int>): MeshSet? {
+internal suspend fun computeMeshes(snap: Plot3DSnap, series: List<Int>): MeshSet? {
     val meshes = ArrayList<Mesh>(); val clouds = ArrayList<Cloud3>()
     val allVals = ArrayList<Double>()
     suspend fun addMesh(m: Mesh?) { if (m != null) { meshes += m; for (row in m.vals) for (v in row) if (v.isFinite()) allVals += v } }
@@ -470,14 +668,37 @@ private suspend fun computeMeshes(snap: Plot3DSnap, series: List<Int>): MeshSet?
     // reserved for the complex component surface, which really is a scalar field.
     fun resolve(custom: Int?): Int? = custom ?: if (complex || series.isEmpty()) null else series[si++ % series.size]
     when (snap.mode) {
-        SurfaceMode.CARTESIAN -> for (e in snap.exprs) { if (e.visible) addMesh(cartesianMesh(e.text, snap, resolve(e.colorArgb))) }
-        SurfaceMode.CYLINDRICAL -> for (e in snap.exprs) { if (e.visible) addMesh(cylindricalMesh(e.text, snap, resolve(e.colorArgb))) }
-        SurfaceMode.SPHERICAL -> for (e in snap.exprs) { if (e.visible) addMesh(sphericalMesh(e.text, snap, resolve(e.colorArgb))) }
-        SurfaceMode.PARAMETRIC -> for (p in snap.params) { if (p.visible) addMesh(parametricMesh(p, snap, resolve(p.colorArgb))) }
+        SurfaceMode.CARTESIAN -> for (e in snap.exprs) {
+            if (!e.visible) continue
+            val xr = entryRange(e.domA0, e.domA1, snap.x0, snap.x1)
+            val yr = entryRange(e.domB0, e.domB1, snap.y0, snap.y1)
+            if (xr != null && yr != null) addMesh(cartesianMesh(e.text, snap, resolve(e.colorArgb), xr.first, xr.second, yr.first, yr.second))
+        }
+        SurfaceMode.CYLINDRICAL -> for (e in snap.exprs) {
+            if (!e.visible) continue
+            val thR = entryRange(e.domA0, e.domA1, 0.0, 2.0 * PI)
+            val zR = entryRange(e.domB0, e.domB1, snap.z0, snap.z1)
+            if (thR != null && zR != null) addMesh(cylindricalMesh(e.text, snap, resolve(e.colorArgb), thR.first, thR.second, zR.first, zR.second))
+        }
+        SurfaceMode.SPHERICAL -> for (e in snap.exprs) {
+            if (!e.visible) continue
+            val thR = entryRange(e.domA0, e.domA1, 0.0, 2.0 * PI)
+            val phR = entryRange(e.domB0, e.domB1, 0.0, PI)
+            if (thR != null && phR != null) addMesh(sphericalMesh(e.text, snap, resolve(e.colorArgb), thR.first, thR.second, phR.first, phR.second))
+        }
+        SurfaceMode.PARAMETRIC -> for (p in snap.params) {
+            if (!p.visible) continue
+            val uR = entryRange(p.u0, p.u1, snap.x0, snap.x1)
+            val vR = entryRange(p.v0, p.v1, snap.y0, snap.y1)
+            if (uR != null && vR != null) addMesh(parametricMesh(p, snap, resolve(p.colorArgb), uR, vR))
+        }
         SurfaceMode.COMPLEX -> for (e in snap.exprs) { addMesh(complexMesh(e.text, snap, e.colorArgb)) }
         SurfaceMode.IMPLICIT -> for (e in snap.exprs) {
             if (!e.visible) continue
-            val c = implicitCloud(e.text, snap, resolve(e.colorArgb))
+            val xr = entryRange(e.domA0, e.domA1, snap.x0, snap.x1)
+            val yr = entryRange(e.domB0, e.domB1, snap.y0, snap.y1)
+            if (xr == null || yr == null) continue
+            val c = implicitCloud(e.text, snap, resolve(e.colorArgb), xr.first, xr.second, yr.first, yr.second)
             if (c != null) { clouds += c; allVals += c.vals.filter { it.isFinite() } }
         }
     }
@@ -496,7 +717,7 @@ private fun scopeWithT(t: Double?): EvalScope {
     return s
 }
 
-private suspend fun cartesianMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null): Mesh? {
+internal suspend fun cartesianMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null, x0: Double = snap.x0, x1: Double = snap.x1, y0: Double = snap.y0, y1: Double = snap.y1): Mesh? {
     val expr = runCatching { ExpressionParser.parse(text) }.getOrNull() ?: return null
     val n = snap.n
     val pts = Array(n) { Array(n) { Vec3(0.0, 0.0, 0.0) } }
@@ -505,7 +726,7 @@ private suspend fun cartesianMesh(text: String, snap: Plot3DSnap, colorArgb: Int
     for (ri in 0 until n) {
         coroutineContext.ensureActive()
         for (ci in 0 until n) {
-            val x = snap.x0 + (snap.x1 - snap.x0) * ci / (n - 1); val y = snap.y0 + (snap.y1 - snap.y0) * ri / (n - 1)
+            val x = x0 + (x1 - x0) * ci / (n - 1); val y = y0 + (y1 - y0) * ri / (n - 1)
             bindXY(scope, x, y)
             val z = evalReal(scope, expr)
             pts[ri][ci] = Vec3(x, y, z); vals[ri][ci] = z
@@ -514,7 +735,7 @@ private suspend fun cartesianMesh(text: String, snap: Plot3DSnap, colorArgb: Int
     return Mesh(pts, vals, colorArgb)
 }
 
-private suspend fun cylindricalMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null): Mesh? {
+internal suspend fun cylindricalMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null, th0: Double = 0.0, th1: Double = 2.0 * PI, z0: Double = snap.z0, z1: Double = snap.z1): Mesh? {
     val expr = runCatching { ExpressionParser.parse(text) }.getOrNull() ?: return null
     val n = snap.n
     val pts = Array(n) { Array(n) { Vec3(0.0, 0.0, 0.0) } }
@@ -522,9 +743,9 @@ private suspend fun cylindricalMesh(text: String, snap: Plot3DSnap, colorArgb: I
     val scope = scopeWithT(snap.t)
     for (ri in 0 until n) {
         coroutineContext.ensureActive()
-        val z = snap.z0 + (snap.z1 - snap.z0) * ri / (n - 1)
+        val z = z0 + (z1 - z0) * ri / (n - 1)
         for (ci in 0 until n) {
-            val th = 2 * PI * ci / (n - 1)
+            val th = th0 + (th1 - th0) * ci / (n - 1)
             scope.vars["th"] = Complex.real(th); scope.vars["theta"] = Complex.real(th); scope.vars["z"] = Complex.real(z)
             val rv = evalReal(scope, expr)
             val x = if (rv.isFinite()) rv * cos(th) else Double.NaN
@@ -535,7 +756,7 @@ private suspend fun cylindricalMesh(text: String, snap: Plot3DSnap, colorArgb: I
     return Mesh(pts, vals, colorArgb)
 }
 
-private suspend fun sphericalMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null): Mesh? {
+internal suspend fun sphericalMesh(text: String, snap: Plot3DSnap, colorArgb: Int? = null, th0: Double = 0.0, th1: Double = 2.0 * PI, ph0: Double = 0.0, ph1: Double = PI): Mesh? {
     val expr = runCatching { ExpressionParser.parse(text) }.getOrNull() ?: return null
     val n = snap.n
     val pts = Array(n) { Array(n) { Vec3(0.0, 0.0, 0.0) } }
@@ -543,9 +764,9 @@ private suspend fun sphericalMesh(text: String, snap: Plot3DSnap, colorArgb: Int
     val scope = scopeWithT(snap.t)
     for (ri in 0 until n) {
         coroutineContext.ensureActive()
-        val ph = PI * ri / (n - 1)
+        val ph = ph0 + (ph1 - ph0) * ri / (n - 1)
         for (ci in 0 until n) {
-            val th = 2 * PI * ci / (n - 1)
+            val th = th0 + (th1 - th0) * ci / (n - 1)
             scope.vars["th"] = Complex.real(th); scope.vars["theta"] = Complex.real(th)
             scope.vars["ph"] = Complex.real(ph); scope.vars["phi"] = Complex.real(ph)
             val rho = evalReal(scope, expr)
@@ -558,13 +779,16 @@ private suspend fun sphericalMesh(text: String, snap: Plot3DSnap, colorArgb: Int
     return Mesh(pts, vals, colorArgb)
 }
 
-private suspend fun parametricMesh(p: Param3D, snap: Plot3DSnap, colorArgb: Int? = null): Mesh? {
+internal suspend fun parametricMesh(p: Param3D, snap: Plot3DSnap, colorArgb: Int? = null, uR: Pair<Double, Double>? = null, vR: Pair<Double, Double>? = null): Mesh? {
     val xe = runCatching { ExpressionParser.parse(p.x) }.getOrNull() ?: return null
     val ye = runCatching { ExpressionParser.parse(p.y) }.getOrNull() ?: return null
     val ze = runCatching { ExpressionParser.parse(p.z) }.getOrNull() ?: return null
     val n = snap.n
-    // u ∈ [x0, x1], v ∈ [y0, y1]; when shareT, the v parameter IS the animation t:
-    // v spans the anim range and the surface grows up to the current t while playing.
+    // u ∈ [x0, x1], v ∈ [y0, y1] by default, narrowed by the per-surface window; when shareT,
+    // the v parameter IS the animation t: v spans the anim range and the surface grows up to
+    // the current t while playing.
+    val u0 = uR?.first ?: snap.x0; val u1 = uR?.second ?: snap.x1
+    val v0 = vR?.first ?: snap.y0; val v1 = vR?.second ?: snap.y1
     val pts = Array(n) { Array(n) { Vec3(0.0, 0.0, 0.0) } }
     val vals = Array(n) { DoubleArray(n) }
     val scope = EvalScope()
@@ -575,8 +799,8 @@ private suspend fun parametricMesh(p: Param3D, snap: Plot3DSnap, colorArgb: Int?
     for (ri in 0 until n) {
         coroutineContext.ensureActive()
         for (ci in 0 until n) {
-            val u = snap.x0 + (snap.x1 - snap.x0) * ci / (n - 1)
-            var v = snap.y0 + (snap.y1 - snap.y0) * ri / (n - 1)
+            val u = u0 + (u1 - u0) * ci / (n - 1)
+            var v = v0 + (v1 - v0) * ri / (n - 1)
             if (snap.shareT && snap.animRange != null && snap.t != null) {
                 val lo = minOf(snap.animRange.lo, snap.animRange.hi); val hi = maxOf(snap.animRange.lo, snap.animRange.hi)
                 // Map row fraction to [lo, current t] so play draws the surface growing.
@@ -619,16 +843,16 @@ private suspend fun complexMesh(text: String, snap: Plot3DSnap, colorArgb: Int? 
     return Mesh(pts, vals, colorArgb)
 }
 
-private suspend fun implicitCloud(text: String, snap: Plot3DSnap, colorArgb: Int? = null): Cloud3? {
+internal suspend fun implicitCloud(text: String, snap: Plot3DSnap, colorArgb: Int? = null, x0: Double = snap.x0, x1: Double = snap.x1, y0: Double = snap.y0, y1: Double = snap.y1): Cloud3? {
     val expr = runCatching { ExpressionParser.parse(text) }.getOrNull() ?: return null
     val n = snap.n.coerceIn(14, 48)
     val scope = scopeWithT(snap.t)
-    val tol = minOf(snap.x1 - snap.x0, snap.y1 - snap.y0, snap.z1 - snap.z0).coerceAtLeast(0.0) * 0.06 + 0.25
+    val tol = minOf(x1 - x0, y1 - y0, snap.z1 - snap.z0).coerceAtLeast(0.0) * 0.06 + 0.25
     val pts = ArrayList<Vec3>(); val vals = ArrayList<Double>()
     for (k in 0 until n) {
         coroutineContext.ensureActive()
         for (j in 0 until n) for (i in 0 until n) {
-            val x = snap.x0 + (snap.x1 - snap.x0) * (i + 0.5) / n; val y = snap.y0 + (snap.y1 - snap.y0) * (j + 0.5) / n; val z = snap.z0 + (snap.z1 - snap.z0) * (k + 0.5) / n
+            val x = x0 + (x1 - x0) * (i + 0.5) / n; val y = y0 + (y1 - y0) * (j + 0.5) / n; val z = snap.z0 + (snap.z1 - snap.z0) * (k + 0.5) / n
             bindXYZ(scope, x, y, z)
             val v = evalReal(scope, expr)
             if (v.isFinite() && abs(v) < tol) { pts += Vec3(x, y, z); vals += v }
@@ -646,23 +870,45 @@ private suspend fun implicitCloud(text: String, snap: Plot3DSnap, colorArgb: Int
     return Cloud3(capped.first, capped.second, lo, hi, colorArgb)
 }
 
-/** High-quality raster: quaternion camera, per-quad Lambert lighting, depth-sorted meshes + clouds. */
-private suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme): Bitmap {
+/** Grid + axes + domain box with nothing plotted: the interactive empty view. */
+private suspend fun rasterEmptyFrame(snap: Plot3DSnap, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme): Bitmap {
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
     canvas.drawColor(theme.paper)
     val cxm = (snap.x0 + snap.x1) / 2; val cym = (snap.y0 + snap.y1) / 2; val czm = (snap.z0 + snap.z1) / 2
     val xH = (snap.x1 - snap.x0) / 2; val yH = (snap.y1 - snap.y0) / 2; val zH = (snap.z1 - snap.z0) / 2
+    drawQuatSpaceFrame(
+        canvas,
+        { x, y, z -> quatProject(x, y, z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm) },
+        quat, cxm, cym, czm, xH, yH, zH, w, h, theme, snap.showGrid, snap.mode,
+    )
+    return bmp
+}
+
+/** High-quality raster: quaternion camera, per-quad Lambert lighting, depth-sorted meshes + clouds.
+ *  With [frame] false the bitmap stays transparent and carries data only, to composite over a
+ *  separately rendered (and therefore live) grid frame. */
+internal suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, frame: Boolean = true): Bitmap {
+    val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
+    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bmp)
+    if (frame) {
+        canvas.drawColor(theme.paper)
+    }
+    val cxm = (snap.x0 + snap.x1) / 2; val cym = (snap.y0 + snap.y1) / 2; val czm = (snap.z0 + snap.z1) / 2
+    val xH = (snap.x1 - snap.x0) / 2; val yH = (snap.y1 - snap.y0) / 2; val zH = (snap.z1 - snap.z0) / 2
     fun proj(p: Vec3): Triple<Float, Float, Float>? {
         if (!p.x.isFinite() || !p.y.isFinite() || !p.z.isFinite()) return null
         return quatProject(p.x, p.y, p.z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm)
     }
-    drawQuatSpaceFrame(
-        canvas,
-        { x, y, z -> quatProject(x, y, z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm) },
-        quat, cxm, cym, czm, xH, yH, zH, w, h, theme, snap.showGrid,
-    )
+    if (frame) {
+        drawQuatSpaceFrame(
+            canvas,
+            { x, y, z -> quatProject(x, y, z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm) },
+            quat, cxm, cym, czm, xH, yH, zH, w, h, theme, snap.showGrid, snap.mode,
+        )
+    }
     // Sun in view space: ambient floor plus a two-sided diffuse term from the true
     // world-space facet normal, with a soft specular lobe for readable ridges.
     val m = quat.matrix()
@@ -701,10 +947,11 @@ private suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zo
                     val vx0 = m[0] * nx + m[1] * ny + m[2] * nz
                     val vy0 = m[3] * nx + m[4] * ny + m[5] * nz
                     val vz0 = m[6] * nx + m[7] * ny + m[8] * nz
-                    val diff = abs(vx0 * lx + vy0 * ly + vz0 * lz)
+                    // Ditredi-style wrapped diffuse: backfaces fall to ambient instead of
+                    // mirroring the key light, with a soft Blinn-Phong lobe for ridges.
+                    val raw = vx0 * lx + vy0 * ly + vz0 * lz
                     val facing = vx0 * hx + vy0 * hy + vz0 * hz
-                    val spec = if (facing > 0) facing.pow(28.0) * 0.28 else 0.0
-                    (0.60 + 0.40 * diff + spec).coerceIn(0.55, 1.22)
+                    shadeLit(raw, facing)
                 }
                 val base = mesh.colorArgb ?: heightArgb(t)
                 val col = android.graphics.Color.rgb(
@@ -737,21 +984,21 @@ private suspend fun rasterMeshes(data: MeshSet, snap: Plot3DSnap, quat: Quat, zo
     dots.sortBy { it.d }
     val dotP = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
     for (d in dots) { dotP.color = d.col; canvas.drawCircle(d.x, d.y, d.r, dotP) }
+    // Box edges on top so the frame stays readable over the data.
+    drawBoxEdges(canvas, { x, y, z -> quatProject(x, y, z, quat, zoom, w, h, xH, yH, zH, cxm, cym, czm) }, cxm, cym, czm, xH, yH, zH, theme)
     return bmp
 }
 
 /** Blue → cyan → green → yellow → red, the usual height ramp in scientific plotting. */
-internal fun heightColor(t: Double): androidx.compose.ui.graphics.Color {
-    val stops = listOf(
-        androidx.compose.ui.graphics.Color(0xFF2E5AAC),
-        androidx.compose.ui.graphics.Color(0xFF2C9BB5),
-        androidx.compose.ui.graphics.Color(0xFF4BAE62),
-        androidx.compose.ui.graphics.Color(0xFFD8B33C),
-        androidx.compose.ui.graphics.Color(0xFFC74B3A),
-    )
-    val x = t.coerceIn(0.0, 1.0) * (stops.size - 1)
-    val i = x.toInt().coerceIn(0, stops.lastIndex - 1)
-    val f = (x - i).toFloat()
-    val a = stops[i]; val b = stops[i + 1]
-    return androidx.compose.ui.graphics.Color(a.red + (b.red - a.red) * f, a.green + (b.green - a.green) * f, a.blue + (b.blue - a.blue) * f, 1f)
+internal fun heightColor(t: Double): androidx.compose.ui.graphics.Color = fieldRampColor(FieldPalette.JET, t)
+
+/**
+ * Wrapped diffuse + specular response shared by the lit 3D surfaces: the diffuse term wraps
+ * around the terminator so backfaces fall to ambient instead of mirroring the key light,
+ * with a soft lobe for readable ridges.
+ */
+internal fun shadeLit(rawDiffuse: Double, facing: Double): Double {
+    val wrap = ((rawDiffuse + 0.55) / 1.55).coerceIn(0.0, 1.0)
+    val spec = if (facing > 0) facing.pow(18.0) * 0.45 else 0.0
+    return (0.34 + 0.66 * wrap + spec).coerceIn(0.3, 1.3)
 }

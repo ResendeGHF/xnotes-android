@@ -1,11 +1,14 @@
 package com.xnotes.core.infinite
 
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.model.Rgba
+import com.xnotes.core.stroke.PencilStyle
 import com.xnotes.core.stroke.RibbonPoints
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.pow
 
 /**
  * A triangle mesh in content space. Positions are doubles because the canvas is unbounded: a float
@@ -150,27 +153,102 @@ object StrokeTessellator {
     }
 
     /**
-     * The pencil: a mitered triangle strip carrying per-vertex density/edge control
-     * bytes (see [PencilGrain.packVertex]); the ink colour itself arrives as a
-     * shader uniform.
+     * Graphite DENSITY for smoothed stylus pressure [p] in `[0, 1]`, drawn
+     * with [style]: the fraction of pixels that carry opaque graphite. Never
+     * 1: paper always shows through somewhere, like real graphite. The
+     * [PencilStyle.pressure] gain answers light touches before the map, the
+     * [PencilStyle.density] scale packs more grains after it.
      *
-     * The strip is exactly non-overlapping: consecutive quads share their whole
-     * mitered edge, sharp turns bevel instead of pinching (the miter scale is
-     * clamped), and round caps exist only at the stroke's true ends. Nothing here
-     * may overlap because the pencil shades with alpha: every overlap would
-     * double-darken and read as a dot or a seam. Runs join seamlessly: miters
-     * peek at the neighbours outside the run, so overlapping runs emit identical
-     * shared stations, and a run never draws a cap except at the stroke's own
-     * ends — baking settled runs once lands exactly where a full repaint would.
+     * The GL cover evaluates the same map from uniforms, so the two
+     * renderers cannot drift apart (see InkShader's uDens* + uPencilCfg).
+     */
+    fun pencilDensity(p: Double, style: PencilStyle): Double =
+        pencilDensityFor(pencilEffectivePressure(p, style.pressure), style.density)
+
+    /** Effective pressure: sensitivity gain applied, NaN-proofed, clamped.
+     *  A zero (or negative) gain means "no response": pressure always reads
+     *  maximum, so the stroke keeps its darkest shade and density everywhere. */
+    fun pencilEffectivePressure(p: Double, gain: Double): Double {
+        if (gain <= 0.0) return 1.0
+        val c = if (p.isNaN()) 0.0 else p.coerceIn(0.0, 1.0)
+        return (c * gain).coerceIn(0.0, 1.0)
+    }
+
+    /** Density map over effective pressure, scaled and capped below solid. */
+    fun pencilDensityFor(pe: Double, scale: Double): Double =
+        ((PENCIL_DENSITY_BASE + PENCIL_DENSITY_SPAN * pe.pow(PENCIL_DENSITY_GAMMA)) * scale)
+            .coerceIn(0.0, PENCIL_DENSITY_MAX)
+
+    /** Density map intercept: graphite density at zero pressure. Mirrored in InkShader. */
+    const val PENCIL_DENSITY_BASE = 0.55
+
+    /** Density map slope: additional density at full pressure. Mirrored in InkShader. */
+    const val PENCIL_DENSITY_SPAN = 0.33
+
+    /** Density map gamma: lifts mid pressure toward solid. Mirrored in InkShader. */
+    const val PENCIL_DENSITY_GAMMA = 0.7
+
+    /** Hard ceiling: graphite is never fully solid, always noise. */
+    const val PENCIL_DENSITY_MAX = 0.97
+
+    /**
+     * Grain SHADE for smoothed stylus pressure [p], drawn with [style]: light
+     * pressure leaves light-grey grains, hard pressure dark graphite ones — a
+     * gradient mapping over pressure, never translucency. 0.45 mixes almost
+     * halfway to white; 1.0 is the full ink colour.
+     */
+    fun pencilShade(p: Double, style: PencilStyle): Double =
+        pencilShadeFor(pencilEffectivePressure(p, style.pressure), style.shadeResponse)
+
+    /** Shade map over effective pressure with an explicit response. */
+    fun pencilShadeFor(pe: Double, response: Double): Double =
+        (PENCIL_SHADE_BASE + (PENCIL_SHADE_SPAN * pe.pow(PENCIL_SHADE_GAMMA)) * response)
+            .coerceIn(0.0, 1.0)
+
+    /** Shade map intercept: grain colour mix at zero pressure. Mirrored in InkShader. */
+    const val PENCIL_SHADE_BASE = 0.45
+
+    /** Shade map slope: additional mix at full pressure. Mirrored in InkShader. */
+    const val PENCIL_SHADE_SPAN = 0.55
+
+    /** Shade map gamma: lifts mid pressure toward full ink. Mirrored in InkShader. */
+    const val PENCIL_SHADE_GAMMA = 0.7
+
+    /** Pressure bands: the paged renderer quantizes effective pressure into
+     *  these, so every band fills from one pre-thresholded tile at one shade. */
+    const val PENCIL_BANDS = 12
+
+    fun pencilBandOf(p: Double, gain: Double): Int =
+        (pencilEffectivePressure(p, gain) * PENCIL_BANDS).toInt().coerceIn(0, PENCIL_BANDS - 1)
+
+    fun pencilBandDensity(band: Int, scale: Double): Double =
+        pencilDensityFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, scale)
+
+    fun pencilBandShade(band: Int, response: Double): Double =
+        pencilShadeFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, response)
+
+    /**
+     * The pencil: the pen's swept ribbon — rail quads plus whole discs at the
+     * stroke's ends and at hard turns — carrying real ink colour with raw
+     * stylus pressure in the vertex alpha (see [packPencilPressure]).
      *
-     * The single-point stroke is a full disc (its own cap everywhere).
+     * Overlaps are never avoided here; the stencil-consume cover
+     * ([com.xnotes.gl.CanvasScene.drawPencil]) unions every pixel exactly
+     * once, so joins and caps are round by construction: no miters, no
+     * bevels, no fans, nothing that can spike or facet. The single-point
+     * stroke is one whole disc.
+     *
+     * Runs tile the ribbon with one shared station; settled runs bake once
+     * and the tail repaints over the same stations with the same pressures,
+     * so the seam cannot tone-shift.
      */
     fun tessellatePencil(
         g: RibbonPoints,
         from: Int,
         count: Int,
         tolerance: Double,
-        densityAt: (Int) -> Double,
+        ink: Rgba,
+        pressureAt: (Int) -> Double,
     ): MeshData {
         if (count <= 0) return MeshData.EMPTY
         val end = from + count
@@ -178,182 +256,87 @@ object StrokeTessellator {
         if (count == 1) {
             val h = g.hw(from)
             if (h > MIN_HALF_WIDTH) {
-                val d = densityAt(from)
-                b.circlePencil(g.cx(from), g.cy(from), h, tolerance, d)
+                b.circleColored(g.cx(from), g.cy(from), h, tolerance, packPencilPressure(ink, pressureAt(from)))
             }
             return b.build()
         }
         if (!g.hasRails) return b.build()
-        // Mitered rails, one station per point. Shared verbatim by neighbouring
-        // runs (the joins read the same neighbours), so seams union exactly.
-        val lx = DoubleArray(count)
-        val ly = DoubleArray(count)
-        val rx = DoubleArray(count)
-        val ry = DoubleArray(count)
-        val n = g.pointCount
-        for (k in 0 until count) {
-            val i = from + k
-            val cx = g.cx(i)
-            val cy = g.cy(i)
-            val h = g.hw(i)
-            // Neighbour directions, peeking past the run so a shared station
-            // miters identically on both sides of a bake-then-tail join.
-            val ia = maxOf(0, i - 1)
-            val ib = minOf(i + 1, n - 1)
-            var dx0 = g.cx(i) - g.cx(ia)
-            var dy0 = g.cy(i) - g.cy(ia)
-            var dx1 = g.cx(ib) - g.cx(i)
-            var dy1 = g.cy(ib) - g.cy(i)
-            var l0 = hypot(dx0, dy0)
-            var l1 = hypot(dx1, dy1)
-            if (l0 < 1e-9) {
-                dx0 = dx1
-                dy0 = dy1
-                l0 = l1
-            }
-            if (l1 < 1e-9) {
-                dx1 = dx0
-                dy1 = dy0
-                l1 = l0
-            }
-            if (l0 < 1e-9) {
-                dx0 = 1.0
-                dy0 = 0.0
-                l0 = 1.0
-            }
-            // Inward/outward unit normals (left = -normal side, like writePoint).
-            val nx0 = -dy0 / l0
-            val ny0 = dx0 / l0
-            val nx1 = -dy1 / l1
-            val ny1 = dx1 / l1
-            // Miter direction, clamped before it can spike: a bevel by another name.
-            var mx = nx0 + nx1
-            var my = ny0 + ny1
-            val ml = hypot(mx, my)
-            val scale: Double
-            if (ml < 1e-9) {
-                // Hairpin: fall back to the outgoing normal, unscaled.
-                mx = nx1
-                my = ny1
-                scale = 1.0
-            } else {
-                mx /= ml
-                my /= ml
-                val cosHalf = (mx * nx0 + my * ny0).coerceIn(0.0, 1.0)
-                scale = (1.0 / max(cosHalf, 1e-9)).coerceAtMost(MITER_LIMIT)
-            }
-            val ox = mx * h * scale
-            val oy = my * h * scale
-            lx[k] = cx - ox
-            ly[k] = cy - oy
-            rx[k] = cx + ox
-            ry[k] = cy + oy
-        }
-        // Strip quads over shared stations: no area overlaps, so alpha unions.
-        val li = IntArray(count)
-        val ci = IntArray(count)
-        val ri = IntArray(count)
-        for (k in 0 until count) {
-            val i = from + k
-            val cx = g.cx(i)
-            val cy = g.cy(i)
-            val d = densityAt(i)
-            li[k] = b.vertexPencil(lx[k], ly[k], lx[k] - cx, ly[k] - cy, d)
-            ci[k] = b.vertexPencil(cx, cy, 0.0, 0.0, d, edge = false)
-            ri[k] = b.vertexPencil(rx[k], ry[k], rx[k] - cx, ry[k] - cy, d)
-        }
-        for (k in 0 until count - 1) {
-            val h0 = g.hw(from + k)
-            val h1 = g.hw(from + k + 1)
+        // Body: one quad per segment off the rails, exactly like the pen's
+        // sweep. Consecutive quads share edges; sharp turns and folds overlap
+        // freely — the stencil cover unions them into one silhouette.
+        for (i in from until end - 1) {
+            val h0 = g.hw(i)
+            val h1 = g.hw(i + 1)
             if (h0 <= MIN_HALF_WIDTH && h1 <= MIN_HALF_WIDTH) continue
-            // Consistent winding (non-negative signed area in content space),
-            // so every consumer treats shared edges identically instead of
-            // double-covering them.
-            quadCCW(
-                b,
-                lx[k], ly[k], g.cx(from + k), g.cy(from + k), rx[k], ry[k],
-                lx[k + 1], ly[k + 1], g.cx(from + k + 1), g.cy(from + k + 1), rx[k + 1], ry[k + 1],
-                li[k], ci[k], ri[k], li[k + 1], ci[k + 1], ri[k + 1],
-            )
+            val p0 = packPencilPressure(ink, pressureAt(i))
+            val p1 = packPencilPressure(ink, pressureAt(i + 1))
+            val cx0 = g.cx(i)
+            val cy0 = g.cy(i)
+            val cx1 = g.cx(i + 1)
+            val cy1 = g.cy(i + 1)
+            val lx0 = g.leftX(i)
+            val ly0 = g.leftY(i)
+            val rx0 = g.rightX(i)
+            val ry0 = g.rightY(i)
+            val lx1 = g.leftX(i + 1)
+            val ly1 = g.leftY(i + 1)
+            val rx1 = g.rightX(i + 1)
+            val ry1 = g.rightY(i + 1)
+            val l0 = b.vertexColored(lx0, ly0, lx0 - cx0, ly0 - cy0, p0)
+            val r0 = b.vertexColored(rx0, ry0, rx0 - cx0, ry0 - cy0, p0)
+            val l1 = b.vertexColored(lx1, ly1, lx1 - cx1, ly1 - cy1, p1)
+            val r1 = b.vertexColored(rx1, ry1, rx1 - cx1, ry1 - cy1, p1)
+            b.triangle(l0, r0, r1)
+            b.triangle(l0, r1, l1)
         }
-        // Round caps, but only at the stroke's own ends: interior run joints
-        // butt-join on the shared mitered station instead, seamlessly. The fan
-        // opens away from the stroke along the end tangent.
+        // Round ends: whole discs, exactly the discs the paged renderer
+        // sweeps. A run caps only at the stroke's own ends.
         if (from == 0 && g.hw(from) > MIN_HALF_WIDTH) {
-            val dx = g.cx(minOf(1, n - 1)) - g.cx(from)
-            val dy = g.cy(minOf(1, n - 1)) - g.cy(from)
-            capFan(b, g.cx(from), g.cy(from), g.hw(from), -dx, -dy, tolerance, densityAt(from))
+            b.circleColored(g.cx(from), g.cy(from), g.hw(from), tolerance, packPencilPressure(ink, pressureAt(from)))
         }
-        if (end == n && g.hw(end - 1) > MIN_HALF_WIDTH) {
-            val dx = g.cx(end - 1) - g.cx(maxOf(0, end - 2))
-            val dy = g.cy(end - 1) - g.cy(maxOf(0, end - 2))
-            capFan(b, g.cx(end - 1), g.cy(end - 1), g.hw(end - 1), dx, dy, tolerance, densityAt(end - 1))
+        if (end == g.pointCount && g.hw(end - 1) > MIN_HALF_WIDTH) {
+            b.circleColored(g.cx(end - 1), g.cy(end - 1), g.hw(end - 1), tolerance, packPencilPressure(ink, pressureAt(end - 1)))
+        }
+        // Round joins: discs where the path turns hard, exactly like the pen.
+        // Turns accumulate along the run and reset at every disc, so a long
+        // gentle curve still gets discs before its outer edge can notch.
+        var acc = 0.0
+        for (i in from + 1 until end - 1) {
+            val h = g.hw(i)
+            if (h <= MIN_HALF_WIDTH) {
+                acc = 0.0
+                continue
+            }
+            acc += turnAngle(g, i)
+            if (acc > JOIN_DISC_ANGLE) {
+                b.circleColored(g.cx(i), g.cy(i), h, tolerance, packPencilPressure(ink, pressureAt(i)))
+                acc = 0.0
+            }
+        }
+        // A hard turn exactly on the run's last station (a bake-then-tail
+        // seam): the next run starts past it, so this run owns its disc.
+        if (end != g.pointCount && count >= 2 && turnAngle(g, end - 1) > JOIN_DISC_ANGLE) {
+            val h = g.hw(end - 1)
+            if (h > MIN_HALF_WIDTH) {
+                b.circleColored(g.cx(end - 1), g.cy(end - 1), h, tolerance, packPencilPressure(ink, pressureAt(end - 1)))
+            }
         }
         return b.build()
     }
 
-    /** Miter clamp: past this the join bevels flat instead of spiking. */
-    private const val MITER_LIMIT = 2.5
-
     /**
-     * An outward half-disc fan: the round cap a ribbon end needs, wound to
-     * union with the strip's butt edge instead of overlapping it. ([outX], [outY])
-     * aim away from the stroke along the end tangent.
+     * Packed ARGB for pencil ink carrying raw stylus pressure `[0, 1]` in the
+     * alpha channel. The cover shader maps pressure to graphite tone and
+     * multiplies the grain; because the stencil guarantees each pixel is
+     * covered once, interpolation across overlapping triangles never compounds.
      */
-    private fun capFan(
-        b: MeshBuilder,
-        cx: Double, cy: Double, r: Double,
-        outX: Double, outY: Double,
-        tolerance: Double, density: Double,
-    ) {
-        if (r <= 0.0) return
-        val hub = b.vertexPencil(cx, cy, 0.0, 0.0, density, edge = false)
-        val base = atan2(outY, outX)
-        val segments = MeshBuilder.circleSegments(r, tolerance).coerceAtLeast(4)
-        val steps = segments / 2
-        var prev = -1
-        var px = 0.0
-        var py = 0.0
-        for (k in 0..steps) {
-            val a = base - PI / 2 + PI * k / steps
-            val dx = r * kotlin.math.cos(a)
-            val dy = r * kotlin.math.sin(a)
-            val v = b.vertexPencil(cx + dx, cy + dy, dx, dy, density)
-            if (prev >= 0) {
-                triCCW(b, cx, cy, px, py, cx + dx, cy + dy, hub, prev, v)
-            }
-            prev = v
-            px = cx + dx
-            py = cy + dy
-        }
-    }
-
-    /**
-     * One strip segment as four consistently-wound triangles over its own
-     * vertices, whatever direction the stroke runs. Consistent winding is what
-     * lets every consumer treat shared edges identically instead of
-     * double-covering them.
-     */
-    private fun quadCCW(
-        b: MeshBuilder,
-        lx0: Double, ly0: Double, cx0: Double, cy0: Double, rx0: Double, ry0: Double,
-        lx1: Double, ly1: Double, cx1: Double, cy1: Double, rx1: Double, ry1: Double,
-        li0: Int, ci0: Int, ri0: Int, li1: Int, ci1: Int, ri1: Int,
-    ) {
-        triCCW(b, lx0, ly0, cx0, cy0, cx1, cy1, li0, ci0, ci1)
-        triCCW(b, lx0, ly0, cx1, cy1, lx1, ly1, li0, ci1, li1)
-        triCCW(b, cx0, cy0, rx0, ry0, rx1, ry1, ci0, ri0, ri1)
-        triCCW(b, cx0, cy0, rx1, ry1, cx1, cy1, ci0, ri1, ci1)
-    }
-
-    /** A triangle wound to non-negative signed area, whatever order the caller built. */
-    private fun triCCW(
-        b: MeshBuilder,
-        ax: Double, ay: Double, bx: Double, by: Double, cx: Double, cy: Double,
-        a: Int, c: Int, d: Int,
-    ) {
-        val area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
-        if (area >= 0) b.triangle(a, c, d) else b.triangle(a, d, c)
+    fun packPencilPressure(ink: Rgba, pressure: Double): Int {
+        val p = if (pressure.isNaN()) 0.0 else pressure.coerceIn(0.0, 1.0)
+        val a = (p * 255.0).toInt().coerceIn(0, 255)
+        return (a shl 24) or
+            (ink.r.coerceIn(0, 255) shl 16) or
+            (ink.g.coerceIn(0, 255) shl 8) or
+            ink.b.coerceIn(0, 255)
     }
 
     /**
@@ -467,3 +450,4 @@ object StrokeTessellator {
 
     private fun estimateIndices(n: Int): Int = 6 * maxOf(0, n - 1) + 6 * (MIN_CIRCLE_SEGMENTS + 2) + 48
 }
+

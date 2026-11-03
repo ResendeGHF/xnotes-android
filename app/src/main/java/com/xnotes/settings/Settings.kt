@@ -278,6 +278,8 @@ data class Settings(
             .put("pattern_color", rgbaArr(b.patternColor))
             .put("spacing", b.spacing)
             .apply { b.paperColor?.let { put("paper_color", rgbaArr(it)) } }
+            .apply { if (b.invertColors) put("invert_colors", true) }
+            .apply { if (b.invertImages) put("invert_images", true) }
 
         private fun canvasBackground(o: JSONObject?): CanvasBackground? {
             if (o == null) return null
@@ -287,6 +289,8 @@ data class Settings(
                 patternColor = rgba(o.optJSONArray("pattern_color")) ?: d.patternColor,
                 spacing = o.optDouble("spacing", d.spacing),
                 paperColor = rgba(o.optJSONArray("paper_color")),
+                invertColors = o.optBoolean("invert_colors", false),
+                invertImages = o.optBoolean("invert_images", false),
             )
         }
 
@@ -365,6 +369,10 @@ data class Settings(
             .put("neon_strength", c.neonStrength)
             .put("dash_length", c.dashLength)
             .put("dash_gap", c.dashGap)
+            .put("pencil_pressure", c.pencilPressure)
+            .put("pencil_density", c.pencilDensity)
+            .put("pencil_grain_size", c.pencilGrainSize)
+            .put("pencil_shade_response", c.pencilShadeResponse)
             .put("erase_mode", c.eraseMode.id)
             .put("switch_back_after_erase", c.switchBackAfterErase)
             .put("erase_markups", c.eraseMarkups)
@@ -379,7 +387,6 @@ data class Settings(
             .put("markup_intensity", c.markupIntensity)
             .put("tape_mode", c.tapeMode.id)
             .put("tape_pattern", c.tapePattern.id)
-            .put("pencil_grain", c.pencilGrain)
             .put("rgba", rgbaArr(c.rgba))
             .apply { c.colorOverride?.let { put("color_override", rgbaArr(it)) } }
 
@@ -398,6 +405,10 @@ data class Settings(
                 neonStrength = o.optDouble("neon_strength", d.neonStrength),
                 dashLength = o.optDouble("dash_length", d.dashLength),
                 dashGap = o.optDouble("dash_gap", d.dashGap),
+                pencilPressure = o.optDouble("pencil_pressure", d.pencilPressure),
+                pencilDensity = o.optDouble("pencil_density", d.pencilDensity),
+                pencilGrainSize = o.optDouble("pencil_grain_size", d.pencilGrainSize),
+                pencilShadeResponse = o.optDouble("pencil_shade_response", d.pencilShadeResponse),
                 eraseMode = EraseMode.fromId(o.optString("erase_mode", d.eraseMode.id)),
                 switchBackAfterErase = o.optBoolean("switch_back_after_erase", d.switchBackAfterErase),
                 eraseMarkups = o.optBoolean("erase_markups", d.eraseMarkups),
@@ -413,8 +424,6 @@ data class Settings(
                     .coerceIn(ToolConfig.MARKUP_INTENSITY_MIN, 1.0),
                 tapeMode = if (o.has("tape_mode")) TapeMode.fromId(o.optString("tape_mode")) else d.tapeMode,
                 tapePattern = if (o.has("tape_pattern")) TapePattern.fromId(o.optString("tape_pattern")) else d.tapePattern,
-                pencilGrain = o.optDouble("pencil_grain", d.pencilGrain)
-                    .coerceIn(ToolConfig.PENCIL_GRAIN_MIN, ToolConfig.PENCIL_GRAIN_MAX),
                 colorOverride = o.optJSONArray("color_override")
                     ?.let { a -> Rgba.fromList((0 until a.length()).map { i -> a.optInt(i, 0) }) }
                     ?: d.colorOverride,

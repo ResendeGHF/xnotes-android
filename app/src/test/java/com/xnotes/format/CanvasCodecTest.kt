@@ -159,6 +159,36 @@ class CanvasCodecTest {
         assertNull(readManifest("""{"format":"xcanvas","created":12,"items":[]}""").created)
     }
 
+    @Test fun invertFlagsRoundTripAndAreOmittedWhenOff() {
+        val on = InfiniteDocument()
+        on.background = CanvasBackground(invertColors = true, invertImages = true)
+        val back = roundTrip(on)
+        assertTrue(back.background.invertColors)
+        assertTrue(back.background.invertImages)
+        assertTrue(manifestText(on).contains("\"invert_colors\""))
+        assertTrue(manifestText(on).contains("\"invert_images\""))
+
+        val inkOnly = InfiniteDocument()
+        inkOnly.background = CanvasBackground(invertColors = true)
+        val backInkOnly = roundTrip(inkOnly)
+        assertTrue(backInkOnly.background.invertColors)
+        assertFalse(backInkOnly.background.invertImages)
+        assertTrue(!manifestText(inkOnly).contains("\"invert_images\""))
+
+        val off = InfiniteDocument()
+        assertFalse(off.background.invertColors)
+        assertFalse(off.background.invertImages)
+        assertFalse(roundTrip(off).background.invertColors)
+        assertFalse(roundTrip(off).background.invertImages)
+        assertTrue(!manifestText(off).contains("invert"))
+    }
+
+    @Test fun invertFlagsForgivingWhenAbsentOrMalformed() {
+        val doc = readManifest("""{"format":"xcanvas","background":{"pattern":"grid"},"items":[]}""")
+        assertFalse(doc.background.invertColors)
+        assertFalse(doc.background.invertImages)
+    }
+
     @Test fun aPeekReadsTheCreatedTimeWithoutLoadingTheCanvas() {
         val dir = Files.createTempDirectory("xcanvas-peek").toFile()
         try {
@@ -303,15 +333,15 @@ class CanvasCodecTest {
         assertEquals(10.0, dashed.config.dashLength, 1e-9)
         assertEquals(8.0, dashed.config.dashGap, 1e-9)
         val pencil = back.items[1] as Stroke
-        assertEquals(ToolConfig.DEFAULT_PENCIL_GRAIN, pencil.config.pencilGrain, 1e-9)
+        assertEquals(Tool.PENCIL, pencil.tool)
     }
 
-    @Test fun pencilGrainRoundTripsAndStaysPencilOnly() {
+    @Test fun pencilPressureRoundTrips() {
         val doc = InfiniteDocument()
         doc.add(
             Stroke(
                 Tool.PENCIL,
-                ToolDefaults.configFor(Tool.PENCIL).copy(pencilGrain = 0.8),
+                ToolDefaults.configFor(Tool.PENCIL),
                 mutableListOf(Sample(0.0, 0.0, 0.2), Sample(12.0, 4.0, 0.9)),
             ),
         )
@@ -322,13 +352,11 @@ class CanvasCodecTest {
                 mutableListOf(Sample(0.0, 0.0, 1.0), Sample(12.0, 4.0, 1.0)),
             ),
         )
-        val text = manifestText(doc)
-        assertTrue(text.contains("\"pencil_grain\""))
         val back = roundTrip(doc)
-        assertEquals(0.8, (back.items[0] as Stroke).config.pencilGrain, 1e-9)
         assertEquals(Tool.PENCIL, (back.items[0] as Stroke).tool)
-        // A pen stroke never carries the field: byte-stable output for existing ink.
-        assertEquals(ToolConfig.DEFAULT_PENCIL_GRAIN, (back.items[1] as Stroke).config.pencilGrain, 1e-9)
+        // Pressure survives the trip: it is the pencil's tone channel.
+        assertEquals(0.2, (back.items[0] as Stroke).samples[0].pressure, 1e-3)
+        assertEquals(0.9, (back.items[0] as Stroke).samples[1].pressure, 1e-3)
     }
 
     @Test fun neonAndStraightSurvive() {

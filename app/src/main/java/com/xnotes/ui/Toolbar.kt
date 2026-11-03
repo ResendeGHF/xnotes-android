@@ -328,7 +328,7 @@ private fun ToolbarItemView(
         ToolbarItem.COLORS -> editor.toolbarColors.take(editor.toolbarColorCount).forEachIndexed { i, color ->
             Box {
                 Swatch(
-                    color = color.toComposeColor(),
+                    color = editor.swatchDisplayColor(color).toComposeColor(),
                     active = i == editor.activeColorIndex,
                     drag = editor,
                     ink = color,
@@ -691,6 +691,7 @@ private fun NoteInsertMenu(
     onInsertNoteLink: () -> Unit = {},
 ) {
     var stickersOpen by remember { mutableStateOf(false) }
+    var handwriteOpen by remember { mutableStateOf(false) }
     InsertButton(
         owner = editor,
         imageRows = listOf(
@@ -701,12 +702,14 @@ private fun NoteInsertMenu(
             InsertRow(XnotesIcons.page, stringResource(R.string.image_as_page)) { onImagePage() },
             InsertRow(XnotesIcons.link, stringResource(R.string.insert_note_link)) { onInsertNoteLink() },
             InsertRow(XnotesIcons.note, stringResource(R.string.sticky_note)) { editor.insertStickyNote() },
+            InsertRow(XnotesIcons.fontFace, stringResource(R.string.handwrite_menu)) { handwriteOpen = true },
             InsertRow(XnotesIcons.sticker, stringResource(R.string.stickers), more = true) { stickersOpen = true },
         ),
         onAudioFromFile = onInsertAudio,
         onRecord = onRecordAudio,
     ) {
         if (stickersOpen) StickersMenu(editor, onAddStickers) { stickersOpen = false }
+        if (handwriteOpen) TextToStrokesDialog(editor.controller, onDismiss = { handwriteOpen = false }, onMessage = editor::showToast)
     }
 }
 

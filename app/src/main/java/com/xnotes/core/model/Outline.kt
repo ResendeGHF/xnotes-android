@@ -12,6 +12,8 @@ import com.xnotes.core.stroke.Sample
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolDefaults
 import com.xnotes.core.vector.PathFlattener
+import com.xnotes.core.vector.VectorContour
+import com.xnotes.core.vector.VectorSeg
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -22,8 +24,42 @@ import kotlin.math.sqrt
  */
 internal object Outline {
 
+    /** Control cage of a contour: every flattened point lies inside it, so a circle far from it is far from the curve. */
+    private fun controlBounds(c: VectorContour): Rect {
+        var minX = c.start.x
+        var minY = c.start.y
+        var maxX = minX
+        var maxY = minY
+        for (s in c.segments) {
+            if (s is VectorSeg.Cubic) {
+                if (s.c1.x < minX) minX = s.c1.x else if (s.c1.x > maxX) maxX = s.c1.x
+                if (s.c1.y < minY) minY = s.c1.y else if (s.c1.y > maxY) maxY = s.c1.y
+                if (s.c2.x < minX) minX = s.c2.x else if (s.c2.x > maxX) maxX = s.c2.x
+                if (s.c2.y < minY) minY = s.c2.y else if (s.c2.y > maxY) maxY = s.c2.y
+            }
+            if (s.end.x < minX) minX = s.end.x else if (s.end.x > maxX) maxX = s.end.x
+            if (s.end.y < minY) minY = s.end.y else if (s.end.y > maxY) maxY = s.end.y
+        }
+        return Rect(minX, minY, maxX - minX, maxY - minY)
+    }
+
     /** Does [p] land within [tol] of a stroked path, or inside a filled head, or in a fill when [filled]? */
     fun hits(paths: List<ShapePath>, p: Pt, tol: Double, filled: Boolean): Boolean {
+        // Near-miss fast path: a point outside every control cage and farther than [tol] from
+        // all of them can be neither inside a fill ring nor near a stroked one.
+        var maybe = false
+        for (path in paths) for (c in path.contours) {
+            val b = controlBounds(c)
+            if (b.contains(p)) {
+                maybe = true
+                break
+            }
+            if (b.distanceTo(p) <= tol + HIT_FLATTEN) {
+                maybe = true
+                break
+            }
+        }
+        if (!maybe) return false
         for (path in paths) {
             val rings = path.contours.map { PathFlattener.flatten(it, HIT_FLATTEN) }
             if ((path.role == PathRole.HEAD_FILLED || (filled && path.role.fills)) && inRings(rings, p)) return true
@@ -76,8 +112,26 @@ internal object Outline {
      * and width, dashed where the path was and neon when [neon]. Null when nothing is stroked.
      */
     fun cut(paths: List<ShapePath>, pen: Pen, neon: Boolean, neonStrength: Double, c: Pt, radius: Double): Pair<Boolean, List<CanvasItem>>? {
-        val outlines = paths
-            .filter { it.role.strokes }
+        val stroked = paths.filter { it.role.strokes }
+        if (stroked.isEmpty()) return null
+        // Near-miss fast path: no control cage comes within the circle, so no flattened curve
+        // can either. The caller discards the ink when untouched, so returning no runs here is
+        // the same observable result without flattening a single curve.
+        var maybe = false
+        for (p in stroked) for (ct in p.contours) {
+            // A point-like contour flattens to fewer than two points and takes the null path
+            // below; leave those to the full logic so the whole-erase fallback still applies.
+            if (ct.segments.isEmpty()) {
+                maybe = true
+                break
+            }
+            if (controlBounds(ct).distanceTo(c) <= radius + ERASE_FLATTEN) {
+                maybe = true
+                break
+            }
+        }
+        if (!maybe) return false to emptyList()
+        val outlines = stroked
             .flatMap { p ->
                 val dashes = ShapePainter.strokePen(p.role, pen)?.takeIf { it.dashed }
                 p.contours.map { Triple(PathFlattener.flatten(it, ERASE_FLATTEN), it.closed, dashes) }

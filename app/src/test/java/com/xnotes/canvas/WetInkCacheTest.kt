@@ -118,6 +118,15 @@ class WetInkCacheTest {
         assertTrue("neither should have taken a surface", factory.created.isEmpty())
     }
 
+    @Test fun pencilKeepsThePlainRedrawSoCrossingsNeverDarken() {
+        // The pencil's bands replace each other inside one isolating layer,
+        // which only works when settled runs and the tail paint together. A
+        // baked settled run with a composited tail over it would darken where
+        // the stroke crosses itself — the committed look it has to match.
+        assertFalse("pencil must not be baked in pieces", frame(liveStroke(Tool.PENCIL, 300)).first)
+        assertTrue("no surface for pencil", factory.created.isEmpty())
+    }
+
     @Test fun theTaperPenKeepsThePlainRedraw() {
         assertFalse(frame(liveStroke(Tool.TAPER, 300)).first)
         assertTrue(factory.created.isEmpty())

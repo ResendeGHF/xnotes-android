@@ -81,6 +81,15 @@ class SdocxVerify2Test {
             assertTrue("audios", audios>=1)
             assertTrue("tables", tables>=1)
             assertTrue("stickies (nested sdocx)", stickies>=1)
+            // Sticky lands on its own host page at the recorded collapse
+            // position (not on a new blank page at 40,40).
+            val stickyItem = doc.pages.flatMap { it.items }.filterIsInstance<com.xnotes.core.model.StickyNoteItem>().firstOrNull()
+            assertNotNull("sticky item", stickyItem)
+            assertTrue("sticky x ${stickyItem!!.rect.x}", stickyItem.rect.x in 680.0..695.0)
+            assertTrue("sticky y ${stickyItem.rect.y}", stickyItem.rect.y in 380.0..395.0)
+            val hostPage = doc.pages.firstOrNull { it.items.contains(stickyItem) }
+            assertNotNull("sticky host page", hostPage)
+            assertEquals("host page holds only the sticky", 1, hostPage!!.items.size)
             // Table values: body table has 1..6
             val tbl = doc.pages.flatMap { it.items }.filterIsInstance<TableItem>().firstOrNull()
             assertNotNull("table item", tbl)
@@ -94,6 +103,29 @@ class SdocxVerify2Test {
             val aud = doc.pages.flatMap { it.items }.filterIsInstance<AudioItem>()
             assertTrue(aud.isNotEmpty() && aud[0].audio.file.exists())
         } finally { tmp.deleteRecursively() }
+    }
+
+    @Test fun stickerPlacementParsedFromHostPage() {
+        val file = File("/tmp/opencode/notes-ref/test/Over_the_Horizon_261010_011234.sdocx")
+        Assume.assumeTrue(file.exists())
+        val entries = HashMap<String, ByteArray>()
+        ZipFile(file).use { zf ->
+            val e = zf.entries()
+            while (e.hasMoreElements()) {
+                val en = e.nextElement()
+                if (!en.isDirectory) entries[en.name] = zf.getInputStream(en).readBytes()
+            }
+        }
+        // The sticker host page carries co_attach_file + skn_collapse_rect in its flex.
+        val parsed = SdocxParser.parseArchive(entries)
+        val hosts = parsed.pages.filter { it.stickers.isNotEmpty() }
+        assertEquals(1, hosts.size)
+        val st = hosts[0].stickers[0]
+        assertEquals(10, st.bindId)
+        assertNotNull(st.collapseRect)
+        assertTrue(st.collapseRect!!.left in 680.0..695.0)
+        assertTrue(st.collapseRect!!.top in 380.0..395.0)
+        assertEquals(-6482, st.bgColorArgb)
     }
 
     @Test fun exportHasTitleAndPens() {

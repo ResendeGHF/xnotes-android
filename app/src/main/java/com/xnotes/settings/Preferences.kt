@@ -37,7 +37,8 @@ data class Preferences(
     val customPageHeightMm: Double = 297.0,
     /** Whether a finger draws (true) or pans (false, default). The stylus always draws. */
     val fingerDraws: Boolean = false,
-    /** Panning allowed while zoom is locked: "single" (default) | "double" | "none". */
+    /** New notes and canvases start with color inversion on. Never touches existing notes. */
+    val invertColorsByDefault: Boolean = false,    /** Panning allowed while zoom is locked: "single" (default) | "double" | "none". */
     val zoomLockPan: String = "single",
     /** Whether holding a freehand ink stroke still snaps it to a recognized shape. */
     val detectShapes: Boolean = true,
@@ -136,6 +137,8 @@ data class Preferences(
     val pdfHeadingBookmarks: Boolean = true,
     /** Shape chips and picker pages, by key, left out of the shape popup. */
     val hiddenShapes: Set<String> = emptySet(),
+    /** Serve notes over encrypted TLS on the LAN for the desktop companion. */
+    val shareEnabled: Boolean = false,
 ) {
     /**
      * A new note's page size in document pixels. A named size is laid out under
@@ -184,6 +187,7 @@ data class Preferences(
         .put("stylus_button_2_tap", stylusButton2Tap)
         .put("volume_keys_turn_pages", volumeKeysTurnPages)
         .put("side_margin", sideMargin)
+        .put("invert_colors_by_default", invertColorsByDefault)
         .put("hide_page_borders", hidePageBorders)
         .put("min_zoom_enabled", minZoomEnabled)
         .put("min_zoom_percent", minZoomPercent)
@@ -237,6 +241,7 @@ data class Preferences(
         .put("hide_dot_items", hideDotItems)
         .apply { readerDark?.let { put("reader_dark", it) } }
         .put("pdf_heading_bookmarks", pdfHeadingBookmarks)
+        .put("share_enabled", shareEnabled)
         .apply { if (hiddenShapes.isNotEmpty()) put("hidden_shapes", org.json.JSONArray(hiddenShapes.sorted())) }
 
     companion object {
@@ -319,6 +324,7 @@ data class Preferences(
                 stylusButton2Tap = tapAction("stylus_button_2_tap"),
                 volumeKeysTurnPages = o.optBoolean("volume_keys_turn_pages", false),
                 sideMargin = o.optDouble("side_margin", 16.0).coerceIn(0.0, 80.0),
+                invertColorsByDefault = o.optBoolean("invert_colors_by_default", false),
                 hidePageBorders = o.optBoolean("hide_page_borders", false),
                 minZoomEnabled = o.optBoolean("min_zoom_enabled", false),
                 minZoomPercent = o.optInt("min_zoom_percent", 50).coerceIn(ZOOM_LIMIT_MIN_PCT, ZOOM_LIMIT_MAX_PCT),
@@ -355,6 +361,7 @@ data class Preferences(
                 hideDotItems = o.optBoolean("hide_dot_items", true),
                 readerDark = if (o.has("reader_dark")) o.optBoolean("reader_dark") else null,
                 pdfHeadingBookmarks = o.optBoolean("pdf_heading_bookmarks", true),
+                shareEnabled = o.optBoolean("share_enabled", false),
                 hiddenShapes = o.optJSONArray("hidden_shapes")?.let { a -> (0 until a.length()).mapNotNull { a.optString(it).ifEmpty { null } }.toSet() }.orEmpty(),
             )
         }

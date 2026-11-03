@@ -583,7 +583,11 @@ object StrokeEngine {
         // disc would shrink to a thin tip; hold the body width out to each end so it meets the line
         // at full width. The other ribbon pens take their ends at the raw pressure.
         val sp = emaByArc(rawP, steps, smoothLen)
-        if (holdEnds && pressureEnabled) holdEndPressure(sp)
+        // Held ends floor the touchdown/liftoff ramps for every tool that
+        // holds them. Widths only listen when pressure is enabled, so the
+        // pencil (constant width) keeps just the tone benefit: no light
+        // gradient where the stroke lands or lifts.
+        if (holdEnds) holdEndPressure(sp)
 
         fun hw(i: Int, ty: Double) = halfWidth(baseWidth, pressureEnabled, m, ds, sp[i], ty)
 
@@ -594,6 +598,7 @@ object StrokeEngine {
             return StrokeGeometry(
                 floatArrayOf(sx[0].toFloat(), sy[0].toFloat()),
                 floatArrayOf(h.toFloat()),
+                pressures = floatArrayOf(sp[0].toFloat()),
             )
         }
 
@@ -667,6 +672,9 @@ object StrokeEngine {
         val halfWidths = FloatArray(n)
         val leftRail = FloatArray(2 * n)
         val rightRail = FloatArray(2 * n)
+        // The smoothed pressure each point drew at, kept for tools that shade
+        // from pressure rather than shaping width from it (the pencil).
+        val pressures = FloatArray(n) { sp[it].toFloat() }
         for (i in 0 until n) {
             // Clamped to [-1, DOT_DIR_Y], not to [-1, 1]: a dot is 1.5 on purpose, past the broad
             // face, so a cap at 1.0 would quietly shrink every tap.
@@ -676,7 +684,7 @@ object StrokeEngine {
             if (tf != null) h *= tf[i]
             writePoint(centerline, halfWidths, leftRail, rightRail, i, sx[i], sy[i], tx[i], ty[i], h)
         }
-        return StrokeGeometry(centerline, halfWidths, leftRail, rightRail)
+        return StrokeGeometry(centerline, halfWidths, leftRail, rightRail, pressures)
     }
 
     /**

@@ -93,6 +93,7 @@ fun Document.deepCopy(measurer: TextMeasurer): Document = Document(
     templates = templates,
     templatePackages = templatePackages,
     newPageSize = newPageSize,
+    mathStudioJson = mathStudioJson,
 )
 
 /**
@@ -129,4 +130,5 @@ fun Document.snapshot(): Document = Document(
     templates = templates,
     templatePackages = templatePackages,
     newPageSize = newPageSize,
+    mathStudioJson = mathStudioJson,
 )

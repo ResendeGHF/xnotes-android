@@ -25,6 +25,14 @@ interface RibbonPoints {
     fun cy(i: Int): Double
     fun hw(i: Int): Double
 
+    /**
+     * Smoothed stylus pressure at each point, in `[0, 1]`. The pencil shades
+     * graphite load from this while its width stays constant; every other tool
+     * shapes width from it instead. Backed by the same channel the widths were
+     * smoothed from, so live and committed runs read identical values.
+     */
+    fun pw(i: Int): Double
+
     /** Whether both edges carry a vertex per point, i.e. the ribbon has a body rather than being a dot. */
     val hasRails: Boolean
 
@@ -59,6 +67,9 @@ class StrokeGeometry(
     val leftRail: FloatArray = EMPTY_F,
     /** Ribbon's right edge, interleaved x,y, in the same order (not reversed). */
     val rightRail: FloatArray = EMPTY_F,
+    /** Smoothed stylus pressure per centreline point, in `[0, 1]`; empty when
+     *  the builder did not keep the channel (read [pw] only within a ribbon). */
+    val pressures: FloatArray = EMPTY_F,
 ) : RibbonPoints {
     /** Number of centerline points (one per input sample). */
     override val pointCount get() = halfWidths.size
@@ -69,6 +80,7 @@ class StrokeGeometry(
     override fun cx(i: Int): Double = centerline[2 * i].toDouble()
     override fun cy(i: Int): Double = centerline[2 * i + 1].toDouble()
     override fun hw(i: Int): Double = halfWidths[i].toDouble()
+    override fun pw(i: Int): Double = pressures[i].toDouble()
 
     override fun leftX(i: Int): Double = leftRail[2 * i].toDouble()
     override fun leftY(i: Int): Double = leftRail[2 * i + 1].toDouble()

@@ -39,9 +39,12 @@ class BackgroundShader(contextGen: Int) {
     ) {
         program.use()
         program.set("uViewport", viewportW.toFloat(), viewportH.toFloat())
-        program.set("uPaper", paper.r / 255f, paper.g / 255f, paper.b / 255f, paper.a / 255f)
+        // Color inversion shows the paper and the ruling lightness-inverted, alpha untouched.
+        val paperEff = if (background.invertColors) paper.inverted() else paper
+        program.set("uPaper", paperEff.r / 255f, paperEff.g / 255f, paperEff.b / 255f, paperEff.a / 255f)
         val ink = background.patternColor
-        program.set("uInk", ink.r / 255f, ink.g / 255f, ink.b / 255f, ink.a / 255f)
+        val inkEff = if (background.invertColors) ink.inverted() else ink
+        program.set("uInk", inkEff.r / 255f, inkEff.g / 255f, inkEff.b / 255f, inkEff.a / 255f)
         program.set("uMode", modeOf(background.pattern))
         program.set("uPeriod", resolved.periodPx.toFloat())
         program.set("uPhase", resolved.phaseXPx.toFloat(), resolved.phaseYPx.toFloat())

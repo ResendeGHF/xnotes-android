@@ -8,6 +8,37 @@ data class Rgba(val r: Int, val g: Int, val b: Int, val a: Int = 255) {
 
     fun withAlpha(newAlpha: Int): Rgba = copy(a = newAlpha.coerceIn(0, 255))
 
+    /** Inverted copy for the color-inversion display mode (alpha untouched, see below). */
+    fun inverted(): Rgba = hslLightnessFlipped()
+
+    /**
+     * This app's color-inversion algorithm (same as the notes app's `withInversion`): the HSL
+     * lightness flipped end for end (`1 - L`), hue and saturation kept, alpha untouched. Reds
+     * stay red instead of turning cyan; white/black/greys behave like a plain invert.
+     * Replicates Dart's `HSLColor` conversion branch for branch (including round-half-up),
+     * so object colours match that app's inversion exactly.
+     */
+    private fun hslLightnessFlipped(): Rgba {
+        val r = r / 255.0
+        val g = g / 255.0
+        val b = b / 255.0
+        val max = maxOf(r, g, b)
+        val min = minOf(r, g, b)
+        val l = (max + min) / 2.0
+        var h = 0.0
+        var s = 0.0
+        if (max != min) {
+            val d = max - min
+            s = if (l > 0.5) d / (2.0 - max - min) else d / (max + min)
+            h = when {
+                max == r -> (g - b) / d + (if (g < b) 6.0 else 0.0)
+                max == g -> (b - r) / d + 2.0
+                else -> (r - g) / d + 4.0
+            } / 6.0
+        }
+        return hslToRgba(h, s, 1.0 - l, a)
+    }
+
     /** Perceived brightness in [0, 1], by the Rec. 709 weights. */
     fun luminance(): Double = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
 
@@ -61,4 +92,23 @@ data class Rgba(val r: Int, val g: Int, val b: Int, val a: Int = 255) {
 
         fun toHex(c: Rgba): String = "#%02x%02x%02x".format(c.r, c.g, c.b)
     }
+}
+
+/** Dart `double.round()` (half away from zero) for channel values known non-negative. */
+private fun roundChannel(v: Double): Int = kotlin.math.floor(v + 0.5).toInt().coerceIn(0, 255)
+
+/** Dart `HSLColor.toColor`, shared by [Rgba.inverted]. */
+private fun hslToRgba(h: Double, s: Double, l: Double, a: Int): Rgba {
+    val chroma = (1.0 - kotlin.math.abs(2.0 * l - 1.0)) * s
+    val secondary = chroma * (1.0 - kotlin.math.abs(((h * 6.0) % 2.0) - 1.0))
+    val m = l - chroma / 2.0
+    val (rr, gg, bb) = when {
+        h < 1.0 / 6.0 -> Triple(chroma, secondary, 0.0)
+        h < 2.0 / 6.0 -> Triple(secondary, chroma, 0.0)
+        h < 3.0 / 6.0 -> Triple(0.0, chroma, secondary)
+        h < 4.0 / 6.0 -> Triple(0.0, secondary, chroma)
+        h < 5.0 / 6.0 -> Triple(secondary, 0.0, chroma)
+        else -> Triple(chroma, 0.0, secondary)
+    }
+    return Rgba(roundChannel((rr + m) * 255.0), roundChannel((gg + m) * 255.0), roundChannel((bb + m) * 255.0), a)
 }

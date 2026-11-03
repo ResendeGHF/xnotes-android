@@ -28,7 +28,9 @@ enum class PageSize(val displayName: String, val shortMm: Double, val longMm: Do
     LETTER("Letter", 215.9, 279.4),
     LEGAL("Legal", 215.9, 355.6),
     SLIDE_16_9("Slide 16:9", 190.5, 338.7),
-    SLIDE_4_3("Slide 4:3", 190.5, 254.0);
+    SLIDE_4_3("Slide 4:3", 190.5, 254.0),
+    /** Samsung Notes page (1440 x 2036 px at 150 dpi): used when importing `.sdocx` notes. */
+    SAMSUNG_NOTES("Samsung Notes", 243.84, 344.76);
 
     /** Returns `(width, height)` in document pixels for [orientation] at [dpi]. */
     fun pixels(orientation: Orientation, dpi: Int): Pair<Double, Double> {

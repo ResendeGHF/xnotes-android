@@ -10,7 +10,9 @@ import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Orientation
 import com.xnotes.core.model.Page
+import com.xnotes.core.model.PagePattern
 import com.xnotes.core.model.PageSize
+import com.xnotes.core.model.PageSizeChoice
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
@@ -38,13 +40,15 @@ import kotlin.math.roundToInt
  * Converts a parsed Samsung Notes document into an xnotes [Document].
  *
  * Covers pages, strokes (+ colors/widths, including type-15 development
- * strokes and single-tap dots), raster images (page objects,
- * page-background and note-body photos), single-PDF backgrounds, text boxes
- * (+ shape labels), basic shapes and straight lines (as editable shapes),
- * free outlines (as polygon/polyline shapes), tables (type-22 page objects
- * and note-body tables, with cell values), sticky memos (nested `.sdocx`
- * sub-notes as [StickyNoteItem]) and voice memos (as audio pills, any
- * container sniffed by magic).
+ * strokes and single-tap dots, plus base-frame creation times for replay),
+ * raster images (page objects, page-background and note-body photos mapped
+ * onto their pages), single-PDF backgrounds, text boxes (+ shape labels),
+ * basic shapes and straight lines (as editable shapes), free outlines (as
+ * polygon/polyline shapes), tables (type-22 page objects and note-body
+ * tables, with cell values), sticky memos (nested `.sdocx` sub-notes as
+ * [StickyNoteItem]) and audio (imported files as type-10 voice-memo pills;
+ * recorded-while-writing sessions as note-level pills with per-stroke
+ * [SyncMark] replay offsets so ink re-appears with the audio).
  *
  * Deliberately dropped: fills on imported shapes (outlines only), text
  * rotation (boxes land upright), mixed per-range styling (collapses to
@@ -52,6 +56,13 @@ import kotlin.math.roundToInt
  * face), video/painting media and containers' hidden layers.
  */
 object SdocxImport {
+    private class NoteVoiceSlot(
+        val voice: SdocxNoteVoice,
+        val rid: Int,
+        val startUs: Long?,
+        val endUs: Long?,
+    )
+
     fun toDocument(
         sdocx: SdocxDocument,
         dpi: Int,
@@ -65,6 +76,19 @@ object SdocxImport {
         if (!sdocx.title.isNullOrBlank()) {
             doc.displayName = sdocx.title
         }
+
+        // Bind ids already claimed by an explicit placement, so the fallback
+        // scan below prefers media no placement names (then anything unused).
+        // Without this, one unresolvable photo would show another photo's
+        // bytes once per placement instead of its own.
+        val referencedIds: Set<Int> = try {
+            (sdocx.pages.flatMap { it.images }.mapNotNull { it.mediaId } +
+                sdocx.bodyImages.mapNotNull { it.mediaId } +
+                sdocx.pages.mapNotNull { it.backgroundImageId }).toSet()
+        } catch (_: Exception) {
+            emptySet()
+        }
+        val usedImages = HashSet<SdocxMediaEntry>()
 
         // Single-PDF case: the media referenced by the most pages wins. Pages
         // referencing any other PDF import as plain pages (strokes preserved).
@@ -87,19 +111,74 @@ object SdocxImport {
         if (pdfFile != null) doc.pdfFile = pdfFile
 
         var nextRid = 0
-        val (fallbackW, fallbackH) = PageSize.A4.pixels(Orientation.PORTRAIT, dpi)
+        // Note-level recorded audio ("record while writing"): allocate rids up
+        // front so per-stroke replay marks can point at them while pages import.
+        // Each entry keeps its replay interval in microseconds since epoch.
+        val noteVoiceSlots: List<NoteVoiceSlot> = try {
+            sdocx.noteVoices.map { v ->
+                val slot = NoteVoiceSlot(v, nextRid++, v.startUs, v.endUs)
+                slot
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+        fun syncForStroke(strokeTsUs: Long?): com.xnotes.core.model.SyncMark? {
+            try {
+                val ts = strokeTsUs ?: return null
+                // Garbage base-frame timestamps (far-future uninitialized data
+                // seen on some writers) must never sync ink to a recording.
+                if (ts < 1_000_000_000_000L || ts > 4_000_000_000_000_000L) return null
+                for (slot in noteVoiceSlots) {
+                    val s = slot.startUs
+                    val e = slot.endUs
+                    if (s == null || e == null) continue
+                    if (ts < s || ts > e) continue
+                    val dur = slot.voice.durationMs.takeIf { it > 0 } ?: continue
+                    val ms = ((ts - s) / 1000L).coerceIn(0L, dur.toLong()).toInt()
+                    return com.xnotes.core.model.SyncMark(slot.rid, ms)
+                }
+            } catch (_: Exception) {
+            }
+            return null
+        }
+        // Samsung pages are 1440 x 2036 px; fall back to the Samsung size
+        // (not A4) when a header carries no usable dimensions.
+        val (fallbackW, fallbackH) = PageSize.SAMSUNG_NOTES.pixels(Orientation.PORTRAIT, dpi)
+        // Note-level Samsung default template: pages without a template of
+        // their own inherit this, so the note keeps one editable default
+        // instead of an explicit copy stamped onto every page.
+        try {
+            val notePattern = SdocxMapping.samsungTemplateToPattern(null, sdocx.defaultTemplateUri)
+            if (notePattern != PagePattern.NONE.id && notePattern != "none") {
+                doc.style = doc.style.copy(template = notePattern)
+            }
+        } catch (_: Exception) {
+        }
+        // Pre-parse sticker sub-notes once: host pages that yield real
+        // content are kept (not dropped as empty shells) and the sticky is
+        // placed back on its own host page at its recorded position.
+        val stickerContents = parseStickerContents(sdocx, textMeasurer)
+        val hostPageOf = HashMap<SdocxPage, Page>()
         for (spage in sdocx.pages) {
             val w = saneDim(spage.width, fallbackW)
             val h = saneDim(spage.height, fallbackH)
             val page = Page(w, h)
 
+            // Background levels mirror Samsung's own structure: only what the
+            // page record itself carries becomes a per-page override (explicit
+            // blank stays plain so it never inherits an unrelated ruling).
+            // Samsung's factory tint means "no override" and stays inheritable
+            // (editable, rendering the same under the default theme); a truly
+            // custom tint stays explicit. Anything else inherits the note
+            // default above, keeping All-Pages editing alive.
             var style = PageStyle()
-            if (spage.backgroundColorArgb != null) {
-                style = style.copy(pageColor = Rgba.fromArgb(spage.backgroundColorArgb))
+            spage.backgroundColorArgb?.let { argb ->
+                if (argb != SdocxMapping.SAMSUNG_DEFAULT_PAPER_ARGB) {
+                    style = style.copy(pageColor = Rgba.fromArgb(argb))
+                }
             }
-            val pattern = SdocxMapping.samsungTemplateToPattern(spage.templateType, spage.templateUri ?: sdocx.defaultTemplateUri)
-            if (pattern != "none") {
-                style = style.copy(template = pattern)
+            SdocxMapping.samsungPageTemplate(spage.templateType, spage.templateUri)?.let {
+                style = style.copy(template = it)
             }
             page.style = style
 
@@ -110,15 +189,24 @@ object SdocxImport {
             }
 
             for (s in spage.strokes) {
-                toStroke(s)?.let { page.items.add(it) }
+                try {
+                    toStroke(s)?.let { stroke ->
+                        try {
+                            syncForStroke(s.createdTimeUs)?.let { stroke.sync = it }
+                        } catch (_: Exception) {
+                        }
+                        page.items.add(stroke)
+                    }
+                } catch (_: Exception) {
+                }
             }
             // Page-background photos (bgImageId) carry real images on some
             // Samsung writers: import them edge-to-edge under the ink.
             spage.backgroundImageId?.let { bgId ->
-                toBackgroundImage(bgId, sdocx, imageDir, imageCodec, w, h)?.let { page.items.add(0, it) }
+                toBackgroundImage(bgId, sdocx, imageDir, imageCodec, w, h, usedImages)?.let { page.items.add(0, it) }
             }
             for (im in spage.images) {
-                toImage(im, sdocx, imageDir, imageCodec)?.let { page.items.add(it) }
+                toImage(im, sdocx, imageDir, imageCodec, usedImages, referencedIds)?.let { page.items.add(it) }
             }
             for (t in spage.textBoxes) {
                 toTextBox(t, textMeasurer)?.let { page.items.add(it) }
@@ -137,52 +225,95 @@ object SdocxImport {
             }
 
             // Drop fully-empty shells (attachment collapses, trailing blanks) but keep
-            // pattern-only pages and meaningfully-tinted pages: they are real
-            // content. The default paper tint alone is not meaningful. Keep at
-            // least one page overall.
+            // pattern-only pages, meaningfully-tinted pages and sticker hosts:
+            // they are real content. The default paper tint alone is not meaningful.
+            // Keep at least one page overall.
             val hasPdf = page.pdfPage != null
-            val defaultBg = 0xFFFCFCFC.toInt()
-            val hasMeaningfulStyle = pattern != "none" ||
+            val defaultBg = SdocxMapping.SAMSUNG_DEFAULT_PAPER_ARGB
+            val resolvedPattern = page.style.template ?: doc.style.template ?: PagePattern.NONE.id
+            val hasMeaningfulStyle = resolvedPattern != PagePattern.NONE.id && resolvedPattern != "none" ||
                 (spage.backgroundColorArgb != null && spage.backgroundColorArgb != defaultBg)
-            if (page.items.isEmpty() && !hasPdf && !hasMeaningfulStyle) continue
+            val hostsSticky = spage.stickers.any { stickerContents.containsKey(it.bindId) }
+            if (page.items.isEmpty() && !hasPdf && !hasMeaningfulStyle && !hostsSticky) continue
             doc.pages.add(page)
+            hostPageOf[spage] = page
         }
 
-        // Photos pasted into Samsung text live in note.note's body, not in any
-        // page: lay each on its own page so none vanish. Empty pages take one
-        // first (never covering ink or PDF paper); the rest append new pages.
+        // Photos pasted into Samsung text live in note.note's body, not in
+        // any page. Their stored bbox is kept (position/size on the page are
+        // accurate); the page itself is resolved in order: the first photo
+        // lands on its mapped page, each following photo that would collide
+        // onto the same page advances to the next page instead, so no two
+        // photos ever stack on the first page. Placements without a usable
+        // bbox reuse an empty page first (never covering ink or PDF paper,
+        // and never a sticker host page reserved for its sticky).
+        val stickerHosts = hostPageOf.values.toSet()
         if (sdocx.bodyImages.isNotEmpty()) {
             val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
                 ?: sdocx.pages.firstOrNull()?.let {
                     Pair(saneDim(it.width, fallbackW), saneDim(it.height, fallbackH))
                 }
                 ?: Pair(fallbackW, fallbackH)
+            val mappedUseCount = HashMap<Int, Int>()
             for (im in sdocx.bodyImages) {
-                val fitted = fitBodyImage(im, sized.first, sized.second) ?: continue
-                val item = toImage(fitted, sdocx, imageDir, imageCodec) ?: continue
-                val target = doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null }
-                    ?: Page(sized.first, sized.second).also { doc.pages.add(it) }
+                val item = toBodyImage(im, sdocx, imageDir, imageCodec, sized.first, sized.second, usedImages, referencedIds) ?: continue
+                if (!im.hasPlacement) {
+                    val target = bodyPageFor(im.bbox.top, sized.first, sized.second, sdocx.pages.size, doc, stickerHosts, placeOnMapped = false)
+                        ?: continue
+                    target.items.add(item)
+                    continue
+                }
+                val mapped = bodyPageIndex(im.bbox.top, sized.second, sdocx.pages.size)
+                val n = mappedUseCount.getOrDefault(mapped, 0)
+                mappedUseCount[mapped] = n + 1
+                val targetIdx = (mapped + n).coerceAtMost(sdocx.pages.size)
+                val target = pageAtOrAppend(doc, targetIdx, sized.first, sized.second)
+                // Keep the stored page-local rect (coordinates stay accurate);
+                // only the page changes so colliding photos spread out.
                 target.items.add(item)
             }
         }
 
-        // Tables pasted into Samsung text (note.note body) land like body photos:
-        // fit-and-clamp into the page, reusing empty pages first.
+        // Tables pasted into Samsung text (note.note body) land like body
+        // photos: on the page their stored bbox falls on, at that bbox,
+        // spreading colliding tables across following pages like images.
         if (sdocx.bodyTables.isNotEmpty()) {
             val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
                 ?: sdocx.pages.firstOrNull()?.let {
                     Pair(saneDim(it.width, fallbackW), saneDim(it.height, fallbackH))
                 }
                 ?: Pair(fallbackW, fallbackH)
+            val mappedUseCount = HashMap<Int, Int>()
             for (t in sdocx.bodyTables) {
-                val item = toTable(t, sized.first, sized.second, textMeasurer, flowCoords = true) ?: continue
-                val target = doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null }
-                    ?: Page(sized.first, sized.second).also { doc.pages.add(it) }
+                val mapped = bodyPageIndex(t.bbox.top, sized.second, sdocx.pages.size)
+                val n = mappedUseCount.getOrDefault(mapped, 0)
+                mappedUseCount[mapped] = n + 1
+                val idx = (mapped + n).coerceAtMost(sdocx.pages.size)
+                val local = SdocxRect(t.bbox.left, t.bbox.top - mapped * sized.second, t.bbox.right, t.bbox.bottom - mapped * sized.second)
+                val item = toTable(SdocxTable(local, t.columnWidths, t.rows), sized.first, sized.second, textMeasurer, flowCoords = true) ?: continue
+                val target = pageAtOrAppend(doc, idx, sized.first, sized.second)
                 target.items.add(item)
             }
         }
 
-        importStickyMemos(sdocx, doc, textMeasurer)
+        importStickyMemos(sdocx, doc, textMeasurer, stickerContents, hostPageOf)
+
+        // Recorded-while-writing audio (note-level voices): Samsung keeps no
+        // canvas pill (its player lives in the app bar), so place one pill per
+        // recording at its page's center (stacked when sharing a page) and
+        // leave stroke SyncMarks pointing at it for replay.
+        try {
+            importNoteVoices(sdocx, doc, imageDir, dpi, textMeasurer, noteVoiceSlots)
+        } catch (_: Exception) {
+        }
+
+        // Safety net: any decodable image bytes never claimed by a placement
+        // (newer frame layouts, missed bboxes, stale bind ids) land on their
+        // own pages so no Samsung photo ever vanishes silently.
+        try {
+            sweepUnusedImages(sdocx, doc, imageDir, imageCodec, usedImages, stickerHosts)
+        } catch (_: Exception) {
+        }
 
         if (doc.pages.isEmpty()) {
             // All shells: keep one page so the note is never page-less.
@@ -190,6 +321,17 @@ object SdocxImport {
             val w = saneDim(first.width, fallbackW)
             val h = saneDim(first.height, fallbackH)
             doc.pages.add(Page(w, h))
+        }
+        // Later pages added to an imported Samsung note keep Samsung's page
+        // size instead of dropping back to the app default.
+        try {
+            val first = sdocx.pages.firstOrNull()
+            val landscape = first != null && first.width > first.height
+            doc.newPageSize = PageSizeChoice(
+                PageSize.SAMSUNG_NOTES,
+                if (landscape) Orientation.LANDSCAPE else Orientation.PORTRAIT,
+            )
+        } catch (_: Exception) {
         }
         doc.created = System.currentTimeMillis()
         return doc
@@ -219,6 +361,15 @@ object SdocxImport {
                 pressureMinFactor = 1.0,
                 highlighterAlpha = (alpha / 255.0).coerceIn(0.10, 1.0),
             )
+        } else if (s.tapered) {
+            // Samsung's taper flag: same coordinates and color, tapered ends
+            // like our taper pen.
+            base.copy(
+                baseWidth = width,
+                rgba = color,
+                taperEnabled = true,
+                taperMinFactor = ToolDefaults.DEFAULT_TAPER_TIP,
+            )
         } else {
             base.copy(baseWidth = width, rgba = color)
         }
@@ -238,49 +389,186 @@ object SdocxImport {
     }
 
     /**
-     * Note-body photo placement: text-flow coordinates are meaningless outside
-     * Samsung's layout, so keep the stored size (scaled to fit an oversized
-     * photo) and clamp it into the page, guaranteeing every photo lands
-     * visibly. Null when the stored bbox is unusable.
+     * Note-body photo placement: the stored bbox is in note coordinates
+     * (pages stacked top to bottom at a uniform page height), so it is kept
+     * at its stored size and mapped onto its page. Only a missing or
+     * non-finite bbox falls back to a fitted rect. Never drops a decodable
+     * photo.
      */
-    private fun fitBodyImage(im: SdocxImage, pageW: Double, pageH: Double): SdocxImage? {
-        var w = im.bbox.width
-        var h = im.bbox.height
-        if (!(w > 0) || !(h > 0) || !w.isFinite() || !h.isFinite()) return null
-        if (!(pageW > 0) || !(pageH > 0) || !pageW.isFinite() || !pageH.isFinite()) return null
-        val scale = minOf(1.0, pageW / w, pageH / h)
-        if (!scale.isFinite() || scale <= 0) return null
-        w *= scale
-        h *= scale
-        val left = im.bbox.left.takeIf { it.isFinite() }
-            ?.coerceIn(0.0, (pageW - w).coerceAtLeast(0.0)) ?: 0.0
-        val top = im.bbox.top.takeIf { it.isFinite() }
-            ?.coerceIn(0.0, (pageH - h).coerceAtLeast(0.0)) ?: 0.0
-        return SdocxImage(SdocxRect(left, top, left + w, top + h), im.mediaId, im.rotationDegrees)
-    }
-
-    private fun toImage(
+    private fun toBodyImage(
         im: SdocxImage,
-        doc: SdocxDocument,
+        sdocx: SdocxDocument,
         imageDir: File,
         imageCodec: ImageCodec,
+        pageW: Double,
+        pageH: Double,
+        usedImages: MutableSet<SdocxMediaEntry>,
+        referencedIds: Set<Int>,
     ): ImageItem? {
         try {
-            // Explicit bind id first; on failure fall through to a scan of any
-            // decodable image so a stale id never drops a real photo.
+            if (!(pageW > 0) || !(pageH > 0) || !pageW.isFinite() || !pageH.isFinite()) return null
+            val (bytes, fileName) = resolveImageBytes(im, sdocx, usedImages, referencedIds) ?: return null
+            val ext = imageExtFor(bytes, fileName) ?: return null
+            val file = File.createTempFile("sdocx-img", ext, imageDir)
+            file.writeBytes(bytes)
+            val intrinsic = try {
+                imageCodec.probeFile(file.path)
+            } catch (_: Exception) {
+                null
+            }
+            val rect = bodyImageRect(im.bbox, pageW, pageH)
+                ?: fallbackBodyRect(intrinsic, pageW, pageH)
+                ?: return null
+            val size = intrinsic ?: ImageSize(
+                rect.w.roundToInt().coerceIn(1, 10000),
+                rect.h.roundToInt().coerceIn(1, 10000),
+            )
+            return ImageItem(ImageData(file, size.width, size.height), rect).also {
+                it.angle = imageAngle(im)
+            }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * A note-body bbox mapped onto its page: the stored size is kept (what
+     * Samsung shows), the origin is made page-local and clamped into the
+     * page. Null when the bbox carries no usable size.
+     */
+    private fun bodyImageRect(bbox: SdocxRect, pageW: Double, pageH: Double): Rect? {
+        val w = bbox.width
+        val h = bbox.height
+        if (!(w > 0) || !(h > 0) || !w.isFinite() || !h.isFinite()) return null
+        if (!(pageW > 0) || !(pageH > 0) || !pageW.isFinite() || !pageH.isFinite()) return null
+        val cw = w.coerceAtMost(pageW)
+        val ch = h.coerceAtMost(pageH)
+        var left = bbox.left.takeIf { it.isFinite() } ?: 0.0
+        var top = bbox.top.takeIf { it.isFinite() } ?: 0.0
+        if (top >= 0.0) {
+            // Note coordinates stack pages top to bottom: make it page-local.
+            val idx = (top / pageH).toInt().coerceAtLeast(0)
+            top -= idx * pageH
+        }
+        left = left.coerceIn(0.0, (pageW - cw).coerceAtLeast(0.0))
+        top = top.coerceIn(0.0, (pageH - ch).coerceAtLeast(0.0))
+        return Rect(left, top, cw, ch)
+    }
+
+    /** Last-resort rect for a decodable photo without a usable bbox: intrinsic
+     *  size fitted into the page at a visible origin, so it never vanishes. */
+    private fun fallbackBodyRect(intrinsic: ImageSize?, pageW: Double, pageH: Double): Rect? {
+        return try {
+            var w = intrinsic?.width?.toDouble()?.takeIf { it > 0 } ?: 800.0
+            var h = intrinsic?.height?.toDouble()?.takeIf { it > 0 } ?: 600.0
+            if (!(w > 0) || !(h > 0) || !w.isFinite() || !h.isFinite()) {
+                w = 800.0
+                h = 600.0
+            }
+            val scale = minOf(1.0, pageW / w, pageH / h)
+            if (scale.isFinite() && scale > 0) {
+                w *= scale
+                h *= scale
+            }
+            w = w.coerceIn(1.0, pageW)
+            h = h.coerceIn(1.0, pageH)
+            val left = 40.0.coerceIn(0.0, (pageW - w).coerceAtLeast(0.0))
+            val top = 40.0.coerceIn(0.0, (pageH - h).coerceAtLeast(0.0))
+            Rect(left, top, w, h)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Note-coordinate top mapped to a page index: the stacked page the
+     *  offset falls on, clamped to one past the end (append a single page).
+     *  [pageCount] is the note's own page count, so dropped empty shells do
+     *  not shift later images onto the wrong page. */
+    private fun bodyPageIndex(top: Double, pageH: Double, pageCount: Int): Int {
+        if (!top.isFinite() || !(pageH > 0) || pageCount <= 0) return 0
+        return (top / pageH).toInt().coerceIn(0, pageCount)
+    }
+
+    /** The page at [idx], appending Samsung-sized pages until it exists.
+     *  [idx] is already clamped to one past the note's own page count, so
+     *  this appends a bounded number of pages. */
+    private fun pageAtOrAppend(doc: Document, idx: Int, w: Double, h: Double): Page {
+        val at = idx.coerceAtLeast(0)
+        while (doc.pages.size <= at) doc.pages.add(Page(w, h))
+        return doc.pages[at]
+    }
+
+    /** Target page for a note-body photo: its mapped page when it carries a
+     *  real placement, else the legacy first-empty-page (or a fresh page). */
+    private fun bodyPageFor(
+        bboxTop: Double,
+        pageW: Double,
+        pageH: Double,
+        pageCount: Int,
+        doc: Document,
+        stickerHosts: Set<Page>,
+        placeOnMapped: Boolean,
+    ): Page {
+        if (!placeOnMapped) {
+            return doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null && it !in stickerHosts }
+                ?: Page(pageW, pageH).also { doc.pages.add(it) }
+        }
+        return pageAtOrAppend(doc, bodyPageIndex(bboxTop, pageH, pageCount), pageW, pageH)
+    }
+
+    /** Free rotation of a placed photo, radians clockwise; 0 when unset. */
+    private fun imageAngle(im: SdocxImage): Double {
+        val deg = im.rotationDegrees?.takeIf { it.isFinite() } ?: return 0.0
+        if (deg == 0.0) return 0.0
+        return deg * PI / 180.0
+    }
+
+    /** True when [im] carries a real placement (a decoded bbox with a media
+     *  id): it belongs on its mapped page, not on a fallback page. */
+    private val SdocxImage.hasPlacement: Boolean
+        get() = mediaId != null && bbox.width > 0 && bbox.height > 0 &&
+            bbox.width.isFinite() && bbox.height.isFinite()
+
+    /** Resolve the media bytes for an image placement: explicit bind id first,
+     *  then an unused decodable image (preferring media no placement names, so
+     *  one unresolvable photo never clones another photo's bytes once per
+     *  placement). Explicit repeats are allowed, so the same photo may still
+     *  appear twice when Samsung references it twice. */
+    private fun resolveImageBytes(
+        im: SdocxImage,
+        sdocx: SdocxDocument,
+        usedImages: MutableSet<SdocxMediaEntry>,
+        referencedIds: Set<Int>,
+    ): Pair<ByteArray, String>? {
+        try {
+            // Explicit bind id first and repeatable: the same photo may
+            // legitimately appear twice. Record the hit so the final sweep
+            // never duplicates an already-placed photo on its own page.
             im.mediaId?.let { id ->
-                val entry = doc.mediaByBindId[id]
+                val entry = sdocx.mediaByBindId[id]
+                    ?: sdocx.mediaByFileName.values.firstOrNull { it.bindId == id && it.bytes?.isNotEmpty() == true }
                 val bytes = entry?.bytes
                 if (bytes != null && bytes.isNotEmpty()) {
-                    imageItemFromBytes(bytes, entry?.fileName ?: "", im.bbox, imageDir, imageCodec)?.let { return it }
+                    usedImages.add(entry)
+                    return bytes to (entry?.fileName ?: "")
+                }
+                // Manifest miss but archive holds the bytes under another key:
+                // scan every media entry with this bind id before falling back.
+                if (entry == null) {
+                    val any = (sdocx.mediaByBindId.values + sdocx.mediaByFileName.values)
+                        .firstOrNull { it.bindId == id && it.bytes?.isNotEmpty() == true }
+                    val anyBytes = any?.bytes
+                    if (anyBytes != null && anyBytes.isNotEmpty()) {
+                        usedImages.add(any)
+                        return anyBytes to any.fileName
+                    }
                 }
             }
-            // No (or unresolvable) bind id: fall back to any media bytes that
-            // actually decode as an image, regardless of file extension.
-            for (entry in doc.mediaByBindId.values + doc.mediaByFileName.values) {
-                val bytes = entry.bytes ?: continue
-                if (bytes.isEmpty()) continue
-                imageItemFromBytes(bytes, entry.fileName, im.bbox, imageDir, imageCodec)?.let { return it }
+            fallbackImageEntry(sdocx, usedImages, referencedIds)?.let { entry ->
+                val bytes = entry.bytes ?: return@let
+                if (bytes.isEmpty()) return@let
+                usedImages.add(entry)
+                return bytes to entry.fileName
             }
             return null
         } catch (_: Exception) {
@@ -288,13 +576,184 @@ object SdocxImport {
         }
     }
 
-    /** Build an [ImageItem] in [bbox] from raw [bytes]; null when not an image. */
+    /** First unused decodable image: media no placement names wins, so an
+     *  unresolvable photo keeps distinct bytes instead of duplicating the
+     *  first asset once per placement. Falls back to reusing an asset only
+     *  when every image is already consumed, so a photo is never dropped
+     *  while decodable bytes exist. Null when no image bytes exist at all. */
+    private fun fallbackImageEntry(
+        sdocx: SdocxDocument,
+        usedImages: MutableSet<SdocxMediaEntry>,
+        referencedIds: Set<Int>,
+    ): SdocxMediaEntry? {
+        // `mediaByBindId` and `mediaByFileName` hold the same objects; dedupe
+        // by identity so one asset is never offered twice.
+        val candidates = LinkedHashSet<SdocxMediaEntry>()
+        for (entry in sdocx.mediaByBindId.values + sdocx.mediaByFileName.values) {
+            candidates.add(entry)
+        }
+        fun usable(e: SdocxMediaEntry, allowUsed: Boolean): Boolean {
+            if (!allowUsed && e in usedImages) return false
+            val bytes = e.bytes ?: return false
+            if (bytes.isEmpty()) return false
+            // Skip non-raster attachments (nested .sdocx, .spi paintings,
+            // video, audio): only real photos qualify for image fallback.
+            if (isNonImageAttachment(e, bytes)) return false
+            return imageExtFor(bytes, e.fileName) != null
+        }
+        return candidates.firstOrNull { it.bindId !in referencedIds && usable(it, allowUsed = false) }
+            ?: candidates.firstOrNull { usable(it, allowUsed = false) }
+            ?: candidates.firstOrNull { usable(it, allowUsed = true) }
+    }
+
+    /** True when [entry] is a known non-image attachment (nested note, painting,
+     *  video, audio, PDF): never surface its bytes as a photo, even when the
+     *  filename is odd. Image sniff wins over the name so mis-suffixed photos
+     *  still qualify. */
+    private fun isNonImageAttachment(e: SdocxMediaEntry, bytes: ByteArray): Boolean {
+        try {
+            val lower = e.fileName.lowercase()
+            if (lower.endsWith(".sdocx") || lower.endsWith(".spi") || lower.endsWith(".pdf")) return true
+            if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".avi") ||
+                lower.endsWith(".mkv") || lower.endsWith(".webm")
+            ) return true
+            // Audio by name or sniff: voice memos must never become photos.
+            if (e.isAudio) return true
+            if (sniffAudioExt(bytes) != null && sniffImageExt(bytes) == null) return true
+            // ZIP without an image magic is a nested note/archive, not a photo.
+            if (bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
+                bytes[2] == 0x03.toByte() && bytes[3] == 0x04.toByte() &&
+                sniffImageExt(bytes) == null
+            ) return true
+            return false
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    /**
+     * Final safety net: every decodable image asset never claimed by a
+     * placement lands on its own page (reusing empty non-sticker pages first)
+     * so no Samsung photo vanishes when its frame layout is newer than the
+     * strict decoder. Already-placed bytes are never duplicated.
+     */
+    private fun sweepUnusedImages(
+        sdocx: SdocxDocument,
+        doc: Document,
+        imageDir: File,
+        imageCodec: ImageCodec,
+        usedImages: MutableSet<SdocxMediaEntry>,
+        stickerHosts: Set<Page>,
+    ) {
+        val candidates = LinkedHashSet<SdocxMediaEntry>()
+        for (entry in sdocx.mediaByBindId.values + sdocx.mediaByFileName.values) {
+            candidates.add(entry)
+        }
+        val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
+            ?: sdocx.pages.firstOrNull()?.let { Pair(saneDim(it.width, 1440.0), saneDim(it.height, 2036.0)) }
+            ?: Pair(1440.0, 2036.0)
+        for (entry in candidates) {
+            if (entry in usedImages) continue
+            val bytes = entry.bytes ?: continue
+            if (bytes.isEmpty()) continue
+            if (isNonImageAttachment(entry, bytes)) continue
+            if (imageExtFor(bytes, entry.fileName) == null) continue
+            // Place on an empty page first (never covering ink/PDF or a
+            // sticker host), else append a fresh Samsung-sized page.
+            val target = doc.pages.firstOrNull { it.items.isEmpty() && it.pdfPage == null && it !in stickerHosts }
+                ?: Page(sized.first, sized.second).also { doc.pages.add(it) }
+            // Fit into the page preserving aspect ratio, like body photos:
+            // intrinsic size wins, clamped to the page; origin at 40,40.
+            try {
+                val ext = imageExtFor(bytes, entry.fileName) ?: continue
+                val file = File.createTempFile("sdocx-img", ext, imageDir)
+                file.writeBytes(bytes)
+                val intrinsic = try {
+                    imageCodec.probeFile(file.path)
+                } catch (_: Exception) {
+                    null
+                }
+                var w = intrinsic?.width?.toDouble()?.takeIf { it > 0 }
+                    ?: (sized.first - 80.0).coerceIn(1.0, sized.first)
+                var h = intrinsic?.height?.toDouble()?.takeIf { it > 0 }
+                    ?: (sized.second - 80.0).coerceIn(1.0, sized.second)
+                if (!(w > 0) || !(h > 0) || !w.isFinite() || !h.isFinite()) {
+                    w = (sized.first - 80.0).coerceIn(1.0, sized.first)
+                    h = (sized.second - 80.0).coerceIn(1.0, sized.second)
+                }
+                val scale = minOf(1.0, sized.first / w, sized.second / h)
+                if (scale.isFinite() && scale > 0) {
+                    w *= scale
+                    h *= scale
+                }
+                w = w.coerceIn(1.0, sized.first)
+                h = h.coerceIn(1.0, sized.second)
+                val left = 40.0.coerceIn(0.0, (sized.first - w).coerceAtLeast(0.0))
+                val top = 40.0.coerceIn(0.0, (sized.second - h).coerceAtLeast(0.0))
+                val size = intrinsic ?: ImageSize(
+                    w.roundToInt().coerceIn(1, 10000),
+                    h.roundToInt().coerceIn(1, 10000),
+                )
+                // Reuse the file we already probed instead of writing twice.
+                val item = ImageItem(ImageData(file, size.width, size.height), Rect(left, top, w, h))
+                target.items.add(item)
+                usedImages.add(entry)
+            } catch (_: Exception) {
+                continue
+            }
+        }
+    }
+
+    private fun toImage(
+        im: SdocxImage,
+        doc: SdocxDocument,
+        imageDir: File,
+        imageCodec: ImageCodec,
+        usedImages: MutableSet<SdocxMediaEntry>,
+        referencedIds: Set<Int>,
+    ): ImageItem? {
+        try {
+            // Explicit bind id first and repeatable: the same photo may
+            // legitimately appear twice. Record the hit so the final sweep
+            // never duplicates an already-placed photo on its own page.
+            // On failure fall through to an unused decodable image so a stale
+            // id never drops a real photo (and never clones another
+            // placement's photo while unused bytes remain).
+            im.mediaId?.let { id ->
+                val entry = doc.mediaByBindId[id]
+                    ?: doc.mediaByFileName.values.firstOrNull { it.bindId == id && it.bytes?.isNotEmpty() == true }
+                    ?: (doc.mediaByBindId.values + doc.mediaByFileName.values)
+                        .firstOrNull { it.bindId == id && it.bytes?.isNotEmpty() == true }
+                val bytes = entry?.bytes
+                if (bytes != null && bytes.isNotEmpty()) {
+                    imageItemFromBytes(bytes, entry?.fileName ?: "", im.bbox, imageDir, imageCodec, imageAngle(im))?.let {
+                        usedImages.add(entry)
+                        return it
+                    }
+                }
+            }
+            // No (or unresolvable) bind id: fall back to unused media bytes
+            // that actually decode as an image, regardless of file extension.
+            val entry = fallbackImageEntry(doc, usedImages, referencedIds) ?: return null
+            val bytes = entry.bytes ?: return null
+            if (bytes.isEmpty()) return null
+            return imageItemFromBytes(bytes, entry.fileName, im.bbox, imageDir, imageCodec, imageAngle(im))?.also {
+                usedImages.add(entry)
+            }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /** Build an [ImageItem] in [bbox] from raw [bytes]; null when not an image.
+     *  [angle] is the photo's free turn, radians clockwise about its centre. */
     private fun imageItemFromBytes(
         bytes: ByteArray,
         fileName: String,
         bbox: SdocxRect,
         imageDir: File,
         imageCodec: ImageCodec,
+        angle: Double = 0.0,
     ): ImageItem? {
         try {
             if (bytes.isEmpty()) return null
@@ -320,7 +779,9 @@ object SdocxImport {
                 h.roundToInt().coerceIn(1, 10000),
             )
             val rect = Rect(left, top, w, h)
-            return ImageItem(ImageData(file, size.width, size.height), rect)
+            return ImageItem(ImageData(file, size.width, size.height), rect).also {
+                it.angle = angle
+            }
         } catch (_: Exception) {
             return null
         }
@@ -334,13 +795,18 @@ object SdocxImport {
         imageCodec: ImageCodec,
         pageW: Double,
         pageH: Double,
+        usedImages: MutableSet<SdocxMediaEntry>? = null,
     ): ImageItem? {
         return try {
-            val entry = doc.mediaByBindId[bindId] ?: return null
+            val entry = doc.mediaByBindId[bindId]
+                ?: doc.mediaByFileName.values.firstOrNull { it.bindId == bindId && it.bytes?.isNotEmpty() == true }
+                ?: return null
             val bytes = entry.bytes ?: return null
             if (bytes.isEmpty()) return null
             if (imageExtFor(bytes, entry.fileName) == null) return null
-            imageItemFromBytes(bytes, entry.fileName, SdocxRect(0.0, 0.0, pageW, pageH), imageDir, imageCodec)
+            imageItemFromBytes(bytes, entry.fileName, SdocxRect(0.0, 0.0, pageW, pageH), imageDir, imageCodec)?.also {
+                usedImages?.add(entry)
+            }
         } catch (_: Exception) {
             null
         }
@@ -366,6 +832,9 @@ object SdocxImport {
             lower.endsWith(".dng") -> ".dng"
             lower.endsWith(".wbmp") -> ".wbmp"
             lower.endsWith(".ico") -> ".ico"
+            lower.endsWith(".svg") -> ".svg"
+            lower.endsWith(".jxl") -> ".jxl"
+            lower.endsWith(".jpe") || lower.endsWith(".jfif") -> ".jpg"
             else -> null
         }
     }
@@ -417,7 +886,64 @@ object SdocxImport {
         if (bytes[0] == 0x00.toByte() && bytes[1] == 0x00.toByte() &&
             bytes[2] == 0x01.toByte() && bytes[3] == 0x00.toByte()
         ) return ".ico"
+        // JPEG XL: FF 0A FF 0B (codestream) or ....ftyp + jxl brand.
+        if (bytes.size >= 4 && bytes[0] == 0xFF.toByte() && bytes[1] == 0x0A.toByte() &&
+            bytes[2] == 0xFF.toByte() && bytes[3] == 0x0B.toByte()
+        ) return ".jxl"
+        // SVG: XML with <svg (after optional BOM/whitespace/comments).
+        if (looksLikeSvg(bytes)) return ".svg"
+        // WBMP: type(0) + fixed header(0) + width/height as multi-byte ints.
+        // Minimal check: starts 00 00 and decodes sanely; extension still wins.
+        if (bytes.size >= 4 && bytes[0] == 0x00.toByte() && bytes[1] == 0x00.toByte()) {
+            // Avoid clashing with ICO (00 00 01 00 handled above).
+            if (!(bytes[2] == 0x01.toByte() && bytes[3] == 0x00.toByte())) {
+                if (isPlausibleWbmp(bytes)) return ".wbmp"
+            }
+        }
         return null
+    }
+
+    private fun looksLikeSvg(bytes: ByteArray): Boolean {
+        try {
+            if (bytes.isEmpty()) return false
+            // Strip UTF-8 BOM.
+            var off = 0
+            if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()) off = 3
+            // Skip leading whitespace.
+            while (off < bytes.size && (bytes[off] == 0x20.toByte() || bytes[off] == 0x0A.toByte() ||
+                    bytes[off] == 0x0D.toByte() || bytes[off] == 0x09.toByte())
+            ) off++
+            if (off + 4 > bytes.size) return false
+            // <?xml ... <svg or direct <svg.
+            val head = try {
+                String(bytes, off, minOf(512, bytes.size - off), Charsets.UTF_8).lowercase()
+            } catch (_: Exception) {
+                return false
+            }
+            return head.contains("<svg")
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    private fun isPlausibleWbmp(bytes: ByteArray): Boolean {
+        try {
+            var off = 2
+            repeat(2) {
+                // Multi-byte int: high-bit continuation.
+                var shifts = 0
+                while (off < bytes.size) {
+                    val b = bytes[off++].toInt() and 0xFF
+                    shifts++
+                    if (shifts > 4) return false
+                    if ((b and 0x80) == 0) break
+                }
+                if (off > bytes.size) return false
+            }
+            return true
+        } catch (_: Exception) {
+            return false
+        }
     }
 
     private fun looksLikeImage(bytes: ByteArray): Boolean = sniffImageExt(bytes) != null
@@ -688,6 +1214,89 @@ object SdocxImport {
         }
     }
 
+    /**
+     * Note-level recorded audio ("record while writing"): one pill per
+     * recording. Samsung keeps no canvas coordinates (its player lives in the
+     * app bar), so pills land at their page's center, stacked when sharing a
+     * page. Target page prefers the one holding most of the recording's synced
+     * strokes, else the first page. Never throws; unresolvable recordings are
+     * skipped without dropping anything else.
+     */
+    private fun importNoteVoices(
+        sdocx: SdocxDocument,
+        doc: Document,
+        imageDir: File,
+        dpi: Int,
+        measurer: TextMeasurer,
+        slots: List<NoteVoiceSlot>,
+    ) {
+        try {
+            if (slots.isEmpty()) return
+            if (doc.pages.isEmpty()) return
+            // Count synced strokes per page per voice to pick host pages.
+            val pageStrokeCounts = HashMap<Int, MutableMap<Int, Int>>()
+            try {
+                for ((pageIdx, page) in doc.pages.withIndex()) {
+                    for (item in page.items) {
+                        val mark = item.sync ?: continue
+                        val voiceIdx = slots.indexOfFirst { it.rid == mark.rid }
+                        if (voiceIdx < 0) continue
+                        val counts = pageStrokeCounts.getOrPut(voiceIdx) { HashMap() }
+                        counts[pageIdx] = (counts[pageIdx] ?: 0) + 1
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            val perPagePillCount = HashMap<Int, Int>()
+            for ((voiceIdx, slot) in slots.withIndex()) {
+                try {
+                    val voice = slot.voice
+                    val entry = sdocx.mediaByBindId[voice.mediaId]
+                        ?: sdocx.mediaByFileName.values.firstOrNull {
+                            it.bindId == voice.mediaId && it.bytes?.isNotEmpty() == true
+                        } ?: continue
+                    val bytes = entry.bytes ?: continue
+                    if (bytes.isEmpty()) continue
+                    val ext = audioExtFor(bytes, entry.fileName) ?: continue
+                    // Skip non-audio payloads masquerading under an audio bind id.
+                    if (sniffAudioExt(bytes) == null && !looksLikeAudioName(entry.fileName) && !entry.isAudio) continue
+                    val file = File.createTempFile("sdocx-aud", ".$ext", imageDir)
+                    try {
+                        file.writeBytes(bytes)
+                    } catch (_: Exception) {
+                        continue
+                    }
+                    val dur = voice.durationMs.takeIf { it > 0 } ?: 0
+                    val audio = AudioData(file, ext, dur, ByteArray(0))
+                    // Host page: most synced strokes, else first page.
+                    val hostIdx = try {
+                        pageStrokeCounts[voiceIdx]?.maxByOrNull { it.value }?.key ?: 0
+                    } catch (_: Exception) {
+                        0
+                    }
+                    val host = doc.pages.getOrNull(hostIdx) ?: doc.pages.first()
+                    val n = perPagePillCount.getOrDefault(hostIdx, 0)
+                    perPagePillCount[hostIdx] = n + 1
+                    val center = Pt(host.width / 2.0, host.height / 2.0 + n * 90.0)
+                    val rect = try {
+                        val base = AudioItem.boxAt(center, dpi)
+                        // Clamp stacked pills inside the page.
+                        val x = base.x.coerceIn(0.0, (host.width - base.w).coerceAtLeast(0.0))
+                        val y = base.y.coerceIn(0.0, (host.height - base.h).coerceAtLeast(0.0))
+                        Rect(x, y, base.w, base.h)
+                    } catch (_: Exception) {
+                        AudioItem.boxAt(Pt(host.width / 2.0, host.height / 2.0), dpi)
+                    }
+                    val name = voice.title.ifEmpty { "Recording" }
+                    host.items.add(AudioItem(audio, rect, name, slot.rid, measurer))
+                } catch (_: Exception) {
+                    continue
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     /** Extension (no dot) for [bytes] named [fileName]; `.dat`/`.bin` count as `m4a`. */
     private fun audioExtFor(bytes: ByteArray, fileName: String): String? {
         sniffAudioExt(bytes)?.let { return it }
@@ -836,22 +1445,27 @@ object SdocxImport {
 
     // --- sticky memos (.sdocx attachments) ---
 
+    private class StickerContent(
+        val strokes: List<Stroke>,
+        val text: String,
+    )
+
     /**
-     * Sticker sub-notes (`.sdocx` media): each inner note's ink+text becomes a
-     * 300×300 [StickyNoteItem] on the first empty page (else a new page sized
-     * like the first). Falls back to a `TextItem("Sticky")` plus regular
-     * strokes. Never throws.
+     * Parse every nested `.sdocx` attachment once: inner ink (as sticky-local
+     * strokes) plus inner text (boxes, shape labels and tables). Entries that
+     * do not parse or carry no content are absent, so their host pages stay
+     * dropped and no blank page appears for them.
      */
-    private fun importStickyMemos(
+    private fun parseStickerContents(
         sdocx: SdocxDocument,
-        doc: Document,
         measurer: TextMeasurer,
-    ) {
+    ): Map<Int, StickerContent> {
+        val out = HashMap<Int, StickerContent>()
         try {
             val entries = (sdocx.mediaByBindId.values + sdocx.mediaByFileName.values)
                 .distinctBy { it.fileName.lowercase() }
                 .filter { it.fileName.lowercase().endsWith(".sdocx") && it.bytes != null && it.bytes!!.isNotEmpty() }
-            if (entries.isEmpty()) return
+            if (entries.isEmpty()) return out
             for (entry in entries) {
                 try {
                     val bytes = entry.bytes ?: continue
@@ -908,7 +1522,6 @@ object SdocxImport {
                     }
                     if (strokes.isEmpty() && texts.isEmpty()) continue
                     val combined = texts.joinToString("\n").trim().take(2000)
-
                     // Fit ink into 300×300 sticky: translate bbox to origin,
                     // scale to fit avail 276×240, offset 12,42.
                     val fittedInk: List<Stroke> = try {
@@ -916,7 +1529,74 @@ object SdocxImport {
                     } catch (_: Exception) {
                         emptyList()
                     }
+                    out[entry.bindId] = StickerContent(fittedInk, combined)
+                } catch (_: Exception) {
+                    continue
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
 
+    /**
+     * Sticker sub-notes (`.sdocx` media): each inner note's ink+text becomes a
+     * 300×300 [StickyNoteItem] on its own host page at its recorded collapse
+     * position (clamped into the page). Stickies without recorded placement
+     * fall back to the first empty page (else a new page sized like the
+     * first) at 40,40. Never throws.
+     */
+    private fun importStickyMemos(
+        sdocx: SdocxDocument,
+        doc: Document,
+        measurer: TextMeasurer,
+        stickerContents: Map<Int, StickerContent>,
+        hostPageOf: Map<SdocxPage, Page>,
+    ) {
+        if (stickerContents.isEmpty()) return
+        try {
+            // Host-page placements first: same page, recorded x/y.
+            val placed = HashSet<Pair<Int, Page>>()
+            for (spage in sdocx.pages) {
+                if (spage.stickers.isEmpty()) continue
+                val target = hostPageOf[spage] ?: continue
+                for (st in spage.stickers) {
+                    val content = stickerContents[st.bindId] ?: continue
+                    if (!placed.add(st.bindId to target)) continue
+                    try {
+                        val stickyW = 300.0
+                        val stickyH = 300.0
+                        val collapse = st.collapseRect
+                        val sx = if (collapse != null && collapse.left.isFinite()) {
+                            collapse.left.coerceIn(0.0, (target.width - stickyW).coerceAtLeast(0.0))
+                        } else {
+                            40.0.coerceIn(0.0, (target.width - stickyW).coerceAtLeast(0.0))
+                        }
+                        val sy = if (collapse != null && collapse.top.isFinite()) {
+                            collapse.top.coerceIn(0.0, (target.height - stickyH).coerceAtLeast(0.0))
+                        } else {
+                            40.0.coerceIn(0.0, (target.height - stickyH).coerceAtLeast(0.0))
+                        }
+                        val rect = Rect(sx, sy, stickyW, stickyH)
+                        val color = try {
+                            st.bgColorArgb?.let { Rgba.fromArgb(it) } ?: StickyNoteItem.DEFAULT_COLOR
+                        } catch (_: Exception) {
+                            StickyNoteItem.DEFAULT_COLOR
+                        }
+                        target.items.add(
+                            // Collapsed by default: the icon pins the Samsung
+                            // position without covering the page; tap to expand.
+                            StickyNoteItem(rect, color, true, content.text, ArrayList(content.strokes), measurer),
+                        )
+                    } catch (_: Exception) {
+                        continue
+                    }
+                }
+            }
+            // Stickies without a host placement: legacy first-empty/new page.
+            for ((bindId, content) in stickerContents) {
+                if (placed.any { it.first == bindId }) continue
+                try {
                     val sized = doc.pages.firstOrNull()?.let { Pair(it.width, it.height) }
                         ?: sdocx.pages.firstOrNull()?.let { Pair(it.width, it.height) }
                         ?: Pair(1440.0, 2036.0)
@@ -927,62 +1607,10 @@ object SdocxImport {
                     val sx = 40.0.coerceIn(0.0, (target.width - stickyW).coerceAtLeast(0.0))
                     val sy = 40.0.coerceIn(0.0, (target.height - stickyH).coerceAtLeast(0.0))
                     val rect = Rect(sx, sy, stickyW, stickyH)
-
-                    val created = try {
-                        StickyNoteItem(rect, StickyNoteItem.DEFAULT_COLOR, false, combined, ArrayList(fittedInk), measurer)
-                    } catch (_: Exception) {
-                        null
-                    }
-                    if (created != null) {
-                        target.items.add(created)
-                    } else {
-                        // Fallback: regular text + strokes when the sticky class is missing.
-                        try {
-                            val label = if (combined.isNotBlank()) combined else "Sticky"
-                            val ti = TextItem(
-                                Pt(rect.x, rect.y),
-                                rect.w,
-                                0.0,
-                                label,
-                                Rgba(20, 20, 20, 255),
-                                13.0,
-                                com.xnotes.core.pal.FontFace.SANS,
-                                measurer,
-                            )
-                            target.items.add(ti)
-                        } catch (_: Exception) {
-                        }
-                        try {
-                            // Offset fitted (sticky-local) ink onto the page.
-                            for (s in fittedInk) {
-                                try {
-                                    if (s.sampleCount < 2) continue
-                                    val samples = ArrayList<com.xnotes.core.stroke.Sample>(s.sampleCount)
-                                    for (i in 0 until s.sampleCount) {
-                                        val t = try {
-                                            s.tAt(i)
-                                        } catch (_: Exception) {
-                                            0.0
-                                        }
-                                        samples.add(
-                                            com.xnotes.core.stroke.Sample(
-                                                s.xAt(i) + rect.x,
-                                                s.yAt(i) + rect.y,
-                                                s.pAt(i),
-                                                t,
-                                            ),
-                                        )
-                                    }
-                                    val c = Stroke(s.tool, s.config.copy(), emptyList(), s.speedScale, s.straight, s.smoothScale)
-                                    c.setSamples(samples)
-                                    c.finished = true
-                                    target.items.add(c)
-                                } catch (_: Exception) {
-                                }
-                            }
-                        } catch (_: Exception) {
-                        }
-                    }
+                    target.items.add(
+                        // Collapsed by default, like the host placement above.
+                        StickyNoteItem(rect, StickyNoteItem.DEFAULT_COLOR, true, content.text, ArrayList(content.strokes), measurer),
+                    )
                 } catch (_: Exception) {
                     continue
                 }
@@ -998,10 +1626,21 @@ object SdocxImport {
                 var e = zis.nextEntry
                 while (e != null) {
                     if (!e.isDirectory) {
-                        out[e.name] = zis.readBytes()
+                        try {
+                            out[e.name] = zis.readBytes()
+                        } catch (_: Exception) {
+                            // Skip a corrupt entry without aborting later ones.
+                        }
                     }
-                    zis.closeEntry()
-                    e = zis.nextEntry
+                    try {
+                        zis.closeEntry()
+                    } catch (_: Exception) {
+                    }
+                    e = try {
+                        zis.nextEntry
+                    } catch (_: Exception) {
+                        break
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -1065,22 +1704,5 @@ object SdocxImport {
             }
         }
         return out
-    }
-
-    /**
-     * Create a sticky note directly (no reflection): yellow paper, expanded,
-     * with [text] and note-local [ink]. Never throws.
-     */
-    private fun createStickyReflective(
-        rect: Rect,
-        text: String,
-        ink: List<Stroke>,
-        measurer: TextMeasurer,
-    ): CanvasItem? {
-        return try {
-            StickyNoteItem(rect, StickyNoteItem.DEFAULT_COLOR, false, text, ArrayList(ink), measurer)
-        } catch (_: Exception) {
-            null
-        }
     }
 }

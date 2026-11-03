@@ -162,7 +162,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        com.xnotes.settings.LiveSettings.prime(com.xnotes.settings.SettingsRepository(this))
+        val settingsRepo = com.xnotes.settings.SettingsRepository(this)
+        com.xnotes.settings.LiveSettings.prime(settingsRepo)
+        // Resume LAN sharing across restarts when the settings toggle is on.
+        if (com.xnotes.settings.LiveSettings.get(settingsRepo).prefs.shareEnabled) {
+            com.xnotes.share.ShareService.start(this)
+        }
         if (!orphanTabStoragePurged) {
             orphanTabStoragePurged = true
             purgeOrphanedTabStorage()

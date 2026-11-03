@@ -15,10 +15,14 @@ import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.model.insets
 import com.xnotes.core.model.resolvedPageColor
+import com.xnotes.core.model.resolvedInvertColors
+import com.xnotes.core.model.resolvedInvertImages
 import com.xnotes.core.model.resolvedTemplate
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.pal.SurfaceFactory
+import com.xnotes.core.pal.clearPageInvert
+import com.xnotes.core.pal.forInvertedPage
 import com.xnotes.core.stroke.StrokeGeometry
 import com.xnotes.core.tools.Tool
 import com.xnotes.ui.theme.Palette
@@ -851,7 +855,11 @@ class CanvasState(
     /** Resolved page template key for [page] ([PageTemplates.NONE] when nothing in the chain sets one). */
     fun effectiveTemplate(page: Page): String = page.resolvedTemplate(document)
 
-    fun paperColor(page: Page): Rgba = effectivePageColor(page) ?: palette.paper
+    fun paperColor(page: Page): Rgba {
+        val paper = effectivePageColor(page) ?: palette.paper
+        // Color inversion shows the paper lightness-inverted, like every other page colour.
+        return if (page.resolvedInvertColors(document)) paper.inverted() else paper
+    }
 
     private fun paperAt(pageIndex: Int?): Rgba =
         document.pages.getOrNull(pageIndex ?: currentPageIndex())?.let(::paperColor) ?: palette.paper
@@ -1266,22 +1274,45 @@ class CanvasState(
         val items = cacheItems(page) // snapshot on the UI thread
         val withFlow = !flowLifted // snapshot too; the generation guard discards stale builds
         runAsync {
-            val entry = renderInk(page, res, items, withFlow)
+            val entry = runBuild { renderInk(page, res, items, withFlow) }
             postToMain {
                 pendingInk.remove(page)
                 val meanwhile = repairedMeanwhile.remove(page)
-                if (gen == cacheGen) {
+                if (gen == cacheGen && entry != null) {
                     caches[page] = entry
                     staleInk.remove(page)
                     // The build painted from what it read then; a repair since, as a playhead crossing ink, would be lost.
                     meanwhile?.let { repaintCached(entry, page, it) }
                 }
-                // Repaint either way. A build the page outgrew mid-flight (a margin drag bumps the
-                // generation on every tick) is discarded here, and the draw loop is what schedules
+                // Repaint either way — and reschedule on failure. A build the page
+                // outgrew mid-flight (a margin drag bumps the generation on every
+                // tick) is discarded here, and the draw loop is what schedules
                 // its replacement — but every frame while this one was in flight was turned away by
                 // [pendingInk], so without this the page would sit blank until something else drew.
+                // A build that died instead (OOM, a bad surface) must also not
+                // leave [pendingInk] set: that would turn every later frame away
+                // and blank the page for good, with new ink vanishing on commit.
                 onCacheReady?.invoke()
             }
+        }
+    }
+
+    /**
+     * Run a cache build off-thread so a dying build can never wedge its page blank:
+     * whatever the build throws (even an [OutOfMemoryError] from a surface
+     * allocation), the pending flag is cleared by the caller and a repaint is
+     * requested, so the next frame reschedules instead of turning every later
+     * frame away for good. Null when the build failed. The interrupt flag is
+     * preserved so executor shutdown still works.
+     */
+    private inline fun <T> runBuild(crossinline build: () -> T): T? {
+        return try {
+            build()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        } catch (_: Throwable) {
+            null
         }
     }
 
@@ -1305,15 +1336,30 @@ class CanvasState(
     }
 
     /**
+     * [base] prepared for painting [page]'s content under color inversion: placed-image and
+     * PDF-raster inversion flags set, and vector/ruling/text colours lightness-inverted, when the
+     * page is inverted (see [resolvedInvertColors]). Finished cache surfaces are always
+     * blitted through an unflagged, unwrapped renderer, so nothing inverts twice. Call
+     * [resetContentRenderer] after painting through a renderer shared with other pages.
+     */
+    fun contentRenderer(base: Renderer, page: Page): Renderer =
+        base.forInvertedPage(document, page)
+
+    /** Clear any image/raster inversion flags [contentRenderer] may have set on shared [base]. */
+    fun resetContentRenderer(base: Renderer) = base.clearPageInvert()
+
+    /**
      * Items baked into a page's ink cache: all but lifted items and highlighters ([isHighlighterInk]
      * — those composite live so they MULTIPLY against the background). While the flow is lifted, so
      * are the fills under it, which the view then paints live beneath it.
      */
     private fun cacheItems(page: Page): InkItems {
         val n = PageLayers.underText(page.items)
-        val under = if (flowLifted) emptyList() else page.items.subList(0, n).filter { !isLiftedItem(it) }
-        val over = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() }
-        return InkItems(under, over)
+        val under = if (flowLifted) emptyList() else page.items.subList(0, n).filter { !isLiftedItem(it) && it !is com.xnotes.core.model.StickyNoteItem }
+        val overNonSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && it !is com.xnotes.core.model.StickyNoteItem }
+        // Sticky notes always sit in front of page ink, whatever the document order says.
+        val overSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && it is com.xnotes.core.model.StickyNoteItem }
+        return InkItems(under, overNonSticky + overSticky)
     }
 
     private fun buildCache(page: Page, res: Double): CacheEntry =
@@ -1325,7 +1371,7 @@ class CanvasState(
         val h = ceil(cover.h * res).toInt().coerceAtLeast(1)
         val surface = surfaceFactory.create(w, h, 1.0)
         surface.fill(TRANSPARENT)
-        val r = surface.renderer()
+        val r = contentRenderer(surface.renderer(), page)
         r.scale(res, res)
         r.translate(-cover.left, -cover.top) // the surface covers the margins, so page space starts inset
         val f = fade
@@ -1380,16 +1426,16 @@ class CanvasState(
         ) {
             return existing
         }
-        return buildHighlighter(stroke, res, g, opaque).also { hlCaches[stroke] = it }
+        return buildHighlighter(stroke, page, res, g, opaque).also { hlCaches[stroke] = it }
     }
 
-    private fun buildHighlighter(stroke: Stroke, res: Double, g: StrokeGeometry, opaque: Rgba): HighlighterCacheEntry {
+    private fun buildHighlighter(stroke: Stroke, page: Page, res: Double, g: StrokeGeometry, opaque: Rgba): HighlighterCacheEntry {
         val cover = stroke.bounds().outset(HL_PAD)
         val w = ceil(cover.w * res).toInt().coerceAtLeast(1)
         val h = ceil(cover.h * res).toInt().coerceAtLeast(1)
         val surface = surfaceFactory.create(w, h, 1.0)
         surface.fill(TRANSPARENT)
-        val r = surface.renderer()
+        val r = contentRenderer(surface.renderer(), page)
         r.scale(res, res)
         r.translate(-cover.left, -cover.top)
         stroke.paintHighlighterRibbon(r)
@@ -1434,10 +1480,10 @@ class CanvasState(
         val gen = cacheGen
         val seq = markupSeq // the build reads the markups after this, so it holds every edit up to here
         runAsync {
-            val entry = buildBackground(page, res)
+            val entry = runBuild { buildBackground(page, res) }
             postToMain {
                 pendingBg.remove(page)
-                if (gen == cacheGen) bgCaches[page] = entry.also { it.seq = seq }
+                if (gen == cacheGen && entry != null) bgCaches[page] = entry.also { it.seq = seq }
                 onCacheReady?.invoke() // discarded or not; see [scheduleInk]
             }
         }
@@ -1497,11 +1543,11 @@ class CanvasState(
         val res = clampedRes(page)
         val seq = markupSeq // the build reads the markups after this, so it holds every edit up to here
         runAsync {
-            val fresh = buildBackground(page, res)
+            val fresh = runBuild { buildBackground(page, res) }
             postToMain {
                 rebaking.remove(page)
                 val shown = bgCaches[page]
-                if (shown != null && shown.seq < seq) bgCaches[page] = fresh.also { it.seq = seq }
+                if (fresh != null && shown != null && shown.seq < seq) bgCaches[page] = fresh.also { it.seq = seq }
                 if (rebakeAgain.remove(page) && bgCaches[page] != null) scheduleRebake(page)
                 onCacheReady?.invoke()
             }
@@ -1536,6 +1582,18 @@ class CanvasState(
         r.scale(res, res)
         r.translate(-cover.left, -cover.top)
         paintItem(item, r)
+        if (item !is com.xnotes.core.model.StickyNoteItem) {
+            // The new ink landed over the whole cache, including any sticky note it overlaps:
+            // repaint those notes so they stay in front.
+            val bounds = item.paintBounds()
+            for (other in page.items) {
+                if (other is com.xnotes.core.model.StickyNoteItem && !isLiftedItem(other) &&
+                    !other.isHighlighterInk() && other.paintBounds().intersects(bounds)
+                ) {
+                    paintItem(other, r)
+                }
+            }
+        }
     }
 
     /**
@@ -1572,17 +1630,22 @@ class CanvasState(
 
     /** Repaint [page]'s cached ink where it meets [region]: the fills under its typed text, the text, then the rest. */
     private fun paintInk(page: Page, r: Renderer, region: Rect) {
+        val rr = contentRenderer(r, page)
         val n = PageLayers.underText(page.items)
         val f = fade
         if (!flowLifted) {
-            InkFade.paint(page.items.subList(0, n), r, f, { !isLiftedItem(it) && it.paintBounds().intersects(region) }) { it.paint(r) }
-            paintFlow?.invoke(page, r, region)
+            InkFade.paint(page.items.subList(0, n), rr, f, { !isLiftedItem(it) && it !is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region) }) { it.paint(rr) }
+            paintFlow?.invoke(page, rr, region)
         }
-        InkFade.paint(page.items.subList(n, page.items.size), r, f, {
-            !isLiftedItem(it) && !it.isHighlighterInk() && it.paintBounds().intersects(region)
-        }) { it.paint(r) }
+        InkFade.paint(page.items.subList(n, page.items.size), rr, f, {
+            !isLiftedItem(it) && !it.isHighlighterInk() && it !is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region)
+        }) { it.paint(rr) }
+        // Sticky notes always sit in front of page ink, whatever the document order says.
+        InkFade.paint(page.items.subList(n, page.items.size), rr, f, {
+            !isLiftedItem(it) && !it.isHighlighterInk() && it is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region)
+        }) { it.paint(rr) }
         // Exported linked pages carry their link's color as a frame.
-        if (page.linkBorder != null) com.xnotes.core.links.LinkBorder.paint(page, r)
+        if (page.linkBorder != null) com.xnotes.core.links.LinkBorder.paint(page, rr)
     }
 
     /**
@@ -1642,6 +1705,22 @@ class CanvasState(
     }
 
     /**
+     * Ink colours changed without touching the model (color inversion): drop the ink and
+     * highlighter caches, whose baked colours are stale. Paper fills live each frame and the
+     * background caches rebuild from the model, so they need nothing beyond the generations.
+     * The wet cache goes too: a stroke baked mid-gesture would otherwise keep its old colours.
+     */
+    fun invalidateInk() {
+        caches.clear()
+        staleInk.clear()
+        hlCaches.clear()
+        unbaked.clear()
+        wetInk.clear()
+        cacheGen++
+        sharpGen++
+    }
+
+    /**
      * Page footprints changed (a margin edit). The surfaces are kept rather than cleared, but they
      * are not drawn while they are the wrong size (see [cacheForOrSchedule]) — the page shows bare
      * paper until its rebuild lands. Keeping them means a slider dragged back to a size already
@@ -1680,10 +1759,19 @@ class CanvasState(
      * could ask for a buffer many times the screen it is drawn on, and past that cap redrawing the
      * ribbon is the cheaper of the two.
      */
-    fun paintLiveStroke(r: Renderer, stroke: Stroke) {
-        val res = (zoom * renderScale).coerceAtLeast(0.01)
-        val cap = 2L * max(viewportW, 1) * max(viewportH, 1)
-        if (!wetInk.paint(r, stroke, res, cap)) stroke.paint(r)
+    fun paintLiveStroke(r: Renderer, stroke: Stroke, pageIndex: Int?) {
+        val page = document.pages.getOrNull(pageIndex ?: -1)
+        // A toggle mid-stroke drops the wet cache (see invalidateAllCaches), so the flag cannot
+        // change under runs already baked: baked surface and live tail always agree.
+        wetInk.invertColors = page?.resolvedInvertColors(document) == true
+        val rr = if (page != null) contentRenderer(r, page) else r
+        try {
+            val res = (zoom * renderScale).coerceAtLeast(0.01)
+            val cap = 2L * max(viewportW, 1) * max(viewportH, 1)
+            if (!wetInk.paint(rr, stroke, res, cap)) stroke.paint(rr)
+        } finally {
+            if (page != null) resetContentRenderer(r)
+        }
     }
 
     /**
@@ -1960,17 +2048,24 @@ class CanvasState(
         val seq = markupSeq
         val withFlow = !flowLifted // snapshot; a session toggle bumps sharpGen and discards this
         runAsync {
-            val base = surfaceFactory.create(vw, vh, 1.0).also { it.fill(bg) }
-            val ink = surfaceFactory.create(vw, vh, 1.0).also { it.fill(TRANSPARENT) }
-            renderSharpFrame(base, ink, o, z, res, draws, withFlow)
+            val built = runBuild {
+                val base = surfaceFactory.create(vw, vh, 1.0).also { it.fill(bg) }
+                val ink = surfaceFactory.create(vw, vh, 1.0).also { it.fill(TRANSPARENT) }
+                renderSharpFrame(base, ink, o, z, res, draws, withFlow)
+                base to ink
+            }
             postToMain {
                 pendingSharp = false
-                if (gen == sharpGen && row == currentRow && !pageFlipAnimating &&
+                if (built != null && gen == sharpGen && row == currentRow && !pageFlipAnimating &&
                     sx == scrollX && sy == scrollY && z == zoom
                 ) {
+                    val (base, ink) = built
                     sharpFrame = SharpFrame(base, ink, sx, sy, z, gen, row, seq)
                     // Replay edits committed during the build; the item snapshot predates them.
                     for ((p, rect) in pendingSharpEdits) repairSharpInk(p, rect)
+                    onCacheReady?.invoke()
+                } else if (built == null) {
+                    // A dying build must still settle the frame request below.
                     onCacheReady?.invoke()
                 }
                 pendingSharpEdits.clear()
@@ -2000,25 +2095,28 @@ class CanvasState(
         ri.scale(z, z)
         for (d in draws) {
             rb.fillRect(d.pr, paperColor(d.page))
-            rb.save()
-            rb.clipRect(d.pr)
-            rb.translate(d.pr.left, d.pr.top)
-            applyPageTransform(rb, d.page)
+            val rbx = contentRenderer(rb, d.page)
+            rbx.save()
+            rbx.clipRect(d.pr)
+            rbx.translate(d.pr.left, d.pr.top)
+            applyPageTransform(rbx, d.page)
             if (paintPageBackground != null && d.region.w > 0.0 && d.region.h > 0.0) {
+                // Raw: paintPageBackground wraps for the page itself; wrapping here would invert twice.
                 paintPageBackground?.invoke(d.page, rb, res, d.region)
             }
-            rb.restore()
-            ri.save()
-            ri.clipRect(d.pr)
-            ri.translate(d.pr.left, d.pr.top)
-            applyPageTransform(ri, d.page)
+            rbx.restore()
+            val rix = contentRenderer(ri, d.page)
+            rix.save()
+            rix.clipRect(d.pr)
+            rix.translate(d.pr.left, d.pr.top)
+            applyPageTransform(rix, d.page)
             val f = fade
-            InkFade.paint(d.items.under, ri, f) { it.paint(ri) }
+            InkFade.paint(d.items.under, rix, f) { it.paint(rix) }
             if (withFlow && d.region.w > 0.0 && d.region.h > 0.0) {
-                paintFlow?.invoke(d.page, ri, d.region)
+                paintFlow?.invoke(d.page, rix, d.region)
             }
-            InkFade.paint(d.items.over, ri, f) { it.paint(ri) }
-            ri.restore()
+            InkFade.paint(d.items.over, rix, f) { it.paint(rix) }
+            rix.restore()
         }
     }
 
@@ -2028,7 +2126,7 @@ class CanvasState(
         val idx = document.pages.indexOf(page)
         val pr = pageRects.getOrNull(idx) ?: return
         val o0 = originFor(f.sx, f.sy, f.z)
-        val r = f.ink.renderer()
+        val r = contentRenderer(f.ink.renderer(), page)
         r.save()
         r.translate(o0.x, o0.y)
         r.scale(f.z, f.z)
@@ -2036,6 +2134,17 @@ class CanvasState(
         r.translate(pr.left, pr.top)
         applyPageTransform(r, page)
         paintItem(item, r)
+        if (item !is com.xnotes.core.model.StickyNoteItem) {
+            // Keep sticky notes in front of the fresh ink they overlap.
+            val bounds = item.paintBounds()
+            for (other in page.items) {
+                if (other is com.xnotes.core.model.StickyNoteItem && !isLiftedItem(other) &&
+                    !other.isHighlighterInk() && other.paintBounds().intersects(bounds)
+                ) {
+                    paintItem(other, r)
+                }
+            }
+        }
         r.restore()
     }
 

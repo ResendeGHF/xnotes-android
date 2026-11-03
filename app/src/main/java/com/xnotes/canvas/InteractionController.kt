@@ -13,6 +13,7 @@ import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.history.AddItem
 import com.xnotes.core.history.AddItems
+import com.xnotes.core.history.AddPage
 import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.EraseItems
@@ -97,6 +98,11 @@ import com.xnotes.core.tools.MarkupMode
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 import com.xnotes.core.tools.ToolDefaults
+import com.xnotes.handwrite.FlowRow
+import com.xnotes.handwrite.HBlock
+import com.xnotes.handwrite.HandwriteTrace
+import com.xnotes.handwrite.PdfPageContent
+import com.xnotes.handwrite.layoutBlocks
 import com.xnotes.ui.theme.Palette
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -1444,7 +1450,9 @@ class InteractionController(
             dwellAnchor = downViewport
             armDwell()
         }
-        frontInk?.wet(stroke, pageIndex)
+        // A sticky stroke rides the ordinary path so the overlay can clip it to the paper;
+        // the front pad has no such clip and would spill it onto the page.
+        if (stickyDrawTarget == null) frontInk?.wet(stroke, pageIndex)
         requestRender()
     }
 
@@ -1469,7 +1477,7 @@ class InteractionController(
             cp.x, cp.y,
             if (drawingIsStylus) e.getPressure(idx).toDouble() else 1.0, e.eventTime, force = false,
         )
-        frontInk?.wet(liveStroke, strokePageIndex)
+        if (stickyDrawTarget == null) frontInk?.wet(liveStroke, strokePageIndex)
         requestRender()
     }
 
@@ -1479,16 +1487,27 @@ class InteractionController(
         if (state.pageRects.getOrNull(pi) == null) return
         val vp = magnetize(Pt(vx, vy))
         val content = state.viewportToContent(vp)
+        // Ink starting inside an expanded sticky stays on the note: clamp it to the paper
+        // so the live preview never spills onto the page. Committed ink is clipped the
+        // same way when it paints, so what the pen shows is what pen-up keeps.
+        val stickyTarget = if (stickyDrawTarget != null && pi == stickyDrawPage) stickyDrawTarget else null
         // The pen has walked onto another page: carry the stroke over rather than let it slide
         // under the paper. A straight line is one segment by definition and never hands over.
-        if (!stroke.straight) {
+        // A sticky stroke never hands over: it is clamped to its paper on this page.
+        if (!stroke.straight && stickyTarget == null) {
             val onPage = state.pageIndexAtContent(content)
             if (onPage != null && onPage != pi) {
                 handOverStroke(stroke, pi, onPage, content, pressure, timeMs)
                 return
             }
         }
-        val local = state.toPageSpace(pi, content)
+        val rawLocal = state.toPageSpace(pi, content)
+        val local = if (stickyTarget != null) {
+            Pt(
+                rawLocal.x.coerceIn(stickyTarget.rect.left, stickyTarget.rect.right),
+                rawLocal.y.coerceIn(stickyTarget.rect.top, stickyTarget.rect.bottom),
+            )
+        } else rawLocal
         if (stroke.straight) {
             // Straight-line mode: the stroke is always pen-down → current point, so the moving
             // endpoint just tracks the pointer (decimation/spacing gates don't apply). Near an axis
@@ -1595,8 +1614,13 @@ class InteractionController(
     /** Commit a finished stroke into an expanded sticky's note-local ink. */
     private fun fileStickyStroke(stroke: Stroke, target: StickyNoteItem, pageIndex: Int, before: List<Stroke>) {
         simplifyForCommit(stroke)
-        // Page-local samples become note-local.
-        val local = stroke.samples.map { Sample(it.x - target.rect.x, it.y - target.rect.y, it.pressure, it.t) }
+        // Page-local samples become note-local, clamped to the paper so no run can live
+        // on the page outside the note.
+        val local = stroke.samples.map {
+            val cx = it.x.coerceIn(target.rect.left, target.rect.right)
+            val cy = it.y.coerceIn(target.rect.top, target.rect.bottom)
+            Sample(cx - target.rect.x, cy - target.rect.y, it.pressure, it.t)
+        }
         val committed = Stroke(stroke.tool, stroke.config, local, stroke.speedScale, stroke.straight, stroke.smoothScale)
         committed.finished = true
         val page = state.document.pages.getOrNull(pageIndex)
@@ -1695,8 +1719,14 @@ class InteractionController(
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport
      *  px at the draw zoom (÷ zoom → content px), capped so zoomed-out ink keeps content fidelity.
      *  The stroke's just-built geometry supplies the half-width channel, so pressure/speed width
-     *  variation survives the reduction. */
+     *  variation survives the reduction. The pencil never reduces: its density is
+     *  per-sample pressure and its grain is page-anchored, so dropping a sample
+     *  would move the live texture on pen-up. */
     private fun simplifyForCommit(stroke: Stroke) {
+        if (stroke.tool == com.xnotes.core.tools.Tool.PENCIL) {
+            stroke.trimToSize()
+            return
+        }
         if (StrokeSimplify.enabled && !stroke.straight) {
             val eps = (SIMPLIFY_EPS / state.zoom).coerceAtMost(SIMPLIFY_EPS)
             val slim = StrokeSimplify.simplify(
@@ -3330,8 +3360,14 @@ class InteractionController(
         val was = item.paintBounds()
         if (item.collapsed) {
             val before = item.collapsed
+            val rectBefore = item.rect
+            // An icon parked at the page's far right/bottom would otherwise open its paper
+            // off the page; shift it minimally so the whole note stays visible.
+            val fitted = StickyNoteItem.fitExpanded(item.rect, state.footprint(page))
             item.collapsed = false
-            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, false))))
+            item.rect = fitted
+            val rectShift = if (fitted != rectBefore) fitted else null
+            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, false, rectBefore, rectShift))))
             state.document.dirty = true
             repairRegion(page, was.union(item.paintBounds()))
             onContentChanged()
@@ -3387,8 +3423,16 @@ class InteractionController(
         val page = state.document.pages.firstOrNull { p -> p.items.any { it === item } } ?: return
         val next = !item.collapsed
         val before = item.collapsed
+        val rectBefore = item.rect
         item.collapsed = next
-        history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, next))))
+        var rectAfter: Rect? = null
+        if (!next) {
+            // Expanding from the far edge must not open the paper off the page.
+            val fitted = StickyNoteItem.fitExpanded(item.rect, state.footprint(page))
+            item.rect = fitted
+            if (fitted != rectBefore) rectAfter = fitted
+        }
+        history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, next, rectBefore, rectAfter))))
         state.document.dirty = true
         state.invalidatePage(page)
         onContentChanged()
@@ -4698,6 +4742,250 @@ class InteractionController(
         swapInk(page, strokes, box)
     }
 
+    /**
+     * Set [blocks] as handwriting on the page under [atContent] (or the viewport
+     * centre): glyph lines, editable math and editable tables flowing down the
+     * paper and onto fresh pages appended after it, so documents of any length
+     * fit. One undoable step; the first page's new items end up selected.
+     * Returns false when there was nothing to set.
+     */
+    fun insertHandwritingBlocks(blocks: List<HBlock>, pointSize: Double, atContent: Pt? = null): Boolean =
+        insertPdfPages(listOf(PdfPageContent.Text(blocks)), pointSize, atContent) > 0
+
+    /**
+     * A whole document (PDF pages, long files) as handwriting, in order: text
+     * sections become glyph/math/table rows, scans become traced strokes. The
+     * first entry starts on the viewport page; every later entry starts on a
+     * fresh page, so a whole PDF converts in its entirety. Everything lands in
+     * one undoable step. Returns how many entries were converted.
+     */
+    fun insertPdfPages(contents: List<PdfPageContent>, pointSize: Double, atContent: Pt? = null): Int {
+        if (contents.isEmpty()) return 0
+        val doc = state.document
+        val centre = atContent ?: state.viewportToContent(Pt(state.viewportW / 2.0, state.viewportH / 2.0))
+        var pi = (state.pageIndexAtContent(centre) ?: state.currentPageIndex())
+            .coerceIn(0, doc.pages.lastIndex)
+        val local = state.toPageSpace(pi, centre)
+        clearSelection()
+        val acc = FlowAcc()
+        var converted = 0
+        var first = true
+        for (content in contents) {
+            when (content) {
+                is PdfPageContent.Text -> {
+                    val cover = state.footprint(doc.pages[pi])
+                    val rows = layoutBlocks(content.blocks, textMeasurer, inkColor, pointSize, cover.w * 0.94)
+                    if (rows.all { it.items.isEmpty() }) continue
+                    pi = flowRows(
+                        acc, pi, rows,
+                        FlowOpts(centered = true, x0 = 0.0, yCenter = if (first) local.y else null, forceNewPage = !first, remove = null),
+                    )
+                    if (pi < 0) continue
+                    converted++
+                    first = false
+                }
+                is PdfPageContent.Scan -> {
+                    pi = flowScan(acc, pi, content.page)
+                    if (pi < 0) continue
+                    converted++
+                    first = false
+                }
+            }
+        }
+        if (converted == 0 || !finishFlow(acc)) return 0
+        return converted
+    }
+
+    /**
+     * Replace text box [item] with [blocks] set as handwriting at the box's
+     * top-left and width, flowing onto fresh pages after it when the words run
+     * past the paper, as one undoable step. False when the box is gone or
+     * there was nothing to set.
+     */
+    fun replaceTextWithHandwritingBlocks(item: TextItem, blocks: List<HBlock>, pointSize: Double): Boolean {
+        val pi = state.document.pages.indexOfFirst { p -> p.items.any { it === item } }
+        if (pi < 0) return false
+        val cover = state.footprint(state.document.pages[pi])
+        val wrap = item.width.coerceIn(40.0, cover.w * 0.94)
+        val rows = layoutBlocks(blocks, textMeasurer, inkColor, pointSize, wrap)
+        if (rows.all { it.items.isEmpty() }) return false
+        clearSelection()
+        val acc = FlowAcc()
+        val end = flowRows(
+            acc, pi, rows,
+            FlowOpts(centered = false, x0 = item.pos.x, yCenter = null, forceNewPage = false, remove = item, yTop = item.pos.y),
+        )
+        if (end < 0) return false
+        return finishFlow(acc)
+    }
+
+    /** How one flow run starts: centred block or fixed left edge, from the paper top or a viewport point. */
+    private class FlowOpts(
+        val centered: Boolean,
+        val x0: Double,
+        val yCenter: Double?,
+        val forceNewPage: Boolean,
+        val remove: TextItem?,
+        /** Fixed top when [yCenter] is null and this is the first page (replaces start at the box). */
+        val yTop: Double? = null,
+    )
+
+    /** One flow run's accumulating commands, placements and fresh-page count. */
+    private class FlowAcc(
+        val cmds: ArrayList<Command> = ArrayList(),
+        val placed: LinkedHashMap<Page, MutableList<CanvasItem>> = LinkedHashMap(),
+        var newPages: Int = 0,
+    )
+
+    /**
+     * Lay pre-built [rows] (block coordinates, x from 0) down from page
+     * [startPi], continuing onto fresh blank pages appended after it whenever
+     * a row runs past the paper. Returns the end page index, or -1 when
+     * nothing was placed.
+     */
+    private fun flowRows(acc: FlowAcc, startPi: Int, rows: List<FlowRow>, opts: FlowOpts): Int {
+        val doc = state.document
+        opts.remove?.let { item ->
+            val rpi = doc.pages.indexOfFirst { p -> p.items.any { it === item } }
+            if (rpi >= 0) {
+                val rp = doc.pages[rpi]
+                rp.items.remove(item)
+                acc.cmds.add(EraseItems(listOf(rp to (item as CanvasItem))))
+                state.invalidatePage(rp)
+            }
+        }
+        var pi = startPi.coerceIn(0, doc.pages.lastIndex)
+        var page = doc.pages[pi]
+        var cover = state.footprint(page)
+        if (opts.forceNewPage) {
+            pi = freshPageAfter(acc, pi)
+            page = doc.pages[pi]
+            cover = state.footprint(page)
+        }
+        val blockW = rows.maxOf { rowWidth(it) }.coerceAtLeast(0.0)
+        var cursor = when {
+            opts.yCenter != null -> {
+                val totalH = rows.lastOrNull()?.let { it.top + it.height }.orZero() - rows.firstOrNull()?.top.orZero()
+                val fitH = minOf(totalH, cover.h)
+                (opts.yCenter - fitH / 2.0).coerceIn(cover.top, (cover.bottom - fitH).coerceAtLeast(cover.top))
+            }
+            opts.yTop != null -> opts.yTop
+            else -> cover.top
+        }
+        for (row in rows) {
+            if (row.items.isEmpty()) {
+                cursor += row.height
+                continue
+            }
+            // A row taller than the paper, or wider than it, shrinks uniformly
+            // to fit. Rows never enlarge.
+            var bounds = rowBounds(row) ?: continue
+            if (row.height > cover.h && row.height > 0.0) {
+                val k = (cover.h * 0.9 / row.height).coerceIn(0.0, 1.0)
+                if (k < 1.0 && k > 0.0) {
+                    for (item in row.items) item.applyTransform(Affine.scaleAbout(Pt(bounds.left, bounds.top), k, k))
+                    row.height *= k
+                    bounds = rowBounds(row) ?: continue
+                }
+            }
+            if (bounds.w > cover.w * 0.96 && bounds.w > 0.0) {
+                val k = (cover.w * 0.96 / bounds.w).coerceIn(0.0, 1.0)
+                if (k < 1.0 && k > 0.0) {
+                    for (item in row.items) item.applyTransform(Affine.scaleAbout(Pt(bounds.left, bounds.top), k, k))
+                    row.height *= k
+                    bounds = rowBounds(row) ?: continue
+                }
+            }
+            // Past the paper's bottom (and not already at its top): continue on
+            // a fresh blank page appended right after this one.
+            if (cursor + row.height > cover.bottom + 1e-9 && cursor > cover.top + 1e-9) {
+                pi = freshPageAfter(acc, pi)
+                page = doc.pages[pi]
+                cover = state.footprint(page)
+                cursor = cover.top
+            }
+            val xc = if (opts.centered) {
+                cover.left + ((cover.w - blockW) / 2.0).coerceAtLeast(0.0)
+            } else {
+                opts.x0.coerceIn(cover.left, (cover.right - blockW).coerceAtLeast(cover.left))
+            }
+            val dx = xc
+            val dy = cursor - row.top
+            if (dx != 0.0 || dy != 0.0) for (item in row.items) item.translate(dx, dy)
+            for (item in row.items) {
+                page.items.add(item)
+                state.appendToCache(page, item)
+            }
+            acc.placed.getOrPut(page) { ArrayList() }.addAll(row.items)
+            for (item in row.items) acc.cmds.add(AddItem(page, item))
+            cursor += row.height
+        }
+        return if (acc.placed.isEmpty()) -1 else pi
+    }
+
+    /**
+     * A scanned page (no text layer) as traced strokes filling a fresh page
+     * appended after [startPi]. Returns the new page index, or -1 when the
+     * trace held no ink.
+     */
+    private fun flowScan(acc: FlowAcc, startPi: Int, scan: HandwriteTrace.ScanPage): Int {
+        val doc = state.document
+        val strokes = HandwriteTrace.toStrokes(scan, inkColor, configFor(Tool.PEN).baseWidth)
+        val bounds = strokes.map { it.bounds() }.reduceOrNull { a, b -> a.union(b) } ?: return -1
+        if (bounds.w <= 0.0 || bounds.h <= 0.0) return -1
+        val pi = freshPageAfter(acc, startPi.coerceIn(0, doc.pages.lastIndex))
+        val page = doc.pages[pi]
+        val cover = state.footprint(page)
+        val k = minOf(cover.w * 0.96 / bounds.w, cover.h * 0.96 / bounds.h).coerceIn(0.0, 2.0)
+        if (k <= 0.0 || !k.isFinite()) return -1
+        for (s in strokes) s.applyTransform(Affine.scaleAbout(Pt(bounds.left, bounds.top), k, k))
+        val placed = strokes.map { it.bounds() }.reduce { a, b -> a.union(b) }
+        val dx = cover.left + (cover.w - placed.w) / 2.0 - placed.left
+        val dy = cover.top + (cover.h - placed.h) / 2.0 - placed.top
+        for (s in strokes) s.translate(dx, dy)
+        for (s in strokes) {
+            page.items.add(s)
+            state.appendToCache(page, s)
+        }
+        acc.placed.getOrPut(page) { ArrayList() }.addAll(strokes)
+        for (s in strokes) acc.cmds.add(AddItem(page, s))
+        return pi
+    }
+
+    /** A fresh blank page after [pi], recorded in [acc]; returns its index. */
+    private fun freshPageAfter(acc: FlowAcc, pi: Int): Int {
+        val doc = state.document
+        val (bw, bh) = doc.blankPageSize(doc.pages[pi])
+        val fresh = Page(bw, bh)
+        doc.pages.add(pi + 1, fresh)
+        acc.cmds.add(AddPage(doc, fresh, pi + 1))
+        acc.newPages++
+        return pi + 1
+    }
+
+    /** Commit one flow run: a single undo step over every page and item it touched. */
+    private fun finishFlow(acc: FlowAcc): Boolean {
+        if (acc.placed.isEmpty()) return false
+        history.push(CompositeCommand(acc.cmds))
+        state.document.dirty = true
+        if (acc.newPages > 0) state.relayout()
+        for (p in acc.placed.keys) state.invalidatePage(p)
+        val first = acc.placed.keys.first()
+        selectPlaced(state.document.pages.indexOf(first), acc.placed.getValue(first))
+        onContentChanged()
+        requestRender()
+        return true
+    }
+
+    /** Union of a row's item bounds, or null when it holds nothing. */
+    private fun rowBounds(row: FlowRow): Rect? =
+        row.items.map { it.bounds() }.reduceOrNull { a, b -> a.union(b) }
+
+    /** Ink width of a row, for centring the block on the page. */
+    private fun rowWidth(row: FlowRow): Double = rowBounds(row)?.w ?: 0.0
+
+    private fun Double?.orZero(): Double = this ?: 0.0
+
     private fun swapInk(page: Page, strokes: List<CanvasItem>, box: TextItem) {
         val removals = strokes.map { page to (it as CanvasItem) }
         for (s in strokes) page.items.remove(s)
@@ -5782,7 +6070,7 @@ class InteractionController(
                 r.withSave {
                     r.translate(pr.left + moveOffset.x, pr.top + moveOffset.y)
                     state.applyPageTransform(r, state.document.pages[sel.pageIndex])
-                    state.paintItem(sel.item, r)
+                    paintPageInverted(r, sel.pageIndex) { rr -> state.paintItem(sel.item, rr) }
                 }
             }
 
@@ -5792,7 +6080,7 @@ class InteractionController(
                 r.withSave {
                     r.translate(pr.left, pr.top)
                     state.applyPageTransform(r, state.document.pages[pi])
-                    for (item in f.items) state.paintItem(item, r)
+                    paintPageInverted(r, pi) { rr -> for (item in f.items) state.paintItem(item, rr) }
                 }
             }
 
@@ -5803,20 +6091,33 @@ class InteractionController(
                     r.withSave {
                         r.translate(pr.left, pr.top)
                         state.applyPageTransform(r, state.document.pages[labelPageIndex])
-                        shape.paint(r)
+                        paintPageInverted(r, labelPageIndex) { rr -> shape.paint(rr) }
                     }
                 }
             }
 
             // Live in-progress stroke / shape preview, clipped to its page. The stroke goes through
             // the wet cache, which blits whatever has stopped moving instead of refilling it.
+            // A sticky stroke is clipped to its paper as well, so it never reads as page ink.
             if (frontInk?.live != true) {
-                liveStroke?.let { stroke -> paintClippedToPage(r, strokePageIndex) { state.paintLiveStroke(r, stroke) } }
+                liveStroke?.let { stroke ->
+                    paintClippedToPage(r, strokePageIndex) {
+                        val sticky = if (strokePageIndex == stickyDrawPage) stickyDrawTarget else null
+                        if (sticky != null) {
+                            r.withSave {
+                                r.clipRect(sticky.rect)
+                                state.paintLiveStroke(r, stroke, strokePageIndex)
+                            }
+                        } else {
+                            state.paintLiveStroke(r, stroke, strokePageIndex)
+                        }
+                    }
+                }
             }
-            pendingShape?.let { shape -> paintClippedToPage(r, shapePageIndex) { shape.paint(r) } }
-            pendingTape?.let { tape -> paintClippedToPage(r, tapePageIndex) { tape.paint(r) } }
-            connectorDraft?.let { d -> paintClippedToPage(r, connectorPage) { d.connector.paint(r) } }
-            pendingTable?.let { table -> paintClippedToPage(r, tableDrawPageIndex) { table.paint(r) } }
+            pendingShape?.let { shape -> paintClippedToPage(r, shapePageIndex) { paintPageInverted(r, shapePageIndex) { rr -> shape.paint(rr) } } }
+            pendingTape?.let { tape -> paintClippedToPage(r, tapePageIndex) { paintPageInverted(r, tapePageIndex) { rr -> tape.paint(rr) } } }
+            connectorDraft?.let { d -> paintClippedToPage(r, connectorPage) { paintPageInverted(r, connectorPage) { rr -> d.connector.paint(rr) } } }
+            pendingTable?.let { table -> paintClippedToPage(r, tableDrawPageIndex) { paintPageInverted(r, tableDrawPageIndex) { rr -> table.paint(rr) } } }
 
             // Disappearing ink (magic wand): ephemeral strokes drawn live at the shared fade alpha,
             // without mutating their stored colour. Highlighters keep their MULTIPLY look while fading.
@@ -5825,7 +6126,7 @@ class InteractionController(
                 if (frontInk?.holding(fs.stroke) == true) continue
                 paintClippedToPage(r, fs.pageIndex) {
                     r.saveLayerBlended(fs.stroke.paintBounds(), fadeAlpha, fs.stroke.blendMode)
-                    fs.stroke.paint(r)
+                    paintPageInverted(r, fs.pageIndex) { rr -> fs.stroke.paint(rr) }
                     r.restore()
                 }
             }
@@ -5925,8 +6226,19 @@ class InteractionController(
         dashGap = com.xnotes.core.infinite.OverlayTessellator.DASH_GAP_DP * state.devicePxPerDp,
     )
 
-    private inline fun paintClippedToPage(r: Renderer, pageIndex: Int?, crossinline paint: () -> Unit) {
-        val pi = pageIndex ?: -1
+    /** Paint page content through its color-inversion wrapper, resetting the shared [r] after. */
+    private inline fun paintPageInverted(r: Renderer, pageIndex: Int?, paint: (Renderer) -> Unit) {
+        val page = state.document.pages.getOrNull(pageIndex ?: -1)
+        if (page == null) return paint(r)
+        val rr = state.contentRenderer(r, page)
+        try {
+            paint(rr)
+        } finally {
+            state.resetContentRenderer(r)
+        }
+    }
+
+    private inline fun paintClippedToPage(r: Renderer, pageIndex: Int?, crossinline paint: () -> Unit) {        val pi = pageIndex ?: -1
         val pr = state.pageRects.getOrNull(pi) ?: return
         r.withSave {
             r.clipRect(pr)

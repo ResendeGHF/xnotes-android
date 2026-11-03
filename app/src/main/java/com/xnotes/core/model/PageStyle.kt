@@ -59,6 +59,17 @@ data class PageStyle(
     val params: Map<String, Double>? = null,
     /** The template's colour parameters by name. */
     val colors: Map<String, Rgba>? = null,
+    /**
+     * Color inversion display mode: paper, ruling and ink paint lightness-inverted. Null
+     * inherits from the level below (page → document → off). Set on the document
+     * ("All Pages"); pages inherit it.
+     */
+    val invertColors: Boolean? = null,
+    /**
+     * With [invertColors], placed images and imported PDF pages invert too; otherwise
+     * they keep their pixels. Same inheritance as [invertColors].
+     */
+    val invertImages: Boolean? = null,
 ) {
     /** The part of this style its template owns. */
     val settings: TemplateSettings
@@ -77,7 +88,8 @@ data class PageStyle(
     /** True when nothing is overridden — the codec writes no `style` object in this case. */
     val isEmpty: Boolean
         get() = pageColor == null && template == null && patternColor == null && spacing == null &&
-            accentColor == null && params.isNullOrEmpty() && colors.isNullOrEmpty()
+            accentColor == null && params.isNullOrEmpty() && colors.isNullOrEmpty() &&
+            invertColors == null && invertImages == null
 
     companion object {
         const val DEFAULT_SPACING = 64.0 // content px (~10.8 mm at 150 dpi)
@@ -128,6 +140,14 @@ fun Page.resolvedColors(doc: Document): Map<String, Rgba> {
     for (s in settingLevels(doc).asReversed()) s.colors?.let { out.putAll(it) }
     return out
 }
+
+/** Whether the page paints color-inverted: its own flag, else the note's, else off. */
+fun Page.resolvedInvertColors(doc: Document): Boolean =
+    style.invertColors ?: doc.style.invertColors ?: false
+
+/** Whether inverted pages also invert images and PDF pages: same inheritance. */
+fun Page.resolvedInvertImages(doc: Document): Boolean =
+    style.invertImages ?: doc.style.invertImages ?: false
 
 /**
  * Copy into each page what older notes let it borrow from the note's style across templates: the

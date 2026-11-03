@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -33,12 +34,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -54,6 +59,7 @@ import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -104,6 +110,12 @@ internal class FieldState {
     var probeX by mutableStateOf("0.5")
     var probeY by mutableStateOf("0.5")
     var probeZ by mutableStateOf("0.5")
+    /** Colour map for scalar values and vector magnitudes; JET matches the legacy ramp. */
+    var palette by mutableStateOf(FieldPalette.JET)
+    /** When false, vector arrows and surfaces use plain series colours instead of the ramp. */
+    var colorByValue by mutableStateOf(true)
+    /** When true pinch zooms the camera; when false it grows the sampled ranges. */
+    var lockDomain by mutableStateOf(true)
     val orbit: OrbitState = OrbitState()
     val anim: AnimState = AnimState()
     var valueLo by mutableStateOf<Double?>(null)
@@ -138,11 +150,40 @@ internal class FieldState {
             FieldMode.VECTOR_3D -> if (i in vector3List.indices) vector3List = vector3List.toMutableList().also { list -> list[i] = list[i].copy(colorArgb = colorArgb, visible = visible) }
         }
     }
+    /** Whether the current mode holds anything to draw: no function means an empty grid, not a spinner. */
+    internal fun hasContent(): Boolean = when (mode) {
+        FieldMode.SCALAR_2D -> scalar2List.any { it.visible && it.text.isNotBlank() } &&
+            (!usePath2D || pathX2.isNotBlank() || pathY2.isNotBlank())
+        FieldMode.VECTOR_2D -> vector2List.any { it.visible && (it.p.isNotBlank() || it.q.isNotBlank()) } &&
+            (!usePath2D || pathX2.isNotBlank() || pathY2.isNotBlank())
+        FieldMode.SCALAR_3D -> scalar3List.any { it.visible && it.text.isNotBlank() } &&
+            (!usePath3D || surfX3.isNotBlank() || surfY3.isNotBlank() || surfZ3.isNotBlank())
+        FieldMode.VECTOR_3D -> vector3List.any { it.visible && (it.p.isNotBlank() || it.q.isNotBlank() || it.r.isNotBlank()) } &&
+            (!usePath3D || surfX3.isNotBlank() || surfY3.isNotBlank() || surfZ3.isNotBlank())
+    }
+
     fun center(): Triple<Double, Double, Double> = Triple(
         centerX.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0,
         centerY.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0,
         centerZ.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0,
     )
+
+    /** Grow/shrink the sampled x/y ranges around the centre (pinch zoom on the 2D panes). */
+    fun zoomDomain2D(factor: Float) {
+        if (!factor.isFinite() || factor <= 0f) return
+        val f = factor.toDouble()
+        xRange = Numbers.tick((rangeOf(xRange) / f).coerceIn(0.05, 1e4))
+        yRange = Numbers.tick((rangeOf(yRange) / f).coerceIn(0.05, 1e4))
+    }
+
+    /** Grow/shrink the sampled ranges around the centre (unlocked pinch zoom). */
+    fun zoomDomain3D(factor: Float) {
+        if (!factor.isFinite() || factor <= 0f) return
+        val f = factor.toDouble()
+        xRange = Numbers.tick((rangeOf(xRange) / f).coerceIn(1e-3, 1e4))
+        yRange = Numbers.tick((rangeOf(yRange) / f).coerceIn(1e-3, 1e4))
+        zRange = Numbers.tick((rangeOf(zRange, 3.0) / f).coerceIn(1e-3, 1e4))
+    }
 
     fun snapshot(): FieldSnap {
         val a = anim
@@ -173,6 +214,9 @@ internal class FieldState {
             pathZ = surfZ3,
             pathR0 = if (is3dSnap) num(surfU0, -3.14) else num(pathS0, 0.0),
             pathR1 = if (is3dSnap) num(surfU1, 3.14) else num(pathS1, 6.28),
+            palette = palette,
+            colorByValue = colorByValue,
+            lock = lockDomain,
         )
     }
 }
@@ -207,13 +251,29 @@ internal class FieldSnap(
     val pathZ: String = "",
     val pathR0: Double = 0.0,
     val pathR1: Double = 6.28,
+    val palette: FieldPalette = FieldPalette.JET,
+    /** When false, vector arrows and surfaces use plain series colours, not the ramp. */
+    val colorByValue: Boolean = true,
+    /** When true pinch zooms the camera; when false it grows the sampled ranges. */
+    val lock: Boolean = true,
 )
 
 private class FieldRaster(val bitmap: Bitmap, val lo: Double, val hi: Double)
-private class CloudPoint(val x: Double, val y: Double, val z: Double, val value: Double)
-private class ScalarCloud(val points: List<CloudPoint>, val lo: Double, val hi: Double, val xRange: Double, val yRange: Double, val zRange: Double, val colorArgb: Int? = null)
-private class Arrow3(val x: Double, val y: Double, val z: Double, val dx: Double, val dy: Double, val dz: Double, val mag: Double)
-private class VectorCloud(val arrows: List<Arrow3>, val maxMag: Double, val xRange: Double, val yRange: Double, val zRange: Double, val colorArgb: Int? = null)
+
+/** Grid + axes + domain box with nothing plotted: the interactive empty view. */
+private suspend fun rasterEmptyFieldFrame(snap: FieldSnap, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, cx: Double, cy: Double, cz: Double): Bitmap {
+    val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
+    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bmp)
+    canvas.drawColor(theme.paper)
+    val proj = quatProjector(w, h, quat, zoom, snap.xRange, snap.yRange, snap.zRange, cx, cy, cz)
+    drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, snap.xRange, snap.yRange, snap.zRange, w, h, theme, snap.showGrid)
+    return bmp
+}
+internal class CloudPoint(val x: Double, val y: Double, val z: Double, val value: Double)
+internal class ScalarCloud(val points: List<CloudPoint>, val lo: Double, val hi: Double, val xRange: Double, val yRange: Double, val zRange: Double, val colorArgb: Int? = null)
+internal class Arrow3(val x: Double, val y: Double, val z: Double, val dx: Double, val dy: Double, val dz: Double, val mag: Double)
+internal class VectorCloud(val arrows: List<Arrow3>, val maxMag: Double, val xRange: Double, val yRange: Double, val zRange: Double, val colorArgb: Int? = null)
 /** One entry's arrows on a shared surface, in that entry's colour. */
 private class ArrowSet(val arrows: List<Arrow3>, val colorArgb: Int?)
 /** Shared surface sampling behind on-surface arrows, for the coloured wireframe. */
@@ -244,6 +304,9 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
     val legend = baseLegend + if (state.anim.enabled) listOf("t=${"%.3f".format(state.anim.tCurrent)}" to series[baseLegend.size % series.size]) else emptyList()
     val animLabel = stringResource(R.string.math_insert_animation)
     val animOn = state.anim.enabled
+    val animLo = state.anim.tMinStr.toDoubleOrNull()
+    val animHi = state.anim.tMaxStr.toDoubleOrNull()
+    val animRangeOk = animLo != null && animHi != null && animLo.isFinite() && animHi.isFinite() && animLo != animHi
     AnimTicker(state.anim)
     LaunchedEffect(state.mode, state.scalar2List, state.vector2List, state.scalar3List, state.vector3List, state.probeX, state.probeY, state.probeZ, state.anim.tCurrent) {
         delay(180)
@@ -255,12 +318,14 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
         selected = state.mode.name,
         onSelect = { state.mode = FieldMode.valueOf(it) },
         legend = legend,
-        ramp = if (lo != null && hi != null && lo != hi) Numbers.tick(lo) to Numbers.tick(hi) else null,
+        ramp = if (lo != null && hi != null && lo != hi && (state.colorByValue || !isVector)) Numbers.tick(lo) to Numbers.tick(hi) else null,
+        rampStops = state.palette.stops.map { androidx.compose.ui.graphics.Color(it) },
         caption = if (state.anim.enabled) "t=${"%.3f".format(state.anim.tCurrent)} (insert captures current frame)" else null,
         showGrid = state.showGrid,
         onToggleGrid = { state.showGrid = !state.showGrid },
         onReset = state::resetView,
         inserting = inserting,
+        insertEnabled = state.hasContent(),
         onInsert = {
             if (inserting) return@GraphWorkspace
             val snap = state.snapshot()
@@ -271,7 +336,7 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                 if (bytes == null) failed = true else onInsert(bytes)
             }
         },
-        animInsertLabel = if (animOn) animLabel else null,
+        animInsertLabel = if (animOn && animRangeOk) animLabel else null,
         animInserting = animInserting,
         onInsertAnim = if (animOn) ({
             if (animInserting || inserting) return@GraphWorkspace
@@ -400,9 +465,27 @@ internal fun FieldPane(state: FieldState, onInsert: (ByteArray) -> Unit) {
                     MathTextField(state.centerY, { state.centerY = it.filter { c -> c.isDigit() || c == '.' || c == '-' } }, "cy", Modifier.weight(1f))
                     if (is3d) MathTextField(state.centerZ, { state.centerZ = it.filter { c -> c.isDigit() || c == '.' || c == '-' } }, "cz", Modifier.weight(1f))
                 }
+                if (is3d) {
+                    Spacer(Modifier.height(4.dp))
+                    MathChip(stringResource(R.string.math_domain_lock), selected = state.lockDomain) {
+                        state.lockDomain = !state.lockDomain
+                    }
+                }
             }
             if (isVector || is3d) CommittedSlider(state.density, { state.density = it }, 6f..20f, stringResource(if (is3d) R.string.math_field_grid else R.string.math_field_density))
             if (state.mode == FieldMode.SCALAR_3D && !state.usePath3D) CommittedSlider(state.level, { state.level = it }, 0.02f..0.98f, stringResource(R.string.math_field_level), readout = { "%.2f".format(it) })
+            MathSectionTitle(stringResource(R.string.math_field_palette), Modifier.fillMaxWidth())
+            MathToolSelector(
+                FieldPalette.entries.map { it.name to it.title },
+                state.palette.name,
+                Modifier.fillMaxWidth(),
+            ) { state.palette = FieldPalette.valueOf(it) }
+            if (isVector) {
+                Spacer(Modifier.height(4.dp))
+                MathChip(stringResource(R.string.math_field_colour_by_value), selected = state.colorByValue) {
+                    state.colorByValue = !state.colorByValue
+                }
+            }
             AnimPanel(state.anim)
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 MathTextField(state.probeX, { state.probeX = it }, "x₀", Modifier.weight(1f))
@@ -439,6 +522,26 @@ private fun fieldLegend(state: FieldState, series: List<androidx.compose.ui.grap
     else listOf("S(u,v)" to series[base.size % series.size])
 }
 
+/** Pixel shift that keeps the last rendered frame glued under the finger while a fresh
+ *  sample is still being computed: positive x moves the image right, positive y moves it down. */
+internal fun fieldPanOffset(
+    frameCx: Double,
+    frameCy: Double,
+    cx: Double,
+    cy: Double,
+    xRange: Double,
+    yRange: Double,
+    w: Int,
+    h: Int,
+): Pair<Float, Float> {
+    if (!frameCx.isFinite() || !frameCy.isFinite() || !cx.isFinite() || !cy.isFinite()) return 0f to 0f
+    if (!xRange.isFinite() || !yRange.isFinite() || xRange <= 0 || yRange <= 0 || w <= 0 || h <= 0) return 0f to 0f
+    val ox = ((frameCx - cx) / (2 * xRange) * w).toFloat()
+    val oy = ((cy - frameCy) / (2 * yRange) * h).toFloat()
+    if (!ox.isFinite() || !oy.isFinite()) return 0f to 0f
+    return ox to oy
+}
+
 @Composable
 private fun Field2DView(state: FieldState, modifier: Modifier = Modifier) {
     val theme = rememberGraphTheme()
@@ -457,36 +560,78 @@ private fun Field2DView(state: FieldState, modifier: Modifier = Modifier) {
     val pathKey2 = rememberSettled(state.pathX2 + "|" + state.pathY2 + "|" + state.pathS0 + "|" + state.pathS1 + "|" + state.usePath2D, 180)
     val density = state.density.toInt().coerceIn(6, 20)
     val tKey = state.anim.tCurrent; val tOn = state.anim.enabled
+    val content = state.hasContent()
     var frame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var frameCenter by remember { mutableStateOf<Pair<Double, Double>?>(null) }
     var view by remember { mutableStateOf(IntSize(1, 1)) }
-    LaunchedEffect(mode, sKey, vKey, xRange, yRange, centerKey2, pathKey2, density, view, theme, tKey, tOn, state.showGrid) {
+    LaunchedEffect(mode, sKey, vKey, xRange, yRange, centerKey2, pathKey2, density, view, theme, tKey, tOn, state.showGrid, content) {
         if (view.width < 2 || view.height < 2) return@LaunchedEffect
         val (ccx, ccy, _) = state.center()
         val snap = state.snapshot()
-        val (w, h) = cappedSize(view.width, view.height, 640)
+        val (w, h) = cappedSize(view.width, view.height, LIVE_CAP)
+        if (!content) {
+            // Nothing to plot: bare paper; the Compose overlay below draws the live grid.
+            frame = withContext(Dispatchers.Default) {
+                emptyPlotFrame(w, h, theme)
+            }.asImageBitmap()
+            frameCenter = ccx to ccy
+            state.valueLo = null; state.valueHi = null
+            return@LaunchedEffect
+        }
         val t = if (tOn) tKey else null
         val raster = withContext(Dispatchers.Default) {
             if (!snap.usePath) {
-                if (mode == FieldMode.SCALAR_2D) renderScalar2Multi(sKey.split("").map(::parseEntry), xRange, yRange, w, h, theme, t, ccx, ccy, snap.showGrid)
-                else renderVector2Multi(vKey.split("").map { val p = it.split(""); val head = parseEntry(p.getOrElse(0) { "" }); Vec2Field(head.text, p.getOrElse(1) { "" }, head.colorArgb, head.visible) }, xRange, yRange, density, w, h, theme, t, ccx, ccy, snap.showGrid)
+                if (mode == FieldMode.SCALAR_2D) renderScalar2Multi(sKey.split("").map(::parseEntry), xRange, yRange, w, h, theme, t, ccx, ccy, snap.showGrid, snap.palette, frame = false)
+                else renderVector2Multi(vKey.split("").map { val p = it.split(""); val head = parseEntry(p.getOrElse(0) { "" }); Vec2Field(head.text, p.getOrElse(1) { "" }, head.colorArgb, head.visible) }, xRange, yRange, density, w, h, theme, t, ccx, ccy, snap.showGrid, snap.palette, frame = false, colorByValue = snap.colorByValue)
             } else {
-                if (mode == FieldMode.SCALAR_2D) renderScalarPath2D(snap.scalar2, snap, w, h, theme, t)
-                else renderVectorPath2D(snap.vector2, snap, w, h, theme, t)
+                if (mode == FieldMode.SCALAR_2D) renderScalarPath2D(snap.scalar2, snap, w, h, theme, t, snap.palette, frame = false)
+                else renderVectorPath2D(snap.vector2, snap, w, h, theme, t, snap.palette, frame = false, colorByValue = snap.colorByValue)
             }
         }
         state.valueLo = raster?.lo; state.valueHi = raster?.hi
         frame = raster?.bitmap?.asImageBitmap()
+        frameCenter = ccx to ccy
     }
+    // Live pan feedback: shift the last frame under the finger while the fresh sample
+    // is still computing; the next frame snaps the offset back to zero.
+    val (liveCx, liveCy, _) = state.center()
+    val liveXr = rangeOf(state.xRange); val liveYr = rangeOf(state.yRange)
+    val (panOx, panOy) = fieldPanOffset(
+        frameCenter?.first ?: liveCx, frameCenter?.second ?: liveCy, liveCx, liveCy,
+        liveXr, liveYr, view.width, view.height,
+    )
+    val measurer = rememberTextMeasurer()
+    val gridTextStyle = TextStyle(color = androidx.compose.ui.graphics.Color(theme.dim), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
     Box(modifier.clipToBounds().onSizeChanged { view = it }.pointerInput(Unit) {
-        detectTransformGestures { _, pan, _, _ ->
-            val xr = rangeOf(state.xRange); val yr = rangeOf(state.yRange)
-            val (ccx, ccy, _) = state.center()
-            state.centerX = "%.4f".format(ccx - pan.x / size.width * 2 * xr)
-            state.centerY = "%.4f".format(ccy + pan.y / size.height * 2 * yr)
+        detectTransformGestures { _, pan, zoom, _ ->
+            if (abs(zoom - 1f) < 0.002f) {
+                val xr = rangeOf(state.xRange); val yr = rangeOf(state.yRange)
+                val (ccx, ccy, _) = state.center()
+                state.centerX = "%.4f".format(ccx - pan.x / size.width * 2 * xr)
+                state.centerY = "%.4f".format(ccy + pan.y / size.height * 2 * yr)
+            } else {
+                state.zoomDomain2D(zoom)
+            }
         }
     }) {
-        frame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
-        if (frame == null) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
+        frame?.let {
+            Image(
+                it, null,
+                Modifier.fillMaxSize().offset { IntOffset(panOx.roundToInt(), panOy.roundToInt()) },
+                contentScale = ContentScale.FillBounds,
+            )
+        }
+        if (state.showGrid) {
+            Canvas(Modifier.fillMaxSize()) {
+                drawLiveFieldGrid(
+                    liveCx - liveXr, liveCx + liveXr, liveCy - liveYr, liveCy + liveYr,
+                    androidx.compose.ui.graphics.Color(theme.grid),
+                    androidx.compose.ui.graphics.Color(theme.axis),
+                    gridTextStyle, measurer,
+                )
+            }
+        }
+        if (frame == null && content) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
         AnimPlayOverlay(state.anim)
     }
 }
@@ -511,13 +656,23 @@ private fun Field3DView(state: FieldState, modifier: Modifier = Modifier) {
     val centerKey3 = rememberSettled(state.centerX + "|" + state.centerY + "|" + state.centerZ, 200)
     val pathKey3 = rememberSettled(state.surfX3 + "|" + state.surfY3 + "|" + state.surfZ3 + "|" + state.surfU0 + "|" + state.surfU1 + "|" + state.usePath3D, 200)
     val tKey = state.anim.tCurrent; val tOn = state.anim.enabled
-    var frame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val content = state.hasContent()
+    var gridFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var meshFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var view by remember { mutableStateOf(IntSize(1, 1)) }
+    val densityDp3 = LocalDensity.current.density
     var scalarClouds by remember { mutableStateOf<List<ScalarCloud>?>(null) }
     var vectorClouds by remember { mutableStateOf<List<VectorCloud>?>(null) }
     var pathScalar by remember { mutableStateOf<SurfField?>(null) }
     var pathVector by remember { mutableStateOf<VecSurfField?>(null) }
-    LaunchedEffect(mode, sKey, vKey, xRange, yRange, zRange, centerKey3, pathKey3, density, level, tKey, tOn, state.showGrid) {
+    LaunchedEffect(mode, sKey, vKey, xRange, yRange, zRange, centerKey3, pathKey3, density, level, tKey, tOn, state.showGrid, state.palette, content) {
+        if (!content) {
+            // Nothing to plot: clear the old data; the frame effect below draws an
+            // interactive grid instead of leaving a spinner up.
+            scalarClouds = null; vectorClouds = null; pathScalar = null; pathVector = null
+            state.valueLo = null; state.valueHi = null
+            return@LaunchedEffect
+        }
         val t = if (tOn) tKey else null
         val snap = state.snapshot()
         val (ccx, ccy, ccz) = state.center()
@@ -536,82 +691,110 @@ private fun Field3DView(state: FieldState, modifier: Modifier = Modifier) {
         }
         pathScalar = null; pathVector = null
         if (mode == FieldMode.SCALAR_3D) {
-            val clouds = withContext(Dispatchers.Default) { sKey.split("").mapNotNull { val e = parseEntry3(it); if (!e.visible) null else buildScalar3(e, xRange, yRange, zRange, density.coerceIn(8, 16), level, t, ccx, ccy, ccz) } }
-            scalarClouds = clouds; vectorClouds = null
+            val clouds = try {
+                withContext(Dispatchers.Default) { sKey.split("").mapNotNull { val e = parseEntry3(it); if (!e.visible) null else buildScalar3(e, xRange, yRange, zRange, density.coerceIn(8, 16), level, t, ccx, ccy, ccz) } }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled } catch (_: Throwable) { emptyList() }
+            scalarClouds = clouds.ifEmpty { null }; vectorClouds = null
             state.valueLo = clouds.minOfOrNull { it.lo }; state.valueHi = clouds.maxOfOrNull { it.hi }
         } else {
-            val clouds = withContext(Dispatchers.Default) {
-                vKey.split("").mapNotNull {
+            val clouds = try {
+                withContext(Dispatchers.Default) {
+                    vKey.split("").mapNotNull {
                     val p = it.split(""); val head = parseEntry3(p.getOrElse(0) { "" })
                     if (!head.visible) null else buildVectors3(Vec3Field(head.text, p.getOrElse(1) { "" }, p.getOrElse(2) { "" }, head.colorArgb, true), xRange, yRange, zRange, density.coerceIn(4, 9), t, ccx, ccy, ccz)
                 }
             }
-            vectorClouds = clouds; scalarClouds = null
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled } catch (_: Throwable) { emptyList() }
+            vectorClouds = clouds.ifEmpty { null }; scalarClouds = null
             state.valueLo = 0.0; state.valueHi = clouds.maxOfOrNull { it.maxMag }
         }
     }
-    LaunchedEffect(scalarClouds, vectorClouds, pathScalar, pathVector, view, theme) {
+    // Domain values read here (not settled) so the grid layer below re-renders instantly on zoom.
+    val liveXR = rangeOf(state.xRange)
+    val liveYR = rangeOf(state.yRange)
+    val liveZR = rangeOf(state.zRange, 3.0)
+    val liveGrid = state.showGrid
+    val liveIs3D = state.mode == FieldMode.SCALAR_3D || state.mode == FieldMode.VECTOR_3D
+    LaunchedEffect(scalarClouds, vectorClouds, pathScalar, pathVector, view, theme, liveIs3D, liveGrid, liveXR, liveYR, liveZR) {
         val sc = scalarClouds; val vc = vectorClouds; val ps = pathScalar; val pv = pathVector
-        if (view.width < 2 || sc == null && vc == null && ps == null && pv == null) return@LaunchedEffect
+        if (view.width < 2 || view.height < 2) return@LaunchedEffect
+        // Layer 1 (live): grid + axes frame that always follows orbit and domain, so the
+        // grid and its tick values update continuously while zooming the domain.
+        // Layer 2 (debounced): transparent data on top; it catches up when resampling lands.
         snapshotFlow { Triple(state.orbit.quat, state.orbit.zoom, state.centerX + state.centerY + state.centerZ) }.conflate().collect { (q, z, _) ->
-            val (w, h) = cappedSize(view.width, view.height, 640)
+            val (w, h) = cappedSize(view.width, view.height, LIVE_CAP)
             val (ccx, ccy, ccz) = state.center()
             val snap = state.snapshot()
+            gridFrame = withContext(Dispatchers.Default) { rasterEmptyFieldFrame(snap, q, z, w, h, theme, ccx, ccy, ccz) }.asImageBitmap()
             val bmp = withContext(Dispatchers.Default) {
                 when {
-                    ps != null -> rasterSurfGrids(ps.grids, ps.range.first, ps.range.second, q, z, w, h, theme, snap.xRange, snap.yRange, snap.zRange, ccx, ccy, ccz, snap.showGrid)
-                    pv != null -> rasterSurfArrows(pv.sets, pv.maxMag, pv.base, q, z, w, h, theme, snap.xRange, snap.yRange, snap.zRange, ccx, ccy, ccz, snap.showGrid)
-                    sc != null -> rasterScalar3Multi(sc, q, z, w, h, theme, ccx, ccy, ccz, snap.showGrid)
-                    vc != null -> rasterVector3Multi(vc, q, z, w, h, theme, ccx, ccy, ccz, snap.showGrid)
+                    ps != null -> rasterSurfGrids(ps.grids, ps.range.first, ps.range.second, q, z, w, h, theme, snap.xRange, snap.yRange, snap.zRange, ccx, ccy, ccz, snap.showGrid, snap.palette, frame = false)
+                    pv != null -> rasterSurfArrows(pv.sets, pv.maxMag, pv.base, q, z, w, h, theme, snap.xRange, snap.yRange, snap.zRange, ccx, ccy, ccz, snap.showGrid, snap.palette, frame = false, colorByValue = snap.colorByValue)
+                    sc != null -> rasterScalar3Multi(sc, q, z, w, h, theme, ccx, ccy, ccz, snap.showGrid, snap.palette, frame = false)
+                    vc != null -> rasterVector3Multi(vc, q, z, w, h, theme, ccx, ccy, ccz, snap.showGrid, snap.palette, frame = false, colorByValue = snap.colorByValue)
                     else -> null
                 }
             }
-            if (bmp != null) frame = bmp.asImageBitmap()
+            if (bmp != null) meshFrame = bmp.asImageBitmap() else meshFrame = null
             delay(28)
         }
     }
     Box(modifier.clipToBounds().onSizeChanged { view = it }.pointerInput(Unit) {
-        detectTransformGestures { _, pan, zoom, _ -> state.orbit.drag(pan.x, pan.y); state.orbit.zoom = (state.orbit.zoom * zoom).coerceIn(0.35f, 4f) }
+        detectTransformGestures { _, pan, zoom, _ ->
+            if (abs(zoom - 1f) < 0.002f) state.orbit.drag(pan.x, pan.y, densityDp3)
+            else if (state.lockDomain) state.orbit.zoom = (state.orbit.zoom * zoom).coerceIn(0.35f, 4f)
+            else state.zoomDomain3D(zoom)
+        }
     }) {
-        frame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
-        if (frame == null) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
+        gridFrame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+        meshFrame?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+        if (gridFrame == null && content) Text(stringResource(R.string.math_3d_computing), color = LocalPalette.current.textDim.toComposeColor(), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.align(Alignment.Center))
         ViewPresetButtons(state.orbit)
         AnimPlayOverlay(state.anim)
     }
 }
 
+private fun FieldState.zoomDomain3D(factor: Float) {
+    if (!factor.isFinite() || factor <= 0f) return
+    fun fmt(v: Double) = Numbers.tick(v.coerceIn(1e-3, 1e4))
+    val f = factor.toDouble()
+    xRange = fmt(rangeOf(xRange) / f)
+    yRange = fmt(rangeOf(yRange) / f)
+    zRange = fmt(rangeOf(zRange, 3.0) / f)
+}
+
 private suspend fun exportField(snap: FieldSnap, theme: GraphTheme, title: String, magnitude: String, heightLabel: String): ByteArray? = try {
     val raster = when {
         snap.usePath && snap.mode == FieldMode.SCALAR_2D ->
-            renderScalarPath2D(snap.scalar2, snap, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t)
+            renderScalarPath2D(snap.scalar2, snap, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.palette)
         snap.usePath && snap.mode == FieldMode.VECTOR_2D ->
-            renderVectorPath2D(snap.vector2, snap, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t)
+            renderVectorPath2D(snap.vector2, snap, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.palette, colorByValue = snap.colorByValue)
         snap.usePath && snap.mode == FieldMode.SCALAR_3D -> {
             val built = scalarSurfGrids(snap, snap.t) ?: return null
             rasterSurfGrids(built.grids, built.range.first, built.range.second, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme,
-                snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid)
+                snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette)
                 .let { FieldRaster(it, built.range.first, built.range.second) }
         }
         snap.usePath && snap.mode == FieldMode.VECTOR_3D -> {
             val built = vectorSurfArrows(snap, snap.t) ?: return null
             rasterSurfArrows(built.sets, built.maxMag, built.base, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme,
-                snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid)
+                snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)
                 .let { FieldRaster(it, 0.0, built.maxMag) }
         }
         else -> when (snap.mode) {
-        FieldMode.SCALAR_2D -> renderScalar2Multi(snap.scalar2, snap.xRange, snap.yRange, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.cx, snap.cy, snap.showGrid)
-        FieldMode.VECTOR_2D -> renderVector2Multi(snap.vector2, snap.xRange, snap.yRange, snap.density, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.cx, snap.cy, snap.showGrid)
+        FieldMode.SCALAR_2D -> renderScalar2Multi(snap.scalar2, snap.xRange, snap.yRange, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.cx, snap.cy, snap.showGrid, snap.palette)
+        FieldMode.VECTOR_2D -> renderVector2Multi(snap.vector2, snap.xRange, snap.yRange, snap.density, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.t, snap.cx, snap.cy, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)
         FieldMode.SCALAR_3D -> {
             val clouds = snap.scalar3.filter { it.visible }.mapNotNull { buildScalar3(it, snap.xRange, snap.yRange, snap.zRange, snap.density.coerceIn(8, 16), snap.level, snap.t, snap.cx, snap.cy, snap.cz) }
             if (clouds.isEmpty()) return null
-            rasterScalar3Multi(clouds, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.cx, snap.cy, snap.cz, snap.showGrid)?.let { FieldRaster(it, clouds.minOf { c -> c.lo }, clouds.maxOf { c -> c.hi }) }
+            rasterScalar3Multi(clouds, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette)?.let { FieldRaster(it, clouds.minOf { c -> c.lo }, clouds.maxOf { c -> c.hi }) }
         }
         FieldMode.VECTOR_3D -> {
             val clouds = snap.vector3.filter { it.visible }.mapNotNull {
                 buildVectors3(it, snap.xRange, snap.yRange, snap.zRange, snap.density.coerceIn(4, 9), snap.t, snap.cx, snap.cy, snap.cz)
             }
             if (clouds.isEmpty()) return null
-            rasterVector3Multi(clouds, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.cx, snap.cy, snap.cz, snap.showGrid)?.let { FieldRaster(it, 0.0, clouds.maxOf { c -> c.maxMag }) }
+            rasterVector3Multi(clouds, snap.quat, snap.zoom, EXPORT_PLOT_W, EXPORT_PLOT_H, theme, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)?.let { FieldRaster(it, 0.0, clouds.maxOf { c -> c.maxMag }) }
         }
         }
     } ?: return null
@@ -626,7 +809,10 @@ private suspend fun exportField(snap: FieldSnap, theme: GraphTheme, title: Strin
         else listOf("on C(s): x=${snap.pathX.ifBlank { "—" }} y=${snap.pathY.ifBlank { "—" }}")
     } else emptyList<String>()
     val rampName = if (snap.mode == FieldMode.VECTOR_2D || snap.mode == FieldMode.VECTOR_3D) magnitude else heightLabel
-    val legend = shown.mapIndexed { index, (label, custom) -> ExportLegend(label, custom ?: theme.series[index % theme.series.size]) } + ExportLegend("$rampName  ${Numbers.tick(raster.lo)} → ${Numbers.tick(raster.hi)}", theme.series[0], ramp = true)
+    val legend = shown.mapIndexed { index, (label, custom) -> ExportLegend(label, custom ?: theme.series[index % theme.series.size]) } +
+        if (snap.colorByValue || (snap.mode != FieldMode.VECTOR_2D && snap.mode != FieldMode.VECTOR_3D))
+            listOf(ExportLegend("${snap.palette.title}  $rampName  ${Numbers.tick(raster.lo)} → ${Numbers.tick(raster.hi)}", theme.series[0], ramp = true, rampStops = snap.palette.stops))
+        else emptyList()
     val foot = buildString {
         append("x ∈ [±${Numbers.tick(snap.xRange)}]    y ∈ [±${Numbers.tick(snap.yRange)}]")
         if (snap.mode == FieldMode.SCALAR_3D || snap.mode == FieldMode.VECTOR_3D) append("    z ∈ [±${Numbers.tick(snap.zRange)}]")
@@ -647,7 +833,8 @@ private fun fieldFrame(snap: FieldSnap, t: Double): FieldSnap =
     FieldSnap(snap.mode, snap.scalar2, snap.vector2, snap.scalar3, snap.vector3,
         snap.xRange, snap.yRange, snap.zRange, snap.density, snap.level,
         snap.quat, snap.zoom, snap.showGrid, snap.probeX, snap.probeY, snap.probeZ, t, snap.animRange,
-        snap.cx, snap.cy, snap.cz, snap.usePath, snap.pathX, snap.pathY, snap.pathZ, snap.pathR0, snap.pathR1)
+        snap.cx, snap.cy, snap.cz, snap.usePath, snap.pathX, snap.pathY, snap.pathZ, snap.pathR0, snap.pathR1,
+        snap.palette, snap.colorByValue, snap.lock)
 
 private suspend fun exportFieldAnimation(base: FieldSnap, theme: GraphTheme, title: String, magnitude: String, heightLabel: String): ByteArray? {
     return try {
@@ -660,33 +847,33 @@ private suspend fun exportFieldAnimation(base: FieldSnap, theme: GraphTheme, tit
         val snap = fieldFrame(base, t)
         val raster = when {
             snap.usePath && snap.mode == FieldMode.SCALAR_2D ->
-                renderScalarPath2D(snap.scalar2, snap, fw, fh, theme, t)
+                renderScalarPath2D(snap.scalar2, snap, fw, fh, theme, t, snap.palette)
             snap.usePath && snap.mode == FieldMode.VECTOR_2D ->
-                renderVectorPath2D(snap.vector2, snap, fw, fh, theme, t)
+                renderVectorPath2D(snap.vector2, snap, fw, fh, theme, t, snap.palette, colorByValue = snap.colorByValue)
             snap.usePath && snap.mode == FieldMode.SCALAR_3D -> {
                 val built = scalarSurfGrids(snap, t) ?: continue
                 rasterSurfGrids(built.grids, built.range.first, built.range.second, snap.quat, snap.zoom, fw, fh, theme,
-                    snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid)
+                    snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette)
                     .let { FieldRaster(it, built.range.first, built.range.second) }
             }
             snap.usePath && snap.mode == FieldMode.VECTOR_3D -> {
                 val built = vectorSurfArrows(snap, t) ?: continue
                 rasterSurfArrows(built.sets, built.maxMag, built.base, snap.quat, snap.zoom, fw, fh, theme,
-                    snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid)
+                    snap.xRange, snap.yRange, snap.zRange, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)
                     .let { FieldRaster(it, 0.0, built.maxMag) }
             }
             else -> when (snap.mode) {
-            FieldMode.SCALAR_2D -> renderScalar2Multi(snap.scalar2, snap.xRange, snap.yRange, fw, fh, theme, t, snap.cx, snap.cy, snap.showGrid)
-            FieldMode.VECTOR_2D -> renderVector2Multi(snap.vector2, snap.xRange, snap.yRange, minOf(snap.density, 12), fw, fh, theme, t, snap.cx, snap.cy, snap.showGrid)
+            FieldMode.SCALAR_2D -> renderScalar2Multi(snap.scalar2, snap.xRange, snap.yRange, fw, fh, theme, t, snap.cx, snap.cy, snap.showGrid, snap.palette)
+            FieldMode.VECTOR_2D -> renderVector2Multi(snap.vector2, snap.xRange, snap.yRange, minOf(snap.density, 12), fw, fh, theme, t, snap.cx, snap.cy, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)
             FieldMode.SCALAR_3D -> {
                 val clouds = snap.scalar3.filter { it.visible }.mapNotNull { buildScalar3(it, snap.xRange, snap.yRange, snap.zRange, minOf(snap.density, 12), snap.level, t, snap.cx, snap.cy, snap.cz) }
                 if (clouds.isEmpty()) null
-                else rasterScalar3Multi(clouds, snap.quat, snap.zoom, fw, fh, theme, snap.cx, snap.cy, snap.cz, snap.showGrid)?.let { FieldRaster(it, clouds.minOf { c -> c.lo }, clouds.maxOf { c -> c.hi }) }
+                else rasterScalar3Multi(clouds, snap.quat, snap.zoom, fw, fh, theme, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette)?.let { FieldRaster(it, clouds.minOf { c -> c.lo }, clouds.maxOf { c -> c.hi }) }
             }
             FieldMode.VECTOR_3D -> {
                 val clouds = snap.vector3.filter { it.visible }.mapNotNull { buildVectors3(it, snap.xRange, snap.yRange, snap.zRange, minOf(snap.density, 7), t, snap.cx, snap.cy, snap.cz) }
                 if (clouds.isEmpty()) null
-                else rasterVector3Multi(clouds, snap.quat, snap.zoom, fw, fh, theme, snap.cx, snap.cy, snap.cz, snap.showGrid)?.let { FieldRaster(it, 0.0, clouds.maxOf { c -> c.maxMag }) }
+                else rasterVector3Multi(clouds, snap.quat, snap.zoom, fw, fh, theme, snap.cx, snap.cy, snap.cz, snap.showGrid, snap.palette, colorByValue = snap.colorByValue)?.let { FieldRaster(it, 0.0, clouds.maxOf { c -> c.maxMag }) }
             }
             }
         } ?: continue
@@ -702,14 +889,17 @@ private suspend fun exportFieldAnimation(base: FieldSnap, theme: GraphTheme, tit
     val labels = shownBase.map { it.first }
     val rampName = if (base.mode == FieldMode.VECTOR_2D || base.mode == FieldMode.VECTOR_3D) magnitude else heightLabel
     // lo/hi across frames unknown cheaply; label ramp generically.
-    val legend = shownBase.mapIndexed { i, (l, custom) -> ExportLegend(l, custom ?: theme.series[i % theme.series.size]) } + ExportLegend(rampName, theme.series[0], ramp = true)
+    val legend = shownBase.mapIndexed { i, (l, custom) -> ExportLegend(l, custom ?: theme.series[i % theme.series.size]) } +
+        if (base.colorByValue || (base.mode != FieldMode.VECTOR_2D && base.mode != FieldMode.VECTOR_3D))
+            listOf(ExportLegend("${base.palette.title}  $rampName", theme.series[0], ramp = true, rampStops = base.palette.stops))
+        else emptyList()
     val c = if (base.cx != 0.0 || base.cy != 0.0 || base.cz != 0.0) "    c=(${Numbers.tick(base.cx)}, ${Numbers.tick(base.cy)}, ${Numbers.tick(base.cz)})" else ""
     val foot = "frames=${ts.size} t∈[${Numbers.tick(minOf(range.lo, range.hi))}, ${Numbers.tick(maxOf(range.lo, range.hi))}]$c    ${probeReadout(fieldFrame(base, ts.last()))}"
     buildAnimationPng(frames, title, legend, foot, theme, specJson = MathAnimSpec.captureFields(base)?.toJson())
 } catch (cancelled: CancellationException) { throw cancelled } catch (_: Throwable) { null }
 }
 
-private suspend fun renderScalar2Multi(entries: List<MathEntry>, xRange: Double, yRange: Double, width: Int, height: Int, theme: GraphTheme, t: Double?, cx: Double = 0.0, cy: Double = 0.0, grid: Boolean = true): FieldRaster? {
+private suspend fun renderScalar2Multi(entries: List<MathEntry>, xRange: Double, yRange: Double, width: Int, height: Int, theme: GraphTheme, t: Double?, cx: Double = 0.0, cy: Double = 0.0, grid: Boolean = true, pal: FieldPalette = FieldPalette.JET, frame: Boolean = true): FieldRaster? {
     val parsed = entries.map { e ->
         if (!e.visible) null else runCatching { ExpressionParser.parse(e.text) }.getOrNull()?.let { it to e }
     }
@@ -731,7 +921,7 @@ private suspend fun renderScalar2Multi(entries: List<MathEntry>, xRange: Double,
     }
     val heatIdx = parsed.indexOfFirst { it != null }.coerceAtLeast(0)
     val (lo, hi) = robustRange(allValues[heatIdx])
-    val bmp = heatBitmap(allValues[heatIdx], lo, hi, width, height, theme.paper)
+    val bmp = heatBitmap(allValues[heatIdx], lo, hi, width, height, theme.paper, pal)
     val canvas = android.graphics.Canvas(bmp)
     // Contours for every visible entry: its own colour, else first ink and rest series.
     val x0 = cx - xRange; val x1 = cx + xRange; val y0 = cy - yRange; val y1 = cy + yRange
@@ -743,12 +933,14 @@ private suspend fun renderScalar2Multi(entries: List<MathEntry>, xRange: Double,
         val col = pe.second.colorArgb ?: if (idx == 0) theme.ink else theme.series[idx % theme.series.size]
         drawWorldOn(canvas, contours, col, x0, x1, y0, y1, bmp.width, bmp.height)
     }
-    if (grid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
-    else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    if (frame) {
+        if (grid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
+        else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    }
     return FieldRaster(bmp, lo, hi)
 }
 
-private suspend fun renderVector2Multi(fields: List<Vec2Field>, xRange: Double, yRange: Double, density: Int, width: Int, height: Int, theme: GraphTheme, t: Double?, cx: Double = 0.0, cy: Double = 0.0, grid: Boolean = true): FieldRaster? {
+private suspend fun renderVector2Multi(fields: List<Vec2Field>, xRange: Double, yRange: Double, density: Int, width: Int, height: Int, theme: GraphTheme, t: Double?, cx: Double = 0.0, cy: Double = 0.0, grid: Boolean = true, pal: FieldPalette = FieldPalette.JET, frame: Boolean = true, colorByValue: Boolean = true): FieldRaster? {
     val visible = fields.filter { it.visible }
     val parsed = visible.mapNotNull { f ->
         val pe = runCatching { ExpressionParser.parse(f.p) }.getOrNull() ?: return@mapNotNull null
@@ -771,7 +963,7 @@ private suspend fun renderVector2Multi(fields: List<Vec2Field>, xRange: Double, 
         }
     }
     val (lo, hi) = robustRange(values)
-    val bmp = heatBitmap(values, lo, hi, width, height, theme.paper)
+    val bmp = heatBitmap(values, lo, hi, width, height, theme.paper, pal)
     val canvas = android.graphics.Canvas(bmp)
     var maxMag = 0.0
     val count = density.coerceIn(6, 20)
@@ -797,21 +989,23 @@ private suspend fun renderVector2Multi(fields: List<Vec2Field>, xRange: Double, 
             }
         }
     }
-    if (grid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
-    else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    if (frame) {
+        if (grid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
+        else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    }
     val entryColors: List<Int?> = parsed.map { (_, _, f) -> f.colorArgb }
-    drawArrows2Multi(canvas, arrows.map { doubleArrayOf(it.x, it.y, it.dx, it.dy, it.mag) to it.idx }, maxMag, x0, x1, y0, y1, count, bmp.width, bmp.height, theme, entryColors)
+    drawArrows2Multi(canvas, arrows.map { doubleArrayOf(it.x, it.y, it.dx, it.dy, it.mag) to it.idx }, maxMag, x0, x1, y0, y1, count, bmp.width, bmp.height, theme, entryColors, pal, colorByValue)
     return FieldRaster(bmp, 0.0, maxMag.coerceAtLeast(hi))
 }
 
-private fun heatBitmap(values: Array<DoubleArray>, lo: Double, hi: Double, width: Int, height: Int, paper: Int): Bitmap {
+private fun heatBitmap(values: Array<DoubleArray>, lo: Double, hi: Double, width: Int, height: Int, paper: Int, pal: FieldPalette): Bitmap {
     val n = values.size
     val small = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
     val pixels = IntArray(n * n)
     val span = (hi - lo).coerceAtLeast(1e-12)
     for (r in 0 until n) for (c in 0 until n) {
         val v = values[r][c]
-        pixels[r * n + c] = if (!v.isFinite()) paper else heightColor(((v - lo) / span).coerceIn(0.0, 1.0)).toArgb()
+        pixels[r * n + c] = if (!v.isFinite()) paper else fieldRampColor(pal, ((v - lo) / span).coerceIn(0.0, 1.0)).toArgb()
     }
     small.setPixels(pixels, 0, n, 0, 0, n, n)
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
@@ -843,7 +1037,7 @@ private fun drawWorldOn(canvas: android.graphics.Canvas, segments: List<WorldSeg
     canvas.drawPath(path, paint)
 }
 
-private fun drawArrows2Multi(canvas: android.graphics.Canvas, arrows: List<Pair<DoubleArray, Int>>, maxMag: Double, x0: Double, x1: Double, y0: Double, y1: Double, density: Int, w: Int, h: Int, theme: GraphTheme, entryColors: List<Int?>? = null) {
+private fun drawArrows2Multi(canvas: android.graphics.Canvas, arrows: List<Pair<DoubleArray, Int>>, maxMag: Double, x0: Double, x1: Double, y0: Double, y1: Double, density: Int, w: Int, h: Int, theme: GraphTheme, entryColors: List<Int?>? = null, pal: FieldPalette = FieldPalette.JET, colorByValue: Boolean = true) {
     if (maxMag <= 1e-12) return
     val cell = min(w.toFloat() / density, h.toFloat() / density)
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { style = android.graphics.Paint.Style.STROKE; strokeWidth = 2.6f; strokeCap = android.graphics.Paint.Cap.ROUND }
@@ -860,7 +1054,7 @@ private fun drawArrows2Multi(canvas: android.graphics.Canvas, arrows: List<Pair<
         val vx = x1 - x0; val vy = y1 - y0
         val len = sqrt(vx * vx + vy * vy)
         if (len < 1.4f) continue
-        paint.color = entryColors?.getOrNull(idx) ?: if (arrows.distinctBy { it.second }.size <= 1) heightArgb((mag / maxMag).coerceIn(0.15, 0.95)) else theme.series[idx % theme.series.size]
+        paint.color = vectorEntryColor(entryColors?.getOrNull(idx), arrows.distinctBy { it.second }.size <= 1, colorByValue, pal, (mag / maxMag).coerceIn(0.15, 0.95), theme.series[idx % theme.series.size])
         canvas.drawLine(x0, y0, x1, y1, paint)
         val ux = vx / len; val uy = vy / len
         val head = (cell * 0.22f).coerceIn(3f, 9f)
@@ -894,6 +1088,8 @@ private suspend fun samplePathCurve(
 /** Scalar field drawn only along its curve: each field becomes a ramp-coloured polyline. */
 private suspend fun renderScalarPath2D(
     entries: List<MathEntry>, snap: FieldSnap, width: Int, height: Int, theme: GraphTheme, t: Double?,
+    pal: FieldPalette = FieldPalette.JET,
+    frame: Boolean = true,
 ): FieldRaster? {
     val exprs = entries.filter { it.visible }.mapNotNull { runCatching { ExpressionParser.parse(it.text) }.getOrNull() }
     if (exprs.isEmpty()) return null
@@ -919,8 +1115,10 @@ private suspend fun renderScalarPath2D(
     canvas.drawColor(theme.paper)
     val x0 = snap.cx - snap.xRange; val x1 = snap.cx + snap.xRange
     val y0 = snap.cy - snap.yRange; val y1 = snap.cy + snap.yRange
-    if (snap.showGrid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
-    else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    if (frame) {
+        if (snap.showGrid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
+        else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    }
     val spanX = (x1 - x0).takeIf { it != 0.0 } ?: 1.0
     val spanY = (y1 - y0).takeIf { it != 0.0 } ?: 1.0
     fun sx(x: Double) = (((x - x0) / spanX) * bmp.width).toFloat()
@@ -941,7 +1139,7 @@ private suspend fun renderScalarPath2D(
             val len = sqrt(dx * dx + dy * dy)
             var ox = 0f; var oy = 0f
             if (len > 1e-6f) { dx /= len; dy /= len; ox = (-dy * lane).toFloat(); oy = (dx * lane).toFloat() }
-            paint.color = heightArgb((((a + b) / 2 - loF) / span).coerceIn(0.0, 1.0))
+            paint.color = fieldRampArgb(pal, (((a + b) / 2 - loF) / span).coerceIn(0.0, 1.0))
             canvas.drawLine(sx(xs[i]) + ox, sy(ys[i]) + oy, sx(xs[i + 1]) + ox, sy(ys[i + 1]) + oy, paint)
         }
     }
@@ -951,6 +1149,9 @@ private suspend fun renderScalarPath2D(
 /** Vector field drawn only along its curve: arrows ride the path instead of filling the grid. */
 private suspend fun renderVectorPath2D(
     fields: List<Vec2Field>, snap: FieldSnap, width: Int, height: Int, theme: GraphTheme, t: Double?,
+    pal: FieldPalette = FieldPalette.JET,
+    frame: Boolean = true,
+    colorByValue: Boolean = true,
 ): FieldRaster? {
     val visible = fields.filter { it.visible }
     val parsed = visible.mapNotNull { f ->
@@ -986,8 +1187,10 @@ private suspend fun renderVectorPath2D(
             arrows += A(x, y, pv, qv, mag, idx)
         }
     }
-    if (snap.showGrid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
-    else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    if (frame) {
+        if (snap.showGrid) drawPlotFrame(canvas, bmp.width, bmp.height, x0, x1, y0, y1, theme, true)
+        else drawAxes2(canvas, x0, x1, y0, y1, bmp.width, bmp.height, theme.axis)
+    }
     // The curve itself, one lane per entry in that entry's colour, so arrows read as riding it.
     run {
         val spanX = ((x1 - x0).takeIf { it != 0.0 } ?: 1.0); val spanY = ((y1 - y0).takeIf { it != 0.0 } ?: 1.0)
@@ -1023,12 +1226,12 @@ private suspend fun renderVectorPath2D(
     drawArrows2Multi(
         canvas,
         arrows.map { doubleArrayOf(it.x, it.y, it.dx, it.dy, it.mag) to it.idx },
-        maxMag, x0, x1, y0, y1, m, bmp.width, bmp.height, theme, entryColors,
+        maxMag, x0, x1, y0, y1, m, bmp.width, bmp.height, theme, entryColors, pal, colorByValue,
     )
     return FieldRaster(bmp, 0.0, maxMag.coerceAtLeast(1e-12))
 }
 
-private suspend fun buildScalar3(entry: MathEntry, xRange: Double, yRange: Double, zRange: Double, density: Int, levelFraction: Double, t: Double?, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0): ScalarCloud? {
+internal suspend fun buildScalar3(entry: MathEntry, xRange: Double, yRange: Double, zRange: Double, density: Int, levelFraction: Double, t: Double?, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0): ScalarCloud? {
     val expr = runCatching { ExpressionParser.parse(entry.text) }.getOrNull() ?: return null
     val n = density.coerceIn(8, 16)
     val scope = EvalScope()
@@ -1081,7 +1284,7 @@ private suspend fun buildVectors3(field: Vec3Field, xRange: Double, yRange: Doub
 
 private fun quatProjector(w: Int, h: Int, q: Quat, zoom: Float, xR: Double, yR: Double, zR: Double, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0): (Double, Double, Double) -> Triple<Float, Float, Float> {
     val m = q.matrix()
-    val px = w / 2f; val py = h * 0.54f; val scale = min(w, h) * 0.36f * zoom
+    val px = w / 2f; val py = h * 0.54f; val scale = min(w, h) * 0.48f * zoom
     return { x, y, z ->
         val nx = ((x - cx) / xR).coerceIn(-1.6, 1.6); val ny = ((y - cy) / yR).coerceIn(-1.6, 1.6); val nz = ((z - cz) / zR).coerceIn(-1.6, 1.6)
         val rx = m[0] * nx + m[1] * ny + m[2] * nz; val ry = m[3] * nx + m[4] * ny + m[5] * nz; val rz = m[6] * nx + m[7] * ny + m[8] * nz
@@ -1089,38 +1292,47 @@ private fun quatProjector(w: Int, h: Int, q: Quat, zoom: Float, xR: Double, yR: 
     }
 }
 
-private fun rasterScalar3Multi(clouds: List<ScalarCloud>, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0, showGrid: Boolean = true): Bitmap {
+internal fun rasterScalar3Multi(clouds: List<ScalarCloud>, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0, showGrid: Boolean = true, pal: FieldPalette = FieldPalette.JET, frame: Boolean = true, colorByValue: Boolean = true): Bitmap {
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
-    canvas.drawColor(theme.paper)
-    val xR = clouds.maxOf { it.xRange }; val yR = clouds.maxOf { it.yRange }; val zR = clouds.maxOf { it.zRange }
+    // Partial input (e.g. a single character typed into one vector component) yields no
+    // plottable data: never throw on an empty list, just return the interactive frame.
+    val xR = clouds.maxOfOrNull { it.xRange } ?: 5.0; val yR = clouds.maxOfOrNull { it.yRange } ?: 5.0; val zR = clouds.maxOfOrNull { it.zRange } ?: 3.0
     val proj = quatProjector(w, h, quat, zoom, xR, yR, zR, cx, cy, cz)
-    drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    if (frame) {
+        canvas.drawColor(theme.paper)
+        drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    }
     data class Dot(val x: Float, val y: Float, val d: Float, val c: Int)
     val dots = ArrayList<Dot>()
     for (cloud in clouds) {
         val span = (cloud.hi - cloud.lo).coerceAtLeast(1e-12)
         for (pt in cloud.points) {
             val pr = proj(pt.x, pt.y, pt.z)
-            val col = cloud.colorArgb ?: heightArgb(((pt.value - cloud.lo) / span).coerceIn(0.0, 1.0))
+            val col = cloud.colorArgb ?: fieldRampArgb(pal, ((pt.value - cloud.lo) / span).coerceIn(0.0, 1.0))
             dots += Dot(pr.first, pr.second, pr.third, col)
         }
     }
     dots.sortBy { it.d }
     val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
     for (d in dots) { paint.color = d.c; canvas.drawCircle(d.x, d.y, 4.0f, paint) }
+    drawBoxEdges(canvas, proj, cx, cy, cz, xR, yR, zR, theme)
     return bmp
 }
 
-private fun rasterVector3Multi(clouds: List<VectorCloud>, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0, showGrid: Boolean = true): Bitmap {
+internal fun rasterVector3Multi(clouds: List<VectorCloud>, quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme, cx: Double = 0.0, cy: Double = 0.0, cz: Double = 0.0, showGrid: Boolean = true, pal: FieldPalette = FieldPalette.JET, frame: Boolean = true, colorByValue: Boolean = true): Bitmap {
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
-    canvas.drawColor(theme.paper)
-    val xR = clouds.maxOf { it.xRange }; val yR = clouds.maxOf { it.yRange }; val zR = clouds.maxOf { it.zRange }
+    // Partial input (e.g. a single character typed into one vector component) yields no
+    // plottable data: never throw on an empty list, just return the interactive frame.
+    val xR = clouds.maxOfOrNull { it.xRange } ?: 5.0; val yR = clouds.maxOfOrNull { it.yRange } ?: 5.0; val zR = clouds.maxOfOrNull { it.zRange } ?: 3.0
     val proj = quatProjector(w, h, quat, zoom, xR, yR, zR, cx, cy, cz)
-    drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    if (frame) {
+        canvas.drawColor(theme.paper)
+        drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    }
     val maxMag = clouds.maxOfOrNull { it.maxMag }?.coerceAtLeast(1e-12) ?: 1.0
     val scale = min(xR, min(yR, zR)) * 0.42 / maxMag
     data class L(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val d: Float, val c: Int)
@@ -1130,7 +1342,7 @@ private fun rasterVector3Multi(clouds: List<VectorCloud>, quat: Quat, zoom: Floa
             val s = proj(a.x, a.y, a.z); val e = proj(a.x + a.dx * scale, a.y + a.dy * scale, a.z + a.dz * scale)
             val vx = e.first - s.first; val vy = e.second - s.second
             if (sqrt(vx * vx + vy * vy) < 1.5f) continue
-            val col = cloud.colorArgb ?: if (clouds.size <= 1) heightArgb((a.mag / maxMag).coerceIn(0.12, 0.95)) else theme.series[ci % theme.series.size]
+            val col = vectorEntryColor(cloud.colorArgb, clouds.size <= 1, colorByValue, pal, (a.mag / maxMag).coerceIn(0.12, 0.95), theme.series[ci % theme.series.size])
             lines += L(s.first, s.second, e.first, e.second, (s.third + e.third) / 2f, col)
         }
     }
@@ -1145,6 +1357,7 @@ private fun rasterVector3Multi(clouds: List<VectorCloud>, quat: Quat, zoom: Floa
         canvas.drawLine(l.x1, l.y1, l.x1 - ux * head - uy * head * 0.55f, l.y1 - uy * head + ux * head * 0.55f, paint)
         canvas.drawLine(l.x1, l.y1, l.x1 - ux * head + uy * head * 0.55f, l.y1 - uy * head - ux * head * 0.55f, paint)
     }
+    drawBoxEdges(canvas, proj, cx, cy, cz, xR, yR, zR, theme)
     return bmp
 }
 
@@ -1244,13 +1457,17 @@ private fun rasterSurfGrids(
     quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme,
     xR: Double, yR: Double, zR: Double, cx: Double, cy: Double, cz: Double,
     showGrid: Boolean = true,
+    pal: FieldPalette = FieldPalette.JET,
+    frame: Boolean = true,
 ): Bitmap {
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
-    canvas.drawColor(theme.paper)
     val proj = quatProjector(w, h, quat, zoom, xR, yR, zR, cx, cy, cz)
-    drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    if (frame) {
+        canvas.drawColor(theme.paper)
+        drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    }
     val span = (hi - lo).coerceAtLeast(1e-12)
     data class Cell(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val x2: Float, val y2: Float, val x3: Float, val y3: Float, val depth: Float, val color: Int)
     data class Dot(val x: Float, val y: Float, val d: Float, val c: Int)
@@ -1272,7 +1489,7 @@ private fun rasterSurfGrids(
                 for (c in 0 until n - 1) {
                     if (!ok[r][c] || !ok[r][c + 1] || !ok[r + 1][c + 1] || !ok[r + 1][c]) continue
                     val avg = (grid.pts[r][c].value + grid.pts[r][c + 1].value + grid.pts[r + 1][c + 1].value + grid.pts[r + 1][c].value) / 4.0
-                    val col = grid.colorArgb ?: heightArgb(((avg - lo) / span).coerceIn(0.0, 1.0))
+                    val col = grid.colorArgb ?: fieldRampArgb(pal, ((avg - lo) / span).coerceIn(0.0, 1.0))
                     cells += Cell(px[r][c], py[r][c], px[r][c + 1], py[r][c + 1], px[r + 1][c + 1], py[r + 1][c + 1], px[r + 1][c], py[r + 1][c],
                         (pd[r][c] + pd[r][c + 1] + pd[r + 1][c + 1] + pd[r + 1][c]) / 4f, col)
                 }
@@ -1280,7 +1497,7 @@ private fun rasterSurfGrids(
         } else {
             for (r in 0 until n) for (c in 0 until n) {
                 if (!ok[r][c]) continue
-                val col = grid.colorArgb ?: heightArgb(((grid.pts[r][c].value - lo) / span).coerceIn(0.0, 1.0))
+                val col = grid.colorArgb ?: fieldRampArgb(pal, ((grid.pts[r][c].value - lo) / span).coerceIn(0.0, 1.0))
                 dots += Dot(px[r][c], py[r][c], pd[r][c], col)
             }
         }
@@ -1297,6 +1514,7 @@ private fun rasterSurfGrids(
     }
     dots.sortBy { it.d }
     for (d in dots) { paint.color = d.c; canvas.drawCircle(d.x, d.y, 4.0f, paint) }
+    drawBoxEdges(canvas, proj, cx, cy, cz, xR, yR, zR, theme)
     return bmp
 }
 
@@ -1305,13 +1523,18 @@ private fun rasterSurfArrows(
     quat: Quat, zoom: Float, width: Int, height: Int, theme: GraphTheme,
     xR: Double, yR: Double, zR: Double, cx: Double, cy: Double, cz: Double,
     showGrid: Boolean = true,
+    pal: FieldPalette = FieldPalette.JET,
+    frame: Boolean = true,
+    colorByValue: Boolean = true,
 ): Bitmap {
     val w = width.coerceIn(2, 1400); val h = height.coerceIn(2, 1400)
     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bmp)
-    canvas.drawColor(theme.paper)
     val proj = quatProjector(w, h, quat, zoom, xR, yR, zR, cx, cy, cz)
-    drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    if (frame) {
+        canvas.drawColor(theme.paper)
+        drawQuatSpaceFrame(canvas, proj, quat, cx, cy, cz, xR, yR, zR, w, h, theme, showGrid)
+    }
     // The surface itself, one wireframe lane per entry in that entry's colour.
     if (base != null && base.pts.isNotEmpty()) {
         val n = base.pts.size
@@ -1354,7 +1577,7 @@ private fun rasterSurfArrows(
             val s = proj(a.x, a.y, a.z); val e = proj(a.x + a.dx * scale, a.y + a.dy * scale, a.z + a.dz * scale)
             val vx = e.first - s.first; val vy = e.second - s.second
             if (sqrt(vx * vx + vy * vy) < 1.5f) continue
-            val col = set.colorArgb ?: if (sets.size <= 1) heightArgb((a.mag / maxMag).coerceIn(0.12, 0.95)) else theme.series[ci % theme.series.size]
+            val col = vectorEntryColor(set.colorArgb, sets.size <= 1, colorByValue, pal, (a.mag / maxMag).coerceIn(0.12, 0.95), theme.series[ci % theme.series.size])
             lines += L(s.first, s.second, e.first, e.second, (s.third + e.third) / 2f, col)
         }
     }
@@ -1369,6 +1592,7 @@ private fun rasterSurfArrows(
         canvas.drawLine(l.x1, l.y1, l.x1 - ux * head - uy * head * 0.55f, l.y1 - uy * head + ux * head * 0.55f, paint)
         canvas.drawLine(l.x1, l.y1, l.x1 - ux * head + uy * head * 0.55f, l.y1 - uy * head - ux * head * 0.55f, paint)
     }
+    drawBoxEdges(canvas, proj, cx, cy, cz, xR, yR, zR, theme)
     return bmp
 }
 

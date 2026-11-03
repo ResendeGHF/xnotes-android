@@ -21,6 +21,10 @@ data class CanvasBackground(
     val spacing: Double = PageStyle.DEFAULT_SPACING,
     /** Paper colour, or null to take the theme's. */
     val paperColor: Rgba? = null,
+    /** When true every canvas colour is shown inverted (paper, ruling and ink). */
+    val invertColors: Boolean = false,
+    /** When true (and [invertColors] is) placed images invert too; otherwise they keep their pixels. */
+    val invertImages: Boolean = false,
 ) {
     val clampedSpacing: Double
         get() = spacing.coerceIn(PageStyle.MIN_SPACING, PageStyle.MAX_SPACING)
@@ -196,7 +200,7 @@ class InfiniteDocument(
      * rather than on top of everything. Returns the slot they landed in, or -1 when [item] is
      * absent. An empty [replacements] simply removes the item.
      */
-    fun replaceItem(item: CanvasItem, replacements: List<CanvasItem>): Int {
+    fun replaceItem(item: CanvasItem, replacements: List<CanvasItem>, notifyOrder: Boolean = true): Int {
         val at = indexOfRef(item)
         if (at < 0) return -1
         backing.removeAt(at)
@@ -209,8 +213,13 @@ class InfiniteDocument(
             listener?.onItemAdded(fragment)
         }
         invalidateDerived()
-        listener?.onOrderChanged()
+        if (notifyOrder) listener?.onOrderChanged()
         return at
+    }
+
+    /** Publish a coalesced z-order change after a batch of [replaceItem] calls made with `notifyOrder = false`. */
+    fun notifyOrderChanged() {
+        listener?.onOrderChanged()
     }
 
     /**
@@ -282,6 +291,13 @@ class InfiniteDocument(
         }
         return out
     }
+
+    /**
+     * Items whose paint bounds meet [rect], in no particular order. For consumers that treat the
+     * result as an unordered candidate set (eraser, scribble, glue targets, connector routing):
+     * skips the order-map build and the sort that [itemsIn] pays on every call.
+     */
+    fun itemsInUnsorted(rect: Rect): List<CanvasItem> = index.query(rect)
 
     /** Union of every item's paint bounds, or null on an empty canvas. Cached between edits. */
     fun contentBounds(): Rect? {

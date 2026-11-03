@@ -79,6 +79,7 @@ fun CanvasDebugOverlay(editor: InfiniteEditor) {
         add("textures  ${stats.textures} (${stats.texturesPending} pending)")
         add("tex vram  ${fmtBytes(stats.textureBytes)}")
         add("tessel    %.2f ms".format(stats.lastTessellateMs))
+        add("cull/com/lift/wet %.1f / %.1f / %.1f / %.1f ms".format(stats.cullMs, stats.commitMs, stats.liftMs, stats.wetMs))
         add("")
         add("verts     ${stats.vertices} / ${stats.vertexCapacity}")
         add("indices   ${stats.indices} / ${stats.indexCapacity}")

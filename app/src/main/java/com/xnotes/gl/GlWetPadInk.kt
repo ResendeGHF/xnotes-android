@@ -8,7 +8,6 @@ import com.xnotes.core.infinite.MeshPart
 import com.xnotes.core.infinite.PixelRect
 import com.xnotes.core.infinite.WetDamage
 import com.xnotes.core.model.Rgba
-import com.xnotes.core.stroke.PencilGrain
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.floor
 import kotlin.math.max
@@ -52,7 +51,7 @@ class GlWetPadInk {
     private class Batch(val serial: Long, val parts: List<MeshPart>, val settled: Boolean)
 
     /** An uploaded slice with the pixels it can reach, so a present that misses it can skip it. */
-    private class Piece(val slice: BufferSlice, val bounds: PixelRect?, val pass: InkPass, val color: Rgba, val pencil: PencilGrain.PencilParams? = null)
+    private class Piece(val slice: BufferSlice, val bounds: PixelRect?, val pass: InkPass, val color: Rgba)
 
     private val pending = ConcurrentLinkedQueue<Batch>()
 
@@ -401,11 +400,11 @@ class GlWetPadInk {
         if (parts.isEmpty()) return emptyList()
         val built = ArrayList<Piece>(parts.size)
         for (part in parts) {
-            // The pad has no copy of the page, so only self-unioning ink lives here:
-            // flat triangles and the field-shaded pencil, whose mesh never
-            // overlaps so its alpha unions. Anything that composites
-            // against the page keeps the ordinary path.
-            if (part.pass != InkPass.OPAQUE && part.pass != InkPass.PENCIL) continue
+            // The pad has no copy of the page, so only self-contained ink lives
+            // here: flat triangles. The pencil needs the stencil-consume cover
+            // and keeps the ordinary path. Anything else that composites
+            // against the page does too.
+            if (part.pass != InkPass.OPAQUE) continue
             val slice = into.put(part.mesh, part.color) ?: run {
                 Log.i(TAG, "wet pad upload: put failed, mesh verts=${part.mesh.vertexCount} tris=${part.mesh.triangleCount} pass=${part.pass}")
                 continue
@@ -419,7 +418,7 @@ class GlWetPadInk {
             if (!mapped) {
                 Log.i(TAG, "wet pad upload: unmapped, bounds=$bounds scroll=(${s.scrollX},${s.scrollY}) zoom=${s.zoom} pass=${part.pass}")
             }
-            built.add(Piece(slice, if (mapped) pixels else null, part.pass, part.color.withAlpha(255), part.pencil))
+            built.add(Piece(slice, if (mapped) pixels else null, part.pass, part.color.withAlpha(255)))
         }
         return built
     }
@@ -450,10 +449,6 @@ class GlWetPadInk {
      * Draw the pieces that reach the damage, which is what keeps a present the size of what moved
      * rather than the size of the stroke. A long stroke is nearly all somewhere else, and a
      * rectangle test throws it out before a vertex is transformed.
-     *
-     * Pencil pieces break the opaque batch: each draws with the grain branch on and
-     * its own ink override. Runs are few (settled batches plus one tail), so the
-     * extra calls cost nothing next to the damage-sized present.
      */
     private fun drawBuffer(program: InkShader, store: GeometryStore, pieces: List<Piece>) {
         if (pieces.isEmpty()) return
@@ -466,21 +461,6 @@ class GlWetPadInk {
         for (piece in pieces) {
             val bounds = piece.bounds
             if (bounds != null && !bounds.intersects(damage)) continue
-            if (piece.pass == InkPass.PENCIL) {
-                if (start >= 0) {
-                    store.drawRange(start, count)
-                    start = -1
-                    count = 0
-                }
-                program.setOverride(piece.color)
-                program.setPencil(true)
-                program.setPencilParams(piece.pencil?.seed ?: 0, piece.pencil?.tipMix ?: 0f)
-                val slice = piece.slice
-                store.drawRange(slice.indexOffset, slice.indexCount)
-                program.setPencil(false)
-                program.clearOverride()
-                continue
-            }
             val slice = piece.slice
             if (start >= 0 && slice.indexOffset == start + count) {
                 count += slice.indexCount

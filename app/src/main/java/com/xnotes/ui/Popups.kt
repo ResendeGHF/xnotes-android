@@ -125,13 +125,16 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
     var glowIntensity by remember { mutableStateOf(ToolConversions.neonStrengthToIntensity(base.neonStrength).toFloat()) }
     var dashLen by remember { mutableStateOf(base.dashLength.toFloat()) }
     var gapLen by remember { mutableStateOf(base.dashGap.toFloat()) }
-    var grain by remember { mutableStateOf(ToolConversions.strengthToGrain(base.pencilGrain).toFloat()) }
     var straight by remember { mutableStateOf(base.straightLine) }
     var scale by remember { mutableStateOf(base.scale) }
     var intensity by remember { mutableStateOf(ToolConversions.highlighterAlphaToIntensity(base.highlighterAlpha).toFloat()) }
     var inverse by remember { mutableStateOf(base.highlighterInverse) }
     var colorOverride by remember { mutableStateOf(base.colorOverride) }
     var snapShapes by remember { mutableStateOf(editor.snapHeldToShapes) }
+    var pencilPressure by remember { mutableStateOf(base.pencilPressure.toFloat()) }
+    var pencilDensity by remember { mutableStateOf(base.pencilDensity.toFloat()) }
+    var pencilGrainSize by remember { mutableStateOf(base.pencilGrainSize.toFloat()) }
+    var pencilShadeResponse by remember { mutableStateOf(base.pencilShadeResponse.toFloat()) }
 
     fun emit() {
         val m = ToolConversions.sensitivityToMinFactor(sensitivity.toDouble())
@@ -139,7 +142,6 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
         val sp = if (tool == Tool.SPEED) ToolConversions.speedToStrength(speed.toDouble()) else 0.0
         val tmf = if (tool == Tool.TAPER) taperTip.toDouble() / 100.0 else base.taperMinFactor
         val ha = if (tool == Tool.HIGHLIGHTER) ToolConversions.intensityToHighlighterAlpha(intensity.toDouble()) else base.highlighterAlpha
-        val gr = if (tool == Tool.PENCIL) ToolConversions.grainToStrength(grain.toDouble()) else base.pencilGrain
         editor.updateToolConfig(
             tool,
             base.copy(
@@ -158,7 +160,14 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 highlighterAlpha = ha,
                 highlighterInverse = inverse,
                 colorOverride = colorOverride,
-                pencilGrain = gr,
+                pencilPressure = if (tool == Tool.PENCIL) pencilPressure.toDouble()
+                    .coerceIn(ToolConfig.PENCIL_PRESSURE_MIN, ToolConfig.PENCIL_PRESSURE_MAX) else base.pencilPressure,
+                pencilDensity = if (tool == Tool.PENCIL) pencilDensity.toDouble()
+                    .coerceIn(ToolConfig.PENCIL_DENSITY_MIN, ToolConfig.PENCIL_DENSITY_MAX) else base.pencilDensity,
+                pencilGrainSize = if (tool == Tool.PENCIL) pencilGrainSize.toDouble()
+                    .coerceIn(ToolConfig.PENCIL_GRAIN_SIZE_MIN, ToolConfig.PENCIL_GRAIN_SIZE_MAX) else base.pencilGrainSize,
+                pencilShadeResponse = if (tool == Tool.PENCIL) pencilShadeResponse.toDouble()
+                    .coerceIn(ToolConfig.PENCIL_SHADE_RESPONSE_MIN, ToolConfig.PENCIL_SHADE_RESPONSE_MAX) else base.pencilShadeResponse,
             ),
         )
     }
@@ -186,7 +195,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 }
             }
             Spacer(Modifier.size(12.dp))
-            val hasPressure = tool == Tool.PEN || tool == Tool.PENCIL || tool == Tool.CALLIGRAPHY || tool == Tool.SPEED || tool == Tool.TAPER
+            val hasPressure = tool == Tool.PEN || tool == Tool.CALLIGRAPHY || tool == Tool.SPEED || tool == Tool.TAPER
             if (hasPressure) {
                 ToggleRow(stringResource(R.string.caption_pressure), pressure) { pressure = it; emit() }
                 SliderRow(stringResource(R.string.caption_sensitivity), sensitivity, 0f..100f, enabled = pressure) { sensitivity = it; emit() }
@@ -222,11 +231,17 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 ToggleRow(stringResource(R.string.caption_inverse), inverse) { inverse = it; emit() }
             }
             if (tool == Tool.PENCIL) {
-                SliderRow(stringResource(R.string.caption_grain), grain, 0f..100f) { grain = it; emit() }
+                // The pencil's four knobs: pressure sensitivity, graphite
+                // density, grain size and colour-shade response. Width stays
+                // fixed; pressure only moves graphite.
+                SliderRow(stringResource(R.string.caption_pencil_pressure), pencilPressure, ToolConfig.PENCIL_PRESSURE_MIN.toFloat()..ToolConfig.PENCIL_PRESSURE_MAX.toFloat()) { pencilPressure = it; emit() }
+                SliderRow(stringResource(R.string.caption_pencil_density), pencilDensity, ToolConfig.PENCIL_DENSITY_MIN.toFloat()..ToolConfig.PENCIL_DENSITY_MAX.toFloat()) { pencilDensity = it; emit() }
+                SliderRow(stringResource(R.string.caption_pencil_grain_size), pencilGrainSize, ToolConfig.PENCIL_GRAIN_SIZE_MIN.toFloat()..ToolConfig.PENCIL_GRAIN_SIZE_MAX.toFloat()) { pencilGrainSize = it; emit() }
+                SliderRow(stringResource(R.string.caption_pencil_shade), pencilShadeResponse, ToolConfig.PENCIL_SHADE_RESPONSE_MIN.toFloat()..ToolConfig.PENCIL_SHADE_RESPONSE_MAX.toFloat()) { pencilShadeResponse = it; emit() }
             }
             // Glow is offered on every stroke tool except the highlighter (translucent) and the
             // dashed pen (it draws a line, not a fillable ribbon, so a halo has nothing to hug).
-            // The pencil keeps its tooth instead of a halo, so it is excluded too.
+            // The pencil is excluded too, keeping its graphite look.
             if (tool.isStroke && tool != Tool.HIGHLIGHTER && tool != Tool.DASHED && tool != Tool.PENCIL) {
                 ToggleRow(stringResource(R.string.caption_neon), glow) { glow = it; emit() }
                 if (glow) {
@@ -359,6 +374,16 @@ fun StylesPopup(editor: Editor, onImportTemplate: () -> Unit = {}, onDismiss: ()
 
             if (tab == 0) {
                 Spacer(Modifier.size(8.dp))
+                // Color inversion for the whole note: paper, ruling and ink paint inverted,
+                // images and PDF pages too when "invert images" is on. Pages inherit it.
+                ToggleRow(stringResource(R.string.invert_colors), docStyle.invertColors == true) { on ->
+                    apply(docStyle.copy(invertColors = on, invertImages = docStyle.invertImages?.takeIf { on }))
+                }
+                if (docStyle.invertColors == true) {
+                    ToggleRow(stringResource(R.string.invert_images), docStyle.invertImages == true) { on ->
+                        apply(docStyle.copy(invertImages = on))
+                    }
+                }
                 if (showNewNoteRow && !docStyle.isEmpty) {
                     // The checkbox's 48dp touch frame insets the drawn box; pull the row back to align it.
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().offset(x = (-14).dp)) {

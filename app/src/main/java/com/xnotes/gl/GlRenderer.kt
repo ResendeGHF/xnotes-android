@@ -191,20 +191,23 @@ class GlRenderer : GLSurfaceView.Renderer {
         val after = ArrayList<() -> Unit>(afterFrame.size)
         while (true) after.add(afterFrame.poll() ?: break)
         val started = System.nanoTime()
-        val paper = f.paper
+        // The clear is the paper itself, so it inverts with everything else. The shader
+        // inverts what it is given, so it always receives the original paper (inverting
+        // here too would invert twice and show the original colour).
+        val clear = if (f.background.invertColors) f.paper.inverted() else f.paper
         // Effects and offscreen passes change GL viewport/scissor state. On a reused canvas
         // surface (e.g. switching from a paged note), reset it before clearing the whole frame.
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, f.widthPx, f.heightPx)
         GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
-        GLES30.glClearColor(paper.r / 255f, paper.g / 255f, paper.b / 255f, 1f)
+        GLES30.glClearColor(clear.r / 255f, clear.g / 255f, clear.b / 255f, 1f)
         GLES30.glClearStencil(0)
         GLES30.glDepthMask(true)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT or GLES30.GL_STENCIL_BUFFER_BIT)
 
         background?.let { shader ->
             val resolved = BackgroundPattern.resolve(f.background, f.zoom, f.scrollX, f.scrollY)
-            shader.draw(f.background, resolved, paper, f.widthPx, f.heightPx)
+            shader.draw(f.background, resolved, f.paper, f.widthPx, f.heightPx)
         }
 
         scene?.drawContent(f)

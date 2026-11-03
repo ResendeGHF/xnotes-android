@@ -12,10 +12,13 @@ import com.xnotes.core.infinite.LiftTransform
 import com.xnotes.core.infinite.MeshData
 import com.xnotes.core.infinite.Minimap
 import com.xnotes.core.infinite.MeshPart
+import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Rgba
-import com.xnotes.core.stroke.PencilGrain
+import com.xnotes.core.model.StickyNoteItem
+import com.xnotes.core.stroke.PencilStyle
+import com.xnotes.core.stroke.PencilTexture
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.floor
@@ -49,8 +52,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val glow: GlowSpec? = null,
         /** A covered tape's body, which the highlights beneath it are drawn round. */
         val covers: Boolean = false,
-        /** A pencil run's grain seed and tip mix (see [drawPencil]). */
-        val pencil: PencilGrain.PencilParams? = null,
+        /** Set on a pencil run: grain phase plus the UI knobs. */
+        val pencil: PencilStyle? = null,
     )
 
     /** A highlight held back to composite last, and the bodies of the covered tape laid over it since. */
@@ -98,6 +101,18 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         /** Items being dragged, and how far from where their triangles sit. Empty ends the drag. */
         class Lift(val items: List<CanvasItem>, val at: LiftTransform) : Edit()
 
+        /** The same drag moved further, with the same items: only the transform changed. */
+        class LiftAt(val at: LiftTransform) : Edit()
+
+        /**
+         * Decimated stand-ins for the lifted strokes, meshed on a worker while the drag runs.
+         * [gen] is the editor's lift generation: anything at or below the watermark is stale.
+         */
+        class SetProxy(val parts: IdentityHashMap<CanvasItem, List<MeshPart>>, val zoom: Double, val gen: Long) : Edit()
+
+        /** Drop the stand-ins; the watermark still retires any late background build. */
+        class ClearProxy(val gen: Long) : Edit()
+
         /** Move a text quad while preserving its already uploaded texture. */
         class RelocateText(val item: CanvasItem, val corners: DoubleArray, val bounds: Rect) : Edit()
         class Remove(val item: CanvasItem) : Edit()
@@ -144,6 +159,28 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
      */
     private val lifted = ArrayList<CanvasItem>()
     private var liftAt = LiftTransform.NONE
+
+    /** Identity set mirroring [lifted], so the per-frame cull tests membership in O(1). */
+    private val liftedSet = IdentityHashMap<CanvasItem, Unit>()
+
+    /**
+     * The lifted items' records, resolved once per content change and drawn in z-order.
+     * Resolving per item per frame cost a hash lookup each, and drawing in selection order
+     * could stack overlaps differently from the settled canvas; z-order matches what the
+     * commit will look like and keeps sequentially-created runs contiguous for batching.
+     */
+    private val liftedRecords = ArrayList<Record>()
+    private var liftedRecordsRevision = -1
+    private val glowingScratch = ArrayList<Record>()
+
+    /**
+     * Decimated stand-ins for lifted strokes, drawn in place of the full meshes while a big
+     * selection moves. Slices live in the main store through the normal put/free path, so the
+     * draw code below needs no second buffer; [proxyGen] retires late background builds.
+     */
+    private val proxySlices = IdentityHashMap<CanvasItem, List<Part>>()
+    private var proxyZoom = Double.NaN
+    private var proxyGen = 0L
 
     /** Records bucketed by content chunk, so a frame only visits what the viewport overlaps. */
     private val buckets = HashMap<Long, ArrayList<Record>>()
@@ -206,6 +243,16 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     @Volatile
     var lastTessellateMs: Double = 0.0
 
+    /** Last frame's render-thread phase costs, for the debug HUD's lag triage. */
+    @Volatile var lastCullMs: Double = 0.0
+        private set
+    @Volatile var lastCommitMs: Double = 0.0
+        private set
+    @Volatile var lastLiftMs: Double = 0.0
+        private set
+    @Volatile var lastWetMs: Double = 0.0
+        private set
+
     override fun describe(into: GlStats): GlStats = into.copy(
         items = records.size,
         visibleItems = lastVisibleItems,
@@ -221,6 +268,10 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         textureBytes = textures.residentBytes,
         texturesPending = textures.pendingCount,
         lastTessellateMs = lastTessellateMs,
+        cullMs = lastCullMs,
+        commitMs = lastCommitMs,
+        liftMs = lastLiftMs,
+        wetMs = lastWetMs,
     )
 
     // --- main-thread API ---
@@ -283,6 +334,27 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     /** Draw [items] displaced by [at] until this is called again with an empty list. */
     fun setLift(items: List<CanvasItem>, at: LiftTransform) {
         post(Edit.Lift(ArrayList(items), at))
+    }
+
+    /** Move the current lifted drag to [at] without re-publishing (and re-comparing) its items. */
+    fun setLiftAt(at: LiftTransform) {
+        post(Edit.LiftAt(at))
+    }
+
+    /**
+     * Show decimated stand-ins for the lifted strokes until [clearLiftProxy]. The queue is FIFO,
+     * so a late build from an earlier drag always lands behind that drag's clear and is retired
+     * by the watermark instead of leaking onto the next drag.
+     */
+    fun setLiftProxy(parts: Map<CanvasItem, List<MeshPart>>, zoom: Double, gen: Long) {
+        val copy = IdentityHashMap<CanvasItem, List<MeshPart>>(parts.size * 2 + 1)
+        copy.putAll(parts)
+        post(Edit.SetProxy(copy, zoom, gen))
+    }
+
+    /** Drop the drag stand-ins; the watermark retires any late background build. */
+    fun clearLiftProxy(gen: Long) {
+        post(Edit.ClearProxy(gen))
     }
 
     fun reset() {
@@ -353,6 +425,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
     override fun drawContent(frame: FrameState) {
         drainEdits()
+        ensureLiftedRecords()
+        val frameStartNs = System.nanoTime()
         textures.beginFrame()
         textures.uploadPending()
         glowTarget.resize(frame.widthPx, frame.heightPx, contextGen)
@@ -384,6 +458,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         collectVisible(frame)
         lastVisibleItems = visible.size
         lastDrawCalls = 0
+        val cullDone = System.nanoTime()
+        lastCullMs = (cullDone - frameStartNs) / 1_000_000.0
 
         // Halos of everything already committed go into a layer that is rebuilt only when the view
         // or the content moves. Re-blurring each of them every frame made the cost of neon scale
@@ -391,14 +467,70 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         // refresh rate, while none of them had actually changed.
         drawCommittedHalos(program, frame, camChunkX, camChunkY)
 
+        // Sticky notes always sit in front of canvas ink, whatever the document order says:
+        // everything else first, then the notes (with their own ink) over it.
+        val fade = fade
+        deferred.clear()
+        val stickyDeferred = ArrayList<Deferred>()
+        drawCommittedBatch(program, frame, camChunkX, camChunkY, fade, stickyOnly = false, deferred)
+        // A sticky's paper covers the plain highlighters beneath it, like a tape does.
+        for (record in visible) {
+            if (record.item !is StickyNoteItem) continue
+            for (part in record.parts) {
+                if (!part.covers) continue
+                for (d in deferred) {
+                    if (d.record !== record && d.record.bounds.intersects(record.bounds)) {
+                        (d.under ?: ArrayList<Part>().also { d.under = it }).add(part)
+                    }
+                }
+            }
+        }
+        for (d in deferred) {
+            drawMasked(store, d.part.slice, d.record.bounds, d.part.coverColor, d.part.coverAlpha, frame, d.part.pass, d.under)
+            rebind(program, frame, camChunkX, camChunkY)
+        }
+        drawCommittedBatch(program, frame, camChunkX, camChunkY, fade, stickyOnly = true, stickyDeferred)
+        for (d in stickyDeferred) {
+            drawMasked(store, d.part.slice, d.record.bounds, d.part.coverColor, d.part.coverAlpha, frame, d.part.pass, d.under)
+            rebind(program, frame, camChunkX, camChunkY)
+        }
+        val commitDone = System.nanoTime()
+        lastCommitMs = (commitDone - cullDone) / 1_000_000.0
+
+        drawLifted(program, frame, camChunkX, camChunkY)
+        val liftDone = System.nanoTime()
+        lastLiftMs = (liftDone - commitDone) / 1_000_000.0
+        drawWet(program, frame, camChunkX, camChunkY)
+        if (frame.minimapVisible) drawMinimap(frame)
+        lastWetMs = (System.nanoTime() - liftDone) / 1_000_000.0
+        lastCommitMs = (commitDone - cullDone) / 1_000_000.0
+
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        program.disableAttributes()
+    }
+
+    /**
+     * One half of the committed pass: either everything but the sticky notes, or just the
+     * notes. The two halves share the visible list (already back-to-front) so each keeps its
+     * own z order; the caller draws the first half's held-back highlighters before the second
+     * half, which is what keeps the notes in front of page ink.
+     */
+    private fun drawCommittedBatch(
+        program: InkShader,
+        frame: FrameState,
+        camChunkX: Double,
+        camChunkY: Double,
+        fade: com.xnotes.core.audio.InkFade?,
+        stickyOnly: Boolean,
+        deferred: MutableList<Deferred>,
+    ) {
         // Back to front, batching every run of opaque items that happens to be contiguous in the
         // buffer into one call. Freshly loaded content is laid down in z order, so a screenful of
         // it is usually a single draw.
-        deferred.clear()
         var runStart = -1
         var runCount = 0
-        val fade = fade
         for (record in visible) {
+            if ((record.item is StickyNoteItem) != stickyOnly) continue
             val faded = fade != null && fade.fades(record.item)
             if (record.textBitmap != null) {
                 flushRun(runStart, runCount)
@@ -460,13 +592,10 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                         }
                     }
                     InkPass.PENCIL -> {
-                        // Grain in the fragment shader, one call per run with the ink
-                        // as a uniform: the mesh never overlaps, so alpha unions
-                        // like opaque ink and runs join seamlessly.
                         flushRun(runStart, runCount)
                         runStart = -1
                         runCount = 0
-                        drawPencil(program, store, part)
+                        drawPencil(program, store, part, record.bounds, frame)
                         rebind(program, frame, camChunkX, camChunkY)
                     }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO -> {
@@ -488,18 +617,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             }
         }
         flushRun(runStart, runCount)
-
-        for (d in deferred) {
-            drawMasked(store, d.part.slice, d.record.bounds, d.part.coverColor, d.part.coverAlpha, frame, d.part.pass, d.under)
-            rebind(program, frame, camChunkX, camChunkY)
-        }
-
-        drawLifted(program, frame, camChunkX, camChunkY)
-        drawWet(program, frame, camChunkX, camChunkY)
-        if (frame.minimapVisible) drawMinimap(frame)
-
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
-        program.disableAttributes()
     }
 
     /**
@@ -537,21 +654,40 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
      * The selection under a drag, drawn above the rest with the drag pushed in as a uniform.
      *
      * Nothing is re-tessellated and nothing is re-uploaded, which is the whole point: the cost of
-     * dragging is the same for one stroke and for a hundred. The opaque batching the main loop does
-     * is skipped, since a selection is a handful of items rather than a screenful.
+     * dragging is the same for one stroke and for a hundred. Contiguous opaque runs batch into a
+     * single draw like the committed pass does, so a large selection of sequentially-created
+     * strokes still moves in a handful of calls rather than one per item.
      */
     private fun drawLifted(program: InkShader, frame: FrameState, camChunkX: Double, camChunkY: Double) {
-        if (lifted.isEmpty()) return
+        if (liftedRecords.isEmpty()) return
         val view = viewRect(frame)
         drawLiftedHalos(program, frame, camChunkX, camChunkY)
         applyView(program, frame, camChunkX, camChunkY, liftAt)
         if (!store.bindForDraw(contextGen)) return
         store.bindAttributes(program)
-        for (item in lifted) {
-            val record = records[item] ?: continue
+        var runStart = -1
+        var runCount = 0
+        fun flushRun() {
+            if (runStart >= 0 && runCount > 0) {
+                store.drawRange(runStart, runCount)
+                lastDrawCalls++
+            }
+            runStart = -1
+            runCount = 0
+        }
+        for (record in liftedRecords) {
+            // A proxy is a decimated stand-in within a pixel of the full mesh; outside a small
+            // zoom drift it would show, so fall back to the full mesh instead of showing that.
+            val useProxy = proxyZoom.isFinite() &&
+                kotlin.math.abs(frame.zoom - proxyZoom) <= 0.25 * proxyZoom
+            val drawParts = if (useProxy) proxySlices[record.item] ?: record.parts else record.parts
             val bounds = liftAt.bounds(record.bounds)
-            if (!bounds.intersects(view)) continue
+            if (!bounds.intersects(view)) {
+                flushRun()
+                continue
+            }
             if (record.textBitmap != null) {
+                flushRun()
                 drawText(record, frame, liftAt)
                 applyView(program, frame, camChunkX, camChunkY, liftAt)
                 store.bindForDraw(contextGen)
@@ -559,25 +695,33 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                 continue
             }
             if (record.image != null) {
+                flushRun()
                 drawImage(record, record.image, frame, liftAt)
                 applyView(program, frame, camChunkX, camChunkY, liftAt)
                 store.bindForDraw(contextGen)
                 store.bindAttributes(program)
                 continue
             }
-            for (part in record.parts) {
+            for (part in drawParts) {
                 when (part.pass) {
                     InkPass.OPAQUE -> {
-                        store.drawRange(part.slice.indexOffset, part.slice.indexCount)
-                        lastDrawCalls++
+                        if (runStart >= 0 && part.slice.indexOffset == runStart + runCount) {
+                            runCount += part.slice.indexCount
+                        } else {
+                            flushRun()
+                            runStart = part.slice.indexOffset
+                            runCount = part.slice.indexCount
+                        }
                     }
                     InkPass.PENCIL -> {
-                        drawPencil(program, store, part)
+                        flushRun()
+                        drawPencil(program, store, part, record.bounds, frame)
                         applyView(program, frame, camChunkX, camChunkY, liftAt)
                         store.bindForDraw(contextGen)
                         store.bindAttributes(program)
                     }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO, InkPass.MULTIPLY, InkPass.SCREEN -> {
+                        flushRun()
                         drawMasked(
                             store, part.slice, bounds, part.coverColor, part.coverAlpha,
                             frame, part.pass,
@@ -587,10 +731,14 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                         store.bindAttributes(program)
                     }
                     // The halo is already down from the layer above; this is the lit body and core.
-                    InkPass.GLOW -> drawGlowBody(program, store, part)
+                    InkPass.GLOW -> {
+                        flushRun()
+                        drawGlowBody(program, store, part)
+                    }
                 }
             }
         }
+        flushRun()
         rebind(program, frame, camChunkX, camChunkY)
     }
 
@@ -614,8 +762,16 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     ) {
         val shader = glowShader ?: return
         if (!glowTarget.ready) return
-        val glowing = lifted.mapNotNull { records[it] }
-            .filter { record -> record.parts.any { it.pass == InkPass.GLOW } }
+        glowingScratch.clear()
+        for (record in liftedRecords) {
+            for (part in record.parts) {
+                if (part.pass == InkPass.GLOW) {
+                    glowingScratch.add(record)
+                    break
+                }
+            }
+        }
+        val glowing = glowingScratch
         if (glowing.isEmpty()) {
             liftHaloKey = null
             return
@@ -714,6 +870,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             runStart = -1
             runCount = 0
         }
+        // Pencil runs defer their covers to the shared union below.
+        val pencilParts = ArrayList<Triple<GeometryStore, Part, Rect>>()
         for (part in parts) {
             if (part.pass == InkPass.OPAQUE) {
                 if (runStart >= 0 && part.slice.indexOffset == runStart + runCount) {
@@ -729,7 +887,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             if (part.pass == InkPass.GLOW) {
                 drawGlow(program, buffer, wetRecord(), part, frame, camChunkX, camChunkY)
             } else if (part.pass == InkPass.PENCIL) {
-                drawPencil(program, buffer, part)
+                pencilParts.add(Triple(buffer, part, wetBounds))
             } else {
                 drawMasked(
                     buffer, part.slice, wetBounds, part.coverColor, part.coverAlpha,
@@ -741,6 +899,22 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             buffer.bindAttributes(program)
         }
         flush()
+        // The live stroke's runs share one union on purpose: mark every run
+        // first, then cover every run, so a tail crossing its own settled ink
+        // paints once exactly like the committed stroke does. (Committed
+        // strokes keep one mark+cover per part instead, so separate strokes
+        // still layer over each other.)
+        if (pencilParts.isNotEmpty()) {
+            if (grainTexture(program) == 0) {
+                for ((from, part, bounds) in pencilParts) drawPencil(program, from, part, bounds, frame)
+            } else {
+                for ((from, part, bounds) in pencilParts) markPencil(program, from, part, bounds, frame)
+                for ((from, part, _) in pencilParts) coverPencil(program, from, part)
+            }
+            rebind(program, frame, camChunkX, camChunkY)
+            buffer.bindForDraw(contextGen)
+            buffer.bindAttributes(program)
+        }
     }
 
     /** Upload one ready-to-draw text bitmap and reuse its GL texture until the text changes. */
@@ -779,7 +953,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             corners[2 * i] = (dx / frame.widthPx * 2.0 - 1.0).toFloat()
             corners[2 * i + 1] = (1.0 - dy / frame.heightPx * 2.0).toFloat()
         }
-        shader.draw(corners, texture, 0, alpha)
+        shader.draw(corners, texture, 0, alpha, invert = frame.background.invertColors)
         lastDrawCalls++
     }
 
@@ -828,7 +1002,10 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             corners[2 * i] = (dx / frame.widthPx * 2.0 - 1.0).toFloat()
             corners[2 * i + 1] = (1.0 - dy / frame.heightPx * 2.0).toFloat()
         }
-        shader.draw(corners, texture, image.orientation / 90, alpha, image.part)
+        // Placed images keep their pixels unless both inversion and "invert images" are on;
+        // rasterized text labels are content ink and follow the main inversion flag.
+        shader.draw(corners, texture, image.orientation / 90, alpha, image.part,
+            invert = frame.background.invertColors && frame.background.invertImages)
         lastDrawCalls++
     }
 
@@ -902,6 +1079,138 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         glowTarget.unbind(frame.widthPx, frame.heightPx)
     }
 
+    /** The pencil grain tile as a GL texture, recreated with the GL context. */
+    private var grainTextureId = 0
+    private var grainTextureGen = -1
+
+    private fun grainTexture(program: InkShader): Int {
+        if (grainTextureId != 0 && grainTextureGen == program.contextGen) return grainTextureId
+        if (grainTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(grainTextureId), 0)
+            grainTextureId = 0
+        }
+        val ids = IntArray(1)
+        GLES30.glGenTextures(1, ids, 0)
+        if (ids[0] == 0) return 0
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, ids[0])
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR_MIPMAP_LINEAR)
+        // Nearest on magnification: grains stay crisp holes instead of
+        // blurring into smaller-looking smudges at high zoom.
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_REPEAT)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_REPEAT)
+        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, PencilTexture.fieldBitmap(), 0)
+        GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_2D)
+        grainTextureId = ids[0]
+        grainTextureGen = program.contextGen
+        return grainTextureId
+    }
+
+    /** Bind the grain field to unit 0 and point the pencil cover at it. */
+    /** Bind the grain field to unit 0 and point the pencil cover at [style]. */
+    private fun bindGrain(program: InkShader, style: PencilStyle) {
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, grainTextureId)
+        program.setPencilGrain(0, (PencilTexture.TILE_CONTENT_PX * style.grainSize).toFloat())
+        program.setPencilDensity(
+            StrokeTessellator.PENCIL_DENSITY_BASE.toFloat(),
+            StrokeTessellator.PENCIL_DENSITY_SPAN.toFloat(),
+            StrokeTessellator.PENCIL_DENSITY_GAMMA.toFloat(),
+        )
+        program.setPencilShade(
+            StrokeTessellator.PENCIL_SHADE_BASE.toFloat(),
+            StrokeTessellator.PENCIL_SHADE_SPAN.toFloat(),
+            StrokeTessellator.PENCIL_SHADE_GAMMA.toFloat(),
+        )
+        program.setPencilConfig(
+            style.density.toFloat(), style.pressure.toFloat(), style.shadeResponse.toFloat(),
+        )
+        program.setPencilPhase(style.phaseX.toFloat(), style.phaseY.toFloat())
+    }
+
+    /**
+     * A pencil run: stencil the round sweep into a union, then cover it with
+     * textured graphite at pressure tone, consuming the stencil as it goes,
+     * so every pixel paints exactly once no matter how the ribbon folds over
+     * itself, caps or joins. Consecutive parts need no clear between them:
+     * each consumes what it stencils.
+     *
+     * The live stroke's runs share one union on purpose (see [drawWetBuffer]):
+     * mark every run first, then cover every run, so a tail crossing its own
+     * settled ink paints once like the committed stroke does. Committed
+     * strokes keep one mark+cover per part instead, so separate strokes still
+     * layer over each other.
+     *
+     * Without a grain texture (effectively never) the run falls back to a
+     * flat stencil cover instead of vanishing.
+     */
+    private fun drawPencil(
+        program: InkShader,
+        from: GeometryStore,
+        part: Part,
+        bounds: Rect,
+        frame: FrameState,
+    ) {
+        if (!markPencil(program, from, part, bounds, frame)) return
+        coverPencil(program, from, part)
+    }
+
+    /**
+     * Stencil a pencil run's union silhouette. Returns false when there is no
+     * grain texture, after drawing the flat fallback instead.
+     */
+    private fun markPencil(
+        program: InkShader,
+        from: GeometryStore,
+        part: Part,
+        bounds: Rect,
+        frame: FrameState,
+    ): Boolean {
+        if (grainTexture(program) == 0) {
+            drawMasked(from, part.slice, bounds, part.coverColor, 0.55, frame, InkPass.TRANSLUCENT)
+            return false
+        }
+        // The union silhouette. Overlaps collapse to 1; the cover consumes
+        // them, so nothing double-darkens.
+        GLES30.glEnable(GLES30.GL_STENCIL_TEST)
+        GLES30.glStencilFunc(GLES30.GL_ALWAYS, 1, 0xFF)
+        GLES30.glStencilOp(GLES30.GL_KEEP, GLES30.GL_KEEP, GLES30.GL_REPLACE)
+        GLES30.glStencilMask(0xFF)
+        GLES30.glColorMask(false, false, false, false)
+        program.setWidthScale(1.0)
+        program.setPencil(0f)
+        from.drawRange(part.slice.indexOffset, part.slice.indexCount)
+        lastDrawCalls++
+        return true
+    }
+
+    /** Cover a marked pencil run with graphite stipple, consuming the mask. */
+    private fun coverPencil(
+        program: InkShader,
+        from: GeometryStore,
+        part: Part,
+    ) {
+        // Shaded stipple at the stroke's own density, shade, phase and size,
+        // composited normally over whatever is beneath.
+        GLES30.glColorMask(true, true, true, true)
+        GLES30.glStencilFunc(GLES30.GL_EQUAL, 1, 0xFF)
+        GLES30.glStencilOp(GLES30.GL_KEEP, GLES30.GL_KEEP, GLES30.GL_ZERO)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        val style = part.pencil
+        if (style != null) {
+            bindGrain(program, style)
+            program.setWidthScale(1.0)
+            program.setPencil(1f)
+            from.drawRange(part.slice.indexOffset, part.slice.indexCount)
+            lastDrawCalls++
+        }
+        GLES30.glDisable(GLES30.GL_STENCIL_TEST)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        program.setPencil(0f)
+        program.setWidthScale(1.0)
+        lastDrawCalls++
+    }
+
     /** Neon's lit body and white core, both from the same triangles the halo came from. */
     private fun drawGlowBody(program: InkShader, from: GeometryStore, part: Part) {
         val spec = part.glow ?: return
@@ -915,24 +1224,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         program.setWidthScale(1.0)
         program.clearOverride()
         lastDrawCalls += 2
-    }
-
-    /**
-     * A pencil run: the ink colour as a uniform override (the vertex bytes carry
-     * density/edge, not colour) with the grain branch on, seeded and tip-mixed
-     * per stroke. The mesh never overlaps, so alpha unions like opaque ink and
-     * a run baked now and the tail over it never seam.
-     */
-    private fun drawPencil(program: InkShader, from: GeometryStore, part: Part) {
-        GLES30.glEnable(GLES30.GL_BLEND)
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
-        program.setOverride(part.coverColor)
-        program.setPencil(true)
-        program.setPencilParams(part.pencil?.seed ?: 0, part.pencil?.tipMix ?: 0f)
-        from.drawRange(part.slice.indexOffset, part.slice.indexCount)
-        program.setPencil(false)
-        program.clearOverride()
-        lastDrawCalls++
     }
 
     private fun drawGlow(
@@ -1174,19 +1465,53 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     // --- record bookkeeping ---
 
     private fun drainEdits() {
+        // Coalesce bursts first: a fast drag posts several transform/ tail edits per frame and
+        // only the last of each consecutive run can survive it; the rest only churn the buffers.
+        // Runs are same-kind and adjacent, so dropping all but the last changes nothing that a
+        // frame could have observed between them; every other kind keeps its exact order.
+        var batch: ArrayList<Edit>? = null
         while (true) {
-            when (val edit = pending.poll() ?: break) {
-                is Edit.Upsert -> applyUpsert(edit)
-                is Edit.RelocateText -> applyRelocateText(edit)
-                is Edit.Wet -> applyWet(edit)
-                is Edit.Lift -> applyLift(edit)
-                is Edit.Remove -> applyRemove(edit.item)
-                is Edit.Order -> applyOrder(edit.items)
-                is Edit.Reserve -> store.reserve(edit.vertices, edit.indices)
-                Edit.Reset -> applyReset()
+            val edit = pending.poll() ?: break
+            if (batch == null) batch = ArrayList(8)
+            batch.add(edit)
+        }
+        if (batch != null) {
+            var i = 0
+            while (i < batch.size) {
+                val edit = batch[i]
+                if (i + 1 < batch.size && isCoalescible(edit) && sameCoalescible(edit, batch[i + 1])) {
+                    i++
+                    continue
+                }
+                applyEdit(edit)
+                i++
             }
         }
         reportMemory()
+    }
+
+    /** Edits a later same-kind edit fully supersedes: a transform, or a tail-buffer replace. */
+    private fun isCoalescible(edit: Edit): Boolean =
+        edit is Edit.LiftAt || (edit is Edit.Wet && edit.kind == WetKind.TAIL)
+
+    private fun sameCoalescible(a: Edit, b: Edit): Boolean =
+        (a is Edit.LiftAt && b is Edit.LiftAt) ||
+            (a is Edit.Wet && b is Edit.Wet && a.kind == WetKind.TAIL && b.kind == WetKind.TAIL)
+
+    private fun applyEdit(edit: Edit) {
+        when (edit) {
+            is Edit.Upsert -> applyUpsert(edit)
+            is Edit.RelocateText -> applyRelocateText(edit)
+            is Edit.Wet -> applyWet(edit)
+            is Edit.Lift -> applyLift(edit)
+            is Edit.LiftAt -> liftAt = edit.at
+            is Edit.SetProxy -> applySetProxy(edit)
+            is Edit.ClearProxy -> applyClearProxy(edit)
+            is Edit.Remove -> applyRemove(edit.item)
+            is Edit.Order -> applyOrder(edit.items)
+            is Edit.Reserve -> store.reserve(edit.vertices, edit.indices)
+            Edit.Reset -> applyReset()
+        }
     }
 
     private fun reportMemory() {
@@ -1277,8 +1602,55 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             revision++
             lifted.clear()
             lifted.addAll(edit.items)
+            liftedSet.clear()
+            for (item in lifted) liftedSet[item] = Unit
         }
         liftAt = edit.at
+    }
+
+    /** Resolve the lifted items to records once per content change, in z-order. */
+    private fun ensureLiftedRecords() {
+        if (liftedRecordsRevision == revision) return
+        liftedRecords.clear()
+        for (item in lifted) {
+            records[item]?.let { liftedRecords.add(it) }
+        }
+        liftedRecords.sortBy { it.z }
+        liftedRecordsRevision = revision
+    }
+
+    /**
+     * Swap in decimated drag stand-ins. Sorted by z before uploading so the proxy slices land
+     * back-to-back in draw order and keep batching; a late build from an earlier drag retires
+     * against the watermark instead of leaking onto this one. No revision bump: the committed
+     * halo layer never contained the lifted items, and the lifted halos keep reading the exact
+     * meshes (a pixel of body mismatch under a soft halo is invisible, while re-blurring on
+     * every swap would defeat the optimisation).
+     */
+    private fun applySetProxy(edit: Edit.SetProxy) {
+        if (edit.gen <= proxyGen) return
+        clearProxySlices()
+        val ordered = edit.parts.entries.sortedBy { records[it.key]?.z ?: Int.MAX_VALUE }
+        for ((item, parts) in ordered) {
+            // The model stands still while lifted, but never trust a background thread for that:
+            // anything gone since is simply left on its full mesh.
+            if (!records.containsKey(item)) continue
+            val built = build(parts, store)
+            if (built.isNotEmpty()) proxySlices[item] = built
+        }
+        proxyZoom = edit.zoom
+        proxyGen = edit.gen
+    }
+
+    private fun clearProxySlices() {
+        for (parts in proxySlices.values) for (part in parts) store.free(part.slice)
+        proxySlices.clear()
+        proxyZoom = Double.NaN
+    }
+
+    private fun applyClearProxy(edit: Edit.ClearProxy) {
+        proxyGen = maxOf(proxyGen, edit.gen)
+        clearProxySlices()
     }
 
     private fun sameItems(a: List<CanvasItem>, b: List<CanvasItem>): Boolean {
@@ -1322,6 +1694,9 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         revision++
         nextZ = 0
         lifted.clear()
+        liftedSet.clear()
+        proxySlices.clear()
+        proxyZoom = Double.NaN
         for (record in records.values) freeText(record)
         records.clear()
         buckets.clear()
@@ -1374,10 +1749,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         while (visible.size > write) visible.removeAt(visible.size - 1)
     }
 
-    private fun isLifted(item: CanvasItem): Boolean {
-        for (i in lifted.indices) if (lifted[i] === item) return true
-        return false
-    }
+    private fun isLifted(item: CanvasItem): Boolean = liftedSet.containsKey(item)
 
     private fun fileRecord(record: Record) {
         val x0 = chunkOf(record.bounds.left)

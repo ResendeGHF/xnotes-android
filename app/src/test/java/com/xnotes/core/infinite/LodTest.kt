@@ -95,4 +95,30 @@ class LodTest {
     @Test fun aZeroWidthStrokeDrawsNothing() {
         assertEquals(0.0, Lod.subPixelAlpha(0.0, 1.0), 1e-12)
     }
+
+    @Test fun meshToleranceStaysWithinBudgetAndNeverBelowDefault() {
+        var z = 0.01
+        while (z <= CanvasViewport.MAX_ZOOM) {
+            val tol = ItemMesher.toleranceForZoom(z)
+            assertTrue("never below the lossless default at zoom $z",
+                tol >= StrokeTessellator.DEFAULT_TOLERANCE - 1e-12)
+            assertTrue("within the screen error budget at zoom $z",
+                tol * z <= Lod.SCREEN_ERROR_PX + 1e-9)
+            z *= 1.17
+        }
+    }
+
+    @Test fun meshToleranceIsLosslessWhenZoomedIn() {
+        assertEquals(StrokeTessellator.DEFAULT_TOLERANCE, ItemMesher.toleranceForZoom(64.0), 1e-12)
+        assertEquals(StrokeTessellator.DEFAULT_TOLERANCE, ItemMesher.toleranceForZoom(1.0), 1e-12)
+    }
+
+    @Test fun meshToleranceCoarsensWhenZoomedOut() {
+        assertTrue(ItemMesher.toleranceForZoom(0.05) > ItemMesher.toleranceForZoom(1.0))
+    }
+
+    @Test fun meshToleranceHandlesDegenerateZoom() {
+        assertEquals(StrokeTessellator.DEFAULT_TOLERANCE, ItemMesher.toleranceForZoom(0.0), 1e-12)
+        assertEquals(StrokeTessellator.DEFAULT_TOLERANCE, ItemMesher.toleranceForZoom(Double.NaN), 1e-12)
+    }
 }

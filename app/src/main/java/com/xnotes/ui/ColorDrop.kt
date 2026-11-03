@@ -41,6 +41,7 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.deepCopy
 import com.xnotes.core.pal.Renderer
+import com.xnotes.core.pal.InvertingRenderer
 import com.xnotes.core.pal.TextMeasurer
 import com.xnotes.platform.AndroidRenderer
 import com.xnotes.ui.theme.LocalPalette
@@ -86,6 +87,16 @@ interface ColorDropHost {
     fun moveColorDrag(window: Offset)
     fun endColorDrag(window: Offset)
     fun cancelColorDrag()
+
+    /** Whether drop previews over [frame] paint inverted (that frame's page is color-inverted). */
+    fun isDropFrameInverted(frame: Int): Boolean
+
+    /** [color] as it shows on [frame]'s page: inverted when that page is. */
+    fun dropDisplayColor(color: Rgba, frame: Int): Rgba =
+        if (isDropFrameInverted(frame)) color.inverted() else color
+
+    /** The frame the carried disc previews against while it is over no preview. */
+    fun dropDiscFrame(): Int
 
     /** The canvas view's bounds, in window pixels. */
     fun canvasInWindow(): androidx.compose.ui.geometry.Rect
@@ -296,10 +307,13 @@ fun ColorDropOverlay(host: ColorDropHost) {
                     r.save()
                     r.translate(canvas.left.toDouble(), canvas.top.toDouble())
                     host.enterDropFrame(r, p.frame)
+                    // The preview shows what the page will show after the drop: the model keeps
+                    // the raw colour while the page paints inverted, so paint inverted here.
+                    val rr = if (host.isDropFrameInverted(p.frame)) InvertingRenderer(r) else r
                     when (p) {
-                        is DropPreview.Line -> p.item.paint(r)
+                        is DropPreview.Line -> p.item.paint(rr)
                         is DropPreview.Area -> {
-                            tint.color = drag.color.withAlpha(PREVIEW_ALPHA).toArgb()
+                            tint.color = host.dropDisplayColor(drag.color, p.frame).withAlpha(PREVIEW_ALPHA).toArgb()
                             val d = p.rect
                             c.nativeCanvas.drawBitmap(p.mask, null, RectF(d.left.toFloat(), d.top.toFloat(), d.right.toFloat(), d.bottom.toFloat()), tint)
                         }
@@ -312,7 +326,8 @@ fun ColorDropOverlay(host: ColorDropHost) {
         if (at.isSpecified) {
             val local = at - origin[0]
             val radius = DISC_RADIUS.dp.toPx()
-            drawCircle(drag.color.toComposeColor(), radius, local)
+            // The carried disc previews the colour as it will land on the page under it.
+            drawCircle(host.dropDisplayColor(drag.color, drag.preview?.frame ?: host.dropDiscFrame()).toComposeColor(), radius, local)
             drawCircle(ring.toComposeColor(), radius, local, style = RingStroke(1.5.dp.toPx()))
         }
     }

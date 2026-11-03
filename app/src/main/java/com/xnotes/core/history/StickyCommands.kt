@@ -1,5 +1,6 @@
 package com.xnotes.core.history
 
+import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
@@ -45,16 +46,28 @@ class RecolorSticky(private val entries: List<Entry>) : Command {
 
 /** Collapse or expand sticky notes. */
 class SetStickyCollapsed(private val entries: List<Entry>) : Command {
-    class Entry(val item: StickyNoteItem, val before: Boolean, val after: Boolean)
+    class Entry(
+        val item: StickyNoteItem,
+        val before: Boolean,
+        val after: Boolean,
+        val rectBefore: Rect? = null,
+        val rectAfter: Rect? = null,
+    )
 
     constructor(item: StickyNoteItem, collapsed: Boolean) : this(listOf(Entry(item, item.collapsed, collapsed)))
 
     override fun redo() {
-        for (e in entries) e.item.collapsed = e.after
+        for (e in entries) {
+            e.item.collapsed = e.after
+            e.rectAfter?.let { e.item.rect = it }
+        }
     }
 
     override fun undo() {
-        for (e in entries) e.item.collapsed = e.before
+        for (e in entries) {
+            e.item.collapsed = e.before
+            e.rectBefore?.let { e.item.rect = it }
+        }
     }
 
     override fun touched(locate: (CanvasItem) -> Page?) = entries.mapNotNull { locate(it.item)?.let { p -> p to it.item } }

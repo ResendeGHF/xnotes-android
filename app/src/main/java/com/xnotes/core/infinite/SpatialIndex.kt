@@ -26,7 +26,8 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
     /** Per-item cell span as `[x0, y0, x1, y1]` inclusive; absent for oversized and unfiled items. */
     private val spans = IdentityHashMap<CanvasItem, IntArray>()
 
-    private val oversized = ArrayList<CanvasItem>()
+    /** Items too wide to bin, keyed by identity so insert/remove stay O(1) however many there are. */
+    private val oversized = IdentityHashMap<CanvasItem, Unit>()
 
     /** Number of indexed items, binned and oversized together. */
     val size: Int get() = spans.size + oversized.size
@@ -41,10 +42,10 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
 
     /** File [item] under its current paint bounds. Re-filing an already-indexed item is a no-op. */
     fun insert(item: CanvasItem) {
-        if (spans.containsKey(item) || containsOversized(item)) return
+        if (spans.containsKey(item) || oversized.containsKey(item)) return
         val span = spanOf(item.paintBounds())
         if (span == null) {
-            oversized.add(item)
+            oversized[item] = Unit
             return
         }
         spans[item] = span
@@ -54,7 +55,7 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
     fun remove(item: CanvasItem) {
         val span = spans.remove(item)
         if (span == null) {
-            removeOversized(item)
+            oversized.remove(item)
             return
         }
         forEachCell(span) { key ->
@@ -77,10 +78,22 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
      * Append every item whose paint bounds intersect [rect] to [out]. An item spanning several
      * cells is appended once per hit cell, so the caller must de-duplicate. [InfiniteDocument]
      * does that while sorting into z-order, which it has to walk anyway.
+     *
+     * A rect covering more than [MAX_QUERY_CELLS] cells falls back to testing every indexed
+     * item: walking millions of mostly-empty cells costs more than the linear scan, and the
+     * linear scan is also what a query that hits the whole document pays anyway.
      */
     fun queryRaw(rect: Rect, out: MutableList<CanvasItem>) {
-        for (item in oversized) if (item.paintBounds().intersects(rect)) out.add(item)
+        for (item in oversized.keys) if (item.paintBounds().intersects(rect)) out.add(item)
         val span = cellRange(rect)
+        val cellsWide = span[2].toLong() - span[0] + 1L
+        val cellsHigh = span[3].toLong() - span[1] + 1L
+        if (cellsWide > MAX_QUERY_CELLS || cellsHigh > MAX_QUERY_CELLS ||
+            cellsWide * cellsHigh > MAX_QUERY_CELLS
+        ) {
+            for (item in spans.keys) if (item.paintBounds().intersects(rect)) out.add(item)
+            return
+        }
         for (cy in span[1]..span[3]) {
             for (cx in span[0]..span[2]) {
                 val bucket = cells[key(cx, cy)] ?: continue
@@ -137,12 +150,6 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
 
     private fun key(cx: Int, cy: Int): Long = (cx.toLong() shl 32) or (cy.toLong() and 0xffffffffL)
 
-    private fun containsOversized(item: CanvasItem): Boolean = oversized.any { it === item }
-
-    private fun removeOversized(item: CanvasItem) {
-        oversized.removeRef(item)
-    }
-
     companion object {
         /**
          * Cell edge in content pixels. Roughly a line of handwriting at the document dpi: small
@@ -153,6 +160,9 @@ class SpatialIndex(val cellSize: Double = DEFAULT_CELL_SIZE) {
 
         /** Widest cell span an item may be binned across before it moves to the oversized list. */
         const val MAX_SPAN_CELLS = 64
+
+        /** Cells a cull walks before it gives up and tests every indexed item instead. */
+        const val MAX_QUERY_CELLS = 4096L
 
         private const val MIN_CELL = Int.MIN_VALUE / 2
         private const val MAX_CELL = Int.MAX_VALUE / 2

@@ -61,4 +61,9 @@ data class GlStats(
     val texturesPending: Int = 0,
     /** Milliseconds the last tessellation took, on whichever thread produced it. */
     val lastTessellateMs: Double = 0.0,
+    /** Last frame's cull (collect + sort + dedupe), committed, lifted and wet passes, in ms. */
+    val cullMs: Double = 0.0,
+    val commitMs: Double = 0.0,
+    val liftMs: Double = 0.0,
+    val wetMs: Double = 0.0,
 )

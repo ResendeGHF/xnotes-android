@@ -119,6 +119,16 @@ fun CanvasStylesPopup(editor: InfiniteEditor, onDismiss: () -> Unit) {
             }
 
             Spacer(Modifier.size(8.dp))
+            ToggleRow(stringResource(R.string.invert_colors), background.invertColors) { on ->
+                apply(background.copy(invertColors = on, invertImages = background.invertImages && on))
+            }
+            if (background.invertColors) {
+                ToggleRow(stringResource(R.string.invert_images), background.invertImages) { on ->
+                    apply(background.copy(invertImages = on))
+                }
+            }
+
+            Spacer(Modifier.size(8.dp))
             if (showNewCanvasRow && background != CanvasBackground()) {
                 // The checkbox's 48dp touch frame insets the drawn box; pull the row back to align it.
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().offset(x = (-14).dp)) {

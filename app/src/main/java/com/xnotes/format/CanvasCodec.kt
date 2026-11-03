@@ -204,6 +204,9 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             j.name("paper_color")
             writeRgba(j, it)
         }
+        // Additive like the paper override, so older readers (which skip unknown keys) stay compatible.
+        if (bg.invertColors) j.name("invert_colors").value(true)
+        if (bg.invertImages) j.name("invert_images").value(true)
         j.endObject()
     }
 
@@ -257,7 +260,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
         }
         if (s.tool == Tool.PENCIL) {
-            j.name("pencil_grain").value(s.config.pencilGrain)
+            j.name("pencil_pressure").value(s.config.pencilPressure)
+            j.name("pencil_density").value(s.config.pencilDensity)
+            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
+            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
         }
         j.endObject()
         // Samples are almost all of a dense manifest's bytes, so they go out through [JsonWrite.samplePoint], which rounds them: 0.01
@@ -498,7 +504,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
         }
         if (s.tool == Tool.PENCIL) {
-            j.name("pencil_grain").value(s.config.pencilGrain)
+            j.name("pencil_pressure").value(s.config.pencilPressure)
+            j.name("pencil_density").value(s.config.pencilDensity)
+            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
+            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
         }
         j.endObject()
         j.name("samples").beginArray()
@@ -790,6 +799,8 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var patternColor = def.patternColor
         var spacing = def.spacing
         var paperColor: Rgba? = null
+        var invertColors = false
+        var invertImages = false
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
@@ -797,11 +808,13 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "pattern_color" -> patternColor = rgbaOrNull(p) ?: def.patternColor
                 "spacing" -> spacing = doubleOr(p, def.spacing)
                 "paper_color" -> paperColor = rgbaOrNull(p)
+                "invert_colors" -> invertColors = boolOr(p, false)
+                "invert_images" -> invertImages = boolOr(p, false)
                 else -> p.skipValue()
             }
         }
         p.endObject()
-        return CanvasBackground(pattern, patternColor, spacing, paperColor)
+        return CanvasBackground(pattern, patternColor, spacing, paperColor, invertColors, invertImages)
     }
 
     private fun parseWaypoints(p: JsonPull, out: MutableList<Waypoint>) {
@@ -927,7 +940,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var dashGap: Double? = null
         var highlighterAlpha: Double? = null
         var highlighterInverse: Boolean? = null
-        var pencilGrain: Double? = null
+        var pencilPressure: Double? = null
+        var pencilDensity: Double? = null
+        var pencilGrainSize: Double? = null
+        var pencilShadeResponse: Double? = null
     }
 
     private fun parseItem(p: JsonPull, items: MutableList<CanvasItem>, pending: MutableList<Pending>, glue: GlueRead) {
@@ -1134,7 +1150,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilGrain = c?.pencilGrain ?: def.pencilGrain,
+            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
+            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
+            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
+            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(t, cfg, emptyList(), speedScale, straight, smoothScale)
         samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
@@ -1161,7 +1180,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilGrain = c?.pencilGrain ?: def.pencilGrain,
+            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
+            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
+            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
+            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(tool, config, emptyList(), s.speedScale, s.straight, s.smoothScale)
         s.samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
@@ -1371,7 +1393,10 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "dash_gap" -> c.dashGap = doubleOrNull(p)
                 "highlighter_alpha" -> c.highlighterAlpha = doubleOrNull(p)
                 "highlighter_inverse" -> c.highlighterInverse = boolOrNull(p)
-                "pencil_grain" -> c.pencilGrain = doubleOrNull(p)
+                "pencil_pressure" -> c.pencilPressure = doubleOrNull(p)
+                "pencil_density" -> c.pencilDensity = doubleOrNull(p)
+                "pencil_grain_size" -> c.pencilGrainSize = doubleOrNull(p)
+                "pencil_shade_response" -> c.pencilShadeResponse = doubleOrNull(p)
                 else -> p.skipValue()
             }
         }

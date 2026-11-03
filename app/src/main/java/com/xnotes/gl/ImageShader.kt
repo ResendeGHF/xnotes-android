@@ -25,7 +25,7 @@ class ImageShader(contextGen: Int) {
      * time, so an image's orientation costs nothing but a different set of texture coordinates, and
      * [part] narrows them to the share of the image a sliced picture shows.
      */
-    fun draw(corners: FloatArray, texture: Int, rotationSteps: Int, alpha: Double = 1.0, part: com.xnotes.core.geometry.Rect? = null) {
+    fun draw(corners: FloatArray, texture: Int, rotationSteps: Int, alpha: Double = 1.0, part: com.xnotes.core.geometry.Rect? = null, invert: Boolean = false) {
         if (texture == 0) return
         program.use()
         program.set("uP0", corners[0], corners[1])
@@ -36,6 +36,7 @@ class ImageShader(contextGen: Int) {
         program.set("uPartFrom", (part?.left ?: 0.0).toFloat(), (part?.top ?: 0.0).toFloat())
         program.set("uPartTo", (part?.right ?: 1.0).toFloat(), (part?.bottom ?: 1.0).toFloat())
         program.set("uAlpha", alpha.coerceIn(0.0, 1.0).toFloat())
+        program.set("uInvert", if (invert) 1f else 0f)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
         program.set("uTexture", 0)
@@ -76,10 +77,20 @@ class ImageShader(contextGen: Int) {
             precision mediump float;
             uniform sampler2D uTexture;
             uniform float uAlpha;
+            uniform float uInvert;
             in vec2 vUv;
             out vec4 fragColor;
+            // The notes app's invert matrix: flips luminance, keeps hue (rec. 709 luma
+            // weights), alpha untouched. Reds stay red instead of turning cyan.
             void main() {
                 vec4 c = texture(uTexture, vUv);
+                if (uInvert > 0.5) {
+                    vec3 inv = vec3(
+                        (1.0 - 2.0 * 0.213) * c.r - 2.0 * 0.715 * c.g - 2.0 * 0.072 * c.b + 1.0,
+                        -2.0 * 0.213 * c.r + (1.0 - 2.0 * 0.715) * c.g - 2.0 * 0.072 * c.b + 1.0,
+                        -2.0 * 0.213 * c.r - 2.0 * 0.715 * c.g + (1.0 - 2.0 * 0.072) * c.b + 1.0);
+                    c.rgb = clamp(inv, 0.0, 1.0);
+                }
                 fragColor = vec4(c.rgb, c.a * uAlpha);
             }
         """.trimIndent()

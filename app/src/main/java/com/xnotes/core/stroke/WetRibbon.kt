@@ -137,6 +137,7 @@ class WetRibbon(
     override fun cx(i: Int): Double = centerline[2 * i].toDouble()
     override fun cy(i: Int): Double = centerline[2 * i + 1].toDouble()
     override fun hw(i: Int): Double = halfWidths[i].toDouble()
+    override fun pw(i: Int): Double = sp[i].toDouble()
 
     /** The packed centres, over-allocated: read `2 * pointCount` floats. */
     fun centerlineArray(): FloatArray = centerline
@@ -164,11 +165,12 @@ class WetRibbon(
         if (n == 0) return StrokeGeometry.EMPTY.also { snapshot = it }
         val c = centerline.copyOf(2 * n)
         val h = halfWidths.copyOf(n)
+        val p = FloatArray(n) { sp[it].toFloat() }
         // A single sample is a dot: one swept disc, no rails, exactly as the batch build returns it.
         val g = if (n == 1) {
-            StrokeGeometry(c, h)
+            StrokeGeometry(c, h, pressures = p)
         } else {
-            StrokeGeometry(c, h, leftRail.copyOf(2 * n), rightRail.copyOf(2 * n))
+            StrokeGeometry(c, h, leftRail.copyOf(2 * n), rightRail.copyOf(2 * n), p)
         }
         return g.also { snapshot = it }
     }

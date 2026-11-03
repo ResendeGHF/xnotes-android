@@ -276,9 +276,14 @@ internal fun NewNoteScreen(
         val sizeOk = !custom || (cw != null && ch != null)
         val canCreate = !busy && sizeOk
 
-        val look = TemplateLook.of(style, null, palette.paper)
+        // A created note starts inverted under "invert colors by default": preview it inverted.
+        // An existing note's cover picker instead follows that cover's own flag.
+        val invertPreview = if (coverEdit != null) coverEdit.current?.invertColors == true else prefs.invertColorsByDefault
+        val look = TemplateLook.of(style, null, palette.paper).let { l ->
+            if (invertPreview) l.copy(ink = l.ink.inverted(), accent = l.accent.inverted(), paper = l.paper.inverted()) else l
+        }
         // A cover draws in its own colours, on the pages' paper unless it has its own.
-        val coverPaper = coverStyle.pageColor ?: look.paper
+        val coverPaper = coverStyle.pageColor?.let { if (invertPreview) it.inverted() else it } ?: look.paper
         val pageKey = style.template ?: PageTemplates.NONE
         val pageT = pages.firstOrNull { it.key == pageKey }?.template
         val coverKey = coverStyle.template
@@ -324,7 +329,9 @@ internal fun NewNoteScreen(
         fun Thumb(t: Template?, key: String, own: TemplateSettings, paper: Rgba, w: Dp, h: Dp, keep: Boolean, tile: Boolean = keep) {
             Box(Modifier.size(w, h).background(paper.toComposeColor())) {
                 if (t != null) {
-                    val d = TemplateDrawing.of(t, own, null, paper, DPI)
+                    val d = TemplateDrawing.of(t, own, null, paper, DPI).let {
+                        if (invertPreview) TemplateDrawing(it.look.copy(ink = it.look.ink.inverted(), accent = it.look.accent.inverted()), it.values) else it
+                    }
                     val spec = if (tile) {
                         TemplateThumbs.spec(key, pageMm, d, thumbPx(w))
                     } else {
@@ -350,7 +357,8 @@ internal fun NewNoteScreen(
         fun CoverThumb(e: TemplateLibrary.Entry, w: Dp, h: Dp) {
             val picked = hasCover && e.key == coverKey
             val set = if (picked) coverStyle else coverTweaks[e.key]
-            Thumb(e.template, e.key, set?.settings ?: TemplateSettings(), set?.pageColor ?: look.paper, w, h, keep = !picked, tile = true)
+            val paper = set?.pageColor?.let { if (invertPreview) it.inverted() else it } ?: look.paper
+            Thumb(e.template, e.key, set?.settings ?: TemplateSettings(), paper, w, h, keep = !picked, tile = true)
         }
 
         @Composable

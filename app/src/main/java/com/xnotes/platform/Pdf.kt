@@ -4,8 +4,6 @@ import com.xnotes.core.model.forExport
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.cos.COSArray
@@ -25,6 +23,9 @@ import com.xnotes.core.model.PageInsets
 import com.xnotes.core.model.PageLayers
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.TextMarkup
+import com.xnotes.core.model.resolvedInvertColors
+import com.xnotes.core.model.resolvedInvertImages
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.displayMarkup
 import com.xnotes.core.model.insets
@@ -32,6 +33,7 @@ import com.xnotes.core.model.sourceHeight
 import com.xnotes.core.model.sourceWidth
 import com.xnotes.core.pal.Mark
 import com.xnotes.core.pal.Renderer
+import com.xnotes.core.pal.forInvertedPage
 import com.xnotes.core.pdf.FlowHeadings
 import com.xnotes.core.pdf.FlowLinks
 import com.xnotes.core.pdf.FlowStructure
@@ -152,6 +154,9 @@ object PdfExporter {
      *  source PDF can't exhaust the heap. Small/medium exports stay fully in memory (fast). */
     private const val SCRATCH_MAIN_MEM_BYTES = 32L * 1024 * 1024
 
+    /** Supersample factor for a rasterized-inverted PDF underlay (×150 dpi content ⇒ ~300 dpi). */
+    private const val UNDERLAY_SCALE = 2.0
+
     /**
      * [paperColor] gives each page's background fill (the on-screen paper colour, e.g. dark-theme
      * `#161616`) — used for plain note pages; an imported PDF page keeps its own background instead.
@@ -190,7 +195,7 @@ object PdfExporter {
         }
         val tags = if (file == null) tagSetup(context, title) else null
         try {
-            exportVector(doc, srcDoc, sink, paperColor, paintRuling, onProgress, isCancelled, mem, flow, tags, headingBookmarks)
+            exportVector(doc, srcDoc, source, sink, paperColor, paintRuling, onProgress, isCancelled, mem, flow, tags, headingBookmarks)
         } finally {
             srcDoc?.runCatching { close() }
         }
@@ -214,6 +219,7 @@ object PdfExporter {
     private fun exportVector(
         doc: Document,
         srcDoc: PDDocument?,
+        source: PdfSource?,
         out: OutputStream,
         paperColor: (Page) -> Rgba,
         paintRuling: (Page, Renderer) -> Unit,
@@ -234,8 +240,9 @@ object PdfExporter {
         // with blank pages appended). Annotate the source document in place and save *it* — its
         // already-compressed page/image streams are copied straight through, never decoded and
         // re-encoded, and no second copy of the document is built. This is the case for "import a PDF
-        // and draw on it", so the common big-PDF export is both fast and low-memory.
-        if (srcDoc != null && canAnnotateSourceInPlace(doc, srcDoc)) {
+        // and draw on it", so the common big-PDF export is both fast and low-memory. A page whose
+        // PDF must rasterize inverted cannot stay in place: its underlay has to be redrawn.
+        if (srcDoc != null && canAnnotateSourceInPlace(doc, srcDoc) && !doc.pages.any { needsUnderlayInvert(doc, it) }) {
             val ctx = PdfExportContext(srcDoc)
             val n = srcDoc.numberOfPages
             doc.pages.forEachIndexed { index, page ->
@@ -247,12 +254,12 @@ object PdfExporter {
                     // must a margined one — its extra paper is written by growing the page's boxes —
                     // and one with room in it, whose PDF is laid in bands round it.
                     if (page.items.isNotEmpty() || flow.bounds(page) != null || !ins.isZero || page.rooms.isNotEmpty()) {
-                        frames[index] = annotatePage(ctx, srcDoc.getPage(index), page, ins, s, paintRuling, flow)
+                        frames[index] = annotatePage(ctx, srcDoc.getPage(index), doc, page, ins, s, paintRuling, flow)
                     } else if (page.markups.isNotEmpty()) {
-                        srcDoc.getPage(index).let { pd -> PdfMarkups.write(ctx, pd, page.markups, sourceFrame(pd, s)) }
+                        srcDoc.getPage(index).let { pd -> PdfMarkups.write(ctx, pd, exportMarkups(doc, page), sourceFrame(pd, s)) }
                     }
                 } else {
-                    frames[index] = vectorBlankPage(ctx, page, ins, s, paperColor, paintRuling, flow) // a blank note page appended after the PDF
+                    frames[index] = vectorBlankPage(ctx, doc, page, ins, s, paperColor, paintRuling, flow) // a blank note page appended after the PDF
                 }
                 PdfItemRaster.releaseInkGeometry(page.items)
                 onProgress(index + 1, total)
@@ -285,9 +292,13 @@ object PdfExporter {
                 val srcIdx = page.pdfPage
                 val ins = page.insets(doc)
                 frames[index] = if (srcIdx != null && srcDoc != null && srcIdx in 0 until srcDoc.numberOfPages) {
-                    vectorImportedPage(ctx, srcDoc, srcIdx, page, ins, s, paintRuling, flow)
+                    if (needsUnderlayInvert(doc, page)) {
+                        vectorRasterUnderlayPage(ctx, source, doc, page, ins, s, paperColor, paintRuling, flow)
+                    } else {
+                        vectorImportedPage(ctx, srcDoc, srcIdx, doc, page, ins, s, paintRuling, flow)
+                    }
                 } else {
-                    vectorBlankPage(ctx, page, ins, s, paperColor, paintRuling, flow)
+                    vectorBlankPage(ctx, doc, page, ins, s, paperColor, paintRuling, flow)
                 }
                 PdfItemRaster.releaseInkGeometry(page.items)
                 onProgress(index + 1, total)
@@ -359,11 +370,31 @@ object PdfExporter {
     }
 
     /** Copy a source page in as vector, then overlay its ruling + annotations; returns where it drew. */
-    private fun vectorImportedPage(ctx: PdfExportContext, srcDoc: PDDocument, srcIdx: Int, page: Page, ins: PageInsets, s: Double, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
+    /**
+     * A page whose imported PDF must rasterize lightness-inverted: color inversion is on, "invert
+     * images" is on, and there is a PDF underneath. Vector sources cannot invert, so these
+     * pages rebuild with a rasterized underlay instead of annotating in place.
+     */
+    private fun needsUnderlayInvert(doc: Document, page: Page): Boolean =
+        page.pdfPage != null && page.resolvedInvertColors(doc) && page.resolvedInvertImages(doc)
+
+    /**
+     * [page]'s markups with colors inverted when the export must show them inverted, mirroring
+     * the screen: markups baked into a PDF-page raster invert with it (images flag), vector ones
+     * invert with everything else.
+     */
+    private fun exportMarkups(doc: Document, page: Page): List<TextMarkup> {
+        val markups = page.markups
+        if (markups.isEmpty() || !page.resolvedInvertColors(doc)) return markups
+        if (page.pdfPage != null && !page.resolvedInvertImages(doc)) return markups
+        return markups.map { it.copy(color = it.color.inverted()) }
+    }
+
+    private fun vectorImportedPage(ctx: PdfExportContext, srcDoc: PDDocument, srcIdx: Int, doc: Document, page: Page, ins: PageInsets, s: Double, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
         val pdfPage = ctx.doc.importPage(srcDoc.getPage(srcIdx))
         ownAnnotations(pdfPage)
         turnAsShown(pdfPage, page)
-        return annotatePage(ctx, pdfPage, page, ins, s, paintRuling, flow)
+        return annotatePage(ctx, pdfPage, doc, page, ins, s, paintRuling, flow)
     }
 
     /** Turn [pdfPage], a source page in the export, as far past its own /Rotate as the note shows it. */
@@ -385,7 +416,7 @@ object PdfExporter {
      * Append [page]'s ruling + annotations as a new content stream over an existing [pdfPage] of the
      * export, then its markups; returns where it drew.
      */
-    private fun annotatePage(ctx: PdfExportContext, pdfPage: PDPage, page: Page, ins: PageInsets, s: Double, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
+    private fun annotatePage(ctx: PdfExportContext, pdfPage: PDPage, doc: Document, page: Page, ins: PageInsets, s: Double, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
         val frame = sourceFrame(pdfPage, s)
         val cover = footprintOf(page, ins)
         // Room inserted into the page lays its PDF in bands round it, before the box grows to hold them.
@@ -393,17 +424,18 @@ object PdfExporter {
         if (banded) PdfBands.band(ctx.doc, pdfPage, page, frame)
         growPageBox(pdfPage, frame, cover, ins, banded)
         PDPageContentStream(ctx.doc, pdfPage, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-            paintItems(cs, ctx, pdfPage, page, frame, cover, paintRuling, flow)
+            paintItems(cs, ctx, pdfPage, doc, page, frame, cover, paintRuling, flow)
         }
+        val markups = exportMarkups(doc, page)
         if (banded) {
             val tiles = com.xnotes.core.model.Rooms.tiles(page.rooms, page.sourceWidth, page.sourceHeight).map { t ->
                 val o = frame.toUser(0.0, 0.0)
                 val d = frame.toUser(t.dx, t.dy)
                 PdfMarkups.Tile(frame.toUser(t.source), com.xnotes.core.geometry.Pt(d.x - o.x, d.y - o.y))
             }
-            PdfMarkups.write(ctx, pdfPage, page.markups, frame, { page.displayMarkup(it, 1.0 / s) }, tiles)
+            PdfMarkups.write(ctx, pdfPage, markups, frame, { page.displayMarkup(it, 1.0 / s) }, tiles)
         } else {
-            PdfMarkups.write(ctx, pdfPage, page.markups, frame)
+            PdfMarkups.write(ctx, pdfPage, markups, frame)
         }
         return frame
     }
@@ -432,7 +464,7 @@ object PdfExporter {
     }
 
     /** A note page with no PDF background: blank page filled with the paper colour, then ruling + annotations and markups; returns where it drew. */
-    private fun vectorBlankPage(ctx: PdfExportContext, page: Page, ins: PageInsets, s: Double, paperColor: (Page) -> Rgba, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
+    private fun vectorBlankPage(ctx: PdfExportContext, doc: Document, page: Page, ins: PageInsets, s: Double, paperColor: (Page) -> Rgba, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport): PageFrame {
         val wPts = ((ins.left + page.width + ins.right) * s).toFloat().coerceAtLeast(1f)
         val hPts = ((ins.top + page.height + ins.bottom) * s).toFloat().coerceAtLeast(1f)
         val pdfPage = PDPage(PDRectangle(wPts, hPts))
@@ -446,42 +478,129 @@ object PdfExporter {
             cs.addRect(0f, 0f, wPts, hPts)
             cs.fill()
             if (ctx.tags != null) cs.appendRawCommands("EMC\n")
-            paintItems(cs, ctx, pdfPage, page, frame, footprintOf(page, ins), paintRuling, flow)
+            paintItems(cs, ctx, pdfPage, doc, page, frame, footprintOf(page, ins), paintRuling, flow)
         }
-        PdfMarkups.write(ctx, pdfPage, page.markups, frame)
+        PdfMarkups.write(ctx, pdfPage, exportMarkups(doc, page), frame)
         return frame
     }
 
+    /**
+     * A page whose imported PDF must show lightness-inverted (see [needsUnderlayInvert]): a blank page
+     * filled with the paper colour, the source page rasterized and inverted underneath (markups
+     * baked in, as on screen), then ruling and annotations as vectors. Returns where it drew.
+     */
+    private fun vectorRasterUnderlayPage(
+        ctx: PdfExportContext,
+        source: PdfSource?,
+        doc: Document,
+        page: Page,
+        ins: PageInsets,
+        s: Double,
+        paperColor: (Page) -> Rgba,
+        paintRuling: (Page, Renderer) -> Unit,
+        flow: FlowExport,
+    ): PageFrame {
+        val wPts = ((ins.left + page.width + ins.right) * s).toFloat().coerceAtLeast(1f)
+        val hPts = ((ins.top + page.height + ins.bottom) * s).toFloat().coerceAtLeast(1f)
+        val pdfPage = PDPage(PDRectangle(wPts, hPts))
+        ctx.doc.addPage(pdfPage)
+        val frame = PageFrame(Affine.IDENTITY, ins.left * s, hPts - ins.top * s, s)
+        val underlay: (PdfBoxRenderer) -> Unit = { base ->
+            underlayBitmap(source, page)?.let { (surface, dest) ->
+                try {
+                    com.xnotes.core.model.Rooms.drawBanded(base, surface, dest, page.rooms, page.sourceWidth, page.sourceHeight)
+                } finally {
+                    surface.recycle()
+                }
+            }
+        }
+        PDPageContentStream(ctx.doc, pdfPage).use { cs ->
+            val paper = paperColor(page)
+            if (ctx.tags != null) cs.appendRawCommands("/Artifact BMC\n")
+            cs.setNonStrokingColor(paper.r / 255f, paper.g / 255f, paper.b / 255f)
+            cs.addRect(0f, 0f, wPts, hPts)
+            cs.fill()
+            if (ctx.tags != null) cs.appendRawCommands("EMC\n")
+            paintItems(cs, ctx, pdfPage, doc, page, frame, footprintOf(page, ins), paintRuling, flow, underlay)
+        }
+        // Markups are baked into the underlay raster, like the rasterized fallback: no vector annotations.
+        return frame
+    }
+
+    /**
+     * The page's imported PDF rasterized lightness-inverted at twice content size (capped, like
+     * [PdfItemRaster]), with its markups baked in as on screen, over the content box [dest].
+     * Null without a source to render from. The surface is freshly rendered and owned.
+     */
+    private fun underlayBitmap(source: PdfSource?, page: Page): Pair<AndroidRasterSurface, Rect>? {
+        val src = source ?: return null
+        val key = page.pdfKey ?: return null
+        val sw = page.sourceWidth
+        val sh = page.sourceHeight
+        if (sw <= 0.0 || sh <= 0.0) return null
+        val wPx = kotlin.math.ceil(sw * UNDERLAY_SCALE).toInt().coerceIn(1, PdfItemRaster.MAX_DIM)
+        val hPx = kotlin.math.ceil(sh * UNDERLAY_SCALE).toInt().coerceIn(1, PdfItemRaster.MAX_DIM)
+        val rendered = src.renderPage(key, wPx, hPx, com.xnotes.canvas.PdfPageFilter.NONE, page.markups) ?: return null
+        val bmp = rendered.bitmap
+        bmp.invertPixels()
+        val turns = ((page.pdfTurn % 4) + 4) % 4
+        if (turns == 0) return rendered to Rect(0.0, 0.0, sw, sh)
+        // Turned like a placed image, so the underlay sits as the viewer shows it.
+        val m = android.graphics.Matrix().apply { postRotate((turns * 90).toFloat()) }
+        val turned = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        if (turned === bmp) return rendered to Rect(0.0, 0.0, sw, sh)
+        rendered.recycle()
+        val dest = if (turns % 2 == 1) Rect(0.0, 0.0, sh, sw) else Rect(0.0, 0.0, sw, sh)
+        return AndroidRasterSurface(turned) to dest
+    }
+
     /** Draw a page's ruling (behind ink), the flow text, then its items in z-order, where [frame] puts them; [cover] is its paper. */
-    private fun paintItems(cs: PDPageContentStream, ctx: PdfExportContext, pdfPage: PDPage, page: Page, frame: PageFrame, cover: Rect, paintRuling: (Page, Renderer) -> Unit, flow: FlowExport) {
-        val renderer = PdfBoxRenderer(cs, ctx, pdfPage, frame.ox, frame.oy, frame.s, frame.turn)
-        renderer.beginMark(Mark.Decoration)
-        paintRuling(page, renderer) // page ruling sits behind the ink
-        renderer.endMark()
+    private fun paintItems(
+        cs: PDPageContentStream,
+        ctx: PdfExportContext,
+        pdfPage: PDPage,
+        doc: Document,
+        page: Page,
+        frame: PageFrame,
+        cover: Rect,
+        paintRuling: (Page, Renderer) -> Unit,
+        flow: FlowExport,
+        /** Pre-inverted underlay (rasterized PDF) drawn under the ruling; empty by default. */
+        underlay: (PdfBoxRenderer) -> Unit = {},
+    ) {
+        val base = PdfBoxRenderer(cs, ctx, pdfPage, frame.ox, frame.oy, frame.s, frame.turn)
+        // Color inversion exports what the screen shows: ruling, ink and text inverted, images
+        // only with "invert images". Effect rasters arrive pre-inverted from [PdfItemRaster].
+        val r: Renderer = base.forInvertedPage(doc, page)
+        underlay(base)
+        r.beginMark(Mark.Decoration)
+        paintRuling(page, r) // page ruling sits behind the ink
+        r.endMark()
+        val invert = page.resolvedInvertColors(doc)
         PageLayers.paint(page.items.forExport(), {
-            flow.paint(page, renderer, cover, tagged = ctx.tags != null)
-            for (link in flow.links(page)) renderer.addFlowLink(link)
+            flow.paint(page, r, cover, tagged = ctx.tags != null)
+            for (link in flow.links(page)) base.addFlowLink(link)
         }) { item ->
-            renderer.beginMark(PdfTags.markOf(item))
+            r.beginMark(PdfTags.markOf(item))
             if (PdfItemRaster.needsRaster(item)) {
-                PdfItemRaster.item(item, cover)?.let { raster ->
-                    renderer.drawItemBitmap(raster.bmp, raster.rect, raster.multiply)
+                PdfItemRaster.item(item, cover, invert)?.let { raster ->
+                    base.drawItemBitmap(raster.bmp, raster.rect, raster.multiply)
                     raster.bmp.recycle()
                 }
-                if (item is ShapeItem) item.paintLabel(renderer)
-                if (item is ConnectorItem) item.paintLabel(renderer)
+                if (item is ShapeItem) item.paintLabel(r)
+                if (item is ConnectorItem) item.paintLabel(r)
             } else {
-                item.paint(renderer)
+                item.paint(r)
             }
-            renderer.endMark()
+            r.endMark()
         }
         // Appended linked pages carry their link's color as a frame (see LinkExport).
         if (page.linkBorder != null) {
-            renderer.beginMark(Mark.Decoration)
-            com.xnotes.core.links.LinkBorder.paint(page, renderer)
-            renderer.endMark()
+            r.beginMark(Mark.Decoration)
+            com.xnotes.core.links.LinkBorder.paint(page, r)
+            r.endMark()
         }
-        renderer.endPage()
+        base.endPage()
     }
 
     /** [page]'s whole paper in page space, margins included (negative on a margined edge). */
@@ -526,7 +645,6 @@ object PdfExporter {
     ) {
         val pdf = PdfDocument()
         val scale = (72.0 / doc.dpi).toFloat()
-        val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
         val total = doc.pages.size
         try {
             onProgress(0, total)
@@ -543,6 +661,8 @@ object PdfExporter {
                 canvas.translate(-cover.left.toFloat(), -cover.top.toFloat())
 
                 val renderer = AndroidRenderer(canvas)
+                // Color inversion exports what the screen shows (see paintItems for the vector path).
+                val r: Renderer = renderer.forInvertedPage(doc, page)
                 val src = page.pdfKey
                 // The page as it was, before any room, laid in bands round the room inserted since.
                 val sw = page.sourceWidth
@@ -550,16 +670,16 @@ object PdfExporter {
                 val bg = if (src != null && source != null) source.renderPage(src, sw.toInt(), sh.toInt(), markups = page.markups) else null
                 if (bg != null) {
                     if (page.rooms.isEmpty()) {
-                        canvas.drawBitmap(bg.bitmap, null, RectF(0f, 0f, page.width.toFloat(), page.height.toFloat()), bitmapPaint)
+                        r.drawRaster(bg, Rect(0.0, 0.0, page.width.toDouble(), page.height.toDouble()))
                     } else {
-                        com.xnotes.core.model.Rooms.drawBanded(renderer, bg, Rect(0.0, 0.0, sw, sh), page.rooms, sw, sh)
+                        com.xnotes.core.model.Rooms.drawBanded(r, bg, Rect(0.0, 0.0, sw, sh), page.rooms, sw, sh)
                     }
                     bg.recycle()
                 } else {
-                    MarkupPainter.paint(renderer, page.markups, doc.dpi / 72.0) // on bare paper, beneath the ruling
+                    MarkupPainter.paint(r, page.markups, doc.dpi / 72.0) // on bare paper, beneath the ruling
                 }
-                paintRuling(page, renderer) // ruling behind ink
-                PageLayers.paint(page.items.forExport(), { flow.paint(page, renderer, cover) }) { it.paint(renderer) }
+                paintRuling(page, r) // ruling behind ink
+                PageLayers.paint(page.items.forExport(), { flow.paint(page, r, cover) }) { it.paint(r) }
                 pdf.finishPage(pdfPage)
                 PdfItemRaster.releaseInkGeometry(page.items)
                 onProgress(index + 1, total)

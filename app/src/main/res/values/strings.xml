@@ -81,6 +81,10 @@
     <string name="caption_gap">Gap</string>
     <string name="caption_intensity">Intensity</string>
     <string name="caption_grain">Grain</string>
+    <string name="caption_pencil_pressure">Pressure response</string>
+    <string name="caption_pencil_density">Grain density</string>
+    <string name="caption_pencil_grain_size">Grain size</string>
+    <string name="caption_pencil_shade">Colour shade</string>
     <string name="caption_straight_line">Straight line</string>
     <string name="caption_inverse">Inverse</string>
     <string name="caption_neon">Neon</string>
@@ -449,6 +453,7 @@
     <string name="pen_button_1">Button 1</string>
     <string name="pen_button_2">Button 2</string>
     <string name="pref_new_notes">New notes</string>
+    <string name="pref_invert_colors_by_default">Invert colors by default</string>
     <string name="pref_filename_template">Filename template</string>
     <string name="pref_page">Page</string>
     <string name="pref_default_page_size">Default page size</string>
@@ -1026,6 +1031,8 @@
     <string name="caption_spacing">Spacing</string>
     <string name="caption_paper">Paper</string>
     <string name="paper_theme">Theme</string>
+    <string name="invert_colors">Invert colors</string>
+    <string name="invert_images">Invert images</string>
     <string name="default_for_new_canvases">Default for new canvases</string>
     <string name="title_waypoints">Waypoints</string>
     <string name="no_waypoints">No saved views yet.</string>
@@ -1367,8 +1374,7 @@
     <string name="trace_ai_on">On</string>
     <string name="trace_ai_tune">Tune</string>
     <string name="trace_ai_tuning">Tuning…</string>
-    <string name="trace_ai_page_badge">AI settings saved for page %1$d</string>
-    <string name="trace_ai_page_reset">Use global settings</string>
+    <string name="trace_apply_all">Apply to all pages</string>
     <string name="kind_read_only_file">Read-only file</string>
     <string name="kind_read_only_files">Read-only files</string>
     <string name="kind_no_read_only_files">No read-only files here.</string>
@@ -1536,12 +1542,26 @@
     <string name="math_3d_hint_cylindrical">x=r·cosθ y=r·sinθ, θ∈[0,2π), z from the domain box</string>
     <string name="math_3d_hint_spherical">θ azimuth [0,2π), φ polar [0,π]</string>
     <string name="math_domain">Domain</string>
+    <string name="math_domain_lock">Lock domain</string>
     <string name="math_x_min">x min</string>
     <string name="math_x_max">x max</string>
     <string name="math_y_min">y min</string>
     <string name="math_y_max">y max</string>
     <string name="math_z_min">z min</string>
     <string name="math_z_max">z max</string>
+    <string name="math_domain_entry">Per-curve domain</string>
+    <string name="math_theta_min">θ min</string>
+    <string name="math_theta_max">θ max</string>
+    <string name="math_r_min">r min</string>
+    <string name="math_r_max">r max</string>
+    <string name="math_t_min">t min</string>
+    <string name="math_t_max">t max</string>
+    <string name="math_u_min">u min</string>
+    <string name="math_u_max">u max</string>
+    <string name="math_v_min">v min</string>
+    <string name="math_v_max">v max</string>
+    <string name="math_phi_min">φ min</string>
+    <string name="math_phi_max">φ max</string>
     <string name="math_toggle_visibility">Show/hide curve</string>
     <string name="math_pick_color">Curve colour</string>
     <string name="math_color_auto">Automatic</string>
@@ -1560,6 +1580,8 @@
     <string name="math_field_density">Density</string>
     <string name="math_field_level">Level</string>
     <string name="math_field_probe">Probe</string>
+    <string name="math_field_colour_by_value">Colour by value</string>
+    <string name="math_field_palette">Colour map</string>
 
     <string name="math_tool_derivative">Derivative</string>
     <string name="math_tool_integral">Integral</string>
@@ -1657,4 +1679,26 @@
     <string name="graph_truncated">Showing %1$s of %2$s notes</string>
     <string name="graph_from_here">From here</string>
     <string name="graph_no_outgoing">This file links to no other file.</string>
+
+    <string name="share_channel">File sharing</string>
+    <string name="share_notif_title">Sharing notes on the local network</string>
+    <string name="share_notif_text">https://%1$s:%2$d</string>
+    <string name="share_notif_fp">Cert %1$s</string>
+    <string name="share_stop">Stop</string>
+
+    <string name="pref_sharing">Sharing</string>
+    <string name="pref_share_files">Share files on the local network</string>
+    <string name="pref_share_help">Serve notes over encrypted TLS so the desktop companion can view and edit them. The desktop sees each save within seconds. Works on public Wi-Fi and over a USB cable.</string>
+    <string name="share_starting">Starting…</string>
+    <string name="share_fingerprint">Fingerprint %1$s</string>
+    <string name="share_token">Token %1$s</string>
+    <string name="share_show_token">Show</string>
+    <string name="share_hide_token">Hide</string>
+
+    <string name="policy">Policy</string>
+    <string name="policy_help">%1$d of the files are shared with the paired desktop. Nothing is shared until you tick it.</string>
+    <string name="policy_search">Search files</string>
+    <string name="policy_no_root">Pick a notes folder on Home first — there is nothing to share yet.</string>
+    <string name="policy_empty">No files in the shared folder.</string>
+    <string name="policy_no_match">No files match the search.</string>
 </resources>

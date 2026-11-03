@@ -85,6 +85,8 @@ import com.xnotes.core.model.insets
 import com.xnotes.core.model.sourceHeight
 import com.xnotes.core.model.sourceWidth
 import com.xnotes.core.model.resolvedPageColor
+import com.xnotes.core.model.resolvedInvertColors
+import com.xnotes.core.pal.forInvertedPage
 import com.xnotes.core.text.CellIndex
 import com.xnotes.core.text.CharStyle
 import com.xnotes.core.text.DeadKeyLatch
@@ -1461,6 +1463,8 @@ class Editor(
         cancelOpenInProgress() // a blank canvas replaces whatever a slower tab open was loading
         val doc = com.xnotes.core.infinite.InfiniteDocument(created = System.currentTimeMillis())
         settings.newCanvasBackground?.let { doc.background = it }
+        // A blanket default: new canvases start inverted without touching saved backgrounds or old ones.
+        if (settings.prefs.invertColorsByDefault) doc.background = doc.background.copy(invertColors = true)
         openCanvasDocument(doc, uri = null, displayName = null)
     }
 
@@ -1570,9 +1574,21 @@ class Editor(
                 val tmp = java.io.File.createTempFile("save", ".xcanvas", saveTmpDir)
                 try {
                     java.io.FileOutputStream(tmp).use { canvasCodec.write(doc, it) }
-                    val out = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")
-                        ?: return@runCatching false
-                    out.use { java.io.FileInputStream(tmp).use { input -> input.copyTo(it, copyBuffer) } }
+                    if (!tmpCanvasValidates(tmp)) return@runCatching false
+                    val backup = backupCurrent(uri)
+                    if (!copyFileToUri(tmp, uri)) {
+                        restoreBackup(uri, backup)
+                        backup?.delete()
+                        return@runCatching false
+                    }
+                    if (!verifyCanvasUri(uri)) {
+                        if (!copyFileToUri(tmp, uri) || !verifyCanvasUri(uri)) {
+                            restoreBackup(uri, backup)
+                            backup?.delete()
+                            return@runCatching false
+                        }
+                    }
+                    backup?.delete()
                     rememberStamp(uri)
                     true
                 } finally {
@@ -2972,9 +2988,15 @@ class Editor(
                         state.paintPageBackground?.invoke(page, r, res, local)
                     }
                 }
-                val showFlow = only == null && local.w > 0.0 && local.h > 0.0
-                val items = itemsSnapshot(page).forExport().let { all -> if (only == null) all else all.filter { it in only } }
-                PageLayers.paint(items, { if (showFlow) state.paintFlow?.invoke(page, r, local) }) { it.paint(r) }
+                // Capture what the screen shows: paper and background invert above; ink and text here.
+                val rr = state.contentRenderer(r, page)
+                try {
+                    val showFlow = only == null && local.w > 0.0 && local.h > 0.0
+                    val items = itemsSnapshot(page).forExport().let { all -> if (only == null) all else all.filter { it in only } }
+                    PageLayers.paint(items, { if (showFlow) state.paintFlow?.invoke(page, rr, local) }) { it.paint(rr) }
+                } finally {
+                    state.resetContentRenderer(r)
+                }
             }
         }
         return surface.bitmap
@@ -3088,7 +3110,7 @@ class Editor(
      * opening on a PDF page, ruled as its margins are, or the page a plain page grew by. Closing
      * room leaves nothing bare.
      */
-    private fun paintRoomPaper(view: com.xnotes.canvas.RoomView, r: Renderer) {
+    private fun paintRoomPaper(view: com.xnotes.canvas.RoomView, renderer: Renderer) {
         if (view.shift <= 0.0 || view.sideways) return
         val page = view.page
         // While the pen drags the page has not grown yet, so it is ruled as it will be.
@@ -3103,6 +3125,7 @@ class Editor(
             Rect(cover.left, view.cover.bottom, cover.w, cover.bottom - view.cover.bottom)
         }
         if (region.h <= 0.0) return
+        val r = state.contentRenderer(renderer, page)
         r.withSave {
             r.clipRect(region)
             TemplateLibrary.paint(r, state.document, shown, cover, region)
@@ -3114,6 +3137,9 @@ class Editor(
         val src = pdfSource
         val pi = page.pdfKey
         val markups = page.markups
+        // Color inversion paints the ruling and the PDF page lightness-inverted (images only
+        // with "invert images"); the wrapper forwards finished rasters untouched.
+        val r = state.contentRenderer(renderer, page)
         if (src != null && pi != null) {
             // The raster covers the page's content box only; a margin is paper beside it. With room
             // in it, the content box is the page as it was, rendered once and drawn in bands.
@@ -3132,9 +3158,9 @@ class Editor(
                 val pxPerPt = res * state.document.dpi / 72.0
                 src.renderRegion(pi, pxPerPt, rx, ry, rw, rh, pdfPageFilter(), markups)?.let { bg ->
                     if (banded) {
-                        com.xnotes.core.model.Rooms.drawBanded(renderer, bg, Rect(rx / res, ry / res, rw / res, rh / res), page.rooms, sw, sh)
+                        com.xnotes.core.model.Rooms.drawBanded(r, bg, Rect(rx / res, ry / res, rw / res, rh / res), page.rooms, sw, sh)
                     } else {
-                        renderer.drawRaster(bg, slice)
+                        r.drawRaster(bg, slice)
                     }
                     bg.recycle()
                 }
@@ -3142,8 +3168,8 @@ class Editor(
         }
         // A template covers a blank note page whole; on an imported PDF page it rules the
         // margins only, so the page itself is never drawn over.
-        TemplateLibrary.paint(renderer, state.document, page, state.footprint(page), region, minLine)
-        if (pi == null) MarkupPainter.paint(renderer, markups, state.document.dpi / 72.0)
+        TemplateLibrary.paint(r, state.document, page, state.footprint(page), region, minLine)
+        if (pi == null) MarkupPainter.paint(r, markups, state.document.dpi / 72.0)
     }
 
     /** [region] cropped to a [w] by [h] content box, a page's own size before any room, or null when it misses it. */
@@ -4460,7 +4486,16 @@ class Editor(
 
     override fun swatches(role: SwatchRole): List<Rgba> = settings.swatchesFor(role)
 
-    /** Recolour one circle; notes keep the colours they already use. */
+    /**
+     * A toolbar swatch dot as it paints on the current page: lightness-inverted when the page is
+     * color-inverted, so the dot previews the stroke. The armed colour itself stays raw —
+     * inversion happens at paint time. Reads [contentVersion] so the dots follow style changes.
+     */
+    fun swatchDisplayColor(color: Rgba): Rgba {
+        contentVersion
+        val page = currentPage ?: return color
+        return if (page.resolvedInvertColors(state.document)) color.inverted() else color
+    }    /** Recolour one circle; notes keep the colours they already use. */
     override fun setSwatch(role: SwatchRole, index: Int, color: Rgba) {
         settings = settings.withSwatch(role, index, color)
         saveSettingsSoon()
@@ -4482,6 +4517,8 @@ class Editor(
     /** Stamp the saved new-note defaults (page style + flow config) onto a fresh [doc]. */
     private fun stampNewNoteDefaults(doc: Document): Document {
         doc.style = settings.newNoteStyle
+        // A blanket default: new notes start inverted without touching saved styles or old notes.
+        if (settings.prefs.invertColorsByDefault) doc.style = doc.style.copy(invertColors = true)
         TemplateLibrary.embed(doc, doc.style.template, imageDir)
         // A default whose template left the library falls back to the built-in ruling.
         doc.style.template?.let { key ->
@@ -4594,8 +4631,13 @@ class Editor(
             prev.accentColor != next.accentColor ||
             prev.params != next.params ||
             prev.colors != next.colors
-        if (rulingChanged) {
-            if (pages.size == 1) state.invalidateBackground(pages[0]) else state.invalidateAllBackgrounds()
+        // Inversion repaints everything the caches baked: ruling, ink and highlighter ribbons.
+        // Paper fills live each frame, so it needs nothing beyond the generations these bump.
+        val invertChanged = prev.invertColors != next.invertColors ||
+            prev.invertImages != next.invertImages
+        if (rulingChanged || invertChanged) {
+            if (pages.size == 1 && !invertChanged) state.invalidateBackground(pages[0]) else state.invalidateAllBackgrounds()
+            if (invertChanged) state.invalidateInk()
         } else {
             state.invalidatePaper()
         }
@@ -4607,8 +4649,11 @@ class Editor(
     // --- export-time style resolution: resolved against the document being exported (which may be a
     //     closed note loaded by URI, or a page subset), not necessarily the open one ---
 
-    private fun exportPaper(doc: Document, page: Page): Rgba =
-        page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper
+    private fun exportPaper(doc: Document, page: Page): Rgba {
+        val paper = page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper
+        // Color inversion exports what the screen shows: the paper lightness-inverted with the ink.
+        return if (page.resolvedInvertColors(doc)) paper.inverted() else paper
+    }
 
     private fun paintExportRuling(doc: Document, page: Page, r: Renderer) {
         val cover = exportFootprint(doc, page)
@@ -5181,7 +5226,8 @@ class Editor(
         // Otherwise the page as shown spans the tile's width: centred top to bottom when it's wider than tall.
         val whole = renderDocPage(doc, 0, (side * shownH / shownW).roundToInt().coerceAtLeast(1), filter, rotation) ?: return null
         val tile = com.xnotes.platform.AndroidRasterSurface.create(side, side)
-        tile.fill(page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper)
+        val tilePaper = page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper
+        tile.fill(if (page.resolvedInvertColors(doc)) tilePaper.inverted() else tilePaper)
         android.graphics.Canvas(tile.bitmap).drawBitmap(whole, 0f, if (shownW > shownH) (side - whole.height) / 2f else 0f, null)
         whole.recycle()
         return tile.bitmap
@@ -5206,8 +5252,9 @@ class Editor(
         val cover = exportFootprint(doc, page)
         val surface = com.xnotes.platform.AndroidRasterSurface.create(w, h)
         // Resolve the paper colour against this note's own document/page style (not the open note's).
-        surface.fill(page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper)
-        val r = surface.renderer()
+        val paper = page.resolvedPageColor(doc, state.pageColorOverride) ?: state.palette.paper
+        surface.fill(if (page.resolvedInvertColors(doc)) paper.inverted() else paper)
+        val r = surface.renderer().forInvertedPage(doc, page)
         r.scale(scale, scale)
         r.translate(-cover.left, -cover.top)
         // A pixel per 300 px of tile, so the ruling survives the disk cache's half-size decode.
@@ -5269,10 +5316,13 @@ class Editor(
         val w = wPx.coerceAtLeast(1)
         val h = hPx.coerceAtLeast(1)
         val surface = com.xnotes.platform.AndroidRasterSurface.create(w, h)
-        surface.fill(doc.background.paperColor ?: state.palette.paper)
+        val paper = doc.background.paperColor ?: state.palette.paper
+        surface.fill(if (doc.background.invertColors) paper.inverted() else paper)
         val bounds = doc.contentBounds()
         if (bounds != null && bounds.w > 0.0 && bounds.h > 0.0) {
-            val r = surface.renderer()
+            val base = surface.renderer()
+            base.invertImageContent = doc.background.invertColors && doc.background.invertImages
+            val r = if (doc.background.invertColors) com.xnotes.core.pal.InvertingRenderer(base) else base
             val margin = minOf(w, h) * 0.06
             val scale = minOf((w - 2 * margin) / bounds.w, (h - 2 * margin) / bounds.h).coerceAtMost(1.0)
             // Centre the content in the tile, whichever way round it is.
@@ -5282,7 +5332,10 @@ class Editor(
             )
             r.scale(scale, scale)
             r.translate(-bounds.left, -bounds.top)
-            for (item in doc.items.toList()) item.paint(r)
+            val all = doc.items.toList()
+            // Sticky notes always sit in front of canvas ink, whatever the document order says.
+            for (item in all) if (item !is com.xnotes.core.model.StickyNoteItem) item.paint(r)
+            for (item in all) if (item is com.xnotes.core.model.StickyNoteItem) item.paint(r)
         }
         return surface.bitmap
     }
@@ -6109,7 +6162,10 @@ class Editor(
     fun createBlankCanvasFile(treeUri: String, parentDocId: String, rawName: String): String? {
         val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.CANVAS)
         return createNoteFile(treeUri, parentDocId, name) {
-            canvasCodec.write(com.xnotes.core.infinite.InfiniteDocument(created = System.currentTimeMillis()), it)
+            val doc = com.xnotes.core.infinite.InfiniteDocument(created = System.currentTimeMillis())
+            settings.newCanvasBackground?.let { doc.background = it }
+            if (settings.prefs.invertColorsByDefault) doc.background = doc.background.copy(invertColors = true)
+            canvasCodec.write(doc, it)
         }
     }
 
@@ -6126,6 +6182,8 @@ class Editor(
         val blank = blankDocument(orientation).also {
             stampNewNoteDefaults(it)
             if (style != null) { it.style = style; TemplateLibrary.embed(it, style.template, imageDir) }
+            // The style override above replaces the stamped default: re-apply the blanket after it.
+            if (settings.prefs.invertColorsByDefault) it.style = it.style.copy(invertColors = true)
         }
         return createNoteFile(treeUri, parentDocId, name) { codec.write(blank, it) }
     }
@@ -6141,6 +6199,7 @@ class Editor(
         val h = PageSize.mmToPx(setup.heightMm, dpi)
         val doc = Document.blankPixels(Document.DEFAULT_NEW_PAGES, w, h, dpi).also { it.created = System.currentTimeMillis() }
         doc.style = setup.style
+        if (settings.prefs.invertColorsByDefault) doc.style = doc.style.copy(invertColors = true)
         TemplateLibrary.embed(doc, setup.style.template, imageDir)
         (settings.newNoteFlow ?: factoryFlow).applyTo(doc.flow)
         setup.cover?.let { style ->
@@ -6343,8 +6402,9 @@ class Editor(
 
     /**
      * Imports a Samsung Notes `.sdocx` file staged on disk as a new `.xnote`.
-     * Strokes, images, page size/color/template and a single embedded PDF survive;
-     * audio, tables, stickers, shapes and text boxes are dropped. Returns its URI. IO.
+     * Strokes, images, page size/color/template, tables (with cell values),
+     * sticky notes, voice memos and a single embedded PDF survive; shapes,
+     * lines and text boxes import as editable content. Returns its URI. IO.
      */
     fun createSdocxNoteFile(treeUri: String, parentDocId: String, rawName: String, file: java.io.File): String? {
         val doc = sdocxDocument(file) ?: return null
@@ -6417,27 +6477,74 @@ class Editor(
 
     /**
      * Build a note from a Samsung Notes `.sdocx` file staged on disk. Parses the ZIP
-     * (pages, strokes, images, PDFs) and converts it to a [Document]; null when it
-     * will not read. IO — call off-thread.
+     * (pages, strokes, images, tables, sticky notes, voice memos, PDFs) and converts
+     * it to a [Document]; null when it will not read. IO — call off-thread.
      */
     private fun sdocxDocument(staged: java.io.File): Document? {
         return try {
             val entries = HashMap<String, ByteArray>()
-            java.util.zip.ZipInputStream(java.io.FileInputStream(staged)).use { zis ->
-                var entry = zis.nextEntry
-                while (entry != null) {
-                    if (!entry.isDirectory) {
-                        entries[entry.name] = zis.readBytes()
+            // Prefer ZipFile (tolerates Samsung's bad-CRC audio entries where
+            // ZipInputStream throws and would abort before the images). Fall
+            // back to a per-entry tolerant ZipInputStream for odd archives.
+            var filled = false
+            try {
+                java.util.zip.ZipFile(staged).use { zf ->
+                    val e = zf.entries()
+                    while (e.hasMoreElements()) {
+                        val entry = e.nextElement()
+                        if (!entry.isDirectory) {
+                            try {
+                                entries[entry.name] = zf.getInputStream(entry).readBytes()
+                            } catch (_: Exception) {
+                                // Skip a corrupt entry (e.g. bad CRC audio) but
+                                // keep later entries such as page images.
+                                continue
+                            }
+                        }
                     }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
+                }
+                filled = entries.isNotEmpty()
+            } catch (_: Exception) {
+                filled = false
+            }
+            if (!filled) {
+                java.util.zip.ZipInputStream(java.io.FileInputStream(staged)).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            try {
+                                entries[entry.name] = zis.readBytes()
+                            } catch (_: Exception) {
+                                // Skip corrupt entries without aborting: images
+                                // after a bad audio entry must still import.
+                            }
+                        }
+                        try {
+                            zis.closeEntry()
+                        } catch (_: Exception) {
+                        }
+                        entry = try {
+                            zis.nextEntry
+                        } catch (_: Exception) {
+                            break
+                        }
+                    }
                 }
             }
             if (entries.isEmpty()) return null
             val parsed = com.xnotes.sdocx.SdocxParser.parseArchive(entries)
             if (parsed.pages.isEmpty()) return null
             com.xnotes.sdocx.SdocxImport.toDocument(parsed, state.document.dpi, imageDir, pdfDir, imageCodec, textMeasurer)
-                ?.also { stampNewNoteDefaults(it) }
+                ?.also { doc ->
+                    val importedStyle = doc.style
+                    stampNewNoteDefaults(doc)
+                    // Samsung's own note background wins over the new-note default:
+                    // stamping above would otherwise wipe the imported template.
+                    if (!importedStyle.isEmpty) {
+                        doc.style = importedStyle
+                        com.xnotes.platform.TemplateLibrary.embed(doc, doc.style.template, imageDir)
+                    }
+                }
         } catch (_: Exception) {
             null
         }
@@ -7481,6 +7588,9 @@ class Editor(
      * throw mid-encode left the note as 0 bytes. Returns true only when [uri] now holds the note.
      */
     private fun writeNoteSafely(uri: String, doc: Document): Boolean = synchronized(saveLock) {
+        // A valid note always has at least one page; writing zero pages over an existing
+        // file could only ever delete the user's content, so refuse outright.
+        if (doc.pages.isEmpty()) return false
         when (writeSealed(uri) { codec.write(doc, it) }) {
             SealedWrite.DONE -> {
                 rememberStamp(uri)
@@ -7504,10 +7614,27 @@ class Editor(
                 val encodeStart = System.nanoTime()
                 val timing = com.xnotes.format.DocumentCodec.WriteTiming()
                 java.io.FileOutputStream(tmp).use { codec.write(doc, it, timing = timing) }
+                // The temp must read back as the note just written before the destination
+                // is touched: a truncated or dropped manifest here used to overwrite the
+                // good file with a blank one on the next open.
+                if (!tmpNoteValidates(tmp, doc.pages.size)) return@runCatching false
+                val backup = backupCurrent(uri)
                 val copyStart = System.nanoTime()
-                val out = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")
-                    ?: return@runCatching false
-                out.use { java.io.FileInputStream(tmp).use { input -> input.copyTo(it, copyBuffer) } }
+                if (!copyFileToUri(tmp, uri)) {
+                    restoreBackup(uri, backup)
+                    backup?.delete()
+                    return@runCatching false
+                }
+                if (!verifyNoteUri(uri, doc.pages.size)) {
+                    // A flaky provider can truncate mid-copy; retry once from the temp
+                    // that is still on disk before giving up and putting the old bytes back.
+                    if (!copyFileToUri(tmp, uri) || !verifyNoteUri(uri, doc.pages.size)) {
+                        restoreBackup(uri, backup)
+                        backup?.delete()
+                        return@runCatching false
+                    }
+                }
+                backup?.delete()
                 state.lastSaveEncodeMs = msBetween(encodeStart, copyStart) // all four for the debug overlay
                 state.lastSaveCopyMs = msSince(copyStart)
                 state.lastSaveManifestMs = timing.manifestMs
@@ -7523,6 +7650,62 @@ class Editor(
             }
         }.getOrDefault(false)
     }
+
+    /** Temp files are never trusted on size alone: the bundle must parse as this note. */
+    private fun tmpNoteValidates(tmp: java.io.File, expectedPages: Int): Boolean = runCatching {
+        java.io.FileInputStream(tmp).use { codec.peek(it.channel)?.pages == expectedPages }
+    }.getOrDefault(false)
+
+    private fun tmpCanvasValidates(tmp: java.io.File): Boolean = runCatching {
+        java.io.FileInputStream(tmp).use { canvasCodec.peek(it.channel) != null }
+    }.getOrDefault(false)
+
+    /** The note at [uri] parses and holds [expectedPages] pages; false when it cannot be read. */
+    private fun verifyNoteUri(uri: String, expectedPages: Int): Boolean = runCatching {
+        // Streams over a provider-owned descriptor are never closed here (see
+        // [writeNoteInPlace]): only the descriptor itself is closed, once.
+        appContext.contentResolver.openFileDescriptor(android.net.Uri.parse(uri), "r")?.use { pfd ->
+            codec.peek(java.io.FileInputStream(pfd.fileDescriptor).channel)?.pages == expectedPages
+        } ?: false
+    }.getOrDefault(false)
+
+    /** The canvas at [uri] parses; false when it cannot be read. */
+    private fun verifyCanvasUri(uri: String): Boolean = runCatching {
+        appContext.contentResolver.openFileDescriptor(android.net.Uri.parse(uri), "r")?.use { pfd ->
+            canvasCodec.peek(java.io.FileInputStream(pfd.fileDescriptor).channel) != null
+        } ?: false
+    }.getOrDefault(false)
+
+    /** Files at or under this size get a backup before a truncating copy, so a failed
+     *  copy can put the old bytes back instead of leaving a truncated note behind. */
+    private val BACKUP_MAX_BYTES = 128L * 1024L * 1024L
+
+    /** A copy of [uri]'s current bytes in [saveTmpDir], or null when there is nothing worth keeping. */
+    private fun backupCurrent(uri: String): java.io.File? = runCatching {
+        val size = fileSizeOf(uri)
+        if (size <= 0L || size > BACKUP_MAX_BYTES) return null
+        val bak = java.io.File.createTempFile("prev", ".bak", saveTmpDir)
+        appContext.contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { input ->
+            java.io.FileOutputStream(bak).use { out -> input.copyTo(out, copyBuffer) }
+        } ?: run { bak.delete(); return null }
+        if (bak.length() == 0L) { bak.delete(); return null }
+        bak
+    }.getOrNull()
+
+    /** Best-effort put-back of [backup] over [uri] after a failed copy; the backup stays on
+     *  disk for the caller to delete. */
+    private fun restoreBackup(uri: String, backup: java.io.File?): Boolean {
+        if (backup == null || !backup.exists() || backup.length() == 0L) return false
+        return copyFileToUri(backup, uri)
+    }
+
+    /** Copy a fully-written temp over [uri] ("wt" truncates first); false when it cannot be opened or copied. */
+    private fun copyFileToUri(file: java.io.File, uri: String): Boolean = runCatching {
+        val out = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")
+            ?: return false
+        out.use { java.io.FileInputStream(file).use { input -> input.copyTo(it, copyBuffer) } }
+        true
+    }.getOrDefault(false)
 
     /**
      * Refresh the graph index for a note just saved: its outgoing links, in page
@@ -7631,6 +7814,9 @@ class Editor(
                 } ?: -1L
             }
             if (length < 0L) return@runCatching false
+            // A splice that reports success but leaves an unreadable bundle must not
+            // count as a save: fall through to the full rewrite below, which repairs it.
+            if (!verifyNoteUri(uri, doc.pages.size)) return@runCatching false
             state.lastSaveEncodeMs = msBetween(encodeStart, spliceStart) // all six for the overlay
             state.lastSaveCopyMs = msSince(spliceStart)
             state.lastSaveManifestMs = msBetween(encodeStart, spliceStart)
@@ -8008,8 +8194,22 @@ class Editor(
         val tmp = java.io.File.createTempFile("enc", ".bin", saveTmpDir)
         return try {
             java.io.FileOutputStream(tmp).use { out -> com.xnotes.crypto.VaultCrypto.encryptFile(key, out, produce) }
-            val dest = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt") ?: return SealedWrite.FAILED
-            dest.use { java.io.FileInputStream(tmp).use { input -> input.copyTo(it) } }
+            // Same truncating-copy hazard as the plain path: back the old bytes up first
+            // so a failed copy can put them back instead of leaving a truncated note.
+            val backup = backupCurrent(uri)
+            if (!copyFileToUri(tmp, uri)) {
+                restoreBackup(uri, backup)
+                backup?.delete()
+                return SealedWrite.FAILED
+            }
+            if (fileSizeOf(uri) != tmp.length()) {
+                if (!copyFileToUri(tmp, uri) || fileSizeOf(uri) != tmp.length()) {
+                    restoreBackup(uri, backup)
+                    backup?.delete()
+                    return SealedWrite.FAILED
+                }
+            }
+            backup?.delete()
             SealedWrite.DONE
         } catch (_: Exception) {
             SealedWrite.FAILED
@@ -9495,6 +9695,11 @@ class Editor(
         r.translate(pr.left, pr.top)
         state.applyPageTransform(r, page)
     }
+
+    override fun isDropFrameInverted(frame: Int): Boolean =
+        state.document.pages.getOrNull(frame)?.resolvedInvertColors(state.document) == true
+
+    override fun dropDiscFrame(): Int = state.currentPageIndex()
 
     /** A closed bit this wide on screen, in px, fills along with the area round it. */
     private fun dropSmallHolePx(): Double = DROP_SMALL_HOLE_MM / 25.4 * appContext.resources.displayMetrics.xdpi

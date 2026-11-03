@@ -163,4 +163,31 @@ class SpatialIndexTest {
         assertEquals(500, all.size)
         assertEquals(ids(made), ids(all))
     }
+
+    @Test fun aVastRectFallsBackToTheSameSet() {
+        val ix = SpatialIndex(cellSize = 128.0)
+        val made = (0 until 200).map { boxAt(it * 91.0, it * 57.0, w = 20.0, h = 20.0) }
+        made.forEach { ix.insert(it) }
+        // ~8000 cells a side: far past the walk-everything threshold.
+        val vast = ix.query(Rect(-1e6, -1e6, 2e6, 2e6))
+        assertEquals(ids(made), ids(vast))
+        // And it agrees with the union of small per-item queries.
+        val union = HashSet<Int>()
+        for (m in made) union.addAll(ids(ix.query(Rect(m.rect.x, m.rect.y, m.rect.w, m.rect.h))))
+        assertEquals(ids(made), union)
+    }
+
+    @Test fun oversizedInsertAndRemoveStayIdentityBased() {
+        val ix = SpatialIndex(cellSize = 1.0) // every item is oversized at this cell size
+        val a = boxAt(0.0, 0.0, w = 1000.0, h = 1000.0)
+        ix.insert(a)
+        ix.insert(a)
+        assertEquals(1, ix.size)
+        ix.remove(boxAt(5.0, 5.0, w = 1000.0, h = 1000.0)) // equal bounds, different identity
+        assertEquals(1, ix.size)
+        ix.remove(a)
+        ix.remove(a)
+        assertEquals(0, ix.size)
+        assertTrue(ix.query(Rect(0.0, 0.0, 2000.0, 2000.0)).isEmpty())
+    }
 }

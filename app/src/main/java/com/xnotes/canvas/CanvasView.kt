@@ -559,8 +559,14 @@ class CanvasView @JvmOverloads constructor(
                             val faint = if (st.fade?.fades(item) == true) com.xnotes.core.audio.InkFade.ALPHA else 1.0
                             // Composited over the finished page, so tape laid over it has to be cut out by hand.
                             val covers = coveringTapes(st, page.items, k, item.bounds())
+                            val stickyCovers = coveringStickies(st, page, item.bounds())
+                            val allCovers = when {
+                                covers != null && stickyCovers != null -> covers + stickyCovers
+                                covers != null -> covers
+                                else -> stickyCovers
+                            }
                             r.withSave {
-                                if (covers != null) r.clipOutPolygons(covers)
+                                if (allCovers != null) r.clipOutPolygons(allCovers)
                                 r.drawRasterBlended(hc.surface, hc.cover, item.renderColor.a / 255.0 * faint, item.blendMode)
                             }
                         }
@@ -640,12 +646,18 @@ class CanvasView @JvmOverloads constructor(
             r.translate(pr.left, pr.top)
             st.applyPageTransform(r, page)
             // What stays put is out of the old ink layer, so it is drawn here until a layer that holds it lands.
-            val old = ink == null || ink.cover == v.cover
-            if (old) for (item in v.fills) st.paintItem(item, r)
-            if (ink != null) {
-                if (ink.cover == v.cover) drawCut(r, ink.surface, ink.cover, v) else r.drawRaster(ink.surface, ink.cover)
+            // Content paints inverted per page; the blits above and below stay raw (finished layers).
+            val rr = st.contentRenderer(r, page)
+            try {
+                val old = ink == null || ink.cover == v.cover
+                if (old) for (item in v.fills) st.paintItem(item, rr)
+                if (ink != null) {
+                    if (ink.cover == v.cover) drawCut(r, ink.surface, ink.cover, v) else r.drawRaster(ink.surface, ink.cover)
+                }
+                if (old) for (item in v.over) st.paintItem(item, rr)
+            } finally {
+                st.resetContentRenderer(r)
             }
-            if (old) for (item in v.over) st.paintItem(item, r)
         }
     }
 
@@ -703,19 +715,43 @@ class CanvasView @JvmOverloads constructor(
     }
 
     /**
+     * Every sticky note on [page] overlapping [bounds], as paper quads. Sticky notes always sit
+     * in front of page ink, so a highlighter composited live over the finished page must be cut
+     * round all of them — not just the ones after it in document order.
+     */
+    private fun coveringStickies(st: CanvasState, page: Page, bounds: Rect): List<List<Pt>>? {
+        var out: ArrayList<List<Pt>>? = null
+        for (item in page.items) {
+            val s = item as? com.xnotes.core.model.StickyNoteItem ?: continue
+            if (st.isLiftedItem(s) || !s.bounds().intersects(bounds)) continue
+            val b = s.bounds()
+            val quad = listOf(b.topLeft, Pt(b.right, b.top), Pt(b.right, b.bottom), Pt(b.left, b.bottom))
+            (out ?: ArrayList<List<Pt>>().also { out = it }).add(quad)
+        }
+        return out
+    }
+
+    /**
      * What goes live between a page's background and its ink cache: the fills under its typed text
      * that the cache leaves out, a lifted flow, and the formulas. [r] stands at the page's display origin.
      */
     private fun paintUnderInk(r: AndroidRenderer, st: CanvasState, page: Page, region: Rect) {
-        r.withSave {
-            st.applyPageTransform(r, page)
-            st.paintUnderText(page, r, region)
-        }
-        st.paintLiftedUnderText?.invoke(page, r)
-        r.withSave {
-            st.applyPageTransform(r, page)
-            if (st.flowLifted) st.paintFlow?.invoke(page, r, region)
-            st.paintMath?.invoke(page, r, region)
+        // The frame renderer is shared across pages: wrap per page and reset afterwards so
+        // blits of finished surfaces (and other pages) never see inversion flags or colors.
+        val rr = st.contentRenderer(r, page)
+        try {
+            rr.withSave {
+                st.applyPageTransform(rr, page)
+                st.paintUnderText(page, rr, region)
+            }
+            st.paintLiftedUnderText?.invoke(page, rr)
+            rr.withSave {
+                st.applyPageTransform(rr, page)
+                if (st.flowLifted) st.paintFlow?.invoke(page, rr, region)
+                st.paintMath?.invoke(page, rr, region)
+            }
+        } finally {
+            st.resetContentRenderer(r)
         }
     }
 

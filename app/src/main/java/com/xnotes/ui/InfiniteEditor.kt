@@ -37,10 +37,11 @@ import com.xnotes.core.infinite.OverlayTessellator
 import com.xnotes.core.infinite.ReplaceCanvasItems
 import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.infinite.EraseSession
-import com.xnotes.core.infinite.InfiniteDocument
 import com.xnotes.core.infinite.GlowSpec
+import com.xnotes.core.infinite.InfiniteDocument
 import com.xnotes.core.infinite.InkPass
 import com.xnotes.core.infinite.ItemMesher
+import com.xnotes.core.infinite.Lod
 import com.xnotes.core.infinite.isRigidTextQuadMotion
 import com.xnotes.core.infinite.textWrapChanged
 import com.xnotes.core.infinite.textBitmapScale
@@ -48,6 +49,7 @@ import com.xnotes.core.infinite.textRasterZoomTier
 import com.xnotes.core.infinite.shouldRefineTextBitmap
 import com.xnotes.core.infinite.Waypoint
 import com.xnotes.core.model.CanvasItem
+import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.DrawStyle
 import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.ImageData
@@ -142,9 +144,20 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         detectShapes = { detectShapes },
         selection = { selection },
         itemsIn = { rect -> document.itemsIn(rect) },
+        itemsInUnsorted = { rect -> document.itemsInUnsorted(rect) },
         onSelectionChanged = { publishOverlay() },
         onCommitSelection = { commitSelection(it) },
-        onLiftSelection = { items, at -> scene.setLift(items, at) },
+        onLiftSelection = { items, at ->
+            liftGen++
+            if (items.isEmpty()) {
+                scene.setLift(emptyList(), at)
+                scene.clearLiftProxy(liftGen)
+            } else {
+                scene.setLift(items, at)
+                maybeStartLiftProxy(items, liftGen)
+            }
+        },
+        onLiftAt = { at -> scene.setLiftAt(at) },
         onTextResizeStart = { startTextResizePreview(it) },
         onTextResizeMove = { previewTextResize(it) },
         onTextResizeEnd = { cancelled -> finishTextResizePreview(cancelled) },
@@ -311,15 +324,156 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      * throughout every pinch and pan, and the worker never recalculates line breaks on input. */
     private val textZoomRefinement = Runnable { refineVisibleTextResolution() }
 
+    /** Lod level each committed stroke was meshed at. Strokes are the only items meshed through
+     * the Lod budget on the direct path (labelled shapes go through the text worker, images and
+     * text boxes through their own raster paths). */
+    private val strokeLodLevel = java.util.IdentityHashMap<Stroke, Int>()
+    private var lodLastNeeded = -1
+    private val lodRefineRunnable = Runnable { refineStrokeLod() }
+
+    /**
+     * One low-priority thread that decimates lifted strokes while a drag runs, so a thousand
+     * strokes never stall the input thread at drag start. Daemon, like the image decoder: the
+     * drag owns nothing it needs to outlive.
+     */
+    private val dragLodExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "xnotes-drag-lod").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }
+    }
+
+    /** Lift generation: bumped on every lift change, so a background proxy build that finishes
+     * after its drag ended retires instead of landing on the next drag. */
+    @Volatile private var liftGen = 0L
+
     private fun scheduleTextZoomRefinement() {
         view.removeCallbacks(textZoomRefinement)
         view.postDelayed(textZoomRefinement, 190L)
     }
 
+    /**
+     * Downgrades for settled zoom-outs land here, debounced like the text refinement: the fine
+     * meshes stay on screen while refining, so a wrong (too coarse) mesh is never shown, only a
+     * too-fine one for a few frames longer. Upgrades past a threshold (zooming in) cannot wait
+     * and go through [upgradeVisibleStrokes] instead.
+     */
+    private fun scheduleLodRefine() {
+        view.removeCallbacks(lodRefineRunnable)
+        view.postDelayed(lodRefineRunnable, LOD_REFINE_DELAY_MS)
+    }
+
+    /** Re-mesh settled visible strokes at the settled zoom's Lod level, a few per frame. */
+    private fun refineStrokeLod() {
+        if (textResizeState != null || editingLabel != null) return
+        if (interaction.mode != CanvasPointerMode.IDLE) {
+            scheduleLodRefine()
+            return
+        }
+        val needed = Lod.levelFor(viewport.zoom)
+        val pending = ArrayList<Stroke>()
+        for (item in document.itemsInUnsorted(viewport.cullRect(96.0))) {
+            val s = item as? Stroke ?: continue
+            if ((strokeLodLevel[s] ?: 0) != needed) pending.add(s)
+        }
+        if (pending.isEmpty()) return
+        refineStrokeLodBatch(pending, needed, 0)
+    }
+
+    private fun refineStrokeLodBatch(pending: List<Stroke>, needed: Int, from: Int) {
+        if (interaction.mode != CanvasPointerMode.IDLE) return
+        if (Lod.levelFor(viewport.zoom) != needed) {
+            scheduleLodRefine()
+            return
+        }
+        val end = minOf(from + LOD_REFINE_BATCH, pending.size)
+        for (i in from until end) {
+            val s = pending[i]
+            if (document.holds(s) && (strokeLodLevel[s] ?: 0) != Lod.levelFor(viewport.zoom)) {
+                pushItem(s)
+            }
+        }
+        if (end < pending.size) view.post { refineStrokeLodBatch(pending, needed, end) }
+        else view.publish()
+    }
+
+    /**
+     * Zooming in past a Lod threshold needs finer meshes now, not after a settle delay: re-mesh
+     * the visible strokes that are coarser than [needed]. Zooming in shrinks the visible set,
+     * so this stays a handful of meshes; zooming out only ever shows too-fine meshes and waits
+     * for the settle refinement instead.
+     */
+    private fun upgradeVisibleStrokes(needed: Int) {
+        var done = 0
+        for (item in document.itemsInUnsorted(viewport.cullRect(96.0))) {
+            if (done >= LOD_UPGRADE_BURST) break
+            val s = item as? Stroke ?: continue
+            if ((strokeLodLevel[s] ?: 0) > needed) {
+                pushItem(s)
+                done++
+            }
+        }
+        if (done > 0) view.publish()
+    }
+
+    /**
+     * Draw a big selection from decimated stand-ins while it is dragged: one background pass
+     * over the lifted ink, then a single cheap swap on the render thread. The drag starts on the
+     * full meshes (nothing waits), and the finger lifts the full meshes back — the swap is within
+     * a pixel either way, so nothing ever visibly pops.
+     *
+     * Only worth it past [DRAG_PROXY_MIN_ITEMS] proxyable items: below that the full meshes
+     * already move at frame rate and a build would be pure overhead. Strokes decimate by sample
+     * count (the body's quads are per-sample); shapes and connectors re-flatten at a drag pixel
+     * budget, which is exactly what sets their outline density.
+     */
+    private fun maybeStartLiftProxy(items: List<CanvasItem>, gen: Long) {
+        var eligible = 0
+        for (item in items) {
+            if (isProxyable(item)) eligible++
+        }
+        if (eligible < DRAG_PROXY_MIN_ITEMS) return
+        val zoomAtStart = viewport.zoom
+        val doInvert = invertInk
+        val lodTol = ItemMesher.toleranceForZoom(zoomAtStart)
+        val eps = DRAG_PROXY_ERROR_PX / zoomAtStart
+        dragLodExecutor.execute {
+            val built = java.util.IdentityHashMap<CanvasItem, List<MeshPart>>(eligible * 2 + 1)
+            for (item in items) {
+                if (gen != liftGen) return@execute // its drag ended; retire, don't land
+                val meshed = when (item) {
+                    is Stroke -> item.dragProxy(eps)?.let { ItemMesher.mesh(it, lodTol) }
+                    is ShapeItem -> if (isProxyable(item)) ItemMesher.mesh(item, coarseShapeTol(zoomAtStart)) else null
+                    is ConnectorItem -> ItemMesher.mesh(item, coarseShapeTol(zoomAtStart))
+                    else -> null
+                }
+                if (meshed == null || meshed.isEmpty) continue
+                built[item] = if (doInvert) meshed.parts.map { it.inverted() } else meshed.parts
+            }
+            if (gen != liftGen || built.isEmpty()) return@execute
+            scene.setLiftProxy(built, zoomAtStart, gen)
+        }
+    }
+
+    /** Strokes too small to matter, room-cut runs that must stay exact, and text boxes and
+     * images, which already draw as single quads, stay on their full meshes during a drag. */
+    private fun isProxyable(item: CanvasItem): Boolean = when (item) {
+        is Stroke -> item.cuts.isEmpty() && item.sampleCount >= 16
+        is ShapeItem -> !item.isTextOnlyBox()
+        is ConnectorItem -> true
+        else -> false
+    }
+
+    /** Drag pixel budget for shape/connector outlines: flattening tolerance is what sets their
+     * vertex count, so this is their sample decimation. Never finer than the Lod budget. */
+    private fun coarseShapeTol(zoom: Double): Double =
+        maxOf(ItemMesher.toleranceForZoom(zoom), DRAG_PROXY_ERROR_PX / zoom)
+
     private fun refineVisibleTextResolution() {
         if (textResizeState != null || editingLabel != null) return
         val detail = textRasterZoomTier(viewport.zoom)
-        for (item in document.itemsIn(viewport.cullRect(96.0))) {
+        // Order-independent: each text box refines against its own presented raster.
+        for (item in document.itemsInUnsorted(viewport.cullRect(96.0))) {
             val shape = item as? ShapeItem ?: continue
             if (!shape.isTextOnlyBox() || shape.labelHidden) continue
             val current = presentedText[shape] ?: continue
@@ -352,6 +506,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             itemsRevision++
             sceneBuildRemoved.add(item) // a pending load batch must not resurrect this item
             if (textResizeState?.item === item) textResizeState = null
+            if (item is Stroke) strokeLodLevel.remove(item)
             // Drop any mesh job still running for it, so its result cannot file the record again.
             if (item is ImageItem) vectorMeshGen.remove(item)
             textMeshes.cancel(item)
@@ -409,6 +564,30 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      */
     private var committingWetStroke = false
 
+    /**
+     * Whether committed vector ink is currently shown lightness-inverted (the styles popup's
+     * "invert colors"): paper and ruling invert in the shaders, ink inverts here by
+     * meshing with inverted colours, so selection chrome keeps its own colours.
+     */
+    private val invertInk: Boolean get() = document.background.invertColors
+
+    /** Whether image content (placed rasters, vector pictures) inverts along with the ink. */
+    private val invertImageContent: Boolean
+        get() = document.background.invertColors && document.background.invertImages
+
+    /** lightness-invert a meshed run for the inversion display mode (alpha untouched, glow with it). */
+    private fun MeshPart.inverted(): MeshPart = MeshPart(
+        mesh, color.inverted(), pass,
+        glow?.let {
+            GlowSpec(it.wideRadius, it.wideAlpha, it.tightRadius, it.tightAlpha,
+                it.bodyColor.inverted(), it.coreColor.inverted(), it.coreScale)
+        },
+        covers,
+    )
+
+    private fun invertParts(parts: List<MeshPart>): List<MeshPart> =
+        if (!invertInk) parts else parts.map { it.inverted() }
+
     /** Tessellate [item] and hand the triangles to the renderer, or drop it if it draws nothing. */
     private fun pushItem(item: CanvasItem) {
         // Held back while the front buffer is still the only thing showing this stroke. The
@@ -432,15 +611,22 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         // Hiding/removing a label also invalidates any older visible-text result.
         textMeshes.cancel(item)
         preparedText.remove(item)
+        val stroke = item as? Stroke
+        val lodLevel = if (stroke != null) Lod.levelFor(viewport.zoom) else null
         val started = System.nanoTime()
         Trace.beginSection("Xnotes.item.mesh")
-        val meshed = try { ItemMesher.mesh(item) } finally { Trace.endSection() }
+        val meshed = try {
+            if (stroke != null) ItemMesher.mesh(stroke, ItemMesher.toleranceForZoom(viewport.zoom))
+            else ItemMesher.mesh(item)
+        } finally { Trace.endSection() }
         scene.lastTessellateMs = (System.nanoTime() - started) / 1_000_000.0
         if (meshed == null || meshed.isEmpty) {
+            if (stroke != null) strokeLodLevel.remove(stroke)
             scene.remove(item)
             return
         }
-        scene.upsert(item, meshed.parts, meshed.bounds, committingWetStroke)
+        if (stroke != null) strokeLodLevel[stroke] = lodLevel!!
+        scene.upsert(item, invertParts(meshed.parts), meshed.bounds, committingWetStroke)
     }
 
     /**
@@ -673,7 +859,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             val reused = preparedText[item]?.rigidCopyFor(item)
             if (reused != null) {
                 textMeshes.cancel(item)
-                scene.upsert(item, reused.parts, reused.bounds)
+                scene.upsert(item, invertParts(reused.parts), reused.bounds)
                 preparedText[item] = com.xnotes.core.infinite.PreparedShapeText(snapshot as ShapeItem, reused)
                 return
             }
@@ -693,7 +879,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
                     scene.remove(item)
                 } else {
                     if (item is ShapeItem) preparedText[item] = com.xnotes.core.infinite.PreparedShapeText(snapshot as ShapeItem, meshed)
-                    scene.upsert(item, meshed.parts, meshed.bounds)
+                    scene.upsert(item, invertParts(meshed.parts), meshed.bounds)
                 }
                 view.publish()
             }
@@ -745,7 +931,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             view.post {
                 if (!vectorMeshGen.remove(item, token) || parts.isEmpty()) return@post
                 scene.lastTessellateMs = ms
-                scene.upsert(item, parts, bounds)
+                // A vector picture is image content: it inverts only with "invert images".
+                val shown = if (invertImageContent) parts.map { it.inverted() } else parts
+                scene.upsert(item, shown, bounds)
                 view.publish()
             }
         }
@@ -777,6 +965,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private fun rebuildScene() {
         sceneBuild.cancel()
         sceneBuildRemoved.clear()
+        strokeLodLevel.clear()
         scene.reset()
         vectorMeshGen.clear()
         textMeshes.clear()
@@ -1174,8 +1363,13 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             kotlin.math.ceil(bounds.w * res).toInt().coerceIn(1, maxDim.toInt()),
             kotlin.math.ceil(bounds.h * res).toInt().coerceIn(1, maxDim.toInt()),
         )
-        surface.fill(view.paperColor)
-        val r = surface.renderer()
+        surface.fill(if (document.background.invertColors) view.paperColor.inverted() else view.paperColor)
+        val base = surface.renderer()
+        // The shared-image decode cache must not be polluted, so image inversion stays scoped
+        // to this capture's renderer.
+        base.invertImageContent = document.background.invertColors && document.background.invertImages
+        val r: com.xnotes.core.pal.Renderer =
+            if (document.background.invertColors) com.xnotes.core.pal.InvertingRenderer(base) else base
         r.scale(res, res)
         r.translate(-bounds.left, -bounds.top)
         val bg = document.background
@@ -1281,7 +1475,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val follow = selection.followOf(listOf(c), rigid = false, pin = false)
         val before = c.snapshotGeometry()
         val margin = InfiniteInteraction.ROUTE_MARGIN_DP * devicePxPerDp / viewport.zoom
-        com.xnotes.core.model.Glue.reroute(c, document.itemsIn(com.xnotes.core.model.Glue.routeArea(c.start.at, c.end.at, margin)), margin)
+        // Order-independent: Glue.reroute sorts its obstacles by distance itself.
+        com.xnotes.core.model.Glue.reroute(c, document.itemsInUnsorted(com.xnotes.core.model.Glue.routeArea(c.start.at, c.end.at, margin)), margin)
         follow.follow(com.xnotes.core.geometry.Affine.IDENTITY)
         val changed = listOf<CanvasItem>(c) + follow.items
         document.itemsChanged(changed)
@@ -1698,6 +1893,10 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         r.translate(-viewport.scrollX, -viewport.scrollY)
     }
 
+    override fun isDropFrameInverted(frame: Int): Boolean = document.background.invertColors
+
+    override fun dropDiscFrame(): Int = 0
+
     /** Fired with a short message for the user, such as why a drop did nothing. */
     var onSay: ((String) -> Unit)? = null
 
@@ -1869,7 +2068,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             val meshed = ItemMesher.mesh(stroke) ?: return
             // Every run, not just the first: a neon stroke is a halo, a lit body and a white core,
             // and keeping only one of them left the wet stroke invisible until the pen lifted.
-            scene.setWetParts(meshed.parts, meshed.bounds)
+            scene.setWetParts(invertParts(meshed.parts), meshed.bounds)
             return
         }
         if (wetOwner !== stroke) {
@@ -1881,11 +2080,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             runPoints = WET_RUN_POINTS
         }
         val bounds = stroke.paintBounds()
+        // Wet runs are rebuilt every sample, so they take the Lod budget too: zoomed out, the
+        // settled discs shrink to a few segments instead of dozens.
+        val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
         val settled = ribbon.settledCount
         if (settled - wetMeshed >= runPoints) {
             val from = (wetMeshed - 1).coerceAtLeast(0)
-            ItemMesher.meshRun(stroke, ribbon, from, settled - from, wetArc)?.let {
-                if (frontInk) pad.appendRun(listOf(it)) else scene.appendWetRun(listOf(it), bounds)
+            ItemMesher.meshRun(stroke, ribbon, from, settled - from, wetArc, wetTol)?.let {
+                val run = if (invertInk) it.inverted() else it
+                if (frontInk) pad.appendRun(listOf(run)) else scene.appendWetRun(listOf(run), bounds)
             }
             for (k in from + 1 until settled) {
                 wetArc += kotlin.math.hypot(ribbon.cx(k) - ribbon.cx(k - 1), ribbon.cy(k) - ribbon.cy(k - 1))
@@ -1893,8 +2096,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             wetMeshed = settled
         }
         val tailFrom = (wetMeshed - 1).coerceAtLeast(0)
-        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, wetArc)
-        val parts = if (tail == null) emptyList() else listOf(tail)
+        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, wetArc, wetTol)
+        val parts = if (tail == null) emptyList() else listOf(if (invertInk) tail.inverted() else tail)
         if (!frontDecided) decideFrontInk(stroke, parts)
         wetTail = parts
         if (frontInk) pad.setTail(parts) else scene.setWetTail(parts, bounds)
@@ -1905,14 +2108,14 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      * from the tool.
      *
      * The pad has no copy of what is under it, so anything that composites against the page cannot
-     * live there: a stencilled translucent pass, or a halo. Plain triangles can, and that is what
-     * a pen and a pencil are — the pencil's grain discards instead of blending.
+     * live there: a stencilled translucent pass, a halo, or the pencil's stencil-consume cover.
+     * Plain triangles can, and that is what a pen is.
      */
     private fun decideFrontInk(stroke: Stroke, parts: List<MeshPart>) {
         frontDecided = true
         // Turned off for this device, so there is no pad to consult and nothing to time against it.
         if (!pad.frontBuffering) return
-        if (parts.isEmpty() || parts.any { it.pass != InkPass.OPAQUE && it.pass != InkPass.PENCIL }) return
+        if (parts.isEmpty() || parts.any { it.pass != InkPass.OPAQUE }) return
         if (joinFrontInk()) return
         // Nothing joined, so the pad has to be wiped for this stroke, and whatever it was showing
         // has to be on the glass first. Being handed over is not that: the scene has the triangles,
@@ -2053,12 +2256,103 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      * Rebuild the chrome drawn over the content: the selection box and handles, or whichever
      * marquee a drag is sweeping out. It goes through the same transient buffer the wet stroke
      * uses, since inking and selecting can never happen at once.
+     *
+     * Transform drags rebuild this every sample; a pure move only translates the last build
+     * instead (see [tryShiftMoveChrome]), and resize/rotate builds coalesce to one per frame.
      */
     private fun publishOverlay() {
         hasSelection = !selection.isEmpty
         refreshSelectionMenu()
+        when (interaction.mode) {
+            CanvasPointerMode.IDLE -> {
+                if (overlayCoalesced) {
+                    view.removeCallbacks(overlayFlush)
+                    overlayCoalesced = false
+                }
+                moveChrome = null
+                publishOverlayNow()
+            }
+            CanvasPointerMode.MOVE -> {
+                if (!tryShiftMoveChrome()) publishOverlayNow()
+            }
+            CanvasPointerMode.RESIZE, CanvasPointerMode.ROTATE -> {
+                if (!overlayCoalesced) {
+                    overlayCoalesced = true
+                    if (!view.post(overlayFlush)) {
+                        overlayCoalesced = false
+                        publishOverlayNow()
+                    }
+                }
+            }
+            else -> publishOverlayNow()
+        }
+    }
+
+    private var overlayCoalesced = false
+    private val overlayFlush = Runnable {
+        overlayCoalesced = false
+        publishOverlayNow()
+    }
+
+    /** The last selection-box build a move can shift instead of rebuilding: base parts, bounds
+     * and the selection they were built from. The parts are a pure function of the box shape,
+     * so the same items at the same zoom rebuild identically. */
+    private var moveChrome: MoveChrome? = null
+
+    private data class MoveChrome(
+        val parts: List<MeshPart>,
+        val bounds: Rect,
+        val items: List<CanvasItem>,
+        val center: Pt,
+        val halfW: Double,
+        val halfH: Double,
+        val angle: Double,
+        val zoom: Double,
+    )
+
+    /**
+     * Shift the last selection-box build by the move since, when the rebuild would draw the
+     * same thing translated: same items and zoom, same box shape, fully on screen (so the
+     * visible-rect clipping both builds share is a no-op). Bit-near-identical to a rebuild at
+     * a fraction of the cost, and synchronous, so the chrome never lags the finger a frame.
+     */
+    private fun tryShiftMoveChrome(): Boolean {
+        if (interaction.mode != CanvasPointerMode.MOVE) return false
+        val box = selection.box ?: return false
+        if (pendingItem != null || interaction.marking || interaction.bandRect != null ||
+            interaction.connectorChrome() != null
+        ) return false
+        val cached = moveChrome ?: return false
+        val zoom = viewport.zoom
+        if (cached.items !== selection.items || cached.zoom != zoom ||
+            cached.halfW != box.halfW || cached.halfH != box.halfH || cached.angle != box.angle
+        ) return false
+        val visible = viewport.cullRect(64.0)
+        if (!containsRect(visible, cached.bounds)) return false
+        val fresh = OverlayTessellator.selectionBounds(box, zoom)
+        if (!containsRect(visible, fresh)) return false
+        val dx = box.center.x - cached.center.x
+        val dy = box.center.y - cached.center.y
+        scene.setWetParts(OverlayTessellator.translated(cached.parts, dx, dy), cached.bounds.translate(dx, dy))
+        moveChrome = cached.copy(center = box.center)
+        view.publish()
+        return true
+    }
+
+    private fun containsRect(outer: Rect, inner: Rect): Boolean =
+        outer.left <= inner.left && outer.top <= inner.top &&
+            outer.right >= inner.right && outer.bottom >= inner.bottom
+
+    /**
+     * The overlay build itself. During a move of a settled selection with nothing else on the
+     * buffer, the result is cached as a shift base (see [tryShiftMoveChrome]).
+     */
+    private fun publishOverlayNow() {
         val accent = palette?.selectionAccent(view.paperColor) ?: InkPalette.DEFAULT
         val zoom = viewport.zoom
+        // Chrome tessellation follows the Lod budget: zoomed out, cap/join discs that would
+        // cover fractions of a pixel collapse to a few segments instead of dozens.
+        val lodTol = ItemMesher.toleranceForZoom(zoom)
         // A lasso drag owns the buffer on its own: it clears the selection when it starts and no
         // marquee can be out at the same time, so nothing else needs a place in the same publish.
         if (publishLasso(zoom, accent)) return
@@ -2066,26 +2360,28 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val parts = ArrayList<MeshPart>(3)
         var bounds: Rect? = null
         // A shape or connector being drawn sits under the chrome, in the same buffer.
+        // It is content, so it inverts with the ink; the chrome around it keeps its colours.
         pendingItem?.let { item ->
             ItemMesher.mesh(item)?.let { m ->
-                parts += m.parts
+                parts += invertParts(m.parts)
                 bounds = m.bounds
             }
         }
         if (interaction.marking) {
             val marks = interaction.connectionMarks()
             val hot = interaction.connectHot
-            parts += OverlayTessellator.connectionMarks(marks, hot, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE)
+            parts += OverlayTessellator.connectionMarks(marks, hot, zoom, accent, lodTol)
             val pad = OverlayTessellator.HOT_PX / zoom
             for (p in marks + hot) bounds = (bounds ?: Rect(p.x, p.y, 0.0, 0.0)).union(Rect(p.x - pad, p.y - pad, 2 * pad, 2 * pad))
         }
         interaction.bandRect?.let {
-            parts += OverlayTessellator.band(it, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE, devicePxPerDp)
+            parts += OverlayTessellator.band(it, zoom, accent, lodTol, devicePxPerDp)
             bounds = it.outset(4.0 / zoom)
         }
         val margin = OverlayTessellator.FRAME_MARGIN_PX / zoom
-        interaction.connectorChrome()?.let { cc ->
-            parts += OverlayTessellator.connectorChrome(cc.ends, cc.segments, cc.waypoints, cc.midpoints, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE)
+        val connectorChrome = interaction.connectorChrome()
+        connectorChrome?.let { cc ->
+            parts += OverlayTessellator.connectorChrome(cc.ends, cc.segments, cc.waypoints, cc.midpoints, zoom, accent, lodTol)
             val pad = OverlayTessellator.END_PX / zoom
             for (p in cc.ends.map { it.first } + cc.segments + cc.waypoints + cc.midpoints) {
                 bounds = (bounds ?: Rect(p.x, p.y, 0.0, 0.0)).union(Rect(p.x - pad, p.y - pad, 2 * pad, 2 * pad))
@@ -2094,8 +2390,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         selection.chromeBox(margin)?.let { box ->
             // A lone shape also shows the dots that edit its points, except while a drag carries it.
             val shape = (selection.items.singleOrNull() as? ShapeItem)?.takeIf { interaction.showsEditDots }
+            val selStart = parts.size
             parts += OverlayTessellator.selection(
-                box, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE, devicePxPerDp,
+                box, zoom, accent, lodTol, devicePxPerDp,
                 handles = selection.handles(margin).map { it.content },
                 vertexDots = shape?.vertexDots()?.map { it.at }.orEmpty(),
                 edgeDots = shape?.edgeDots(OverlayTessellator.EDGE_DOT_MIN_PX / zoom)?.map { it.at }.orEmpty(),
@@ -2106,6 +2403,16 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             )
             val b = OverlayTessellator.selectionBounds(box, zoom)
             bounds = bounds?.union(b) ?: b
+            // A settled selection being moved rebuilds this same box translated every sample;
+            // keep the build as a shift base instead of re-tessellating it.
+            moveChrome = if (interaction.mode == CanvasPointerMode.MOVE && pendingItem == null &&
+                !interaction.marking && interaction.bandRect == null && connectorChrome == null
+            ) {
+                MoveChrome(parts.subList(selStart, parts.size).toList(), b, selection.items,
+                    box.center, box.halfW, box.halfH, box.angle, zoom)
+            } else null
+        } ?: run {
+            if (interaction.mode != CanvasPointerMode.MOVE) moveChrome = null
         }
         if (parts.isEmpty()) {
             scene.setWet(null, InkPalette.DEFAULT, InkPass.OPAQUE, Rect(0.0, 0.0, 0.0, 0.0))
@@ -2157,13 +2464,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             lassoBounds = lassoBounds.union(Rect(p.x, p.y, 0.0, 0.0))
         }
         val bounds = lassoBounds.outset(4.0 / zoom)
+        // Same Lod budget as the other chrome.
+        val lodTol = ItemMesher.toleranceForZoom(zoom)
         if (points.size - lassoSettled >= LASSO_RUN_POINTS) {
             // From one point back, so the segment bridging this run to the last one is drawn. The
             // arc is measured through that same point, so it is both the phase this run starts at
             // and, once its own length is added, the phase the tail starts at.
             val from = lassoSettled - 1
             val run = OverlayTessellator.lassoRun(
-                points, from, points.size - from, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE,
+                points, from, points.size - from, zoom, accent, lodTol,
                 lassoArc, devicePxPerDp,
             )
             if (run.isNotEmpty()) scene.appendWetRun(run, bounds)
@@ -2174,7 +2483,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         }
         scene.setWetTail(
             OverlayTessellator.lassoTail(
-                points, lassoSettled - 1, zoom, accent, StrokeTessellator.DEFAULT_TOLERANCE,
+                points, lassoSettled - 1, zoom, accent, lodTol,
                 lassoArc, devicePxPerDp,
             ),
             bounds,
@@ -2340,9 +2649,19 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Collapse or expand [item], wherever it sits, as one undo step. */
     fun toggleStickyCollapsed(item: com.xnotes.core.model.StickyNoteItem) {
+        val expanding = item.collapsed
+        val rectBefore = item.rect
+        var rectAfter: com.xnotes.core.geometry.Rect? = null
+        if (expanding) {
+            // An icon parked at the viewport's far edge would otherwise open its paper
+            // off-screen; shift it minimally so the whole note stays visible.
+            val fitted = com.xnotes.core.model.StickyNoteItem.fitExpanded(item.rect, viewport.visibleContentRect())
+            item.rect = fitted
+            if (fitted != rectBefore) rectAfter = fitted
+        }
         val cmd = com.xnotes.core.history.SetStickyCollapsed(
             listOf(
-                com.xnotes.core.history.SetStickyCollapsed.Entry(item, item.collapsed, !item.collapsed),
+                com.xnotes.core.history.SetStickyCollapsed.Entry(item, item.collapsed, !item.collapsed, rectBefore, rectAfter),
             ),
         )
         cmd.redo()
@@ -2633,8 +2952,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val front = frontInk
         frontInk = false
         stroke.finished = true
+        // Content samples become note-local, clamped to the paper so no run can live
+        // on the canvas outside the note.
         val local = stroke.samples.map {
-            com.xnotes.core.stroke.Sample(it.x - target.rect.x, it.y - target.rect.y, it.pressure, it.t)
+            val cx = it.x.coerceIn(target.rect.left, target.rect.right)
+            val cy = it.y.coerceIn(target.rect.top, target.rect.bottom)
+            com.xnotes.core.stroke.Sample(cx - target.rect.x, cy - target.rect.y, it.pressure, it.t)
         }
         val committed = Stroke(stroke.tool, stroke.config, local, stroke.speedScale, stroke.straight, stroke.smoothScale)
         committed.finished = true
@@ -2749,7 +3072,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         fadingStrokes.add(FadingStroke(stroke, meshed))
         // clearsWet releases the buffer under the pen in the same message this stroke arrives in,
         // so no frame can fall between the two and blink.
-        scene.upsert(stroke, meshed.parts, meshed.bounds, clearsWet = true)
+        scene.upsert(stroke, invertParts(meshed.parts), meshed.bounds, clearsWet = true)
         solidifyFading()
         view.publish()
     }
@@ -2819,7 +3142,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     /** Re-file every held stroke at the current alpha, from the triangles it already has. */
     private fun republishFading() {
         for (f in fadingStrokes) {
-            scene.upsert(f.stroke, f.meshed.parts.map { fadedPart(it, fadeAlpha) }, f.meshed.bounds)
+            scene.upsert(f.stroke, invertParts(f.meshed.parts.map { fadedPart(it, fadeAlpha) }), f.meshed.bounds)
         }
     }
 
@@ -3079,10 +3402,29 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     fun setBackground(background: CanvasBackground) {
+        val invertChanged = document.background.invertColors != background.invertColors ||
+            document.background.invertImages != background.invertImages
         document.background = background
         view.background = background
         view.paperColor = background.paperColor ?: view.paperColor
+        // Ink colours are baked into the GPU buffers at mesh time, so a flag flip needs
+        // every item re-meshed; paper and ruling follow the flags live, flag-free.
+        if (invertChanged) rebuildScene()
+        backgroundRevision++
         markDirty()
+    }
+
+    /** Bumped on every background change, so toolbar swatch dots track color inversion. */
+    var backgroundRevision by mutableStateOf(0)
+        private set
+
+    /**
+     * A toolbar swatch dot as it paints on the canvas: lightness-inverted when the canvas is
+     * color-inverted, so the dot previews the stroke. The armed colour itself stays raw.
+     */
+    fun swatchDisplayColor(color: Rgba): Rgba {
+        backgroundRevision // subscribe: dots follow background changes
+        return if (document.background.invertColors) color.inverted() else color
     }
 
     // --- history ---
@@ -3114,6 +3456,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         if (interaction.marking) publishOverlay()
         document.lastView = viewport.toWaypoint()
         zoomPercent = Math.round(viewport.zoom * 100).toInt()
+        // Strokes meshed coarser than the zoom now needs come back up at once; coarser-than-
+        // needed ones wait for the settle refinement, which only ever swaps in cheaper meshes.
+        // Strokes meshed coarser than the zoom now needs come back up, but never mid-gesture:
+        // re-meshing a burst synchronously while the fingers are moving is a hitch of its own,
+        // and the settle refinement below picks the remainder up 250 ms after the camera stops.
+        val needed = Lod.levelFor(viewport.zoom)
+        if (needed < lodLastNeeded && interaction.mode == CanvasPointerMode.IDLE) upgradeVisibleStrokes(needed)
+        lodLastNeeded = needed
+        scheduleLodRefine()
         // The menu is anchored in viewport pixels, so a pan or a zoom moves it.
         refreshSelectionMenu()
         // The minimap maps everything drawn, so its extent moves with the content, not the view.
@@ -3160,6 +3511,21 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
         /** Lasso vertices a settled run holds; the tail is rebuilt on every sample. */
         const val LASSO_RUN_POINTS = 16
+
+        /** Lod settle delay: zoom-out downgrades wait for the camera to stop, like text. */
+        const val LOD_REFINE_DELAY_MS = 250L
+
+        /** Strokes re-meshed per frame by the settle refinement, to never stall a frame. */
+        const val LOD_REFINE_BATCH = 12
+
+        /** Cap on synchronous zoom-in upgrades: the visible set already shrinks as zoom rises. */
+        const val LOD_UPGRADE_BURST = 24
+
+        /** A drag builds decimated stand-ins only past this many proxyable items. */
+        const val DRAG_PROXY_MIN_ITEMS = 24
+
+        /** Screen-space deviation a drag stand-in may introduce, in device pixels. */
+        const val DRAG_PROXY_ERROR_PX = 1.0
 
         private val EMPTY_RECT = Rect(0.0, 0.0, 0.0, 0.0)
 

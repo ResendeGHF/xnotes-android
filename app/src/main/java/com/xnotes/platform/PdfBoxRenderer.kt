@@ -14,6 +14,7 @@ import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import com.tom_roush.pdfbox.util.Matrix
 import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Flip
+import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
@@ -22,10 +23,11 @@ import com.xnotes.core.pal.FillRule
 import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.Mark
 import com.xnotes.core.pal.Pen
+import com.xnotes.core.pal.RIBBON_JOIN_DISC_ANGLE
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.pal.TextFlags
-import com.xnotes.core.stroke.PencilField
+import com.xnotes.core.pal.ribbonJoinStations
 import com.xnotes.core.pdf.GlyphPlacement
 import com.xnotes.core.pdf.LinkFinder
 import com.xnotes.core.pdf.PdfNumbers
@@ -78,6 +80,9 @@ internal class PdfBoxRenderer(
     private var oy = oy
     private var sx = s
     private var sy = -s
+
+    /** When true, placed images embed lightness-inverted (the "invert images" half of color inversion). */
+    override var invertImageContent: Boolean = false
 
     // The opacity a saveLayerAlpha put in force; a translucent colour inside it multiplies with it.
     private var layerAlpha = 1.0
@@ -190,31 +195,54 @@ internal class PdfBoxRenderer(
     }
 
     /**
-     * A pencil run for export: the same page-anchored field the screen and the
-     * live shader evaluate, rasterized fine and embedded as bitmaps, so print
-     * keeps the graphite instead of falling back to flat vector ink.
+     * A pencil run for export: the pen's swept ribbon as one vector union
+     * path (same quad math), with discs only where the run truly needs them,
+     * so translucent pressure tone never double-darkens. Print keeps crisp
+     * graphite instead of rasterized bitmaps.
      */
-    override fun fillPencil(
-        positions: DoubleArray,
-        colors: IntArray,
-        indices: IntArray,
-        ink: Rgba,
-        seed: Int,
-        tipMix: Float,
+    override fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float,
+        capStart: Boolean,
+        capEnd: Boolean,
+        overwrite: Boolean,
+        endJoin: Boolean,
+        ox: Double,
+        oy: Double,
+        density: Double,
+        shade: Double,
+        grainSize: Double,
     ) {
-        if (positions.isEmpty() || indices.isEmpty() || colors.isEmpty()) return
-        // Print at four field pixels per content px so exported grain stays crisp.
-        val px = 0.25
-        for (chunk in PencilField.render(positions, colors, indices, ink, 1.0, fieldPx = px, seed = seed, tipMix = tipMix.toDouble())) {
-            if (chunk.w <= 0 || chunk.h <= 0) continue
-            val bmp = Bitmap.createBitmap(chunk.w, chunk.h, Bitmap.Config.ARGB_8888)
-            bmp.setPixels(chunk.pixels, 0, chunk.w, 0, 0, chunk.w, chunk.h)
-            drawItemBitmap(
-                bmp,
-                Rect(chunk.left, chunk.top, chunk.w * px, chunk.h * px),
-                false,
-            )
-            bmp.recycle()
+        if (count <= 0) return
+        fun pt(i: Int) = Pt(centers[2 * i].toDouble(), centers[2 * i + 1].toDouble())
+        fun r(i: Int) = radii[i].toDouble() * radiusScale
+        val end = from + count
+        tag()
+        // Print averages the stipple: density times shade doubles as the flat
+        // tone, so graphite reads at the right weight without bitmaps.
+        val tone = color.withAlpha((density.coerceIn(0.0, 1.0) * shade.coerceIn(0.0, 1.0) * 255.0).toInt())
+        translucent(tone) {
+            setFill(color)
+            if (count == 1) {
+                if ((capStart || capEnd) && r(from) > 0.0) ellipsePath(pt(from), r(from), r(from))
+            } else {
+                for (i in from until end - 1) {
+                    if (r(i) <= 0.0 && r(i + 1) <= 0.0) continue
+                    val q = Geometry.ribbonQuad(pt(i), r(i), pt(i + 1), r(i + 1))
+                    if (q.size >= 3) polyPath(q, close = true)
+                }
+                if (capStart && r(from) > 0.0) ellipsePath(pt(from), r(from), r(from))
+                if (capEnd && r(end - 1) > 0.0) ellipsePath(pt(end - 1), r(end - 1), r(end - 1))
+                for (i in ribbonJoinStations(centers, from, count)) {
+                    if (r(i) > 0.0) ellipsePath(pt(i), r(i), r(i))
+                }
+                if (endJoin && !capEnd && r(end - 1) > 0.0) ellipsePath(pt(end - 1), r(end - 1), r(end - 1))
+            }
+            cs.fill()
         }
     }
 
@@ -307,6 +335,7 @@ internal class PdfBoxRenderer(
             EXPORT_CAP_PX to EXPORT_CAP_PX
         }
         var bmp = ImageDecoder.decodeSampledFile(image.file.path, reqW, reqH) ?: return
+        var owned = false
         if (p != null) {
             // Only the part goes into the file: the pixels of it, before the picture turns or mirrors.
             val l = (p.left * bmp.width).toInt().coerceIn(0, bmp.width - 1)
@@ -314,6 +343,7 @@ internal class PdfBoxRenderer(
             val r = kotlin.math.ceil(p.right * bmp.width).toInt().coerceIn(l + 1, bmp.width)
             val b = kotlin.math.ceil(p.bottom * bmp.height).toInt().coerceIn(t + 1, bmp.height)
             bmp = Bitmap.createBitmap(bmp, l, t, r - l, b - t)
+            owned = true
         }
         val o = ((orientation % 360) + 360) % 360
         if (o != 0 || flip != Flip.NONE) {
@@ -322,6 +352,12 @@ internal class PdfBoxRenderer(
                 postScale(if (flip.x) -1f else 1f, if (flip.y) -1f else 1f)
             }
             bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            owned = true
+        }
+        if (invertImageContent) {
+            // Never mutate the shared decode cache: copy first unless this bitmap is already ours.
+            if (!owned) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
+            bmp.invertPixels()
         }
         tag()
         if (angle == 0.0) placeBitmap(bmp, dest, multiply = false) else placeTurnedBitmap(bmp, dest, angle)

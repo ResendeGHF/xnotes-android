@@ -10,6 +10,10 @@ import com.xnotes.core.tools.Tool
 object SdocxMapping {
     fun samsungPenToTool(penName: String?, colorArgb: Int? = null): Tool {
         val short = (penName ?: "").trim()
+        // Samsung's taper pen (any generation/casing) draws with our taper
+        // tool: coordinates and colors carry over, only the tip pattern
+        // (which Samsung renders natively) is left to each side.
+        if (short.contains("taper", ignoreCase = true)) return Tool.TAPER
         return when (short) {
             "FountainPen", "MontblancFountainPen" -> Tool.PEN
             "MontblancCalligraphyPen", "ChineseBrush", "ObliquePen" -> Tool.CALLIGRAPHY
@@ -55,6 +59,26 @@ object SdocxMapping {
         1 -> com.xnotes.core.pal.HAlign.RIGHT
         2 -> com.xnotes.core.pal.HAlign.CENTER
         else -> com.xnotes.core.pal.HAlign.LEFT
+    }
+
+    /** Samsung's factory paper tint. Pages carrying exactly this carry no custom
+     *  color (it matches the reader's omitted-background default), so importing
+     *  it as "no override" keeps the note inheritable and editable while
+     *  rendering the same paper under the default theme. */
+    val SAMSUNG_DEFAULT_PAPER_ARGB: Int = 0xFFFCFCFC.toInt()
+
+    /**
+     * Samsung per-page template as an xnotes pattern id, explicit [PagePattern.NONE.id]
+     * for an explicit blank (type 0) or an unsupported id (Todo/Oxford/weekly/…,
+     * which the reference renderer also leaves as solid background), or null when
+     * the page record carries no template of its own (bit 9 and bit 2 both absent)
+     * so the page inherits the note default instead of having it stamped on.
+     */
+    fun samsungPageTemplate(templateType: Int?, templateUri: String?): String? {
+        val hasOwn = templateType != null || !templateUri.isNullOrEmpty()
+        if (!hasOwn) return null
+        if (templateType == 0) return PagePattern.NONE.id
+        return samsungTemplateToPattern(templateType, templateUri)
     }
 
     /** xnotes pattern id -> Samsung numeric template type for export (null = blank, omit). */

@@ -181,7 +181,7 @@ import kotlinx.coroutines.withTimeout
 import kotlin.math.roundToInt
 
 /** Which pane the backstage shows on the right. */
-enum class BackstageView { HOME, GRAPH, PREFERENCES, ABOUT, TRASH }
+enum class BackstageView { HOME, GRAPH, POLICY, PREFERENCES, ABOUT, TRASH }
 
 /** Whether the Home explorer is awaiting a new file/folder name. */
 private enum class CreateMode { NONE, FILE, CANVAS, FOLDER, ENCRYPTED_FOLDER }
@@ -535,6 +535,7 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
             nav.recent?.let { on -> Command(XnotesIcons.home, stringResource(R.string.home), selected = on) { nav.onRecent() } }
             Command(XnotesIcons.folder, stringResource(R.string.browse), selected = nav.homeSelected) { nav.onHome() }
+            Command(XnotesIcons.share, stringResource(R.string.policy), selected = nav.view == BackstageView.POLICY) { nav.onSelectView(BackstageView.POLICY) }
             Command(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) {
                 Command(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH, count = nav.trashCount.takeIf { it > 0 }?.toString()) {
@@ -589,6 +590,7 @@ private fun BackstageRail(modifier: Modifier, nav: SidebarNav, onExpand: () -> U
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
             nav.recent?.let { on -> RailItem(XnotesIcons.home, stringResource(R.string.home), selected = on) { nav.onRecent() } }
             RailItem(XnotesIcons.folder, stringResource(R.string.browse), selected = nav.homeSelected) { nav.onHome() }
+            RailItem(XnotesIcons.share, stringResource(R.string.policy), selected = nav.view == BackstageView.POLICY) { nav.onSelectView(BackstageView.POLICY) }
             RailItem(XnotesIcons.graph, stringResource(R.string.graph), selected = nav.view == BackstageView.GRAPH) { nav.onSelectView(BackstageView.GRAPH) }
             if (nav.trashCount >= 0) RailItem(XnotesIcons.trash, stringResource(R.string.trash), selected = nav.view == BackstageView.TRASH) { nav.onSelectView(BackstageView.TRASH) }
             if (nav.pins.isNotEmpty()) Spacer(Modifier.height(8.dp))
@@ -657,6 +659,7 @@ private fun BackstageMain(
             when (view) {
                 BackstageView.HOME -> HomePane(editor, calls, createMode, onCreateMode, sidebarOpen, onShowSidebar, link)
                 BackstageView.GRAPH -> GraphPane(editor, sidebarOpen, onShowSidebar, onBackToHome, calls.openFile)
+                BackstageView.POLICY -> PolicyPane(editor)
                 BackstageView.PREFERENCES -> PreferencesPane(editor, compact, sidebarOpen, onShowSidebar, onBackToHome, onImportCodeTheme, onImportFont, onBackup)
                 BackstageView.TRASH -> TrashPane(editor, sidebarOpen, onShowSidebar, onOpenPreferences, onCloseTabsForDeletion)
                 BackstageView.ABOUT -> AboutPane()

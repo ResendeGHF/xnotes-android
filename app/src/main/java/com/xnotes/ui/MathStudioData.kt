@@ -63,6 +63,7 @@ internal object MathStudioData {
             .put("exprs", entriesOf(plot2d.expressions))
             .put("params", JSONArray(plot2d.paramCurves.map {
                 JSONObject().put("x", it.x).put("y", it.y).put("c", it.colorArgb ?: 0).put("v", it.visible)
+                    .put("t0", it.t0).put("t1", it.t1)
             }))
             .put("impl", entriesOf(plot2d.implicitList))
             .put("complex", plot2d.complex)
@@ -78,6 +79,7 @@ internal object MathStudioData {
             .put("sph", entriesOf(plot3d.sphList))
             .put("params", JSONArray(plot3d.paramList.map {
                 JSONObject().put("x", it.x).put("y", it.y).put("z", it.z).put("c", it.colorArgb ?: 0).put("v", it.visible)
+                    .put("u0", it.u0).put("u1", it.u1).put("v0", it.v0).put("v1", it.v1)
             }))
             .put("impl", entriesOf(plot3d.implicitList))
             .put("cexpr", plot3d.complexExpression)
@@ -89,6 +91,7 @@ internal object MathStudioData {
             .put("res", plot3d.resolution.toDouble())
             .put("quat", quatOf(plot3d.orbit.quat))
             .put("zoom", plot3d.orbit.zoom.toDouble())
+            .put("lock", plot3d.lockDomain)
             .put("anim", animOf(plot3d.anim)))
         .put("fields", JSONObject()
             .put("mode", fields.mode.name)
@@ -112,8 +115,11 @@ internal object MathStudioData {
             .put("sx", fields.surfX3).put("sy", fields.surfY3).put("sz", fields.surfZ3)
             .put("u0", fields.surfU0).put("u1", fields.surfU1)
             .put("ox", fields.probeX).put("oy", fields.probeY).put("oz", fields.probeZ)
+            .put("pal", fields.palette.name)
+            .put("cbv", fields.colorByValue)
             .put("quat", quatOf(fields.orbit.quat))
             .put("zoom", fields.orbit.zoom.toDouble())
+            .put("lock", fields.lockDomain)
             .put("anim", animOf(fields.anim)))
         .put("calc2", JSONObject()
             .put("tool", calculus.tool.name)
@@ -249,7 +255,8 @@ internal object MathStudioData {
                 plot2d.paramCurves = List(a.length()) { i ->
                     val e = a.optJSONObject(i)
                     ParamCurve2D(e?.optString("x", "") ?: "", e?.optString("y", "") ?: "",
-                        e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true)
+                        e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true,
+                        e?.optString("t0", "") ?: "", e?.optString("t1", "") ?: "")
                 }
             }
             entriesFrom(j.optJSONArray("impl"))?.let { plot2d.implicitList = it }
@@ -269,7 +276,9 @@ internal object MathStudioData {
                 plot3d.paramList = List(a.length()) { i ->
                     val e = a.optJSONObject(i)
                     Param3D(e?.optString("x", "") ?: "", e?.optString("y", "") ?: "", e?.optString("z", "") ?: "",
-                        e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true)
+                        e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true,
+                        e?.optString("u0", "") ?: "", e?.optString("u1", "") ?: "",
+                        e?.optString("v0", "") ?: "", e?.optString("v1", "") ?: "")
                 }
             }
             entriesFrom(j.optJSONArray("impl"))?.let { plot3d.implicitList = it }
@@ -282,6 +291,7 @@ internal object MathStudioData {
             if (j.has("res")) plot3d.resolution = j.optDouble("res", 40.0).toFloat()
             quatFrom(j.optJSONObject("quat"))?.let { plot3d.orbit.quat = it }
             if (j.has("zoom")) plot3d.orbit.zoom = j.optDouble("zoom", 1.0).toFloat()
+            if (j.has("lock")) plot3d.lockDomain = j.optBoolean("lock", true)
             animFrom(j.optJSONObject("anim"), plot3d.anim)
         }
         o.optJSONObject("fields")?.let { j ->
@@ -325,8 +335,11 @@ internal object MathStudioData {
             if (j.has("ox")) fields.probeX = j.optString("ox", "0.5")
             if (j.has("oy")) fields.probeY = j.optString("oy", "0.5")
             if (j.has("oz")) fields.probeZ = j.optString("oz", "0.5")
+            if (j.has("pal")) fields.palette = runCatching { FieldPalette.valueOf(j.optString("pal", "JET")) }.getOrDefault(FieldPalette.JET)
+            if (j.has("cbv")) fields.colorByValue = j.optBoolean("cbv", true)
             quatFrom(j.optJSONObject("quat"))?.let { fields.orbit.quat = it }
             if (j.has("zoom")) fields.orbit.zoom = j.optDouble("zoom", 1.0).toFloat()
+            if (j.has("lock")) fields.lockDomain = j.optBoolean("lock", true)
             animFrom(j.optJSONObject("anim"), fields.anim)
         }
         o.optJSONObject("calc2")?.let { j ->
@@ -433,14 +446,19 @@ internal object MathStudioData {
     }.getOrNull()
 
     private fun entriesOf(list: List<MathEntry>): JSONArray = JSONArray(
-        list.map { JSONObject().put("t", it.text).put("c", it.colorArgb ?: 0).put("v", it.visible) },
+        list.map {
+            JSONObject().put("t", it.text).put("c", it.colorArgb ?: 0).put("v", it.visible)
+                .put("a0", it.domA0).put("a1", it.domA1).put("b0", it.domB0).put("b1", it.domB1)
+        },
     )
 
     private fun entriesFrom(a: JSONArray?): List<MathEntry>? {
         if (a == null) return null
         return List(a.length()) { i ->
             val e = a.optJSONObject(i)
-            MathEntry(e?.optString("t", "") ?: "", e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true)
+            MathEntry(e?.optString("t", "") ?: "", e?.optInt("c", 0)?.takeIf { it != 0 }, e?.optBoolean("v", true) ?: true,
+                e?.optString("a0", "") ?: "", e?.optString("a1", "") ?: "",
+                e?.optString("b0", "") ?: "", e?.optString("b1", "") ?: "")
         }
     }
 

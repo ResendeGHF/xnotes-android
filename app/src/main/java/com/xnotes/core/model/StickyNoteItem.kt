@@ -166,12 +166,17 @@ class StickyNoteItem(
                 r.restore()
             }
         }
-        // Freehand ink, clipped to the paper.
+        // Freehand ink, clipped to the paper. Pencil ink samples the grain
+        // tile in page space (paper offset added), so the committed note
+        // wears the same tooth as the live page stroke.
         if (ink.isNotEmpty()) {
             r.save()
             r.clipRect(b)
             r.translate(b.x, b.y)
-            for (s in ink) s.paint(r)
+            for (s in ink) {
+                if (s.tool == com.xnotes.core.tools.Tool.PENCIL) s.paintWithFieldOrigin(r, b.x, b.y)
+                else s.paint(r)
+            }
             r.restore()
         }
     }
@@ -282,6 +287,21 @@ class StickyNoteItem(
         /** Box of the default size centred on [center]. */
         fun boxAt(center: Pt): Rect =
             Rect(center.x - DEFAULT_WIDTH / 2.0, center.y - DEFAULT_HEIGHT / 2.0, DEFAULT_WIDTH, DEFAULT_HEIGHT)
+
+        /**
+         * Shift [rect] minimally so the expanded paper stays inside [bounds] (the page
+         * footprint on a note, the viewport on a canvas). When the icon was parked at
+         * the far right or bottom, an unshifted expand would open off-screen; moving
+         * the paper left/up keeps the whole note visible. Oversized paper aligns its
+         * top-left with the bounds so at least its origin stays in view.
+         */
+        fun fitExpanded(rect: Rect, bounds: Rect): Rect {
+            var x = rect.x
+            var y = rect.y
+            x = if (rect.w >= bounds.w) bounds.x else (x.coerceIn(bounds.left, bounds.right - rect.w))
+            y = if (rect.h >= bounds.h) bounds.y else (y.coerceIn(bounds.top, bounds.bottom - rect.h))
+            return if (x == rect.x && y == rect.y) rect else Rect(x, y, rect.w, rect.h)
+        }
 
         /** A 24-gon ring standing in for a stroked circle (the paged renderer has no strokeCircle). */
         internal fun circleOutline(c: Pt, radius: Double, sides: Int = 24): List<Pt> =

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Text-to-handwriting strings. Kept in their own file so the feature adds no
+     churn to the shared strings.xml that other work is editing. -->
+<resources>
+    <string name="handwrite_menu">Text to handwriting</string>
+    <string name="handwrite_title">Text to handwriting</string>
+    <string name="handwrite_hint">Type text, use the selected box, or import a file…</string>
+    <string name="handwrite_use_selected">Selected</string>
+    <string name="handwrite_import_file">File…</string>
+    <string name="handwrite_import_pdf">PDF…</string>
+    <string name="handwrite_size">Hand size: %1$d pt</string>
+    <string name="handwrite_replace">Replace the selected text box</string>
+    <string name="handwrite_convert">To handwriting</string>
+    <string name="handwrite_reading">Reading…</string>
+    <string name="handwrite_tracing">Tracing page %1$d of %2$d…</string>
+    <string name="handwrite_placing">Placing handwriting…</string>
+    <string name="handwrite_added">Converted %1$d of %2$d pages</string>
+    <string name="handwrite_pdf_empty">No readable content in that file</string>
+    <string name="handwrite_pdf_skipped">Skipped pages without readable content: %1$s</string>
+    <string name="handwrite_empty">Nothing to convert</string>
+    <string name="handwrite_failed">Could not place the handwriting</string>
+    <string name="handwrite_failed_text">Handwriting failed: %1$s</string>
+</resources>

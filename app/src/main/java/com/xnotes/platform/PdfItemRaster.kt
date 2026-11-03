@@ -44,10 +44,10 @@ internal object PdfItemRaster {
     }
 
     /** Render a single item, cropped to its [cover]-clamped paint bounds, into a transparent bitmap. */
-    fun item(item: CanvasItem, cover: Rect): Raster? {
+    fun item(item: CanvasItem, cover: Rect, invert: Boolean = false): Raster? {
         val multiply = item is Stroke && item.tool == Tool.HIGHLIGHTER
         // A shape's label stays out of its picture: the exporter writes it on top as real text.
-        return region(item.paintBounds(), cover, multiply) { r, _ ->
+        return region(item.paintBounds(), cover, multiply, invert) { r, _ ->
             when (item) {
                 is ShapeItem -> item.paintBody(r)
                 is ConnectorItem -> item.paintBody(r)
@@ -61,7 +61,7 @@ internal object PdfItemRaster {
      * bitmap. [paint] is handed the crop it actually got, which the flow-text layer needs to lay out
      * the right slice. Null when the crop is empty or falls outside the page entirely.
      */
-    fun region(want: Rect, cover: Rect, multiply: Boolean, paint: (Renderer, Rect) -> Unit): Raster? {
+    fun region(want: Rect, cover: Rect, multiply: Boolean, invert: Boolean = false, paint: (Renderer, Rect) -> Unit): Raster? {
         val left = want.left.coerceAtLeast(cover.left)
         val top = want.top.coerceAtLeast(cover.top)
         val right = want.right.coerceAtMost(cover.right)
@@ -76,7 +76,9 @@ internal object PdfItemRaster {
         canvas.scale((w / cw).toFloat(), (h / ch).toFloat()) // content px → bitmap px
         canvas.translate(-left.toFloat(), -top.toFloat())
         val crop = Rect(left, top, cw, ch)
-        paint(AndroidRenderer(canvas), crop)
+        // Effect rasters are never images, so plain colour inversion is the whole of it.
+        val base = AndroidRenderer(canvas)
+        paint(if (invert) com.xnotes.core.pal.InvertingRenderer(base) else base, crop)
         return Raster(bmp, crop, multiply)
     }
 

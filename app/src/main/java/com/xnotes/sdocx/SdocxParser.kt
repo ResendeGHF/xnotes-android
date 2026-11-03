@@ -39,12 +39,36 @@ object SdocxParser {
             var entry: SdocxMediaEntry? = bindId?.let { mediaByBindId[it] }
             if (entry == null) entry = mediaByFileName[name]
             if (entry == null) {
+                // Newer writers vary filename case/encoding: match case-insensitively
+                // before synthesising so real photo bytes never orphan.
+                val lower = name.lowercase()
+                entry = mediaByFileName.entries.firstOrNull { it.key.lowercase() == lower }?.value
+            }
+            if (entry == null) {
                 val synth = SdocxMediaEntry(bindId ?: -1, fileName)
                 if (bindId != null) mediaByBindId[bindId] = synth
                 mediaByFileName[name] = synth
                 entry = synth
             }
-            entry.bytes = bytes
+            // A manifest entry already holding bytes from a same-bind sibling
+            // keeps the first payload; a second same-bind file synthesises its
+            // own slot so no photo overwrites another.
+            if (entry.bytes == null || entry.bytes!!.isEmpty()) {
+                entry.bytes = bytes
+            } else if (entry.bytes!!.size != bytes.size || !entry.bytes!!.contentEquals(bytes)) {
+                val synth = SdocxMediaEntry(bindId ?: -1, fileName)
+                synth.bytes = bytes
+                if (bindId != null && !mediaByBindId.containsKey(bindId)) {
+                    mediaByBindId[bindId] = synth
+                }
+                if (!mediaByFileName.containsKey(name)) {
+                    mediaByFileName[name] = synth
+                } else {
+                    mediaByFileName["$name#${mediaByFileName.size}"] = synth
+                }
+            } else {
+                entry.bytes = bytes
+            }
         }
 
         var stringTable: Map<Int, String> = emptyMap()
@@ -52,6 +76,7 @@ object SdocxParser {
         var bodyImages = listOf<SdocxImage>()
         var bodyTables = listOf<SdocxTable>()
         var docTitle: String? = null
+        var noteVoices = listOf<SdocxNoteVoice>()
         val noteBytes = entries["note.note"]
         if (noteBytes != null) {
             try {
@@ -74,6 +99,14 @@ object SdocxParser {
                     bodyImages = parseNoteBodyImages(noteBytes)
                 } catch (_: Exception) {
                 }
+            }
+            // Recorded-while-writing audio (note-level voices with replay
+            // intervals) lives here too, not as type-10 page objects: without
+            // it every Samsung recording vanishes on import.
+            try {
+                noteVoices = parseNoteVoices(noteBytes)
+            } catch (_: Exception) {
+                noteVoices = emptyList()
             }
         }
 
@@ -136,6 +169,7 @@ object SdocxParser {
             bodyImages = bodyImages,
             bodyTables = bodyTables,
             title = docTitle,
+            noteVoices = noteVoices,
         )
     }
 
@@ -288,6 +322,165 @@ object SdocxParser {
         flex.skip(4 + 4 + 4 + 4)
     }
 
+    /**
+     * Note-level recorded audio sessions (`note.note` bit 13): Samsung's
+     * "record while writing" audio. Layout mirrors the reference SDK
+     * (`note_metadata.rs::voices`): count + sized records of
+     * `media_id u32, name, play_time, created_time i64, event_count u32,
+     * events[action i32, time i64]*, recording_time i64?`.
+     * Event times and the interval they bound are microseconds since epoch;
+     * `recording_time`/parsed `play_time` give the pill length in ms.
+     * Never throws; malformed blobs yield no voices.
+     */
+    fun parseNoteVoices(data: ByteArray): List<SdocxNoteVoice> {
+        return try {
+            val r = SdocxReader(data)
+            val flexibleOffset = r.readU32().toInt()
+            SdocxMask.read(r) // properties
+            val fields = SdocxMask.read(r)
+            if (!fields.contains(13)) return emptyList()
+            r.skip(4) // format version
+            r.readUtf16U16() // note id
+            r.skip(4 + 8 + 8 + 4 + 4 + 4 + 4 + 4)
+            val titleSize = r.readU32().toInt()
+            if (titleSize < 0 || titleSize > r.remaining) return emptyList()
+            r.skip(titleSize)
+            val bodySize = r.readU32().toInt()
+            if (bodySize < 0 || bodySize > r.remaining) return emptyList()
+            r.skip(bodySize)
+            val payloadEnd = data.size - 32
+            if (flexibleOffset < r.offset || flexibleOffset > payloadEnd || payloadEnd < 0) {
+                return emptyList()
+            }
+            val flex = SdocxReader(data.copyOfRange(flexibleOffset, payloadEnd))
+            for (bit in 0 until fields.bytes.size * 8) {
+                if (!fields.contains(bit)) continue
+                if (bit == 13) {
+                    return readNoteVoiceList(flex)
+                }
+                // Skip preceding fields exactly as parseNoteMetadata does so
+                // offsets stay aligned up to bit 13.
+                when (bit) {
+                    0 -> flex.readUtf16U16()
+                    1 -> {
+                        flex.skip(4 + 4)
+                        flex.readUtf16U16()
+                    }
+                    2 -> {
+                        flex.readNullableUtf16U16()
+                        flex.readNullableUtf16U16()
+                        flex.readNullableUtf16U16()
+                        flex.skip(4)
+                    }
+                    3 -> flex.skip(8 + 8)
+                    6 -> flex.readUtf16U16()
+                    7 -> flex.skip(4)
+                    9 -> flex.skip(4 + 8)
+                    10 -> {
+                        val size = flex.readU32().toInt()
+                        flex.skip(size)
+                    }
+                    11 -> flex.skip(4)
+                    12 -> skipNotePen(flex, modern = false)
+                    else -> return emptyList()
+                }
+            }
+            emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun readNoteVoiceList(flex: SdocxReader): List<SdocxNoteVoice> {
+        val out = ArrayList<SdocxNoteVoice>()
+        try {
+            val count = flex.readU32().toInt()
+            if (count < 0 || count > 1000) return emptyList()
+            for (i in 0 until count) {
+                val recSize = flex.readU32().toInt()
+                if (recSize < 0 || recSize > flex.remaining) return out
+                val recBytes = flex.readBytes(recSize)
+                try {
+                    parseOneNoteVoice(recBytes)?.let { out.add(it) }
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+            return out
+        }
+        return out
+    }
+
+    private fun parseOneNoteVoice(rec: ByteArray): SdocxNoteVoice? {
+        return try {
+            if (rec.size < 4 + 2 + 2 + 8 + 4) return null
+            val r = SdocxReader(rec)
+            val mediaId = r.readU32().toInt()
+            if (mediaId < 0) return null
+            val name = try {
+                r.readUtf16U16()
+            } catch (_: Exception) {
+                ""
+            }.take(200)
+            val playTime = try {
+                r.readUtf16U16()
+            } catch (_: Exception) {
+                ""
+            }.take(32)
+            if (r.remaining < 8 + 4) return null
+            val createdMs = r.readI64()
+            val eventCount = r.readU32().toInt()
+            if (eventCount < 0 || eventCount > 10000) return null
+            var startUs: Long? = null
+            var endUs: Long? = null
+            repeat(eventCount) {
+                if (r.remaining < 4 + 8) throw SdocxFormatException("Truncated voice event")
+                r.readI32() // action (1 = start, 4 = stop on observed writers)
+                val t = r.readI64()
+                if (startUs == null || t < startUs) startUs = t
+                if (endUs == null || t > endUs) endUs = t
+            }
+            var recordingMs: Long? = null
+            if (r.remaining >= 8) {
+                try {
+                    recordingMs = r.readI64()
+                } catch (_: Exception) {
+                    recordingMs = null
+                }
+            }
+            var durationMs = try {
+                parseVoiceDuration(playTime)
+            } catch (_: Exception) {
+                0
+            }
+            if (durationMs <= 0) {
+                recordingMs?.let {
+                    if (it in 1..86_400_000L) durationMs = it.toInt()
+                }
+            }
+            if (durationMs <= 0) {
+                if (startUs != null && endUs != null && endUs > startUs) {
+                    durationMs = ((endUs - startUs) / 1000L).coerceIn(1L, 86_400_000L).toInt()
+                }
+            }
+            if (startUs != null && endUs != null && endUs < startUs) {
+                val tmp = startUs
+                startUs = endUs
+                endUs = tmp
+            }
+            SdocxNoteVoice(
+                mediaId = mediaId,
+                title = name,
+                durationMs = durationMs,
+                startUs = startUs,
+                endUs = endUs,
+                createdTimeMs = createdMs.takeIf { it in 0L..32_000_000_000_000L },
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun scanPenStrings(data: ByteArray): Map<Int, String> {
         val known = setOf(
             "DefaultPen", "AirBrushPen", "Beautify", "Brush", "BrushPen", "ChineseBrush", "Crayon",
@@ -362,10 +555,41 @@ object SdocxParser {
      * Full note-body walk: images, tables and the note title from `note.note`'s
      * title/body text objects (base + 6 + 7 frames, TextCommon). Never throws;
      * malformed blobs yield empty lists and null title.
+     *
+     * Every candidate header size (the known 44/40 first, then a bounded scan
+     * for the fixed sizes other Samsung versions use) is scored by coherence
+     * and the best parse wins, so body photos/tables do not vanish. Title and
+     * body are validated independently: an unreadable title blob never drops
+     * a valid body (and vice versa).
      */
     fun parseNoteBody(data: ByteArray): Triple<List<SdocxImage>, List<SdocxTable>, String?> {
         return try {
-            val (titleBlob, bodyBlob) = readNoteBlobs(data) ?: return Triple(emptyList(), emptyList(), null)
+            var best = Triple<List<SdocxImage>, List<SdocxTable>, String?>(emptyList(), emptyList(), null)
+            var bestScore = 0
+            val dimsList = (listOf(44, 40) + (24..72 step 4).filter { it != 44 && it != 40 }).distinct()
+            for (dims in dimsList) {
+                val blobs = try {
+                    readNoteBlobsWithDims(data, dims)
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+                val res = tryParseBlobs(blobs.first, blobs.second)
+                val score = (res.third?.length ?: 0) + 1000 * (res.first.size + res.second.size)
+                if (score > bestScore) {
+                    bestScore = score
+                    best = res
+                }
+            }
+            best
+        } catch (_: Exception) {
+            Triple(emptyList(), emptyList(), null)
+        }
+    }
+
+    /** Parse one title/body blob pair; never throws. Each blob is validated on
+     *  its own, so an unreadable title never drops a valid body (and vice versa). */
+    private fun tryParseBlobs(titleBlob: ByteArray, bodyBlob: ByteArray): Triple<List<SdocxImage>, List<SdocxTable>, String?> {
+        return try {
             val images = ArrayList<SdocxImage>()
             val tables = ArrayList<SdocxTable>()
             var title: String? = null
@@ -374,7 +598,8 @@ object SdocxParser {
                 val blob = blobs[idx]
                 try {
                     val r = SdocxReader(blob)
-                    readFrame(r) // kind 0 base
+                    val base = readFrame(r) // kind 0 base
+                    if (base.kind != 0) continue
                     if (r.isEof) continue
                     val shapeBase = readFrame(r)
                     if (shapeBase.kind != 6) continue
@@ -397,47 +622,34 @@ object SdocxParser {
         }
     }
 
-    /** Raw title/body text-object blobs from `note.note`; null when not readable. */
-    private fun readNoteBlobs(data: ByteArray): Pair<ByteArray, ByteArray>? {
-        for (dims in listOf(44, 40)) {
-            try {
-                val r = SdocxReader(data)
-                r.skip(4) // flexible offset
-                SdocxMask.read(r)
-                SdocxMask.read(r)
-                r.skip(4) // format version
-                val idUnits = r.readU16()
-                if (idUnits != 0xFFFF) {
-                    if (idUnits * 2 > r.remaining) continue
-                    if (idUnits > 0) r.skip(idUnits * 2)
-                }
-                if (r.remaining < dims + 8) continue
-                r.skip(dims)
-                if (r.remaining < 4) continue
-                val titleSize = r.readU32().toInt()
-                if (titleSize < 0 || titleSize > r.remaining) continue
-                val title = r.readBytes(titleSize)
-                if (r.remaining < 4) continue
-                val bodySize = r.readU32().toInt()
-                if (bodySize < 0 || bodySize > r.remaining) continue
-                val body = r.readBytes(bodySize)
-                if (!looksLikeTextBlob(title) || !looksLikeTextBlob(body)) continue
-                return Pair(title, body)
-            } catch (_: Exception) {
-                continue
-            }
-        }
-        return null
-    }
-
-    private fun looksLikeTextBlob(blob: ByteArray): Boolean {
+    /** Raw title/body blobs for one fixed header size; null when the two sizes
+     *  do not split the payload sanely. Blobs are validated individually by
+     *  the caller, so one unreadable blob never hides the other. */
+    private fun readNoteBlobsWithDims(data: ByteArray, dims: Int): Pair<ByteArray, ByteArray>? {
         return try {
-            if (blob.size < 12) return false
-            val r = SdocxReader(blob)
-            val f = readFrame(r)
-            f.kind == 0
+            val r = SdocxReader(data)
+            r.skip(4) // flexible offset
+            SdocxMask.read(r)
+            SdocxMask.read(r)
+            r.skip(4) // format version
+            val idUnits = r.readU16()
+            if (idUnits != 0xFFFF) {
+                if (idUnits * 2 > r.remaining) return null
+                if (idUnits > 0) r.skip(idUnits * 2)
+            }
+            if (r.remaining < dims + 8) return null
+            r.skip(dims)
+            if (r.remaining < 4) return null
+            val titleSize = r.readU32().toInt()
+            if (titleSize < 0 || titleSize > r.remaining) return null
+            val title = r.readBytes(titleSize)
+            if (r.remaining < 4) return null
+            val bodySize = r.readU32().toInt()
+            if (bodySize < 0 || bodySize > r.remaining) return null
+            val body = r.readBytes(bodySize)
+            Pair(title, body)
         } catch (_: Exception) {
-            false
+            null
         }
     }
 
@@ -467,6 +679,7 @@ object SdocxParser {
         var backgroundWidth: Int? = null
         var backgroundRotation: Int? = null
         val pdfPapers = ArrayList<SdocxPdfPaper>()
+        var stickers = listOf<SdocxSticker>()
         if (propertyOffset != 0) {
             val flex = SdocxReader(data.copyOfRange(propertyOffset, rawLayerOffset))
             if ((propertyMask and (1 shl 0)) != 0) flex.skip(32)
@@ -503,6 +716,16 @@ object SdocxParser {
             }
             if ((propertyMask and (1 shl 9)) != 0) templateType = flex.readU32().toInt()
         }
+        // Sticker placements (nested `.sdocx` attachments) live in the same
+        // flexible properties (`co_attach_file` block with `skn_collapse_rect`
+        // / `skn_bg_color` entries); without them stickies land on the wrong
+        // page at the wrong position.
+        try {
+            if (propertyOffset != 0) {
+                stickers = parseStickerAttachments(data.copyOfRange(propertyOffset, rawLayerOffset))
+            }
+        } catch (_: Exception) {
+        }
 
         val lr = SdocxReader(data, rawLayerOffset)
         val layerCount = lr.readU16()
@@ -534,7 +757,125 @@ object SdocxParser {
             backgroundImageMode = backgroundImageMode,
             backgroundWidth = backgroundWidth,
             backgroundRotation = backgroundRotation,
+            stickers = stickers,
         )
+    }
+
+    /**
+     * Sticker placements from a page's flexible properties: each
+     * `co_attach_file` block names the attached nested `.sdocx` (bind id)
+     * and carries `skn_bg_color` / `skn_collapse_rect` entries. Names and
+     * values in this block are ASCII (unlike the UTF-16 elsewhere in the
+     * format). Never throws; unknown blocks yield no stickers so import falls
+     * back to the legacy first-empty-page placement.
+     */
+    fun parseStickerAttachments(flex: ByteArray): List<SdocxSticker> {
+        val out = ArrayList<SdocxSticker>()
+        try {
+            if (flex.size < 8) return out
+            val marker = "co_attach_file".toByteArray(Charsets.US_ASCII)
+            var searchFrom = 0
+            while (searchFrom <= flex.size - marker.size) {
+                val nameIdx = indexOfSubArray(flex, marker, searchFrom) ?: break
+                try {
+                    var off = nameIdx + marker.size
+                    if (off + 8 > flex.size) {
+                        searchFrom = nameIdx + 2
+                        continue
+                    }
+                    val bindId = leI32At(flex, off)
+                    off += 4
+                    val entryCount = leU32At(flex, off).toInt()
+                    off += 4
+                    if (bindId < 0 || entryCount < 0 || entryCount > 64) {
+                        searchFrom = nameIdx + 2
+                        continue
+                    }
+                    var rect: SdocxRect? = null
+                    var bg: Int? = null
+                    var ok = true
+                    repeat(entryCount) {
+                        if (!ok) return@repeat
+                        if (off + 4 > flex.size) {
+                            ok = false
+                            return@repeat
+                        }
+                        val nameLen = leU32At(flex, off).toInt()
+                        off += 4
+                        if (nameLen < 0 || nameLen > 256 || off + nameLen > flex.size) {
+                            ok = false
+                            return@repeat
+                        }
+                        val key = try {
+                            String(flex.copyOfRange(off, off + nameLen), Charsets.US_ASCII)
+                        } catch (_: Exception) {
+                            ""
+                        }
+                        off += nameLen
+                        if (off + 4 > flex.size) {
+                            ok = false
+                            return@repeat
+                        }
+                        val valLen = leU32At(flex, off).toInt()
+                        off += 4
+                        if (valLen < 0 || valLen > 4096 || off + valLen > flex.size) {
+                            ok = false
+                            return@repeat
+                        }
+                        val raw = flex.copyOfRange(off, off + valLen)
+                        off += valLen
+                        val value = try {
+                            String(raw, Charsets.US_ASCII)
+                        } catch (_: Exception) {
+                            ""
+                        }
+                        when (key) {
+                            "skn_collapse_rect" -> parseRectString(value)?.let { rect = it }
+                            "skn_bg_color" -> value.trim().toIntOrNull()?.let { bg = it }
+                        }
+                    }
+                    if (ok) out.add(SdocxSticker(bindId, rect, bg))
+                    searchFrom = off
+                } catch (_: Exception) {
+                    searchFrom = nameIdx + 2
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    private fun indexOfSubArray(hay: ByteArray, needle: ByteArray, from: Int): Int? {
+        if (needle.isEmpty() || from > hay.size - needle.size) return null
+        var i = from.coerceAtLeast(0)
+        while (i <= hay.size - needle.size) {
+            var j = 0
+            while (j < needle.size && hay[i + j] == needle[j]) j++
+            if (j == needle.size) return i
+            i++
+        }
+        return null
+    }
+
+    private fun leI32At(b: ByteArray, off: Int): Int {
+        return (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8) or
+            ((b[off + 2].toInt() and 0xFF) shl 16) or ((b[off + 3].toInt() and 0xFF) shl 24)
+    }
+
+    private fun leU32At(b: ByteArray, off: Int): Long {
+        return (leI32At(b, off).toLong() and 0xFFFFFFFFL)
+    }
+
+    private fun parseRectString(s: String): SdocxRect? {
+        return try {
+            val parts = s.trim().split(",")
+            if (parts.size != 4) return null
+            val v = parts.map { it.trim().toDoubleOrNull() ?: return null }
+            if (v.any { !it.isFinite() }) return null
+            SdocxRect(minOf(v[0], v[2]), minOf(v[1], v[3]), maxOf(v[0], v[2]), maxOf(v[1], v[3]))
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Everything one page's layers collect. */
@@ -597,19 +938,67 @@ object SdocxParser {
                     val tb = try { decodeTextBox(payload) } catch (_: Exception) { null }
                     tb?.let { out.textBoxes.add(it) }
                     // Inline photos attached to a text run live in the text
-                    // payload's object spans, which the textbox decoder
-                    // skips: salvage every image fill so they still import.
+                    // payload's object spans. Prefer their stored bboxes and
+                    // ids; fall back to a fill scan with the box bbox so a
+                    // rigid TextCommon layout never drops a real photo.
                     try {
-                        val box = tb?.bbox ?: readObjectMeta(payload)?.bbox
-                        if (box != null) {
-                            for (id in scanImageBindIds(payload)) {
-                                out.images.add(SdocxImage(box, id, null))
+                        val precise = extractTextInlineImages(payload)
+                        if (precise.isNotEmpty()) {
+                            out.images.addAll(precise)
+                        } else {
+                            val box = tb?.bbox ?: readObjectMeta(payload)?.bbox
+                            if (box != null) {
+                                for (id in scanImageBindIds(payload)) {
+                                    out.images.add(SdocxImage(box, id, null))
+                                }
                             }
                         }
                     } catch (_: Exception) {
                     }
                 }
-                3 -> decodeImage(payload)?.let { out.images.add(it) }
+                3 -> {
+                    val img = try {
+                        decodeImage(payload)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (img != null) {
+                        out.images.add(img)
+                    } else {
+                        // Never drop a raster just because the frame chain is
+                        // newer than the strict decoder: keep the stored bbox
+                        // (even when hidden) plus every scanned bind id so the
+                        // importer can fall back to unused media bytes.
+                        try {
+                            val meta = try {
+                                readObjectMeta(payload)
+                            } catch (_: Exception) {
+                                null
+                            }
+                            val box = meta?.bbox
+                            val ids = try {
+                                scanImageBindIds(payload)
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+                            if (box != null && ids.isNotEmpty()) {
+                                for (id in ids) out.images.add(SdocxImage(box, id, meta?.rotationDegrees))
+                            } else if (box != null) {
+                                out.images.add(SdocxImage(box, null, meta?.rotationDegrees))
+                            } else if (ids.isNotEmpty()) {
+                                for (id in ids) out.images.add(
+                                    SdocxImage(SdocxRect(0.0, 0.0, 400.0, 400.0), id, null),
+                                )
+                            } else {
+                                // No bbox and no scanned id: still keep a
+                                // placeholder so the importer can surface any
+                                // unused image bytes instead of vanishing.
+                                out.images.add(SdocxImage(SdocxRect(0.0, 0.0, 400.0, 400.0), null, null))
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
                 // Type 4 containers only group children (walked below); types 7/8
                 // are shapes and lines; type 10 is a voice memo; type 22 is a
                 // table. Paintings, videos and stickers stay skipped: the
@@ -622,6 +1011,12 @@ object SdocxParser {
                     decodeShape(payload, stringTable)?.let { out.shapes.add(it) }
                     try {
                         decodeTable(payload)?.let { out.tables.add(it) }
+                    } catch (_: Exception) {
+                    }
+                    // Shape label inline photos (TextCommon object spans) keep
+                    // their stored bboxes; bitmap fills keep the shape bbox.
+                    try {
+                        out.images.addAll(extractShapeLabelImages(payload))
                     } catch (_: Exception) {
                     }
                     for (id in scanImageBindIds(payload)) {
@@ -689,6 +1084,8 @@ object SdocxParser {
         val bbox: SdocxRect,
         val visible: Boolean,
         val rotationDegrees: Double?,
+        /** Base-frame creation time in microseconds since epoch (bit 13), null when absent. */
+        val createdTimeUs: Long?,
     )
 
     private fun readObjectMeta(payload: ByteArray): ObjectMeta? {
@@ -708,12 +1105,38 @@ object SdocxParser {
             fixed.skip(4 + 1)
             val visible = frame.properties.contains(3)
             var rotation: Double? = null
+            var createdTimeUs: Long? = null
             if (frame.fields.contains(0)) {
                 val flex = SdocxReader(frame.flexible)
                 rotation = flex.readF32().toDouble()
                 if (!rotation.isFinite()) return null
+            } else if (frame.fields.contains(13)) {
+                // No rotation (bit 0 absent) but a creation timestamp (bit 13):
+                // flexible is [timestamp i64][pageW u32][pageH u32]. Newer
+                // writers set bits 13+14; older ones carry rotation under bit 0.
+                try {
+                    val flex = SdocxReader(frame.flexible)
+                    if (flex.remaining >= 8) {
+                        createdTimeUs = flex.readI64()
+                    }
+                } catch (_: Exception) {
+                    createdTimeUs = null
+                }
+            } else if (frame.fields.contains(14)) {
+                // Page-size only, no timestamp; leave null.
             }
-            return ObjectMeta(uuid, SdocxRect(left, top, right, bottom), visible, rotation)
+            // Both bits set: rotation first, then timestamp + page size.
+            if (frame.fields.contains(0) && frame.fields.contains(13)) {
+                try {
+                    val flex = SdocxReader(frame.flexible)
+                    flex.skip(4) // rotation f32 already read above
+                    if (flex.remaining >= 8) {
+                        createdTimeUs = flex.readI64()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            return ObjectMeta(uuid, SdocxRect(left, top, right, bottom), visible, rotation, createdTimeUs)
         } catch (_: Exception) {
             return null
         }
@@ -733,6 +1156,9 @@ object SdocxParser {
         val frame = readFrame(r)
         if (frame.kind != 1) return null
         if (frame.properties.contains(3)) return null // eraser
+        // Newer Samsung writers flag tapered ends on the stroke properties
+        // (bit 9, unassigned in older research); coordinates and colors are
+        // decoded the same way either way.
 
         val fixed = SdocxReader(frame.fixed)
         if (fixed.remaining < 2) return null
@@ -827,6 +1253,8 @@ object SdocxParser {
             penNameId = penNameId ?: legacyPenNameId,
             advancedSettingId = advancedPenSettingId,
             toolTypeRaw = toolTypeRaw,
+            tapered = frame.properties.contains(9),
+            createdTimeUs = meta.createdTimeUs?.takeIf { it in 1_000_000_000_000L..4_000_000_000_000_000L },
         )
     }
 
@@ -880,6 +1308,7 @@ object SdocxParser {
         // photos are never dropped by a rigid layout check.
         var strictId: Int? = null
         var strictOk = false
+        var shapeRotation: Double? = null
         try {
             val r = SdocxReader(payload)
             readFrame(r)
@@ -889,6 +1318,10 @@ object SdocxParser {
                     val shape = readFrame(r)
                     if (shape.kind == 7) {
                         strictOk = true
+                        // The shape-fixed block carries its own rotation f32
+                        // after the bbox (mirroring shapes); prefer it over the
+                        // base frame's, which older writers leave unset.
+                        shapeRotation = shapeFixedRotation(shape.fixed)
                         try {
                             val flex = SdocxReader(shape.flexible)
                             if (!shape.fields.contains(5)) {
@@ -910,11 +1343,32 @@ object SdocxParser {
                                         strictId = null
                                     } else if (fillSize > flex.remaining + 1) {
                                         strictId = null
-                                    } else {
+                                    } else if (fillSize == 42 || fillSize == 62) {
                                         val fill = SdocxReader(flex.readBytes(fillSize))
                                         fill.skip(1)
                                         val rawId = fill.readI32()
                                         strictId = if (rawId >= 0) rawId else null
+                                    } else {
+                                        // Newer extended fills: validate the
+                                        // structure (122-byte coedit hashes and
+                                        // unrelated blobs stay null) so fresh
+                                        // Samsung photos still resolve.
+                                        try {
+                                            val fillBytes = flex.readBytes(fillSize)
+                                            val kindByte = 2.toByte()
+                                            val probe = ByteArray(4 + 1 + fillBytes.size)
+                                            // Rebuild the scanned window:
+                                            // size + kind + fill body.
+                                            probe[0] = (fillSize and 0xFF).toByte()
+                                            probe[1] = ((fillSize ushr 8) and 0xFF).toByte()
+                                            probe[2] = ((fillSize ushr 16) and 0xFF).toByte()
+                                            probe[3] = ((fillSize ushr 24) and 0xFF).toByte()
+                                            probe[4] = kindByte
+                                            System.arraycopy(fillBytes, 0, probe, 5, fillBytes.size)
+                                            strictId = isPlausibleImageFill(probe, 0, fillSize)
+                                        } catch (_: Exception) {
+                                            strictId = null
+                                        }
                                     }
                                 }
                             }
@@ -926,25 +1380,46 @@ object SdocxParser {
             }
         } catch (_: Exception) {
         }
-        if (strictOk) return SdocxImage(meta.bbox, strictId ?: scanImageBindId(payload), meta.rotationDegrees)
+        if (strictOk) return SdocxImage(meta.bbox, strictId ?: scanImageBindId(payload), shapeRotation ?: meta.rotationDegrees)
         // Non-standard chain: still a placed raster when an image fill is
         // present. Keep the stored bbox and the scanned bind id.
-        return SdocxImage(meta.bbox, scanImageBindId(payload), meta.rotationDegrees)
+        return SdocxImage(meta.bbox, scanImageBindId(payload), shapeRotation ?: meta.rotationDegrees)
+    }
+
+    /**
+     * Rotation (degrees) from a kind-7 shape-fixed block: u32 template id +
+     * bbox + f32 rotation. Null when absent or non-finite. Mirrors the read
+     * [decodeShape] does for shapes, so image rotation survives import.
+     */
+    private fun shapeFixedRotation(fixed: ByteArray): Double? {
+        return try {
+            if (fixed.size < 4 + 32 + 4) return null
+            val r = SdocxReader(fixed)
+            r.skip(4)
+            r.skip(32)
+            val rot = r.readF32().toDouble()
+            if (rot.isFinite()) rot else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
      * Best-effort scan for an image-fill bind id (`fillSize + kind(2) +
      * imageType + bindId`) anywhere in [payload]. Returns the first plausible
-     * non-negative id, or null. Strict field walking misses real writers that
-     * store photos as shapes or reorder flexible fields; the fill magic
-     * (`u32 size` + `u8 kind == 2`) plus a sane id is distinctive enough.
+     * non-negative id, or null. The native 42/62-byte image fills carry a
+     * main bind id (the 122-byte coedit hash does not); other sizes are
+     * validated structurally (fill mode + bind id + 9 finite floats with the
+     * 100x100 tiling scale) so newer extended fills still resolve while
+     * unrelated data (e.g. audio ids) never mis-resolves as an image.
      */
     fun scanImageBindId(payload: ByteArray): Int? {
+        // Fast path: native fills first (most common).
         var i = 0
         // Need at least size(4) + kind(1) + imageType(1) + bindId(4).
         while (i + 10 <= payload.size) {
             val size = leI32(payload, i)
-            if (size in 32..512 && i + 4 + 1 <= payload.size && payload[i + 4] == 2.toByte()) {
+            if ((size == 42 || size == 62) && i + 4 + 1 <= payload.size && payload[i + 4] == 2.toByte()) {
                 val bindOff = i + 4 + 1 + 1
                 if (bindOff + 4 <= payload.size) {
                     val rawId = leI32(payload, bindOff)
@@ -953,7 +1428,8 @@ object SdocxParser {
             }
             i++
         }
-        return null
+        // Extended fills (newer writers): validate structure, not just size.
+        return scanExtendedImageBindId(payload)
     }
 
     /** All plausible image-fill bind ids in [payload] (photos stored as shapes). */
@@ -962,11 +1438,78 @@ object SdocxParser {
         var i = 0
         while (i + 10 <= payload.size) {
             val size = leI32(payload, i)
-            if (size in 32..512 && payload[i + 4] == 2.toByte()) {
+            if ((size == 42 || size == 62) && payload[i + 4] == 2.toByte()) {
                 val bindOff = i + 4 + 1 + 1
                 if (bindOff + 4 <= payload.size) {
                     val rawId = leI32(payload, bindOff)
                     if (rawId in 0..1_000_000 && !out.contains(rawId)) out.add(rawId)
+                }
+            }
+            i++
+        }
+        for (id in scanExtendedImageBindIds(payload)) {
+            if (!out.contains(id)) out.add(id)
+        }
+        return out
+    }
+
+    /** Validate a candidate image fill at [off] with declared [size]: kind 2,
+     *  plausible bind id, 9 finite floats with the 100x100 tiling scale and a
+     *  0/1 rotatable flag. Catches newer extended fills without snagging
+     *  audio ids or hashes. */
+    private fun isPlausibleImageFill(payload: ByteArray, off: Int, size: Int): Int? {
+        try {
+            if (size < 42 || size > 512) return null
+            if (off + 4 + 1 + 1 + 4 > payload.size) return null
+            if (payload[off + 4] != 2.toByte()) return null
+            if (off + 4 + 1 + size > payload.size) return null
+            val bindOff = off + 4 + 1 + 1
+            val rawId = leI32(payload, bindOff)
+            if (rawId !in 0..1_000_000) return null
+            // Fill body: mode(1) + bind(4) + 9xf32 + rotatable(1) (+ optional nine-patch).
+            // The tiling scale pair (indices 6,7) is 100 on real writers.
+            if (size < 1 + 4 + 36 + 1) return null
+            val floatsOff = bindOff + 4
+            if (floatsOff + 36 > payload.size) return null
+            for (k in 0 until 9) {
+                val bits = leI32(payload, floatsOff + k * 4)
+                val f = java.lang.Float.intBitsToFloat(bits)
+                if (!f.isFinite()) return null
+                if (f < -1e6 || f > 1e6) return null
+            }
+            val scale6 = java.lang.Float.intBitsToFloat(leI32(payload, floatsOff + 6 * 4))
+            val scale7 = java.lang.Float.intBitsToFloat(leI32(payload, floatsOff + 7 * 4))
+            if (scale6 !in 99.0f..101.0f || scale7 !in 99.0f..101.0f) return null
+            val rotOff = floatsOff + 36
+            if (rotOff >= payload.size) return null
+            val rot = payload[rotOff].toInt() and 0xFF
+            if (rot != 0 && rot != 1) return null
+            return rawId
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun scanExtendedImageBindId(payload: ByteArray): Int? {
+        var i = 0
+        while (i + 10 <= payload.size) {
+            val size = leI32(payload, i)
+            if (size != 42 && size != 62 && size in 30..512) {
+                isPlausibleImageFill(payload, i, size)?.let { return it }
+            }
+            i++
+        }
+        return null
+    }
+
+    private fun scanExtendedImageBindIds(payload: ByteArray): List<Int> {
+        val out = ArrayList<Int>()
+        var i = 0
+        while (i + 10 <= payload.size) {
+            val size = leI32(payload, i)
+            if (size != 42 && size != 62 && size in 30..512) {
+                isPlausibleImageFill(payload, i, size)?.let {
+                    if (!out.contains(it)) out.add(it)
                 }
             }
             i++
@@ -1079,10 +1622,12 @@ object SdocxParser {
             val s = SdocxReader(span)
             val objectSize = s.readU32().toInt()
             val objectType = s.readU32().toInt()
-            if (objectSize < 0 || objectSize > span.size - 20) return null
+            // The text index, layout option and constraint follow the object;
+            // writers vary the tail (4 bytes on newer writers, 12 on older),
+            // which is unread — placement comes from the embedded object's
+            // own bbox. Tolerate a short tail like embedded tables do.
+            if (objectSize < 0 || objectSize > span.size - 8) return null
             val objectData = s.readBytes(objectSize)
-            // The text index, layout option and constraint follow; placement
-            // comes from the embedded object's own bbox, so they are unread.
             if (objectType != 3) return null
             decodeImage(objectData)
         } catch (_: Exception) {
@@ -1210,12 +1755,60 @@ object SdocxParser {
             if (!shapeText.fields.contains(0)) return null
             val flex = SdocxReader(shapeText.flexible)
             val rich = decodeTextCommon(flex.readBytes(flex.remaining))
+            if (rich.text.isEmpty() && rich.images.isEmpty()) return null
+            // Image-only boxes (placeholder text only) still carry a box but
+            // import as images; keep an empty-text box out of the text flow.
             if (rich.text.isEmpty()) return null
             val st = resolveBoxStyle(rich)
             SdocxTextBox(meta.bbox, rich.text, st.colorArgb, st.fontSize, st.bold, st.italic,
                 st.underline, st.strike, st.align, meta.rotationDegrees)
         } catch (_: Exception) {
             null
+        }
+    }
+
+    /**
+     * Inline photos inside a type-2 text box payload (TextCommon object spans
+     * of type 3). Never throws; empty when the payload holds no photos or the
+     * TextCommon layout is unknown. Stored bboxes are in page coordinates.
+     */
+    fun extractTextInlineImages(payload: ByteArray): List<SdocxImage> {
+        return try {
+            val r = SdocxReader(payload)
+            readFrame(r) // kind 0
+            if (r.isEof) return emptyList()
+            val shapeBase = readFrame(r)
+            if (shapeBase.kind != 6) return emptyList()
+            if (r.isEof) return emptyList()
+            val shapeText = readFrame(r)
+            if (shapeText.kind != 7) return emptyList()
+            if (!shapeText.fields.contains(0)) return emptyList()
+            val flex = SdocxReader(shapeText.flexible)
+            decodeTextCommon(flex.readBytes(flex.remaining)).images
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Inline photos inside a type-7 shape label (its TextCommon block).
+     * Bitmap fills are handled separately via [scanImageBindIds]; this only
+     * surfaces label-embedded spans. Never throws.
+     */
+    fun extractShapeLabelImages(payload: ByteArray): List<SdocxImage> {
+        return try {
+            val r = SdocxReader(payload)
+            readFrame(r) // kind 0
+            if (r.isEof) return emptyList()
+            readFrame(r) // kind 6
+            if (r.isEof) return emptyList()
+            val shape = readFrame(r)
+            if (shape.kind != 7) return emptyList()
+            if (!shape.fields.contains(0)) return emptyList()
+            val flex = SdocxReader(shape.flexible)
+            decodeTextCommon(flex.readBytes(flex.remaining)).images
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 

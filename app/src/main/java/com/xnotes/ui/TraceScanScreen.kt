@@ -144,10 +144,10 @@ fun TraceScanDialog(
     var tuning by remember { mutableStateOf(false) }
     var tuneMessage by remember { mutableStateOf<String?>(null) }
     var tuneIsError by remember { mutableStateOf(false) }
-    // Per-page AI recipes: page index → the tune stored for it. The preview
-    // and the conversion use a page's recipe when present, the dialog sliders
-    // otherwise, so every PDF page can carry different settings.
-    val pageTunes = remember { mutableStateMapOf<Int, VlmTraceTune.TraceTune>() }
+    // Per-page custom settings: page index → its full recipe. A page follows
+    // the dialog sliders unless it has a recipe (stored by AI tune or by
+    // switching the page to custom), so each PDF page can be tuned alone.
+    val pageCustom = remember { mutableStateMapOf<Int, EffectiveTraceParams>() }
 
     // Serializes the preview pipeline against source-bitmap replacement, so a
     // trace never reads a bitmap the page flip just recycled.
@@ -179,41 +179,45 @@ fun TraceScanDialog(
     }
 
     /**
-     * The filter settings in force for page [p]: its stored AI recipe where
-     * set, the dialog sliders everywhere else. Geometry (crop, fine angle)
-     * stays global; the quarter turn rides with the recipe since page
-     * orientation is genuinely per page.
+     * The filter settings in force for page [p]: its custom recipe when the
+     * page is switched to custom, the dialog sliders otherwise. Geometry
+     * (crop, fine angle) stays global; the quarter turn rides with the recipe
+     * since page orientation is genuinely per page.
      */
     fun effectiveFor(p: Int): EffectiveTraceParams {
-        val t = pageTunes[p]
+        pageCustom[p]?.let { return it }
         return EffectiveTraceParams(
-            autoThreshold = t?.autoThreshold ?: autoThreshold,
-            threshold = (t?.threshold ?: threshold.toInt()).coerceIn(1, 254),
-            brightness = t?.brightness ?: brightness.toInt(),
-            contrast = (t?.contrast ?: contrast.toInt()).coerceIn(50, 200),
-            denoise = (t?.denoise ?: denoise.toInt()).coerceIn(0, 60),
-            removeLines = t?.removeLines ?: removeLines,
-            printedText = t?.printedText ?: printedText,
-            invert = t?.invert ?: invert,
-            enhance = t?.enhance ?: enhance,
-            quarterTurns = (t?.quarterTurns ?: quarterTurns).coerceIn(0, 3),
+            autoThreshold = autoThreshold,
+            threshold = threshold.toInt().coerceIn(1, 254),
+            brightness = brightness.toInt(),
+            contrast = contrast.toInt().coerceIn(50, 200),
+            denoise = denoise.toInt().coerceIn(0, 60),
+            removeLines = removeLines,
+            printedText = printedText,
+            invert = invert,
+            enhance = enhance,
+            quarterTurns = quarterTurns.coerceIn(0, 3),
         )
     }
 
-    /** Human-readable summary of the present settings, sent along for the model. */
+    /** True when page [p] carries its own recipe instead of the globals. */
+    fun isCustom(p: Int): Boolean = pageCustom.containsKey(p)
+
+    /** Human-readable summary of the settings in force, sent along for the model. */
     fun currentSettingsSummary(): String {
+        val eff = effectiveFor(pageIndex)
         val on = context.getString(R.string.trace_ai_on)
         val off = context.getString(R.string.trace_ai_off)
         return listOf(
-            "${context.getString(R.string.trace_auto_threshold)} ${if (autoThreshold) on else "${context.getString(R.string.trace_threshold)} ${threshold.toInt()}"}",
-            "${context.getString(R.string.trace_brightness)} ${brightness.toInt()}",
-            "${context.getString(R.string.trace_contrast)} ${contrast.toInt()}%",
-            "${context.getString(R.string.trace_cleanup)} ${denoise.toInt()}px",
-            "${context.getString(R.string.trace_remove_lines)} ${if (removeLines) on else off}",
-            "${context.getString(R.string.trace_content)} ${context.getString(if (printedText) R.string.trace_content_print else R.string.trace_content_hand)}",
-            "${context.getString(R.string.trace_invert)} ${if (invert) on else off}",
-            "${context.getString(R.string.trace_auto_enhance)} ${if (enhance) on else off}",
-            "${context.getString(R.string.trace_rotation)} ${context.getString(R.string.trace_degrees, quarterTurns * 90)}",
+            "${context.getString(R.string.trace_auto_threshold)} ${if (eff.autoThreshold) on else "${context.getString(R.string.trace_threshold)} ${eff.threshold}"}",
+            "${context.getString(R.string.trace_brightness)} ${eff.brightness}",
+            "${context.getString(R.string.trace_contrast)} ${eff.contrast}%",
+            "${context.getString(R.string.trace_cleanup)} ${eff.denoise}px",
+            "${context.getString(R.string.trace_remove_lines)} ${if (eff.removeLines) on else off}",
+            "${context.getString(R.string.trace_content)} ${context.getString(if (eff.printedText) R.string.trace_content_print else R.string.trace_content_hand)}",
+            "${context.getString(R.string.trace_invert)} ${if (eff.invert) on else off}",
+            "${context.getString(R.string.trace_auto_enhance)} ${if (eff.enhance) on else off}",
+            "${context.getString(R.string.trace_rotation)} ${context.getString(R.string.trace_degrees, eff.quarterTurns * 90)}",
         ).joinToString("; ")
     }
 
@@ -264,8 +268,9 @@ fun TraceScanDialog(
      * Ask the configured vision model for this page's best filter settings and
      * apply whatever it returns. The model sees the photo beside the current
      * edges preview and must answer with explicit values (automatic modes are
-     * normalized away); the recipe is stored for this page and applied to the
-     * dialog, so the preview updates at once and the conversion reuses it.
+     * normalized away); the full recipe is stored for this page alone, which
+     * switches it to custom mode, so the preview updates at once and the
+     * conversion reuses it. Globals stay untouched.
      */
     fun autoTune() {
         val src = sourceBmp ?: return
@@ -332,25 +337,36 @@ fun TraceScanDialog(
                     ?: throw IllegalStateException(context.getString(R.string.trace_ai_failed))
                 // No automatic modes, ever: stray `true` values fall back to an
                 // explicit recipe (Otsu level for the threshold).
-                val tune = VlmTraceTune.normalizeManual(parsed, built.second)
-                pageTunes[page] = tune
+                val sparse = VlmTraceTune.normalizeManual(parsed, built.second)
+                // Materialize the full recipe: model-set fields win, anything it
+                // omitted keeps following the dialog. Stored for this page only —
+                // globals stay untouched, and the page switches to custom mode.
+                val full = EffectiveTraceParams(
+                    autoThreshold = sparse.autoThreshold ?: eff.autoThreshold,
+                    threshold = (sparse.threshold ?: eff.threshold).coerceIn(1, 254),
+                    brightness = sparse.brightness ?: eff.brightness,
+                    contrast = (sparse.contrast ?: eff.contrast).coerceIn(50, 200),
+                    denoise = (sparse.denoise ?: eff.denoise).coerceIn(0, 60),
+                    removeLines = sparse.removeLines ?: eff.removeLines,
+                    printedText = sparse.printedText ?: eff.printedText,
+                    invert = sparse.invert ?: eff.invert,
+                    enhance = sparse.enhance ?: eff.enhance,
+                    quarterTurns = (sparse.quarterTurns ?: eff.quarterTurns).coerceIn(0, 3),
+                )
+                pageCustom[page] = full
                 val on = context.getString(R.string.trace_ai_on)
                 val off = context.getString(R.string.trace_ai_off)
                 val changes = ArrayList<String>()
-                tune.autoThreshold?.let { autoThreshold = it }
-                tune.threshold?.let { threshold = it.toFloat(); changes.add("${context.getString(R.string.trace_threshold)} $it") }
-                tune.brightness?.let { brightness = it.toFloat(); changes.add("${context.getString(R.string.trace_brightness)} $it") }
-                tune.contrast?.let { contrast = it.toFloat(); changes.add("${context.getString(R.string.trace_contrast)} $it%") }
-                tune.denoise?.let { denoise = it.toFloat(); changes.add("${context.getString(R.string.trace_cleanup)} ${it}px") }
-                tune.removeLines?.let { removeLines = it; changes.add("${context.getString(R.string.trace_remove_lines)} ${if (it) on else off}") }
-                tune.printedText?.let {
-                    printedText = it
+                sparse.threshold?.let { changes.add("${context.getString(R.string.trace_threshold)} $it") }
+                sparse.brightness?.let { changes.add("${context.getString(R.string.trace_brightness)} $it") }
+                sparse.contrast?.let { changes.add("${context.getString(R.string.trace_contrast)} $it%") }
+                sparse.denoise?.let { changes.add("${context.getString(R.string.trace_cleanup)} ${it}px") }
+                sparse.removeLines?.let { changes.add("${context.getString(R.string.trace_remove_lines)} ${if (it) on else off}") }
+                sparse.printedText?.let {
                     changes.add("${context.getString(R.string.trace_content)} ${context.getString(if (it) R.string.trace_content_print else R.string.trace_content_hand)}")
                 }
-                tune.invert?.let { invert = it; changes.add("${context.getString(R.string.trace_invert)} ${if (it) on else off}") }
-                tune.enhance?.let { enhance = it }
-                tune.quarterTurns?.let {
-                    quarterTurns = it
+                sparse.invert?.let { changes.add("${context.getString(R.string.trace_invert)} ${if (it) on else off}") }
+                sparse.quarterTurns?.let {
                     changes.add("${context.getString(R.string.trace_rotation)} ${context.getString(R.string.trace_degrees, it * 90)}")
                 }
                 tuneMessage = context.getString(R.string.trace_ai_applied, changes.joinToString(", "))
@@ -402,8 +418,8 @@ fun TraceScanDialog(
             }
             staged = file
             kind = k
-            // A new document means new pages: drop any stored AI recipes.
-            pageTunes.clear()
+            // A new document means new pages: drop any per-page recipes.
+            pageCustom.clear()
         }
     }
 
@@ -435,7 +451,7 @@ fun TraceScanDialog(
     LaunchedEffect(
         sourceBmp, pageIndex, quarterTurns, fineDegrees, cropL, cropT, cropR, cropB,
         brightness, contrast, enhance, autoThreshold, threshold, invert, denoise, removeLines, printedText,
-        pageTunes[pageIndex],
+        pageCustom[pageIndex],
     ) {
         val src = sourceBmp ?: return@LaunchedEffect
         delay(250)
@@ -525,22 +541,20 @@ fun TraceScanDialog(
         val snapName = noteName.ifBlank { Paths.stem(request.sourceName).ifEmpty { "Traced notes" } }
         // Freeze every page's recipe up front: flipping pages or dragging
         // sliders mid-run must not change what later pages trace with.
-        val frozenTunes = HashMap(pageTunes)
-        fun effFor(p: Int): EffectiveTraceParams {
-            val t = frozenTunes[p]
-            return EffectiveTraceParams(
-                autoThreshold = t?.autoThreshold ?: snapAuto,
-                threshold = (t?.threshold ?: snapLevel).coerceIn(1, 254),
-                brightness = t?.brightness ?: snapBright,
-                contrast = (t?.contrast ?: snapContrast).coerceIn(50, 200),
-                denoise = (t?.denoise ?: snapDenoise).coerceIn(0, 60),
-                removeLines = t?.removeLines ?: snapLines,
-                printedText = t?.printedText ?: snapPrint,
-                invert = t?.invert ?: snapInvert,
-                enhance = t?.enhance ?: snapEnhance,
-                quarterTurns = (t?.quarterTurns ?: snapQ).coerceIn(0, 3),
-            )
-        }
+        val frozenCustom = HashMap(pageCustom)
+        val globalFallback = EffectiveTraceParams(
+            autoThreshold = snapAuto,
+            threshold = snapLevel,
+            brightness = snapBright,
+            contrast = snapContrast,
+            denoise = snapDenoise,
+            removeLines = snapLines,
+            printedText = snapPrint,
+            invert = snapInvert,
+            enhance = snapEnhance,
+            quarterTurns = snapQ,
+        )
+        fun effFor(p: Int): EffectiveTraceParams = frozenCustom[p] ?: globalFallback
         scope.launch {
             // An OOM anywhere below becomes a message, never a crash: nothing has
             // been written yet at this point, so there is no partial note to clean.
@@ -694,25 +708,34 @@ fun TraceScanDialog(
                                 Text(stringResource(R.string.trace_show_edges), color = dim, fontSize = 13.sp)
                             }
                         }
-                        // A stored AI recipe overrides the sliders for this page.
-                        if (pageTunes.containsKey(pageIndex)) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    stringResource(R.string.trace_ai_page_badge, pageIndex + 1),
-                                    color = accent, fontSize = 13.sp, modifier = Modifier.weight(1f),
-                                )
-                                TextButton(onClick = { pageTunes.remove(pageIndex) }) { Text(stringResource(R.string.trace_ai_page_reset)) }
-                            }
+                        // Per-page scope: on = this page follows the dialog sliders
+                        // like every image; off = it keeps its own recipe.
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                stringResource(R.string.trace_apply_all),
+                                color = text, fontSize = 13.sp, modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = !isCustom(pageIndex),
+                                onCheckedChange = { global ->
+                                    if (global) pageCustom.remove(pageIndex)
+                                    else if (!isCustom(pageIndex)) pageCustom[pageIndex] = effectiveFor(pageIndex)
+                                },
+                            )
                         }
                     }
                 }
 
                 @Composable
                 fun ParamsContent() {
+                    // Displayed values resolve through the page recipe; writes go
+                    // to the recipe in custom mode, to the globals otherwise.
+                    val eff = effectiveFor(pageIndex)
+                    val custom = isCustom(pageIndex)
                     TraceSection(stringResource(R.string.trace_section_paper)) {
                         if (kind == TracePreprocess.TraceKind.PDF && pageCount > 1) {
                             Text(
@@ -723,13 +746,16 @@ fun TraceScanDialog(
                         Text(stringResource(R.string.trace_rotation), color = dim, fontSize = 13.sp)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             for (q in 0..3) {
-                                val on = quarterTurns == q
+                                val on = eff.quarterTurns == q
                                 Text(
                                     stringResource(R.string.trace_degrees, q * 90), color = if (on) accent else dim,
                                     fontSize = 14.sp,
                                     modifier = Modifier.clip(RoundedCornerShape(6.dp))
                                         .background(if (on) palette.selectionBackground.toComposeColor() else palette.menuBg.toComposeColor())
-                                        .clickable { quarterTurns = q }.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        .clickable {
+                                            if (custom) pageCustom[pageIndex] = eff.copy(quarterTurns = q)
+                                            else quarterTurns = q
+                                        }.padding(horizontal = 12.dp, vertical = 8.dp),
                                 )
                             }
                         }
@@ -769,31 +795,46 @@ fun TraceScanDialog(
                                 stringResource(R.string.trace_content_hand) to false,
                                 stringResource(R.string.trace_content_print) to true,
                             )) {
-                                val on = printedText == print
+                                val on = eff.printedText == print
                                 Text(
                                     label, color = if (on) accent else dim,
                                     fontSize = 14.sp,
                                     modifier = Modifier.clip(RoundedCornerShape(6.dp))
                                         .background(if (on) palette.selectionBackground.toComposeColor() else palette.menuBg.toComposeColor())
-                                        .clickable { printedText = print }.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        .clickable {
+                                            if (custom) pageCustom[pageIndex] = eff.copy(printedText = print)
+                                            else printedText = print
+                                        }.padding(horizontal = 12.dp, vertical = 8.dp),
                                 )
                             }
                         }
                         Text(stringResource(R.string.trace_content_hint), color = dim, fontSize = 12.sp)
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.trace_auto_enhance), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Switch(checked = enhance, onCheckedChange = { enhance = it })
+                            Switch(
+                                checked = eff.enhance,
+                                onCheckedChange = { if (custom) pageCustom[pageIndex] = eff.copy(enhance = it) else enhance = it },
+                            )
                         }
                         Text(stringResource(R.string.trace_auto_enhance_hint), color = dim, fontSize = 12.sp)
-                        TraceSlider(stringResource(R.string.trace_brightness), brightness, -100f, 100f, "%.0f") { brightness = it }
-                        TraceSlider(stringResource(R.string.trace_contrast), contrast, 50f, 200f, "%.0f%%") { contrast = it }
+                        TraceSlider(stringResource(R.string.trace_brightness), eff.brightness.toFloat(), -100f, 100f, "%.0f") {
+                            if (custom) pageCustom[pageIndex] = eff.copy(brightness = it.toInt()) else brightness = it
+                        }
+                        TraceSlider(stringResource(R.string.trace_contrast), eff.contrast.toFloat(), 50f, 200f, "%.0f%%") {
+                            if (custom) pageCustom[pageIndex] = eff.copy(contrast = it.toInt()) else contrast = it
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.trace_auto_threshold), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Switch(checked = autoThreshold, onCheckedChange = { autoThreshold = it })
+                            Switch(
+                                checked = eff.autoThreshold,
+                                onCheckedChange = { if (custom) pageCustom[pageIndex] = eff.copy(autoThreshold = it) else autoThreshold = it },
+                            )
                         }
-                        if (!autoThreshold) {
-                            TraceSlider(stringResource(R.string.trace_threshold), threshold, 1f, 254f, "%.0f") { threshold = it }
-                        } else if (!invert) {
+                        if (!eff.autoThreshold) {
+                            TraceSlider(stringResource(R.string.trace_threshold), eff.threshold.toFloat(), 1f, 254f, "%.0f") {
+                                if (custom) pageCustom[pageIndex] = eff.copy(threshold = it.toInt()) else threshold = it
+                            }
+                        } else if (!eff.invert) {
                             Text(
                                 stringResource(R.string.trace_auto_local),
                                 color = dim, fontSize = 13.sp, modifier = Modifier.padding(bottom = 4.dp),
@@ -806,13 +847,21 @@ fun TraceScanDialog(
                         }
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.trace_invert), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Switch(checked = invert, onCheckedChange = { invert = it })
+                            Switch(
+                                checked = eff.invert,
+                                onCheckedChange = { if (custom) pageCustom[pageIndex] = eff.copy(invert = it) else invert = it },
+                            )
                         }
                         Text(stringResource(R.string.trace_invert_hint), color = dim, fontSize = 12.sp)
-                        TraceSlider(stringResource(R.string.trace_cleanup), denoise, 0f, 60f, "%.0f") { denoise = it }
+                        TraceSlider(stringResource(R.string.trace_cleanup), eff.denoise.toFloat(), 0f, 60f, "%.0f") {
+                            if (custom) pageCustom[pageIndex] = eff.copy(denoise = it.toInt()) else denoise = it
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.trace_remove_lines), color = text, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Switch(checked = removeLines, onCheckedChange = { removeLines = it })
+                            Switch(
+                                checked = eff.removeLines,
+                                onCheckedChange = { if (custom) pageCustom[pageIndex] = eff.copy(removeLines = it) else removeLines = it },
+                            )
                         }
                         Text(stringResource(R.string.trace_remove_lines_hint), color = dim, fontSize = 12.sp)
                     }

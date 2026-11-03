@@ -4,9 +4,12 @@ import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.os.Build
 import com.xnotes.core.geometry.Flip
@@ -20,9 +23,11 @@ import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
+import com.xnotes.core.pal.RIBBON_JOIN_DISC_ANGLE
 import com.xnotes.core.pal.TextFlags
-import com.xnotes.core.stroke.PencilField
-import com.xnotes.core.stroke.PencilGrain
+import com.xnotes.core.pal.ribbonJoinTurn
+import com.xnotes.core.pal.ribbonJoinStations
+import com.xnotes.core.stroke.PencilTexture
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 
@@ -42,6 +47,15 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         strokeCap = Paint.Cap.ROUND
     }
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isDither = true }
+    /**
+     * The pencil's own fill paint: grain shader, overwrite xfermode and ink
+     * tint live here so they can never leak into any other draw. Bilinear
+     * sampling so the tooth stays fine instead of chunking at high zoom.
+     */
+    private val pencilPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        isFilterBitmap = true
+    }
     private val animBadgeFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; color = android.graphics.Color.argb(210, 20, 22, 28)
     }
@@ -52,6 +66,29 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         style = Paint.Style.FILL; color = android.graphics.Color.argb(255, 255, 255, 255)
     }
     private val rasterBlendPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isDither = true }
+    /**
+     * When true, placed images ([drawImage]) and plain raster blits ([drawRaster]) draw
+     * lightness-inverted: the "invert images" half of the color-inversion display mode.
+     * [drawRasterBlended] (highlighter compositing) stays untouched.
+     */
+    override var invertImageContent: Boolean = false
+    private val invertBitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        isDither = true
+        // The notes app's invert matrix (same as InvertWidget.filter): flips luminance,
+        // keeps hue, alpha untouched. Reds stay red instead of turning cyan.
+        colorFilter = android.graphics.ColorMatrixColorFilter(
+            android.graphics.ColorMatrix(
+                floatArrayOf(
+                    1f - 2f * 0.213f, -2f * 0.715f, -2f * 0.072f, 0f, 255f,
+                    -2f * 0.213f, 1f - 2f * 0.715f, -2f * 0.072f, 0f, 255f,
+                    -2f * 0.213f, -2f * 0.715f, 1f - 2f * 0.072f, 0f, 255f,
+                    0f, 0f, 0f, 1f, 0f,
+                ),
+            ),
+        )
+    }
+    /** The bitmap paint for image and raster draws, honouring [invertImageContent] without touching shared state. */
+    private val imagePaint: Paint get() = if (invertImageContent) invertBitmapPaint else bitmapPaint
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val layerPaint = Paint()
     private val mathInk by lazy { MathRendering.Ink() }
@@ -190,50 +227,101 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
     }
 
     /**
-     * A pencil run as rasterized graphite: the tessellated ribbon shaded by the
-     * page-anchored field both renderers share, so the committed stroke is the
-     * live texture rather than stamped dots. Tiles the run so no bitmap grows
-     * without bound; the union path is exact because coverage is a pure
-     * function of page position.
+     * A pencil run as one union path: the pen's swept ribbon (same quad math),
+     * but with discs only where the run truly needs them. One WINDING path
+     * paints every pixel exactly once, so translucent pressure tone never
+     * double-darkens — not at folds, caps or joins. The fill wears the grain
+     * tile (see [PencilTexture]) through a repeating shader aligned to
+     * content coordinates, so committed strokes carry the same tooth as the
+     * live GL cover.
      */
-    override fun fillPencil(
-        positions: DoubleArray,
-        colors: IntArray,
-        indices: IntArray,
-        ink: Rgba,
-        seed: Int,
-        tipMix: Float,
+    override fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float,
+        capStart: Boolean,
+        capEnd: Boolean,
+        overwrite: Boolean,
+        endJoin: Boolean,
+        ox: Double,
+        oy: Double,
+        density: Double,
+        shade: Double,
+        grainSize: Double,
     ) {
-        if (positions.isEmpty() || indices.isEmpty() || colors.isEmpty()) return
-        // LOD from the canvas scale, like the GL zoom fade: full grain at
-        // normal zoom, averaged out when minified.
-        val q = PencilGrain.lodQuality(avgScale.toDouble())
-        for (chunk in PencilField.render(positions, colors, indices, ink, q, seed = seed, tipMix = tipMix.toDouble())) {
-            if (chunk.w <= 0 || chunk.h <= 0) continue
-            val bmp = Bitmap.createBitmap(chunk.w, chunk.h, Bitmap.Config.ARGB_8888)
-            bmp.setPixels(chunk.pixels, 0, chunk.w, 0, 0, chunk.w, chunk.h)
-            canvas.drawBitmap(
-                bmp,
-                null,
-                RectF(
-                    chunk.left.toFloat(), chunk.top.toFloat(),
-                    (chunk.left + chunk.w * PencilField.FIELD_PX).toFloat(),
-                    (chunk.top + chunk.h * PencilField.FIELD_PX).toFloat(),
-                ),
-                bitmapPaint,
-            )
-            // A software canvas consumed the pixels synchronously; a hardware
-            // canvas may still reference the bitmap, so only it is recycled.
-            if (!canvas.isHardwareAccelerated) bmp.recycle()
+        if (count <= 0) return
+        val end = from + count
+        val path = Path().apply { fillType = Path.FillType.WINDING }
+        appendRibbon(path, centers, radii, from, end, radiusScale)
+        fun disc(i: Int) {
+            val r = radii[i] * radiusScale
+            if (r > 0f) path.addCircle(centers[2 * i], centers[2 * i + 1], r, Path.Direction.CW)
         }
+        if (count == 1) {
+            if (capStart || capEnd) disc(from)
+        } else {
+            if (capStart) disc(from)
+            if (capEnd) disc(end - 1)
+            for (i in ribbonJoinStations(centers, from, count)) disc(i)
+            // A hard turn exactly on the run's last station (a bake-then-tail
+            // seam): the next run starts past it, so this run owns its disc.
+            if (endJoin && !capEnd) disc(end - 1)
+        }
+        // Opaque graphite stipple at [density]: the pre-thresholded tile
+        // carries the tooth, the tint carries the ink. A dedicated paint so
+        // neither the overwrite xfermode, the shader nor the tint can ever
+        // leak into any other draw. The matrix maps geometry to tile space at
+        // the stroke's grain size, shifted by sticky offset plus grain phase.
+        val span = PencilTexture.TILE_CONTENT_PX * grainSize.coerceIn(0.1, 8.0)
+        val s = 1f / span.toFloat()
+        grainMatrix.setScale(s, s)
+        if (ox != 0.0 || oy != 0.0) grainMatrix.preTranslate(ox.toFloat(), oy.toFloat())
+        val shader = PencilTexture.tileShader(density)
+        shader.setLocalMatrix(grainMatrix)
+        // Opaque tinted stipple: the tile carries the tooth as binary alpha,
+        // the tint carries the pressure shade. Paint colour is ignored under
+        // a shader — the SRC_IN tint is what inks the grains.
+        pencilPaint.color = color.toArgb()
+        pencilPaint.shader = shader
+        pencilPaint.colorFilter = PorterDuffColorFilter(shadedInk(color, shade).toArgb(), PorterDuff.Mode.SRC_IN)
+        if (overwrite) pencilPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC)
+        canvas.drawPath(path, pencilPaint)
+        pencilPaint.shader = null
+        pencilPaint.colorFilter = null
+        pencilPaint.xfermode = null
+    }
+
+    /** Scratch matrix for the grain shader's per-fill alignment. */
+    private val grainMatrix = Matrix()
+
+    /** Ink mixed toward white by [shade]: the pressure-driven grain colour. */
+    private fun shadedInk(color: Rgba, shade: Double): Rgba {
+        val s = shade.coerceIn(0.0, 1.0)
+        return Rgba(
+            (255 + (color.r - 255) * s).toInt(),
+            (255 + (color.g - 255) * s).toInt(),
+            (255 + (color.b - 255) * s).toInt(),
+            255,
+        )
     }
 
     /**
      * The swept-disc ribbon quads over `[from, end)`, wound consistently so
      * overlapping pieces union under WINDING (the [Geometry.ribbonQuad] math
-     * inlined, so a dense page allocates nothing per point).
+     * inlined, so a dense page allocates nothing per point). [radiusScale]
+     * shrinks the ribbon about its centreline (the pencil's inset core).
      */
-    private fun appendRibbon(path: Path, centers: FloatArray, radii: FloatArray, from: Int, end: Int) {
+    private fun appendRibbon(
+        path: Path,
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        end: Int,
+        radiusScale: Float = 1f,
+    ) {
         for (i in from until end - 1) {
             val x0 = centers[2 * i]
             val y0 = centers[2 * i + 1]
@@ -245,8 +333,8 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             if (len < 1e-9f) continue
             val nx = -dy / len
             val ny = dx / len
-            val r0 = radii[i]
-            val r1 = radii[i + 1]
+            val r0 = radii[i] * radiusScale
+            val r1 = radii[i + 1] * radiusScale
             val ax = x0 + nx * r0
             val ay = y0 + ny * r0
             val bx = x1 + nx * r1
@@ -365,7 +453,7 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             android.graphics.Rect(it.left.toInt(), it.top.toInt(), it.right.toInt(), it.bottom.toInt())
         }
         val destRect = RectF(dest.left.toFloat(), dest.top.toFloat(), dest.right.toFloat(), dest.bottom.toFloat())
-        canvas.drawBitmap(bmp, srcRect, destRect, bitmapPaint)
+        canvas.drawBitmap(bmp, srcRect, destRect, if (invertImageContent) invertBitmapPaint else bitmapPaint)
     }
 
     // MULTIPLY uses the W3C separable blend (API 29+); below that (and for SRC_OVER) it falls back
@@ -415,14 +503,14 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         if (flip != Flip.NONE) canvas.scale(if (flip.x) -1f else 1f, if (flip.y) -1f else 1f)
         if (o != 0) canvas.rotate(o.toFloat())
         if (p == null) {
-            canvas.drawBitmap(bmp, null, RectF(-uw / 2f, -uh / 2f, uw / 2f, uh / 2f), bitmapPaint)
+            canvas.drawBitmap(bmp, null, RectF(-uw / 2f, -uh / 2f, uw / 2f, uh / 2f), imagePaint)
         } else {
             // The whole picture laid where its part fills the box, the clip showing only the part.
             val w = uw / p.w
             val h = uh / p.h
             val cx = (0.5 - p.centerX) * w
             val cy = (0.5 - p.centerY) * h
-            canvas.drawBitmap(bmp, null, RectF((cx - w / 2).toFloat(), (cy - h / 2).toFloat(), (cx + w / 2).toFloat(), (cy + h / 2).toFloat()), bitmapPaint)
+            canvas.drawBitmap(bmp, null, RectF((cx - w / 2).toFloat(), (cy - h / 2).toFloat(), (cx + w / 2).toFloat(), (cy + h / 2).toFloat()), imagePaint)
         }
         canvas.restore()
         // Math Studio animation filmstrips carry their setup in the PNG itself: badge them so a
@@ -494,7 +582,7 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         // A slice may reach past the part it was cut for; the box is where the part ends.
         if (part != null) canvas.clipRect(dest.left.toFloat(), dest.top.toFloat(), dest.right.toFloat(), dest.bottom.toFloat())
         if (flip != Flip.NONE) canvas.scale(if (flip.x) -1f else 1f, if (flip.y) -1f else 1f, target.centerX(), target.centerY())
-        canvas.drawBitmap(slice.bitmap, null, target, bitmapPaint)
+        canvas.drawBitmap(slice.bitmap, null, target, imagePaint)
         canvas.restore()
         return true
     }
@@ -614,4 +702,28 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         /** Long-edge cap (device px) for an on-screen image decode, so extreme zoom can't OOM. */
         private const val DECODE_CAP_PX = 4096
     }
+}
+
+/** Inverts [this]'s pixels with the notes app's luma matrix (alpha untouched). The bitmap must be mutable and owned. */
+fun Bitmap.invertPixels() {
+    val w = width
+    val h = height
+    if (w <= 0 || h <= 0) return
+    val pixels = IntArray(w * h)
+    getPixels(pixels, 0, w, 0, 0, w, h)
+    for (i in pixels.indices) {
+        val p = pixels[i]
+        val r = ((p shr 16) and 0xFF).toDouble()
+        val g = ((p shr 8) and 0xFF).toDouble()
+        val b = (p and 0xFF).toDouble()
+        // Same matrix as InvertWidget.filter, rounded half up like a color-matrix blit.
+        val nr = ((1.0 - 2.0 * 0.213) * r - 2.0 * 0.715 * g - 2.0 * 0.072 * b + 255.0)
+        val ng = (-2.0 * 0.213 * r + (1.0 - 2.0 * 0.715) * g - 2.0 * 0.072 * b + 255.0)
+        val nb = (-2.0 * 0.213 * r - 2.0 * 0.715 * g + (1.0 - 2.0 * 0.072) * b + 255.0)
+        pixels[i] = (p and -0x1000000) or
+            (kotlin.math.floor(nr + 0.5).toInt().coerceIn(0, 255) shl 16) or
+            (kotlin.math.floor(ng + 0.5).toInt().coerceIn(0, 255) shl 8) or
+            kotlin.math.floor(nb + 0.5).toInt().coerceIn(0, 255)
+    }
+    setPixels(pixels, 0, w, 0, 0, w, h)
 }

@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import kotlin.math.cos
+import kotlin.math.PI
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -196,23 +197,31 @@ internal data class Quat(val w: Double, val x: Double, val y: Double, val z: Dou
 }
 
 internal class OrbitState {
-    var quat by mutableStateOf(Quat.axisAngle(1.0, 0.0, 0.0, -0.46).times(Quat.axisAngle(0.0, 0.0, 1.0, 0.72)))
+    var quat by mutableStateOf(isoQuat())
     var zoom by mutableStateOf(1f)
 
     fun reset() {
-        quat = Quat.axisAngle(1.0, 0.0, 0.0, -0.46).times(Quat.axisAngle(0.0, 0.0, 1.0, 0.72))
+        quat = isoQuat()
         zoom = 1f
     }
 
     /**
-     * Free trackball with content-follows-finger direction: dragging right moves the
-     * graph right, dragging up moves it up. No clamps: full 360° on every axis.
+     * Turntable orbit: a horizontal drag yaws around world Z (the vertical), a vertical
+     * drag pitches around the camera's right axis, so motion on screen follows the finger.
+     * Rate is 0.5 degrees per dp, density-independent. No clamps: full 360°.
+     *
+     * Frame order matters. The projector maps world to camera as r = M * n, so a world
+     * rotation Y composes on the RIGHT (M' = M * Y) while a camera-frame rotation P
+     * composes on the LEFT (M' = P * M). The combined step is therefore
+     * q' = pitch_cam * q * yaw_world: the z-axis tip stays fixed under pure horizontal
+     * drags (no roll) and vertical drags move pixels purely vertically.
      */
-    fun drag(dxPx: Float, dyPx: Float) {
-        val k = 0.008
+    fun drag(dxPx: Float, dyPx: Float, density: Float = 1f) {
+        if (!dxPx.isFinite() || !dyPx.isFinite() || !density.isFinite() || density <= 0f) return
+        val k = (0.5 * PI / 180.0) / density
         val yaw = Quat.axisAngle(0.0, 0.0, 1.0, dxPx * k)
-        val pitch = Quat.axisAngle(1.0, 0.0, 0.0, dyPx * k)
-        quat = (yaw.times(pitch)).times(quat)
+        val pitch = Quat.axisAngle(1.0, 0.0, 0.0, -dyPx * k)
+        quat = pitch.times(quat).times(yaw)
     }
 }
 
@@ -231,6 +240,6 @@ internal fun quatProject(
     val rx = m[0] * nx + m[1] * ny + m[2] * nz
     val ry = m[3] * nx + m[4] * ny + m[5] * nz
     val rz = m[6] * nx + m[7] * ny + m[8] * nz
-    val scale = minOf(w, h) * 0.36f * zoom
+    val scale = minOf(w, h) * 0.48f * zoom
     return Triple((w / 2f + rx * scale).toFloat(), (h * 0.54f - ry * scale).toFloat(), rz.toFloat())
 }

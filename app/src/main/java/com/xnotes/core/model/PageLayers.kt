@@ -17,8 +17,17 @@ object PageLayers {
     /** Paint [items] through [each] with [text] in its place: after the fills under it, before the rest. */
     inline fun paint(items: List<CanvasItem>, text: () -> Unit, each: (CanvasItem) -> Unit) {
         val n = underText(items)
-        for (i in 0 until n) each(items[i])
+        val stickies = ArrayList<CanvasItem>()
+        for (i in 0 until n) {
+            val it = items[i]
+            if (it is StickyNoteItem) stickies.add(it) else each(it)
+        }
         text()
-        for (i in n until items.size) each(items[i])
+        for (i in n until items.size) {
+            val it = items[i]
+            if (it is StickyNoteItem) stickies.add(it) else each(it)
+        }
+        // Sticky notes always sit in front of page ink, whatever the document order says.
+        for (it in stickies) each(it)
     }
 }

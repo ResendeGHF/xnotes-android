@@ -229,7 +229,11 @@ internal object TemplateThumbs {
     fun render(t: Template, s: Spec, keep: Boolean): ImageBitmap? {
         if (keep) cached(s)?.let { return it }
         val (w, h) = s.pageMm
-        val hPx = (s.wPx * h / w).toInt().coerceAtLeast(8)
+        // The strip and preview boxes clamp the aspect (see TemplateStrip/TemplatePreview), so the
+        // bitmap keeps that same aspect: an unclamped bitmap letterboxes into an identical strip on
+        // every tile. The layout still spans the full page (ruling scale stays true); paint crops.
+        val aspect = (h / w).coerceIn(0.5, 2.0)
+        val hPx = (s.wPx * aspect).toInt().coerceAtLeast(8)
         val img = runCatching {
             val bmp = Bitmap.createBitmap(s.wPx, hPx, Bitmap.Config.ARGB_8888)
             val c = Canvas(bmp)

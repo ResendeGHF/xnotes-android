@@ -1,5 +1,6 @@
 package com.xnotes.core.infinite
 
+import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
@@ -54,42 +55,88 @@ class EraseSession(private val doc: InfiniteDocument) {
      * what a lock is for. A fill it touches at all goes whole, in both modes; a filled shape it
      * touches inside but not on its outline loses just its fill (see [EraseRule]).
      */
-    fun erase(cx: Double, cy: Double, radius: Double, area: Boolean): Rect? {
-        val box = Rect(cx - radius, cy - radius, radius * 2, radius * 2)
-        var dirty: Rect? = null
-        for (item in doc.itemsIn(box)) {
-            if (!EraseRule.erasable(item)) continue
-            if (EraseRule.takesFill(item, cx, cy, radius)) {
-                val shape = item as ShapeItem
-                unfilled.add(RefillShapes.Entry(shape, shape.fillRgba, null))
-                shape.fillRgba = null
-                doc.itemsChanged(listOf(shape))
-                dirty = dirty?.union(shape.paintBounds()) ?: shape.paintBounds()
-                continue
-            }
-            val whole = EraseRule.whole(item)
-            val fragments: List<CanvasItem> = if (area && !whole) {
-                when (item) {
-                    is Stroke -> item.erasedBy(cx, cy, radius) ?: continue
-                    // A cut shape's label stays behind as drawn text.
-                    is ShapeItem -> item.erasedBy(cx, cy, radius)?.let { it + listOfNotNull(item.labelAsGlyphs()) } ?: continue
-                    is ConnectorItem -> item.erasedBy(cx, cy, radius)?.let { it + listOfNotNull(item.labelAsGlyphs()) } ?: continue
-                    else -> continue
-                }
-            } else {
-                if (!EraseRule.takes(item, cx, cy, radius)) continue
-                emptyList()
-            }
-            for (f in fragments) {
-                f.sync = item.sync // pieces were written when the whole was
-                f.group = item.group
-            }
-            val touched = item.paintBounds()
-            val at = doc.replaceItem(item, fragments)
-            if (at < 0) continue
-            record(item, at, fragments)
-            dirty = dirty?.union(touched) ?: touched
+    fun erase(cx: Double, cy: Double, radius: Double, area: Boolean): Rect? =
+        erasePoints(listOf(Pt(cx, cy)), radius, area)
+
+    /**
+     * Pass the eraser over a chain of content-space points sharing one [radius], as one input
+     * event delivers them (its historical samples plus the newest). Exactly the sequence of
+     * [erase] calls with the same arguments, but with a single spatial query: the union of the
+     * per-point boxes covers every point's own box, and fragments created mid-chain ride a live
+     * list so later points re-cut them just as a fresh per-point query would find them.
+     */
+    fun erasePoints(pts: List<Pt>, radius: Double, area: Boolean): Rect? {
+        if (pts.isEmpty()) return null
+        var minX = Double.POSITIVE_INFINITY
+        var minY = Double.POSITIVE_INFINITY
+        var maxX = Double.NEGATIVE_INFINITY
+        var maxY = Double.NEGATIVE_INFINITY
+        for (p in pts) {
+            if (p.x < minX) minX = p.x
+            if (p.y < minY) minY = p.y
+            if (p.x > maxX) maxX = p.x
+            if (p.y > maxY) maxY = p.y
         }
+        val union = Rect(minX - radius, minY - radius, (maxX - minX) + radius * 2, (maxY - minY) + radius * 2)
+        // Order-independent (see [erase]): entries record their own slots, and undo replays them
+        // in reverse, so the unordered candidate set erases and restores exactly like sorted ones.
+        val live = ArrayList(doc.itemsInUnsorted(union))
+        // Originals already consumed by an earlier point of this chain; a fresh per-point query
+        // would no longer return them.
+        val gone = IdentityHashMap<CanvasItem, Unit>()
+        var dirty: Rect? = null
+        var replaced = false
+        for (p in pts) {
+            val box = Rect(p.x - radius, p.y - radius, radius * 2, radius * 2)
+            // Snapshot: fragments created by this point join [live] but wait for the next point,
+            // exactly as a fresh query would only find them afterwards.
+            val snap = live.toList()
+            for (item in snap) {
+                if (gone.containsKey(item)) continue
+                if (!EraseRule.erasable(item)) continue
+                if (!item.paintBounds().intersects(box)) continue
+                if (EraseRule.takesFill(item, p.x, p.y, radius)) {
+                    val shape = item as ShapeItem
+                    unfilled.add(RefillShapes.Entry(shape, shape.fillRgba, null))
+                    shape.fillRgba = null
+                    doc.itemsChanged(listOf(shape))
+                    dirty = dirty?.union(shape.paintBounds()) ?: shape.paintBounds()
+                    continue
+                }
+                val whole = EraseRule.whole(item)
+                val fragments: List<CanvasItem> = if (area && !whole) {
+                    when (item) {
+                        is Stroke -> item.erasedBy(p.x, p.y, radius) ?: continue
+                        // A cut shape's label stays behind as drawn text.
+                        is ShapeItem -> item.erasedBy(p.x, p.y, radius)?.let { it + listOfNotNull(item.labelAsGlyphs()) } ?: continue
+                        is ConnectorItem -> item.erasedBy(p.x, p.y, radius)?.let { it + listOfNotNull(item.labelAsGlyphs()) } ?: continue
+                        else -> continue
+                    }
+                } else {
+                    if (!EraseRule.takes(item, p.x, p.y, radius)) continue
+                    emptyList()
+                }
+                for (f in fragments) {
+                    f.sync = item.sync // pieces were written when the whole was
+                    f.group = item.group
+                }
+                val touched = item.paintBounds()
+                // Coalesce the z-order publish across everything this pass cuts: each splice still
+                // re-files the index at once, but one ordering covers the whole pass instead of one
+                // per item (each of which copies the full item list).
+                val at = doc.replaceItem(item, fragments, notifyOrder = false)
+                if (at < 0) {
+                    gone[item] = Unit
+                    continue
+                }
+                replaced = true
+                record(item, at, fragments)
+                dirty = dirty?.union(touched) ?: touched
+                gone[item] = Unit
+                for (f in fragments) live.add(f)
+            }
+        }
+        if (replaced) doc.notifyOrderChanged()
         return dirty
     }
 

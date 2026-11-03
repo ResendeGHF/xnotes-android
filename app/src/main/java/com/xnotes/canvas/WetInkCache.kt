@@ -3,10 +3,12 @@ package com.xnotes.canvas
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
+import com.xnotes.core.pal.InvertingRenderer
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.pal.SurfaceFactory
 import com.xnotes.core.stroke.WetRibbon
+import com.xnotes.core.tools.Tool
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.hypot
@@ -48,6 +50,9 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
     /** The stroke the surface holds, by identity; a different one starts over. */
     private var owner: Stroke? = null
 
+    /** When true the baked runs paint lightness-inverted (color inversion); set per stroke by the host. */
+    var invertColors: Boolean = false
+
     /** Ribbon points already in the surface. */
     private var baked = 0
 
@@ -65,6 +70,12 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
     fun paint(r: Renderer, stroke: Stroke, res: Double, maxPixels: Long): Boolean {
         val ribbon = stroke.wetRibbon ?: return false
         if (!stroke.wetCacheable) return false
+        // The pencil repaints whole every frame instead: its bands replace
+        // each other inside one isolating layer, which only works when the
+        // settled runs and the tail paint together. A baked settled run with
+        // a composited tail over it would darken where the stroke crosses
+        // itself, exactly what the layer exists to prevent.
+        if (stroke.tool == Tool.PENCIL) return false
         if (owner !== stroke || abs(this.res - res) > 1e-9) {
             owner = stroke
             this.res = res
@@ -154,9 +165,10 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
      */
     private fun bake(stroke: Stroke, ribbon: WetRibbon, settled: Int) {
         if (settled <= baked) return
-        val r = into ?: return
+        val into = into ?: return
         // From one point back, so the segment bridging the last baked point to the next one is
         // drawn; its disc is simply laid down again, which opaque ink does not notice.
+        val r = if (invertColors) InvertingRenderer(into) else into
         val from = max(baked - 1, 0)
         r.withSave {
             r.scale(res, res)

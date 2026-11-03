@@ -66,6 +66,10 @@ object CanvasPdfExporter {
         val items = doc.items.filter { it.paintBounds().isFinite() }.forExport()
         val bounds = if (items.size == doc.itemCount) doc.contentBounds() else items.fold(null as Rect?) { acc, it -> acc?.union(it.paintBounds()) ?: it.paintBounds() }
         val layout = CanvasPdfLayout.of(bounds, doc.dpi)
+        // Color inversion exports exactly what the canvas shows: paper, ruling and ink inverted,
+        // images only when the canvas inverts them too.
+        val invert = doc.background.invertColors
+        val paper = if (invert) paperColor.inverted() else paperColor
         onProgress(0, items.size)
         val mem = MemoryUsageSetting.setupMixed(SCRATCH_MAIN_MEM_BYTES).setTempDir(context.cacheDir)
         val outDoc = PDDocument(mem)
@@ -78,11 +82,11 @@ object CanvasPdfExporter {
             outDoc.addPage(page)
             PDPageContentStream(outDoc, page).use { cs ->
                 cs.appendRawCommands("/Artifact BMC\n")
-                cs.setNonStrokingColor(paperColor.r / 255f, paperColor.g / 255f, paperColor.b / 255f)
+                cs.setNonStrokingColor(paper.r / 255f, paper.g / 255f, paper.b / 255f)
                 cs.addRect(0f, 0f, wPts, hPts)
                 cs.fill()
                 cs.appendRawCommands("EMC\n")
-                if (!paintContent(cs, ctx, page, doc, items, layout, hPts, onProgress, isCancelled)) return
+                if (!paintContent(cs, ctx, page, doc, items, layout, hPts, invert, onProgress, isCancelled)) return
             }
             ctx.finish()
             // PdfBox writes a file token by token; buffered, that is a few large writes, not many tiny ones.
@@ -103,6 +107,7 @@ object CanvasPdfExporter {
         items: List<CanvasItem>,
         layout: CanvasPdfLayout.Layout,
         hPts: Float,
+        invert: Boolean,
         onProgress: (Int, Int) -> Unit,
         isCancelled: () -> Boolean,
     ): Boolean {
@@ -110,7 +115,9 @@ object CanvasPdfExporter {
         val s = layout.scale
         // Map the cover's top-left corner onto the page's, in the (translate + axis scale) form
         // PdfBoxRenderer takes: user = (ox + x·s, oy − y·s).
-        val r = PdfBoxRenderer(cs, ctx, pdfPage, -cover.left * s, hPts + cover.top * s, s)
+        val base = PdfBoxRenderer(cs, ctx, pdfPage, -cover.left * s, hPts + cover.top * s, s)
+        base.invertImageContent = invert && doc.background.invertImages
+        val r: Renderer = if (invert) com.xnotes.core.pal.InvertingRenderer(base) else base
         r.beginMark(Mark.Decoration)
         paintRuling(doc, r, layout)
         r.endMark()
@@ -118,8 +125,9 @@ object CanvasPdfExporter {
             if (isCancelled()) return false
             r.beginMark(PdfTags.markOf(item))
             if (PdfItemRaster.needsRaster(item)) {
-                PdfItemRaster.item(item, cover)?.let { raster ->
-                    r.drawItemBitmap(raster.bmp, raster.rect, raster.multiply)
+                PdfItemRaster.item(item, cover, invert)?.let { raster ->
+                    // Already inverted at raster time when [invert]; straight onto the page.
+                    base.drawItemBitmap(raster.bmp, raster.rect, raster.multiply)
                     raster.bmp.recycle()
                 }
                 if (item is ShapeItem) item.paintLabel(r)
@@ -133,7 +141,7 @@ object CanvasPdfExporter {
             PdfItemRaster.releaseInkGeometry(item)
             onProgress(index + 1, items.size)
         }
-        r.endPage()
+        base.endPage()
         return !isCancelled()
     }
 

@@ -101,21 +101,41 @@ data class ToolConfig(
     val tapeMode: TapeMode = TapeMode.STRAIGHT,
     /** Tape: what is printed on it. Only used by [Tool.TAPE]. */
     val tapePattern: TapePattern = TapePattern.SOLID,
-    /** Pencil: how much paper tooth shows through, in `[0, 1]`. 0 draws the ribbon
-     *  almost solid (a soft pen); 1 leaves the grain at full strength. Only used by
-     *  [Tool.PENCIL]. Kept last so the positional constructor stays stable. */
-    val pencilGrain: Double = DEFAULT_PENCIL_GRAIN,
+    /** Pencil: pressure sensitivity — effective pressure is stylus pressure
+     *  times this, clamped to `[0, 1]`. Higher answers lighter touches with
+     *  darker graphite. Only used by [Tool.PENCIL]. */
+    val pencilPressure: Double = DEFAULT_PENCIL_PRESSURE,
+    /** Pencil: graphite density scale applied on top of the pressure map.
+     *  Higher packs more grains at any pressure. Only used by [Tool.PENCIL]. */
+    val pencilDensity: Double = DEFAULT_PENCIL_DENSITY,
+    /** Pencil: grain size scale multiplying the tile span. Higher reads as
+     *  coarser tooth. Only used by [Tool.PENCIL]. */
+    val pencilGrainSize: Double = DEFAULT_PENCIL_GRAIN_SIZE,
+    /** Pencil: colour-shade response — how far grain colour travels from
+     *  light grey toward full ink with pressure. 0 pins every grain light;
+     *  higher darkens hard presses faster. Only used by [Tool.PENCIL]. */
+    val pencilShadeResponse: Double = DEFAULT_PENCIL_SHADE_RESPONSE,
 ) {
     companion object {
         const val DEFAULT_MARKUP_INTENSITY = 0.9
         const val MARKUP_INTENSITY_MIN = 0.1
 
-        /** Default grain for a fresh pencil: visible tooth without breaking the line. */
-        const val DEFAULT_PENCIL_GRAIN = 0.55
+        /** Factory defaults for the pencil's four knobs (see the fields). */
+        const val DEFAULT_PENCIL_PRESSURE = 1.0
+        const val DEFAULT_PENCIL_DENSITY = 1.0
+        const val DEFAULT_PENCIL_GRAIN_SIZE = 1.0
+        const val DEFAULT_PENCIL_SHADE_RESPONSE = 1.0
 
-        /** Hard bounds the UI clamps [pencilGrain] to. */
-        const val PENCIL_GRAIN_MIN = 0.0
-        const val PENCIL_GRAIN_MAX = 1.0
+        /** Hard bounds the UI clamps the pencil knobs to. A zero pressure
+         *  response means "always full": darkest shade, densest grains. */
+        const val PENCIL_PRESSURE_MIN = 0.0
+        const val PENCIL_PRESSURE_MAX = 2.0
+        const val PENCIL_DENSITY_MIN = 0.2
+        const val PENCIL_DENSITY_MAX = 1.3
+        const val PENCIL_GRAIN_SIZE_MIN = 0.1
+        const val PENCIL_GRAIN_SIZE_MAX = 4.0
+        const val PENCIL_SHADE_RESPONSE_MIN = 0.0
+        const val PENCIL_SHADE_RESPONSE_MAX = 1.5
     }
 }
 
@@ -130,11 +150,11 @@ object ToolDefaults {
 
     fun configFor(tool: Tool): ToolConfig = when (tool) {
         Tool.PEN -> ToolConfig(baseWidth = 3.0, pressureEnabled = true, pressureMinFactor = 0.35, directionStrength = 0.0)
-        // Pencil: a narrow graphite line with pressure on and a mid tooth, so light
-        // strokes break up and hard ones fill in. Same width range as the pen.
+        // Pencil: a narrow graphite line at one fixed width — pressure shades
+        // graphite tone, never width. Same width range as the pen.
         Tool.PENCIL -> ToolConfig(
-            baseWidth = 2.5, pressureEnabled = true, pressureMinFactor = 0.30,
-            directionStrength = 0.0, pencilGrain = ToolConfig.DEFAULT_PENCIL_GRAIN,
+            baseWidth = 2.5, pressureEnabled = false, pressureMinFactor = 1.0,
+            directionStrength = 0.0,
         )
         // Dashed pen: uniform-width (pressure off), so its dashes stay even; dash/gap set the rhythm.
         Tool.DASHED -> ToolConfig(baseWidth = 3.0, pressureEnabled = false, pressureMinFactor = 1.0, directionStrength = 0.0, dashLength = 10.0, dashGap = 8.0)
@@ -196,10 +216,4 @@ object ToolConversions {
         Tool.PENCIL -> 1.0..20.0
         else -> 1.0..20.0
     }
-
-    /** GRAIN slider (0..100, higher = more paper shows through) -> [ToolConfig.pencilGrain]. */
-    fun grainToStrength(grain: Double): Double =
-        grain.coerceIn(0.0, 100.0) / 100.0
-
-    fun strengthToGrain(s: Double): Double = (s.coerceIn(0.0, 1.0)) * 100.0
 }

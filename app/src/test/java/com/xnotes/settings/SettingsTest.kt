@@ -151,6 +151,13 @@ class SettingsTest {
         assertTrue(back.disableFrontBuffering)
     }
 
+    @Test fun invertColorsByDefaultIsOffUntilTurnedOn() {
+        // Settings written before the switch existed default it off.
+        assertFalse(Settings.fromJson(JSONObject()).prefs.invertColorsByDefault)
+        val back = Settings.fromJson(Settings(prefs = Preferences(invertColorsByDefault = true)).toJson()).prefs
+        assertTrue(back.invertColorsByDefault)
+    }
+
     @Test fun headingBookmarksAreOnUntilTurnedOff() {
         assertTrue(Settings.fromJson(JSONObject()).prefs.pdfHeadingBookmarks)
         val back = Settings.fromJson(Settings(prefs = Preferences(pdfHeadingBookmarks = false)).toJson()).prefs
@@ -314,6 +321,22 @@ class SettingsTest {
         val back = Settings.fromJson(Settings(newCanvasBackground = bg).toJson())
         assertEquals(bg, back.newCanvasBackground)
         assertNull(back.newCanvasBackground?.paperColor)
+    }
+
+    @Test fun newCanvasBackgroundInvertFlagsRoundTrip() {
+        val bg = com.xnotes.core.infinite.CanvasBackground(
+            pattern = com.xnotes.core.model.PagePattern.GRID,
+            invertColors = true,
+            invertImages = true,
+        )
+        val back = Settings.fromJson(Settings(newCanvasBackground = bg).toJson())
+        assertEquals(bg, back.newCanvasBackground)
+        assertTrue(back.newCanvasBackground!!.invertColors)
+        assertTrue(back.newCanvasBackground!!.invertImages)
+        val plain = Settings.fromJson(Settings(newCanvasBackground = com.xnotes.core.infinite.CanvasBackground()).toJson())
+        assertFalse(plain.newCanvasBackground!!.invertColors)
+        assertFalse(plain.newCanvasBackground!!.invertImages)
+        assertFalse(plain.toJson().optJSONObject("new_canvas_background")!!.has("invert_colors"))
     }
 
     @Test fun fingerDrawAutoCheckedDefaultsFalse() {

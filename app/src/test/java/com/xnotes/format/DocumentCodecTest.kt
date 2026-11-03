@@ -23,6 +23,8 @@ import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageSizeChoice
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.resolvedInvertColors
+import com.xnotes.core.model.resolvedInvertImages
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.pal.FontFace
@@ -779,6 +781,29 @@ class DocumentCodecTest {
         assertEquals(PagePattern.GRID.id, s.template)
         assertEquals(Rgba(100, 100, 100, 120), s.patternColor)
         assertEquals(32.0, s.spacing!!, 1e-9)
+    }
+
+    @Test fun invertFlagsRoundTripAndInherit() {
+        val doc = Document(dpi = 150)
+        doc.style = PageStyle(invertColors = true, invertImages = true)
+        doc.pages.add(Page(100.0, 100.0))
+        doc.pages.add(Page(100.0, 100.0).also { it.style = PageStyle(invertColors = false) })
+
+        val back = roundTrip(doc)
+
+        assertEquals(true, back.style.invertColors)
+        assertEquals(true, back.style.invertImages)
+        // Pages inherit the document flags; an explicit page flag shadows them.
+        assertTrue(back.pages[0].resolvedInvertColors(back))
+        assertTrue(back.pages[0].resolvedInvertImages(back))
+        assertFalse(back.pages[1].resolvedInvertColors(back))
+        // Unset everywhere resolves off.
+        val plain = Document(dpi = 150)
+        plain.pages.add(Page(100.0, 100.0))
+        val backPlain = roundTrip(plain)
+        assertFalse(backPlain.pages[0].resolvedInvertColors(backPlain))
+        assertFalse(backPlain.pages[0].resolvedInvertImages(backPlain))
+        assertNull(backPlain.style.invertColors)
     }
 
     @Test fun embeddedTemplatesRoundTripWithTheirParameters() {

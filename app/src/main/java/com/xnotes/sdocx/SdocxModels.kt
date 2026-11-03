@@ -40,6 +40,10 @@ class SdocxStroke(
     val penNameId: Int?,
     val advancedSettingId: Int?,
     val toolTypeRaw: Int?,
+    /** Tapered ends (stroke properties bit 9 on newer Samsung writers). */
+    val tapered: Boolean = false,
+    /** Creation time in microseconds since epoch (base-frame bit 13), null when absent/garbage. */
+    val createdTimeUs: Long? = null,
 )
 
 data class SdocxPoint(val x: Double, val y: Double)
@@ -130,6 +134,41 @@ class SdocxVoice(
     val durationMs: Int,
 )
 
+/**
+ * A note-level recorded audio session (`note.note` bit 13): Samsung's
+ * "record while writing" audio. Unlike type-10 voice memos (imported files
+ * placed as pills on a page), these live at note level with replay events.
+ * Strokes whose base-frame timestamp falls in [startUs, endUs] were written
+ * while this recording ran and replay in sync with it.
+ */
+class SdocxNoteVoice(
+    /** Media bind id of the `.m4a`/`.3gp` asset. */
+    val mediaId: Int,
+    val title: String,
+    /** Length in milliseconds (from `play_time` label, else `recording_time`). */
+    val durationMs: Int,
+    /** Recording start/end in microseconds since epoch (min/max event times). */
+    val startUs: Long?,
+    val endUs: Long?,
+    /** Creation time in milliseconds since epoch, null when absent. */
+    val createdTimeMs: Long? = null,
+)
+
+/**
+ * A sticker (sticky memo) placement hosted on a page: the page's flexible
+ * properties reference an attached nested `.sdocx` ([bindId]) and carry the
+ * collapsed icon rect plus paper color (`skn_collapse_rect`, `skn_bg_color`).
+ * Bboxes are in Samsung page coordinates.
+ */
+class SdocxSticker(
+    /** Media bind id of the nested `.sdocx` sub-note. */
+    val bindId: Int,
+    /** Collapsed icon rect on the host page, or null when not recorded. */
+    val collapseRect: SdocxRect?,
+    /** Paper color as a Samsung ARGB int, or null when not recorded. */
+    val bgColorArgb: Int?,
+)
+
 /** A decoded Samsung table cell: text in column [col] (rowSpan/colSpan merged into neighbours). */
 class SdocxTableCell(
     val col: Int,
@@ -169,11 +208,13 @@ class SdocxPage(
     val backgroundImageMode: Int? = null,
     val backgroundWidth: Int? = null,
     val backgroundRotation: Int? = null,
+    /** Sticker placements hosted on this page (nested `.sdocx` attachments). */
+    val stickers: List<SdocxSticker> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = strokes.isEmpty() && images.isEmpty() && pdfPapers.isEmpty() &&
             textBoxes.isEmpty() && shapes.isEmpty() && lines.isEmpty() && voices.isEmpty() &&
-            tables.isEmpty()
+            tables.isEmpty() && stickers.isEmpty()
 }
 
 /** Whole document in Samsung page order (`pageIdInfo.dat`). */
@@ -192,4 +233,10 @@ class SdocxDocument(
     val bodyImages: List<SdocxImage> = emptyList(),
     /** Tables embedded in `note.note`'s title/body text (object spans of type 22). */
     val bodyTables: List<SdocxTable> = emptyList(),
+    /**
+     * Note-level recorded audio sessions (`note.note` bit 13): Samsung's
+     * "record while writing" audio with replay intervals. Empty when the note
+     * has no recording (imported `.m4a` files arrive as type-10 page voices).
+     */
+    val noteVoices: List<SdocxNoteVoice> = emptyList(),
 )

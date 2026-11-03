@@ -10,11 +10,13 @@ import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.infinite.InkPass
 import com.xnotes.core.infinite.ItemMesher
+import com.xnotes.core.infinite.GlowSpec
 import com.xnotes.core.infinite.MeshPart
 import com.xnotes.core.infinite.PixelRect
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Stroke
+import com.xnotes.core.model.resolvedInvertColors
 import com.xnotes.gl.GlWetPad
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -146,10 +148,15 @@ class FrontInk(
         if (!decided) decide(stroke, pageIndex)
         if (!live) return
 
+        // The pad shows what the canvas will: inverted runs on an inverted page.
+        val page = state.document.pages.getOrNull(pageIndex)
+        val invert = page?.resolvedInvertColors(state.document) == true
         val settled = ribbon.settledCount
         if (settled - meshed >= runPoints) {
             val from = (meshed - 1).coerceAtLeast(0)
-            ItemMesher.meshRun(stroke, ribbon, from, settled - from, arc)?.let { pad.appendRun(listOf(it)) }
+            ItemMesher.meshRun(stroke, ribbon, from, settled - from, arc)?.let {
+                pad.appendRun(listOf(if (invert) it.inverted() else it))
+            }
             for (k in from + 1 until settled) {
                 arc += hypot(ribbon.cx(k) - ribbon.cx(k - 1), ribbon.cy(k) - ribbon.cy(k - 1))
             }
@@ -158,8 +165,18 @@ class FrontInk(
         val tailFrom = (meshed - 1).coerceAtLeast(0)
         val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, arc)
         tailPart = tail
-        pad.setTail(if (tail == null) emptyList() else listOf(tail))
+        pad.setTail(if (tail == null) emptyList() else listOf(if (invert) tail.inverted() else tail))
     }
+
+    /** lightness-invert a meshed run for color inversion (alpha untouched, glow with it). */
+    private fun MeshPart.inverted(): MeshPart = MeshPart(
+        mesh, color.inverted(), pass,
+        glow?.let {
+            GlowSpec(it.wideRadius, it.wideAlpha, it.tightRadius, it.tightAlpha,
+                it.bodyColor.inverted(), it.coreColor.inverted(), it.coreScale)
+        },
+        covers,
+    )
 
     /**
      * The pad's pixels have gone, under the stroke being drawn or under ink it was still holding.
@@ -195,16 +212,15 @@ class FrontInk(
      * from the tool.
      *
      * The pad has no copy of what is under it, so anything that composites against the page cannot
-     * live there. Plain triangles can, and that is what a pen and a pencil are: the pencil's
-     * field blends instead of punching holes, but its triangles never overlap, so it
-     * unions exactly like opaque ink.
+     * live there. Plain triangles can, and that is what a pen is. The pencil needs the
+     * stencil-consume cover (its ribbon overlaps freely), which the pad cannot give it,
+     * so it keeps the ordinary path.
      */
     private fun decide(stroke: Stroke, pageIndex: Int) {
         decided = true
         // Turned off for this device, so there is no pad to consult and nothing to time against it.
         if (!pad.frontBuffering) return
-        val pass = ItemMesher.passFor(stroke)
-        if (pass != InkPass.OPAQUE && pass != InkPass.PENCIL) return
+        if (ItemMesher.passFor(stroke) != InkPass.OPAQUE) return
         // A rotated view is a rotation, and the ink shader has room for a scroll and a zoom.
         if (state.rotationDeg != 0) return
         val page = state.document.pages.getOrNull(pageIndex) ?: return

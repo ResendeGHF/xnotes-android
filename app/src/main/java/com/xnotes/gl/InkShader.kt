@@ -54,7 +54,7 @@ class InkShader(contextGen: Int) {
         setWidthScale(1.0)
         clearLift()
         clearOverride()
-        setPencil(false)
+        setPencil(0f)
     }
 
     /**
@@ -105,19 +105,51 @@ class InkShader(contextGen: Int) {
         program.set("uOverrideMix", 1f)
     }
 
-    /** Draw the next pencil runs with the paper grain on; off again afterwards. */
-    fun setPencil(enabled: Boolean) {
-        program.set("uPencil", if (enabled) 1f else 0f)
-    }
-
-    /** Per-stroke grain parameters for the pencil branch (see [setPencil]). */
-    fun setPencilParams(seed: Int, tipMix: Float) {
-        program.set("uSeed", seed)
-        program.set("uTipMix", tipMix)
-    }
-
     fun clearOverride() {
         program.set("uOverrideMix", 0f)
+    }
+
+    /**
+     * Pencil cover mode for the next draws: 0 off (ordinary ink), 1 graphite
+     * stipple. The grain texture unit must be bound before drawing; see
+     * [setPencilGrain].
+     */
+    fun setPencil(mode: Float) {
+        program.set("uPencil", mode)
+    }
+
+    /** Density map matching [com.xnotes.core.infinite.StrokeTessellator.pencilDensityFor]. */
+    fun setPencilDensity(base: Float, span: Float, gamma: Float) {
+        program.set("uDensBase", base)
+        program.set("uDensSpan", span)
+        program.set("uDensGamma", gamma)
+    }
+
+    /** Grain shade map matching [com.xnotes.core.infinite.StrokeTessellator.pencilShadeFor]. */
+    fun setPencilShade(base: Float, span: Float, gamma: Float) {
+        program.set("uShadeBase", base)
+        program.set("uShadeSpan", span)
+        program.set("uShadeGamma", gamma)
+    }
+
+    /**
+     * Per-stroke pencil config: graphite density scale, pressure sensitivity
+     * gain, colour-shade response. The grain size folds into the tile span
+     * ([setPencilGrain]) and the phase into [setPencilPhase].
+     */
+    fun setPencilConfig(densityScale: Float, pressureGain: Float, shadeResponse: Float) {
+        program.set("uPencilCfg", densityScale, pressureGain, shadeResponse, 0f)
+    }
+
+    /** Grain tile phase in tile units: decorrelates strokes so they layer. */
+    fun setPencilPhase(phaseX: Float, phaseY: Float) {
+        program.set("uGrainPhase", phaseX, phaseY)
+    }
+
+    /** Grain sampler unit and the content px one tile spans. */
+    fun setPencilGrain(unit: Int, tilePx: Float) {
+        program.set("uGrain", unit)
+        program.set("uGrainTile", tilePx)
     }
 
     fun disableAttributes() {
@@ -134,14 +166,6 @@ class InkShader(contextGen: Int) {
          * evenly instead of breaking into a crawling dotted shimmer.
          */
         val MIN_HALF_WIDTH_PX = CanvasProjection.MIN_HALF_WIDTH_PX.toFloat()
-
-        /**
-         * Graphite field supertile, in content px. Every octave period divides
-         * it, and the canvas chunk is a multiple of it, so wrapping the
-         * camera-relative page position keeps the grain glued to the paper.
-         * Matches [com.xnotes.core.stroke.PencilGrain.FIELD_TILE]; pinned by test.
-         */
-        const val PENCIL_FIELD_TILE = 128.0
 
         private val VERTEX_SRC = """#version 300 es
             in vec2 aLocal;
@@ -167,14 +191,9 @@ class InkShader(contextGen: Int) {
             uniform float uOverrideMix;
 
             out vec4 vColor;
-            // Pencil control, straight from the vertex bytes: x = across-ribbon edge
-            // (0 centre, 1 rail/ring), y = graphite density. Only read when uPencil
-            // is set; the ink colour itself arrives as the override.
-            out vec2 vPencil;
-            // Page-space position, camera-relative so every intermediate stays
-            // small and exact. The field wraps it into its supertile per pixel,
-            // which keeps the grain glued to the paper: live runs and the
-            // committed stroke sample the identical page-anchored field.
+            // Pencil cover: the page-space position for the grain lookup.
+            // Small magnitudes stay exact, so the tile phase matches the
+            // paged renderer's bitmap shader cell-for-cell up to filtering.
             out highp vec2 vPage;
 
             void main() {
@@ -227,10 +246,6 @@ class InkShader(contextGen: Int) {
                     0.0, 1.0);
                 vec4 base = mix(aColor, uOverride, uOverrideMix);
                 vColor = vec4(base.rgb, base.a * fade);
-                vPencil = vec2(aColor.r, aColor.a);
-                // Camera-relative page position for the graphite field. Small
-                // magnitudes stay exact, so the per-pixel wrap below lands on
-                // the same cells as the paged rasterizer's doubles.
                 vPage = world;
             }
         """.trimIndent()
@@ -239,109 +254,36 @@ class InkShader(contextGen: Int) {
             precision highp float;
             precision highp int;
             in vec4 vColor;
-            in vec2 vPencil;
             in highp vec2 vPage;
             out vec4 fragColor;
+            // Pencil cover: 0 off, 1 graphite stipple. The vertex alpha
+            // carries raw stylus pressure (already min-width faded, like
+            // every other vertex alpha); pressure maps to graphite DENSITY
+            // (how many pixels carry ink) and to grain SHADE (light grey to
+            // full ink), and the field texture stipples both into opaque
+            // grains composited normally. The maps match
+            // StrokeTessellator.pencilDensityFor/pencilShadeFor; uGrainTile
+            // matches PencilTexture.TILE_CONTENT_PX times the stroke's grain
+            // size, uGrainPhase its decorrelating offset.
             uniform float uPencil;
-            // Shared with the vertex stage, whose default float precision is highp:
-            // the link fails when the two sides disagree (Mali rejects it outright),
-            // so this one is pinned. The app already assumes fragment highp
-            // (BackgroundShader renders in it).
-            uniform highp float uZoom;
-            // Per-stroke grain parameters: the seed decorrelates the noise
-            // between strokes, the tip mix fades the coarse bands for fine tips.
-            // Only read when uPencil is set. The integer seed keeps both sides
-            // bit-identical (see PencilGrain); the paged rasterizer evaluates
-            // the same octave stack over the same page coordinates.
-            uniform int uSeed;
-            uniform float uTipMix;
-            // Exact integer lattice hash both renderers share (see PencilGrain):
-            // 32-bit ops that never overflow, so the field can never NaN out and
-            // matches the paged rasterizer cell-for-cell up to float rounding.
-            int plat(ivec2 c) {
-                int h = c.x * 73 + c.y * 149;
-                h = (h ^ 61) ^ (h >> 3);
-                h += h << 5;
-                h = (h ^ (h >> 7)) & 0xFFFF;
-                h += h << 6;
-                h = h ^ (h >> 5);
-                return h & 0xFF;
-            }
-            ivec2 pwrap(ivec2 c, ivec2 m) {
-                return ivec2(((c.x % m.x) + m.x) % m.x, ((c.y % m.y) + m.y) % m.y);
-            }
-            // Same lattice as PencilGrain.noise: explicit lattice coords in,
-            // wrapped cell indices out. Bit-identical on both sides.
-            float vnoise(highp vec2 l, ivec2 wrap, int salt) {
-                highp vec2 f = fract(l);
-                ivec2 c = ivec2(floor(l)) + ivec2(salt * 57, salt * 131);
-                highp vec2 u = f * f * (3.0 - f * 2.0);
-                ivec2 x0 = pwrap(c, wrap);
-                ivec2 x1 = pwrap(c + ivec2(1, 0), wrap);
-                ivec2 x2 = pwrap(c + ivec2(0, 1), wrap);
-                ivec2 x3 = pwrap(c + ivec2(1, 1), wrap);
-                float a = float(plat(x0)) * (1.0 / 255.0);
-                float b = float(plat(x1)) * (1.0 / 255.0);
-                float cc = float(plat(x2)) * (1.0 / 255.0);
-                float d = float(plat(x3)) * (1.0 / 255.0);
-                return a + (b - a) * u.x + (cc - a) * u.y + (a - b - cc + d) * u.x * u.y;
-            }
+            uniform sampler2D uGrain;
+            uniform float uDensBase;
+            uniform float uDensSpan;
+            uniform float uDensGamma;
+            uniform float uShadeBase;
+            uniform float uShadeSpan;
+            uniform float uShadeGamma;
+            uniform vec4 uPencilCfg;
+            uniform vec2 uGrainPhase;
+            uniform float uGrainTile;
             void main() {
                 if (uPencil < 0.5) { fragColor = vColor; return; }
-                // Page-anchored graphite field, identical to the paged rasterizer:
-                // wrap the camera-relative page position into the supertile, then
-                // evaluate the same octave stack the CPU evaluates. The integer
-                // seed shifts every octave's lattice, decorrelating strokes.
-                highp vec2 pm = mod(vPage, $PENCIL_FIELD_TILE);
-                int ss = uSeed * 13;
-                float tip = clamp(uTipMix, 0.0, 1.0);
-                float coarse = 0.30 + 0.70 * tip;
-                float medium = 0.62 + 0.38 * tip;
-                float lump = (vnoise(pm / 32.0, ivec2(4, 4), 11 + ss)
-                    + 0.5 * vnoise(pm / 16.0, ivec2(8, 8), 11 + 7919 + ss)
-                    + 0.25 * vnoise(pm / 8.0, ivec2(16, 16), 11 + 15838 + ss)) / 1.75;
-                float tooth = (vnoise(pm / 8.0, ivec2(16, 16), 23 + ss)
-                    + 0.5 * vnoise(pm / 4.0, ivec2(32, 32), 23 + 7919 + ss)
-                    + 0.25 * vnoise(pm / 2.0, ivec2(64, 64), 23 + 15838 + ss)) / 1.75;
-                float gritF = (vnoise(pm / 4.0, ivec2(32, 32), 37 + ss)
-                    + 0.5 * vnoise(pm / 2.0, ivec2(64, 64), 37 + 7919 + ss)
-                    + 0.25 * vnoise(pm, ivec2(128, 128), 37 + 15838 + ss)) / 1.75;
-                ivec2 scell = pwrap(ivec2(floor(pm)) + ivec2(uSeed * 3, uSeed * 7), ivec2(128, 128));
-                float spark = float(plat(scell)) * (1.0 / 255.0);
-                float grit = gritF * 0.82 + spark * 0.18;
-                float mid = (vnoise(pm / 2.0, ivec2(64, 64), 43 + ss)
-                    + 0.5 * vnoise(pm, ivec2(128, 128), 43 + 7919 + ss)) / 1.5;
-                float fa = (vnoise(vec2(pm.x / 32.0, pm.y / 2.0), ivec2(4, 64), 53 + ss)
-                    + 0.5 * vnoise(vec2(pm.x / 16.0, pm.y), ivec2(8, 128), 53 + 7919 + ss)) / 1.5;
-                float fb = (vnoise(vec2(pm.x / 2.0, pm.y / 32.0), ivec2(64, 4), 59 + ss)
-                    + 0.5 * vnoise(vec2(pm.x, pm.y / 16.0), ivec2(128, 8), 59 + 7919 + ss)) / 1.5;
-                float fibre = mix(fa, fb, 0.5);
-                float lodq = clamp((uZoom - 0.25) / 0.75, 0.0, 1.0);
-                float lumps;
-                if (lodq < 0.5) { lumps = lump; }
-                else {
-                    lumps = 0.6 * vnoise(pm / 64.0, ivec2(2, 2), 67 + ss)
-                        + 0.4 * vnoise(pm / 32.0, ivec2(4, 4), 71 + ss);
-                }
-                float edge = clamp(vPencil.x, 0.0, 1.0);
-                float dens = clamp(vPencil.y, 0.0, 1.0);
-                float deff = dens * (1.0 - 0.45 * edge);
-                float slow = 0.30 * (lump - 0.5) * coarse
-                    + 0.32 * (tooth - 0.5) * medium
-                    + 0.22 * (fibre - 0.5) * medium
-                    + 0.22 * (lumps - 0.5) * coarse;
-                float fast = (grit - 0.5) * 0.95 * (1.10 - 0.15 * tip)
-                    + 0.40 * (mid - 0.5);
-                float deposit = (0.645 - 0.025 * tip) + slow + fast;
-                float edge0 = clamp(0.72 - 0.40 * deff + 0.03375 + 0.045 * (1.0 - tip), 0.02, 0.95);
-                float soft = mix(0.20, 0.30, tip);
-                float grain = smoothstep(edge0, edge0 + soft, deposit);
-                grain = mix(0.05, grain, 0.95);
-                float lod = smoothstep(0.45, 0.95, lodq);
-                float density = mix(1.0, 0.70 + 0.62 * grit, lod);
-                float alpha = clamp(grain * 0.85 * density, 0.0, 1.0);
-                if (alpha <= 0.0) discard;
-                fragColor = vec4(vColor.rgb, alpha * vColor.a);
+                float pe = uPencilCfg.y <= 0.0 ? 1.0 : clamp(clamp(vColor.a, 0.0, 1.0) * uPencilCfg.y, 0.0, 1.0);
+                float dens = clamp((uDensBase + uDensSpan * pow(pe, uDensGamma)) * uPencilCfg.x, 0.0, 0.97);
+                float shade = clamp(uShadeBase + (uShadeSpan * pow(pe, uShadeGamma)) * uPencilCfg.z, 0.0, 1.0);
+                float f = step(texture(uGrain, vPage / uGrainTile + uGrainPhase).a, dens);
+                vec3 graphite = mix(vec3(1.0), vColor.rgb, shade);
+                fragColor = vec4(graphite, f);
             }
         """.trimIndent()
     }
