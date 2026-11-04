@@ -30,6 +30,18 @@ class PairingClient(
     private val sender: Sender,
     var onPaired: (name: String) -> Unit = {},
 ) {
+    /**
+     * Android-to-Android mutual-confirm SAS: set by the dialer UI flow. When
+     * the host answers `hello_ack` with `pair_mode:"sas"`, [onSasPeer] fires
+     * with the code both phones display; the UI calls [confirmSas] after the
+     * user verifies the match, or [cancelPairing] to abort.
+     */
+    var onSasPeer: ((sas: String, name: String) -> Unit)? = null    /**
+     * This phone's listener port, advertised in `hello` so an Android peer
+     * can dial back. Zero while the listener is down.
+     */
+    var listenPort: Int = 0
+
     /** This connection's peer fingerprint, for the device registry. */
     val peerFingerprint: String? get() = synchronized(lock) { peerFp }
     /** Minimal send surface so tests need no socket. */
@@ -43,7 +55,7 @@ class PairingClient(
         private const val APP = "xnotes-android"
     }
 
-    private enum class State { IDLE, HELLO_SENT, CODE_REQUIRED, WAIT_RESULT, DONE, FAILED }
+    private enum class State { IDLE, HELLO_SENT, CODE_REQUIRED, SAS_REQUIRED, WAIT_RESULT, DONE, FAILED }
 
     private val lock = Any()
     private var state = State.IDLE
@@ -105,6 +117,36 @@ class PairingClient(
         }
     }
 
+    /**
+     * The user verified the SAS matches on both phones: send `pair_confirm`.
+     * The peer fingerprint comes from TLS ([peerFp]), never from the message,
+     * so a relay cannot substitute its own cert.
+     */
+    fun confirmSas() {
+        synchronized(lock) {
+            if (state != State.SAS_REQUIRED) return
+            val fp = peerFp ?: return
+            state = State.WAIT_RESULT
+            sender.send(
+                JSONObject()
+                    .put("t", "pair_confirm")
+                    .put("device_name", deviceName)
+                    .put("host_cert_fp", ownFp)
+                    .put("sas", Pairing.sasFor(ownFp, fp)),
+            )
+            ui.showStatus("Waiting for the other phone to confirm…")
+            armLocked()
+        }
+    }
+
+    /** Abort an SAS pairing after the code was shown. */
+    fun cancelPairing() {
+        synchronized(lock) {
+            if (state != State.SAS_REQUIRED) return
+            failLocked("Pairing cancelled.")
+        }
+    }
+
     fun close() {
         synchronized(lock) {
             timeout?.cancel(false)
@@ -113,12 +155,16 @@ class PairingClient(
         timers.shutdownNow()
     }
 
-    private fun hello(): JSONObject = JSONObject()
-        .put("t", "hello")
-        .put("app", APP)
-        .put("version", VERSION)
-        .put("device_name", deviceName)
-        .put("host_cert_fp", ownFp)
+    private fun hello(): JSONObject {
+        val o = JSONObject()
+            .put("t", "hello")
+            .put("app", APP)
+            .put("version", VERSION)
+            .put("device_name", deviceName)
+            .put("host_cert_fp", ownFp)
+        if (listenPort > 0) o.put("listen_port", listenPort)
+        return o
+    }
 
     private fun onHelloAck(ack: JSONObject) {
         synchronized(lock) {
@@ -137,6 +183,18 @@ class PairingClient(
                     ui.pairingDone(name)
                 }
                 onPaired(name)
+                return
+            }
+            // Android-to-Android mutual confirm: the ack carries the SAS both
+            // phones display; no code is typed.
+            if (ack.optString("pair_mode") == HostHandshake.PAIR_MODE || ack.has("sas")) {
+                val sas = ack.optString("sas")
+                    .ifEmpty { Pairing.sasFor(ownFp, peerFp ?: "") }
+                state = State.SAS_REQUIRED
+                val name = ack.optString("companion_name").ifEmpty { "phone" }
+                ui.showStatus("Confirm this code matches on both phones: $sas")
+                onSasPeer?.invoke(sas, name)
+                armLocked()
                 return
             }
             if (ack.optBoolean("code_required", false) || !ack.optBoolean("paired", false)) {
@@ -184,7 +242,7 @@ class PairingClient(
         timeout?.cancel(false)
         timeout = timers.schedule({
             synchronized(lock) {
-                if (state == State.HELLO_SENT || state == State.CODE_REQUIRED || state == State.WAIT_RESULT) {
+                if (state == State.HELLO_SENT || state == State.CODE_REQUIRED || state == State.SAS_REQUIRED || state == State.WAIT_RESULT) {
                     failLocked("Timed out waiting for the companion.")
                 }
             }

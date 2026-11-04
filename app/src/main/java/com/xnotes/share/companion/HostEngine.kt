@@ -43,11 +43,17 @@ class HostEngine(
     private val backend: ShareServer.ShareBackend,
     private val files: SyncFiles,
     private val grants: com.xnotes.share.db.GrantSource,
-    private val versionsFile: File,
+    versionsFile: File,
     private val host: HostEngineHost,
     val deviceName: String,
     /** Where received image bytes land; defaults to the process temp dir. */
     private val imageDir: File = File(System.getProperty("java.io.tmpdir"), "xnotes-sync-images").apply { mkdirs() },
+    /**
+     * Shared version/dedupe store. Defaults to a private one over
+     * [versionsFile]; the service passes one shared instance so every peer
+     * connection serving this device's files sees one monotonic version.
+     */
+    private val store: SyncVersions = SyncVersions(versionsFile),
 ) {
     interface HostEngineHost {
         fun send(msg: JSONObject)
@@ -78,15 +84,9 @@ class HostEngine(
     private val lock = Any()
     private val io: Executor = Executors.newSingleThreadExecutor { r -> Thread(r, "xnotes-sync-io").apply { isDaemon = true } }
     private var seq = 0
-    private val versions = HashMap<String, Long>()
-    private val seenDedupes = HashMap<String, ArrayDeque<String>>()
     private val companionPresence = HashMap<String, Int>()
     private val coveredIds = HashSet<String>()
     private val idPaths = HashMap<String, String>()
-
-    init {
-        loadVersions()
-    }
 
     // --- transport ---
 
@@ -856,29 +856,11 @@ class HostEngine(
     // --- versions / dedupe / policy ---
 
     /** Head version of [id], registering new files at 1 (and only then persisting). */
-    fun headVersion(id: String): Long = synchronized(lock) {
-        versions[id] ?: run {
-            versions[id] = 1L
-            saveVersionsLocked()
-            1L
-        }
-    }
+    fun headVersion(id: String): Long = store.head(id)
 
-    private fun bumpVersion(id: String): Long = synchronized(lock) {
-        val next = (versions[id] ?: 1L) + 1
-        versions[id] = next
-        saveVersionsLocked()
-        next
-    }
+    private fun bumpVersion(id: String): Long = store.bump(id)
 
-    private fun markDedupe(file: String, dedupe: String): Boolean = synchronized(lock) {
-        if (dedupe.isEmpty()) return true
-        val seen = seenDedupes.getOrPut(file) { ArrayDeque() }
-        if (dedupe in seen) return false
-        seen.addLast(dedupe)
-        while (seen.size > DEDUPE_KEPT) seen.removeFirst()
-        true
-    }
+    private fun markDedupe(file: String, dedupe: String): Boolean = store.markDedupe(file, dedupe)
 
     private fun policyAllows(id: String): Boolean = synchronized(lock) { id in coveredIds }
 
@@ -888,42 +870,7 @@ class HostEngine(
     }
 
     private fun dropFile(id: String) {
-        synchronized(lock) {
-            versions.remove(id)
-            seenDedupes.remove(id)
-            saveVersionsLocked()
-        }
-    }
-
-    private fun loadVersions() {
-        try {
-            val f = File(versionsFile, VERSIONS)
-            if (!f.isFile) return
-            val o = JSONObject(f.readText())
-            val names = o.names() ?: return
-            synchronized(lock) {
-                for (i in 0 until names.length()) {
-                    val id = names.getString(i)
-                    versions[id] = o.optLong(id, 1L).coerceAtLeast(1L)
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun saveVersionsLocked() {
-        try {
-            versionsFile.mkdirs()
-            val o = JSONObject()
-            for ((id, v) in versions) o.put(id, v)
-            val tmp = File(versionsFile, "$VERSIONS.tmp")
-            tmp.writeText(o.toString())
-            if (!tmp.renameTo(File(versionsFile, VERSIONS))) {
-                File(versionsFile, VERSIONS).delete()
-                tmp.renameTo(File(versionsFile, VERSIONS))
-            }
-        } catch (_: Exception) {
-        }
+        store.drop(id)
     }
 
     companion object {
@@ -931,7 +878,6 @@ class HostEngine(
         const val IMAGE_CHUNK = 256 * 1024
         const val IMAGE_MAX_BYTES = 64L * 1024 * 1024
         const val IMAGE_KEPT = 8
-        const val DEDUPE_KEPT = 64
         const val VERSIONS = "sync_versions.json"
     }
 }

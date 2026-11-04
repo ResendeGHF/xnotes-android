@@ -34,10 +34,16 @@ class ShareStore private constructor(
 
     suspend fun device(fp: String): DeviceEntity? = dao.device(fp)
 
+    suspend fun devicesOnce(): List<DeviceEntity> = dao.devicesOnce()
+
     override suspend fun grantIds(fp: String): List<String> = dao.grantIds(fp)
 
-    /** Remember a companion (pairing, reconnect with new address/name). First one ever becomes active. */
-    suspend fun remember(fp: String, name: String, host: String, port: Int) {
+    /**
+     * Remember a companion (pairing, reconnect with new address/name). The
+     * Linux dial path passes [makeActive] so the first companion ever becomes
+     * the active dial target; Android peers never take that slot.
+     */
+    suspend fun remember(fp: String, name: String, host: String, port: Int, makeActive: Boolean = false) {
         val now = System.currentTimeMillis()
         val cur = dao.device(fp)
         val keepNick = cur?.nickname
@@ -45,7 +51,7 @@ class ShareStore private constructor(
         dao.upsertDevice(
             DeviceEntity(fp, name.ifBlank { cur?.name ?: "" }, host, port, keepNick, now, wasActive),
         )
-        if (!wasActive) {
+        if (!wasActive && makeActive) {
             // First companion ever: make it active so existing setups keep working untouched.
             if (dao.devicesOnce().size == 1) dao.markActive(fp)
         }

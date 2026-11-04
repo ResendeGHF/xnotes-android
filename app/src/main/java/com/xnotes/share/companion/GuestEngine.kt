@@ -1,0 +1,809 @@
+package com.xnotes.share.companion
+
+import com.xnotes.canvas.RemoteLiveStrokes
+import com.xnotes.core.model.Document
+import com.xnotes.core.model.Page
+import com.xnotes.core.model.Stroke
+import com.xnotes.format.DocumentCodec
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.security.MessageDigest
+import java.util.ArrayDeque
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * The guest side of SYNC.md v1 for Android-to-Android sharing: this phone
+ * edits files hosted by an Android peer.
+ *
+ * Mirrors the host protocol: subscribes to the peer's shared index, fetches
+ * file bytes into a version-aware local cache (refetch only when the
+ * advertised version moves), applies the host's committed ops and live
+ * strokes to the open document, and submits local edits with the head
+ * version as base.
+ *
+ * Cache layout under [cacheDir]: `<fp12>/<sha256(remoteId)>.xnote` plus
+ * `meta.json` mapping hashes back to `{remoteId, version, path, name}` so a
+ * reconnect serves unchanged files instantly instead of refetching them.
+ *
+ * Threading matches [HostEngine]: [onMessage] and controller hooks run on
+ * the main thread; file IO runs on [io].
+ */
+class GuestEngine(
+    /** Peer's cert fingerprint; empty until the TLS handshake identifies it. */
+    var hostFp: String,
+    private val sender: Sender,
+    private val host: GuestHost,
+    /** Already-scoped cache root (per dial target); meta + blobs live here. */
+    cacheRoot: File,
+    var peerName: String,
+) {
+    fun interface Sender {
+        fun send(msg: JSONObject)
+    }
+
+    interface GuestHost {
+        /** The live document open for [cacheUri], or null. */
+        fun openDocument(cacheUri: String): Document?
+        fun repaintDocument(cacheUri: String)
+        fun repaintLive(cacheUri: String)
+        fun editorState(cacheUri: String): com.xnotes.canvas.CanvasState?
+        fun structureChanged(cacheUri: String)
+        fun previewRoom(cacheUri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double)
+        fun clearRoomPreview(cacheUri: String)
+        fun applyRoomEdit(cacheUri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean
+        fun liveOverlay(cacheUri: String): RemoteLiveStrokes?
+        /** The remote index changed; the Shared-with-me screen re-renders. */
+        fun onIndexChanged(hostFp: String)
+        /** A fetch completed: open [cacheUri] in the editor when [openNow]. */
+        fun onFileReady(hostFp: String, remoteId: String, cacheUri: String, version: Long, openNow: Boolean)
+        /** A create/delete request was answered (toast/status wiring). */
+        fun onResult(hostFp: String, ok: Boolean, reason: String)
+        fun onError(reason: String)
+    }
+
+    data class RemoteEntry(val id: String, val path: String, val kind: Int, val version: Long, val size: Long)
+
+    private val lock = Any()
+    private val io: Executor = Executors.newSingleThreadExecutor { r -> Thread(r, "xnotes-guest-io").apply { isDaemon = true } }
+    private val dir = cacheRoot.apply { mkdirs() }
+    private var seq = 0
+
+    /** Last advertised index, by remote id. */
+    private val index = HashMap<String, RemoteEntry>()
+    /** Known host versions, by remote id (from index/file/op/op_ack). */
+    private val versions = HashMap<String, Long>()
+    /** Cache file bound to each remote id. */
+    private val bound = HashMap<String, String>()
+    /** Dedupes of our own submitted ops, to drop the host's echo. */
+    private val sentDedupes = HashMap<String, ArrayDeque<String>>()
+    /** Host presence: remote id -> page. */
+    private val hostPresence = HashMap<String, Int>()
+
+    private fun send(msg: JSONObject) {
+        msg.put("seq", ++seq)
+        sender.send(msg)
+    }
+
+    // --- session ---
+
+    /** Called when pairing finished (or on every reconnect): subscribe. */
+    fun start() {
+        send(JSONObject().put("t", "index_subscribe"))
+    }
+
+    fun onMessage(msg: JSONObject) {
+        when (msg.optString("t")) {
+            "index" -> onIndex(msg)
+            "file" -> onFileChunk(msg)
+            "op" -> onOp(msg)
+            "op_ack" -> onOpAck(msg)
+            "resync" -> onResync(msg)
+            "live" -> onLive(msg)
+            "room_live" -> onRoomLive(msg)
+            "image_data" -> onImageChunk(msg)
+            "presence" -> synchronized(lock) {
+                val file = msg.optString("file")
+                if (file.isNotEmpty()) hostPresence[file] = msg.optInt("page", -1)
+            }
+            "delete_result", "create_result" -> host.onResult(
+                hostFp, msg.optBoolean("ok", false), msg.optString("reason"),
+            )
+            "heartbeat" -> Unit
+            else -> Unit
+        }
+    }
+
+    fun remoteIndex(): List<RemoteEntry> = synchronized(lock) { index.values.toList() }
+
+    fun presenceOf(remoteId: String): Int = synchronized(lock) { hostPresence[remoteId] ?: -1 }
+
+    // --- index ---
+
+    private fun onIndex(msg: JSONObject) {
+        val arr = msg.optJSONArray("files") ?: JSONArray()
+        val fresh = HashMap<String, RemoteEntry>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isEmpty()) continue
+            fresh[id] = RemoteEntry(id, o.optString("path"), o.optInt("kind", 0), o.optLong("version", 1L), o.optLong("size", 0L))
+        }
+        val stale: List<String>
+        synchronized(lock) {
+            stale = index.keys.filter { it !in fresh }
+            index.clear()
+            index.putAll(fresh)
+            for ((id, e) in fresh) versions[id] = maxOf(versions[id] ?: 1L, e.version)
+        }
+        // Drop cache bindings for files that are no longer shared.
+        for (id in stale) synchronized(lock) { bound.remove(id) }
+        host.onIndexChanged(hostFp)
+        // Opportunistically refresh open docs whose version moved.
+        for ((id, e) in fresh) {
+            val cache = synchronized(lock) { bound[id] }
+            if (cache != null && host.openDocument(cache) != null) {
+                if (e.version != synchronized(lock) { versions[id] }) fetch(id, openNow = false)
+            }
+        }
+    }
+
+    // --- fetch / file cache ---
+
+    /**
+     * Fetch [remoteId] into the cache; opens it in the editor when [openNow].
+     * Skips the socket entirely when the cache already holds the advertised
+     * version.
+     */
+    fun fetch(remoteId: String, openNow: Boolean) {
+        val known = synchronized(lock) { versions[remoteId] ?: 0L }
+        val cache = cacheFile(remoteId)
+        if (cache.isFile && cacheMeta(remoteId)?.version == known && known > 0) {
+            bind(remoteId, cache)
+            host.onFileReady(hostFp, remoteId, cacheUri(cache), known, openNow)
+            return
+        }
+        fileAsm.remove(remoteId)
+        send(JSONObject().put("t", "fetch").put("id", remoteId).put("offset", 0).put("length", 0))
+        pendingOpen.add(remoteId to openNow)
+    }
+
+    private val pendingOpen = ArrayDeque<Pair<String, Boolean>>()
+
+    private class FileAsm(val total: Long, val buf: ByteArrayOutputStream, var filled: Long = 0)
+    private val fileAsm = HashMap<String, FileAsm>()
+
+    private fun onFileChunk(msg: JSONObject) {
+        val id = msg.optString("id")
+        if (id.isEmpty()) return
+        val total = msg.optLong("total", -1)
+        val offset = msg.optLong("offset", -1)
+        if (total < 0 || total > 64L * 1024 * 1024 || offset < 0 || offset > total) {
+            fileAsm.remove(id)
+            return
+        }
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(msg.optString("data"))
+        } catch (_: Exception) {
+            fileAsm.remove(id)
+            return
+        }
+        val asm = fileAsm.getOrPut(id) { FileAsm(total, ByteArrayOutputStream(total.coerceAtMost(8L * 1024 * 1024).toInt())) }
+        if (asm.total != total || offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            fileAsm.remove(id)
+            return
+        }
+        asm.buf.write(bytes)
+        asm.filled += bytes.size
+        if (!msg.optBoolean("last", false) && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            fileAsm.remove(id)
+            return
+        }
+        fileAsm.remove(id)
+        val version = msg.optLong("version", 1L)
+        val data = asm.buf.toByteArray()
+        val openNow = synchronized(lock) {
+            val want = pendingOpen.filter { it.first == id }.lastOrNull()?.second ?: (host.openDocument(bound[id] ?: "") != null)
+            pendingOpen.removeAll { it.first == id }
+            versions[id] = version
+            want
+        }
+        io.execute {
+            val cache = cacheFile(id)
+            runCatching {
+                cache.parentFile?.mkdirs()
+                val tmp = File(cache.parentFile, "${cache.name}.tmp")
+                tmp.writeBytes(data)
+                if (!tmp.renameTo(cache)) {
+                    cache.delete()
+                    tmp.renameTo(cache)
+                }
+                saveMeta(id, version, data.size.toLong())
+            }
+            bind(id, cache)
+            host.onFileReady(hostFp, id, cacheUri(cache), version, openNow)
+        }
+    }
+
+    private fun onResync(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        synchronized(lock) { versions[file] = msg.optLong("version", versions[file] ?: 1L) }
+        fetch(file, openNow = false)
+    }
+
+    private fun onOpAck(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        synchronized(lock) { versions[file] = maxOf(versions[file] ?: 1L, msg.optLong("version", 1L)) }
+    }
+
+    // --- committed ops from the host ---
+
+    private fun onOp(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        val dedupe = msg.optString("dedupe")
+        val cacheUri = synchronized(lock) { bound[file] }
+        // Our own echo: advance the version, skip the apply.
+        if (dedupe.isNotEmpty() && synchronized(lock) { sentDedupes[file]?.contains(dedupe) == true }) {
+            synchronized(lock) { versions[file] = maxOf(versions[file] ?: 1L, msg.optLong("version", 1L)) }
+            return
+        }
+        val base = msg.optLong("base_version", -1)
+        val known = synchronized(lock) { versions[file] ?: 1L }
+        if (base != -1L && base != known) {
+            fetch(file, openNow = false)
+            return
+        }
+        val ops = msg.optJSONArray("ops") ?: JSONArray()
+        var changed = false
+        for (i in 0 until ops.length()) {
+            val op = ops.optJSONObject(i) ?: continue
+            when (op.optString("op")) {
+                "add_stroke" -> {
+                    val stroke = SyncWire.toNative(op.optJSONObject("stroke") ?: continue) ?: continue
+                    if (applyStroke(cacheUri, file, op.optInt("page", 0), stroke)) changed = true
+                }
+                "erase_strokes" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: continue
+                    if (applyErase(cacheUri, file, op.optInt("page", 0), ids)) changed = true
+                }
+                "add_page" -> {
+                    if (applyPageAdd(cacheUri, file, op.optInt("index", 0), op.optDouble("width", 0.0), op.optDouble("height", 0.0))) changed = true
+                }
+                "remove_page" -> {
+                    if (applyPageRemove(cacheUri, file, op.optInt("index", -1))) changed = true
+                }
+                "open_room" -> {
+                    if (applyRoomEdit(cacheUri, op.optInt("page", 0), op.optBoolean("sideways", false), true, op.optDouble("at", 0.0), op.optDouble("at", 0.0) + op.optDouble("size", 0.0))) changed = true
+                }
+                "close_room" -> {
+                    if (applyRoomEdit(cacheUri, op.optInt("page", 0), op.optBoolean("sideways", false), false, op.optDouble("a", 0.0), op.optDouble("b", 0.0))) changed = true
+                }
+                "add_image" -> {
+                    if (applyRemoteImage(cacheUri, file, op)) changed = true
+                }
+                else -> Unit
+            }
+        }
+        if (dedupe.isNotEmpty() && cacheUri != null) host.liveOverlay(cacheUri)?.finish(dedupe)
+        synchronized(lock) { versions[file] = maxOf(known, msg.optLong("version", known + if (changed) 1 else 0)) }
+    }
+
+    private fun applyStroke(cacheUri: String?, file: String, page: Int, stroke: Stroke): Boolean {
+        val uri = cacheUri ?: return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            pg.items.add(stroke)
+            true
+        }
+        host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            pg.items.add(stroke)
+            doc.dirty = true
+            host.editorState(uri)?.appendToCache(pg, stroke)
+            host.repaintDocument(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            pg.items.add(stroke)
+            true
+        }
+    }
+
+    private fun applyErase(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            val targets = pg.items.filterIsInstance<Stroke>().filter { SyncWire.fingerprintOf(it) in ids }
+            if (targets.isEmpty()) return false
+            val dirty = targets.map { it.paintBounds() }.reduce { a, b -> a.union(b) }.outset(2.0)
+            pg.items.removeAll(targets.toSet())
+            doc.dirty = true
+            val st = host.editorState(uri)
+            if (st == null || !st.repairRegion(pg, dirty)) st?.invalidatePage(pg)
+            host.repaintDocument(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            val targets = pg.items.filterIsInstance<Stroke>().filter { SyncWire.fingerprintOf(it) in ids }
+            if (targets.isEmpty()) return@modifyCache false
+            pg.items.removeAll(targets.toSet())
+            true
+        }
+    }
+
+    private fun applyPageAdd(cacheUri: String?, file: String, index: Int, width: Double, height: Double): Boolean {
+        val mk: (MutableList<Page>) -> Boolean = { pages ->
+            val ref = pages.getOrNull(index.coerceIn(0, pages.size)) ?: pages.lastOrNull()
+            val at = index.coerceIn(0, pages.size)
+            pages.add(at, Page(if (width > 0) width else ref?.width ?: 595.0, if (height > 0) height else ref?.height ?: 842.0))
+            true
+        }
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            mk(doc.pages)
+            doc.dirty = true
+            host.editorState(uri)?.let { st ->
+                st.relayout()
+                st.clampScroll()
+            }
+            host.structureChanged(uri)
+            return true
+        }
+        return modifyCache(file) { mk(it.pages) }
+    }
+
+    private fun applyPageRemove(cacheUri: String?, file: String, index: Int): Boolean {
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            if (doc.pages.size <= 1 || index !in doc.pages.indices) return false
+            val page = doc.pages.removeAt(index)
+            doc.dirty = true
+            host.editorState(uri)?.let { st ->
+                st.invalidatePage(page)
+                st.relayout()
+                st.clampScroll()
+            }
+            host.structureChanged(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            if (doc.pages.size <= 1 || index !in doc.pages.indices) return@modifyCache false
+            doc.pages.removeAt(index)
+            true
+        }
+    }
+
+    private fun applyRoomEdit(cacheUri: String?, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
+        val uri = cacheUri ?: return false
+        return host.applyRoomEdit(uri, page, sideways, open, a, b)
+    }
+
+    // --- images ---
+
+    private class ImageAsm(val file: String, val total: Long, val buf: ByteArrayOutputStream, var filled: Long = 0)
+    private val imageAsm = HashMap<String, ImageAsm>()
+    private val pendingImageOps = HashMap<String, ArrayList<Pair<String, JSONObject>>>()
+    private val imageBytes = HashMap<String, Pair<String, ByteArray>>()
+    private val imageOrder = ArrayDeque<String>()
+    private val imageDir: File = File(cacheRoot, "images").apply { mkdirs() }
+
+    private fun onImageChunk(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        val id = msg.optString("image_id")
+        if (id.isEmpty()) return
+        val total = msg.optLong("total", -1)
+        val offset = msg.optLong("offset", -1)
+        if (total < 0 || total > HostEngine.IMAGE_MAX_BYTES || offset < 0 || offset > total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        if (total == 0L) {
+            if (!msg.optBoolean("last", false)) {
+                imageAsm.remove(id)
+                pendingImageOps.remove(id)
+                return
+            }
+            rememberImage(id, file, ByteArray(0))
+            flushImage(id)
+            return
+        }
+        val asm = imageAsm.getOrPut(id) { ImageAsm(file, total, ByteArrayOutputStream(total.coerceAtMost(HostEngine.IMAGE_MAX_BYTES).toInt())) }
+        if (asm.total != total || asm.file != file) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(msg.optString("data"))
+        } catch (_: Exception) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        if (offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        asm.buf.write(bytes)
+        asm.filled += bytes.size
+        if (!msg.optBoolean("last", false) && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        imageAsm.remove(id)
+        rememberImage(id, file, asm.buf.toByteArray())
+        flushImage(id)
+    }
+
+    private fun rememberImage(id: String, file: String, bytes: ByteArray) {
+        imageBytes[id] = file to bytes
+        imageOrder.remove(id)
+        imageOrder.addLast(id)
+        while (imageOrder.size > HostEngine.IMAGE_KEPT) {
+            if (imageBytes.size <= 1 || imageOrder.isEmpty()) break
+            imageBytes.remove(imageOrder.removeFirst())
+        }
+    }
+
+    private fun flushImage(id: String) {
+        val pend = pendingImageOps.remove(id) ?: return
+        val (file, bytes) = imageBytes[id] ?: return
+        for ((f, op) in pend) if (f == file) {
+            val uri = synchronized(lock) { bound[f] }
+            applyImageBytes(uri, f, op, bytes)
+        }
+    }
+
+    private fun applyRemoteImage(cacheUri: String?, file: String, op: JSONObject): Boolean {
+        val id = op.optString("image_id")
+        if (id.isEmpty()) return false
+        val ready = imageBytes[id]?.takeIf { it.first == file }?.second
+        if (ready != null) return applyImageBytes(cacheUri, file, op, ready)
+        val pend = pendingImageOps.getOrPut(id) { ArrayList() }
+        pend += file to op
+        while (pendingImageOps.values.sumOf { it.size } > 16) {
+            val first = pendingImageOps.keys.firstOrNull() ?: break
+            val list = pendingImageOps[first]!!
+            list.removeAt(0)
+            if (list.isEmpty()) pendingImageOps.remove(first)
+        }
+        return false
+    }
+
+    private fun applyImageBytes(cacheUri: String?, file: String, op: JSONObject, bytes: ByteArray): Boolean {
+        val page = op.optInt("page", 0)
+        val rect = op.optJSONArray("rect") ?: return false
+        if (rect.length() < 4) return false
+        val safeId = op.optString("image_id").filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(64).ifEmpty { "img" }
+        val dest = try {
+            imageDir.mkdirs()
+            File.createTempFile("img-$safeId-", ".bin", imageDir)
+        } catch (_: Exception) {
+            return false
+        }
+        try {
+            dest.writeBytes(bytes)
+        } catch (_: Exception) {
+            dest.delete()
+            return false
+        }
+        val partArr = op.optJSONArray("part")
+        val part = if (partArr != null && partArr.length() == 4) {
+            com.xnotes.core.geometry.Rect(partArr.optDouble(0), partArr.optDouble(1),
+                partArr.optDouble(2) - partArr.optDouble(0), partArr.optDouble(3) - partArr.optDouble(1))
+        } else null
+        val item = com.xnotes.core.model.ImageItem(
+            com.xnotes.core.model.ImageData(dest, op.optInt("width", 0), op.optInt("height", 0)),
+            com.xnotes.core.geometry.Rect(rect.optDouble(0), rect.optDouble(1), rect.optDouble(2), rect.optDouble(3)),
+            orientation = op.optInt("orientation", 0),
+            angle = op.optDouble("angle", 0.0),
+            flip = com.xnotes.core.geometry.Flip.of(op.optBoolean("flip_x", false), op.optBoolean("flip_y", false)),
+            part = part,
+        )
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: run {
+                dest.delete()
+                return false
+            }
+            if (item.rect.w <= 0 || item.rect.h <= 0) {
+                dest.delete()
+                return false
+            }
+            pg.items.add(item)
+            doc.dirty = true
+            host.editorState(uri)?.appendToCache(pg, item)
+            host.repaintDocument(uri)
+            return true
+        }
+        val ok = modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            if (item.rect.w <= 0 || item.rect.h <= 0) return@modifyCache false
+            pg.items.add(item)
+            true
+        }
+        if (!ok) dest.delete()
+        return ok
+    }
+
+    // --- live strokes ---
+
+    private fun onLive(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        val uri = synchronized(lock) { bound[file] } ?: return
+        val doc = host.openDocument(uri) ?: return
+        val overlay = host.liveOverlay(uri) ?: return
+        val samples = msg.optJSONArray("samples") ?: JSONArray()
+        if (samples.length() == 0 && !msg.optBoolean("done", false)) return
+        val color = RemoteLiveStrokes.parseColor(msg.optString("color")) ?: return
+        val pts = ArrayList<com.xnotes.core.geometry.Pt>(samples.length())
+        for (i in 0 until samples.length()) {
+            val s = samples.optJSONArray(i) ?: continue
+            if (s.length() < 2) continue
+            pts += com.xnotes.core.geometry.Pt(s.optDouble(0), s.optDouble(1))
+        }
+        val page = msg.optInt("page", 0)
+        if (page !in doc.pages.indices) return
+        overlay.update(file, page, msg.optString("stroke_id"), msg.optDouble("width", 3.0), color, pts, msg.optBoolean("done", false))
+        host.repaintLive(uri)
+    }
+
+    private fun onRoomLive(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        val uri = synchronized(lock) { bound[file] } ?: return
+        if (msg.optBoolean("done", false)) {
+            host.clearRoomPreview(uri)
+        } else {
+            val page = msg.optInt("page", 0)
+            val doc = host.openDocument(uri) ?: return
+            if (page !in doc.pages.indices) return
+            host.previewRoom(
+                uri, page, msg.optBoolean("sideways", false),
+                msg.optDouble("split", 0.0), msg.optDouble("resume", 0.0), msg.optDouble("shift", 0.0),
+            )
+        }
+        host.repaintLive(uri)
+    }
+
+    // --- local submits (controller hooks, via the service router) ---
+
+    private fun remoteIdOf(cacheUri: String): String? = synchronized(lock) {
+        bound.entries.firstOrNull { it.value == cacheUri }?.key
+    }
+
+    fun isGuestUri(cacheUri: String): Boolean = synchronized(lock) { bound.containsValue(cacheUri) }
+
+    fun submitLocalStroke(cacheUri: String, page: Int, stroke: Stroke, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val ops = JSONArray().put(
+            JSONObject().put("op", "add_stroke").put("page", page).put("stroke", SyncWire.toWire(stroke)),
+        )
+        submitLocalOps(file, ops, dedupe)
+    }
+
+    fun submitLocalPageAdd(cacheUri: String, index: Int, width: Double, height: Double, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        submitLocalOps(file, JSONArray().put(
+            JSONObject().put("op", "add_page").put("index", index).put("width", width).put("height", height),
+        ), dedupe)
+    }
+
+    fun submitLocalPageRemove(cacheUri: String, index: Int, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "remove_page").put("index", index)), dedupe)
+    }
+
+    fun submitLocalErase(cacheUri: String, page: Int, ids: List<String>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (ids.isEmpty()) return
+        submitLocalOps(file, JSONArray().put(
+            JSONObject().put("op", "erase_strokes").put("page", page).put("ids", JSONArray(ids)),
+        ), dedupe)
+    }
+
+    fun submitLocalRoomOpen(cacheUri: String, page: Int, sideways: Boolean, at: Double, size: Double, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        submitLocalOps(file, JSONArray().put(
+            JSONObject().put("op", "open_room").put("page", page).put("at", at).put("size", size)
+                .let { if (sideways) it.put("sideways", true) else it },
+        ), dedupe)
+    }
+
+    fun submitLocalRoomClose(cacheUri: String, page: Int, sideways: Boolean, a: Double, b: Double, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        submitLocalOps(file, JSONArray().put(
+            JSONObject().put("op", "close_room").put("page", page).put("a", a).put("b", b)
+                .let { if (sideways) it.put("sideways", true) else it },
+        ), dedupe)
+    }
+
+    private fun submitLocalOps(file: String, ops: JSONArray, dedupe: String) {
+        val base = synchronized(lock) { versions[file] ?: 1L }
+        synchronized(lock) {
+            val q = sentDedupes.getOrPut(file) { ArrayDeque() }
+            q.addLast(dedupe)
+            while (q.size > SyncVersions.DEDUPE_KEPT) q.removeFirst()
+        }
+        send(
+            JSONObject().put("t", "op").put("file", file)
+                .put("base_version", base).put("ops", ops).put("dedupe", dedupe),
+        )
+    }
+
+    /** A local image insert: chunked bytes first, then the placing op. */
+    fun submitLocalImage(
+        cacheUri: String, page: Int, imageId: String, bytes: ByteArray,
+        width: Int, height: Int, rect: com.xnotes.core.geometry.Rect,
+        orientation: Int, angle: Double, flipX: Boolean, flipY: Boolean, part: com.xnotes.core.geometry.Rect?,
+        dedupe: String,
+    ) {
+        val file = remoteIdOf(cacheUri) ?: return
+        sendImageBytes(file, imageId, bytes)
+        val op = JSONObject().put("op", "add_image").put("page", page).put("image_id", imageId)
+            .put("width", width).put("height", height)
+            .put("rect", JSONArray().put(rect.x).put(rect.y).put(rect.w).put(rect.h))
+            .put("orientation", orientation).put("angle", angle)
+        if (flipX) op.put("flip_x", true)
+        if (flipY) op.put("flip_y", true)
+        part?.let { op.put("part", JSONArray().put(it.x).put(it.y).put(it.right).put(it.bottom)) }
+        submitLocalOps(file, JSONArray().put(op), dedupe)
+    }
+
+    /** Chunked image bytes ahead of their op (256 KiB frames, base64 like file chunks). */
+    private fun sendImageBytes(file: String, imageId: String, bytes: ByteArray) {
+        if (bytes.isEmpty()) {
+            send(JSONObject().put("t", "image_data").put("file", file).put("image_id", imageId)
+                .put("total", 0).put("offset", 0).put("data", "").put("last", true))
+            return
+        }
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + HostEngine.IMAGE_CHUNK, bytes.size)
+            send(JSONObject().put("t", "image_data").put("file", file).put("image_id", imageId)
+                .put("total", bytes.size).put("offset", offset)
+                .put("data", java.util.Base64.getEncoder().encodeToString(bytes.sliceArray(offset until end)))
+                .put("last", end >= bytes.size))
+            offset = end
+        }
+    }
+
+    fun liveSample(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String, x: Double, y: Double, p: Double) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val samples = JSONArray().put(JSONArray().put(x).put(y).put(p))
+        send(
+            JSONObject().put("t", "live").put("file", file).put("page", page)
+                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+                .put("samples", samples).put("done", false),
+        )
+    }
+
+    fun finishStroke(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        send(
+            JSONObject().put("t", "live").put("file", file).put("page", page)
+                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+                .put("samples", JSONArray()).put("done", true),
+        )
+    }
+
+    fun roomPreview(cacheUri: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val msg = JSONObject().put("t", "room_live").put("file", file).put("page", page)
+            .put("split", split).put("resume", resume).put("shift", shift)
+            .put("live_id", liveId).put("done", false)
+        if (sideways) msg.put("sideways", true)
+        send(msg)
+    }
+
+    fun finishRoom(cacheUri: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val msg = JSONObject().put("t", "room_live").put("file", file).put("page", page)
+            .put("split", split).put("resume", resume).put("shift", shift)
+            .put("live_id", liveId).put("done", true)
+        if (sideways) msg.put("sideways", true)
+        send(msg)
+    }
+
+    fun presence(cacheUri: String, page: Int) {
+        val file = remoteIdOf(cacheUri) ?: return
+        send(JSONObject().put("t", "presence").put("file", file).put("page", page))
+    }
+
+    fun requestDelete(cacheUri: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        send(JSONObject().put("t", "delete_request").put("id", file).put("device", peerName))
+    }
+
+    fun requestCreate(cacheUri: String?, name: String, kind: Int) {
+        send(JSONObject().put("t", "create_request").put("dir_id", cacheUri).put("name", name).put("kind", kind).put("device", peerName))
+    }
+
+    // --- cache files ---
+
+    private val codec by lazy {
+        DocumentCodec(com.xnotes.platform.AndroidImageCodec(), com.xnotes.platform.AndroidTextMeasurer())
+    }
+
+    private fun cacheKey(remoteId: String): String =
+        MessageDigest.getInstance("SHA-256").digest(remoteId.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun cacheFile(remoteId: String): File = File(dir, "${cacheKey(remoteId)}.xnote")
+
+    private fun cacheUri(cache: File): String = "file://${cache.absolutePath}"
+
+    private fun bind(remoteId: String, cache: File) {
+        synchronized(lock) { bound[remoteId] = cacheUri(cache) }
+    }
+
+    /** Raw cached bytes for [remoteId] (copy-out wiring), or null. */
+    fun cachedBytes(remoteId: String): ByteArray? {
+        val f = cacheFile(remoteId)
+        return if (f.isFile) runCatching { f.readBytes() }.getOrNull() else null
+    }
+
+    /** Cache URI currently bound to [remoteId], if any. */
+    fun boundUri(remoteId: String): String? = synchronized(lock) { bound[remoteId] }
+
+    private data class Meta(val version: Long, val path: String)
+
+    private fun metaFile(): File = File(dir, "meta.json")
+
+    private fun cacheMeta(remoteId: String): Meta? = try {
+        val o = JSONObject(metaFile().readText()).optJSONObject(cacheKey(remoteId)) ?: return null
+        Meta(o.optLong("version", 0L), o.optString("path"))
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun saveMeta(remoteId: String, version: Long, size: Long) {
+        try {
+            val root = try {
+                JSONObject(metaFile().readText())
+            } catch (_: Exception) {
+                JSONObject()
+            }
+            root.put(cacheKey(remoteId), JSONObject().put("version", version).put("path", indexPath(remoteId)).put("size", size))
+            val tmp = File(dir, "meta.json.tmp")
+            tmp.writeText(root.toString())
+            if (!tmp.renameTo(metaFile())) {
+                metaFile().delete()
+                tmp.renameTo(metaFile())
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun indexPath(remoteId: String): String = synchronized(lock) { index[remoteId]?.path ?: remoteId }
+
+    /** Read-modify-write a cached file through the codec. */
+    private fun modifyCache(file: String, edit: (Document) -> Boolean): Boolean {
+        val cache = cacheFile(file)
+        if (!cache.isFile) return false
+        return try {
+            val doc = cache.inputStream().use { codec.read(it, null, null) }
+            if (!edit(doc)) return false
+            val out = ByteArrayOutputStream()
+            codec.write(doc, out)
+            cache.writeBytes(out.toByteArray())
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+}

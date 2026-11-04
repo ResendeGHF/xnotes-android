@@ -256,6 +256,8 @@ object XnotesIcons {
     val view = icon("M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z", circle(12.0, 12.0, 3.0))
     val home = icon("M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z", "M9 22V12h6v10")
     val share = icon("M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8", "M16 6l-4-4-4 4", "M12 2v13")
+    /** Two phones side by side (the Phones screen: Android-to-Android sharing). */
+    val phones = icon(roundRect(1.5, 8.0, 9.0, 12.0, 2.0), roundRect(12.5, 4.0, 10.0, 16.0, 2.0))
     /** Link graph: three notes joined by their links (the Graph screen). */
     val graph = icon(
         "M12 7.5v5", "M12 12.5 6.8 17", "M12 12.5l5.2 4.5",

@@ -226,6 +226,15 @@ fun ConnectPane() {
             Spacer(Modifier.width(12.dp))
             Text(status.text, color = palette.textDim.toComposeColor(), fontSize = 12.sp)
         }
+        val listenPort by CompanionService.listenPort.collectAsState()
+        if (sharing && listenPort > 0) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "This phone also listens on port $listenPort — a friend's phone can pair with it from Phones.",
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+            )
+        }
         if (codeNeeded && sharing) {
             Spacer(Modifier.height(12.dp))
             Text("Enter the code shown on the desktop.", color = palette.text.toComposeColor(), fontSize = 13.sp)
