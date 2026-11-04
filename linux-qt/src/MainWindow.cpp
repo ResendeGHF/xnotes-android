@@ -291,6 +291,33 @@ void MainWindow::buildUi() {
             a->setMenu(menu);
             if (auto* button = qobject_cast<QToolButton*>(tools->widgetForAction(a))) button->setPopupMode(QToolButton::MenuButtonPopup);
         }
+        if (qstrcmp(t.id, "markup") == 0) {
+            // The markup button picks select or the mark a drag makes.
+            static const ToolEntry kMarkupModes[] = {
+                {"select", "Select", "", ""},
+                {"highlight", "Highlight", "", ""},
+                {"underline", "Underline", "", ""},
+                {"strikeout", "Strikeout", "", ""},
+                {"squiggly", "Squiggly", "", ""},
+            };
+            auto* menu = new QMenu(this);
+            auto* modes = new QActionGroup(menu);
+            for (const ToolEntry& m : kMarkupModes) {
+                QAction* ma = menu->addAction(QString::fromUtf8(m.label));
+                ma->setCheckable(true);
+                ma->setChecked(markupMode_ == m.id);
+                ma->setData(QByteArray(m.id));
+                modes->addAction(ma);
+                markupModes_.insert(m.id, ma);
+                connect(ma, &QAction::triggered, this, [this, a, m] {
+                    markupMode_ = m.id;
+                    applyMarkupMode();
+                    a->trigger();
+                });
+            }
+            a->setMenu(menu);
+            if (auto* button = qobject_cast<QToolButton*>(tools->widgetForAction(a))) button->setPopupMode(QToolButton::MenuButtonPopup);
+        }
         if (qstrcmp(t.id, "shape") == 0) {
             // The shape tool's button also opens what it draws.
             auto* menu = new QMenu(this);
@@ -498,6 +525,12 @@ void MainWindow::applyShape() {
     xn_editor_set_shape_style(e, &style);
 }
 
+/* The markup tool's mode, handed to the editor. */
+void MainWindow::applyMarkupMode() {
+    if (QAction* m = markupModes_.value(markupMode_)) m->setChecked(true);
+    if (auto* e = canvas_->editor()) xn_editor_set_markup_mode(e, markupMode_.constData());
+}
+
 /* The pen button draws with kind from now on; its icon and tip say which. */
 void MainWindow::setPenKind(const QByteArray& kind) {
     const ToolEntry* entry = penEntry(kind);
@@ -553,6 +586,7 @@ void MainWindow::applyToolSettings() {
     xn_editor_set_erase_mode(e, eraseMode_->currentData().toInt());
     xn_editor_set_text_face(e, face_->currentData().toByteArray().constData());
     xn_editor_set_text_size(e, textSize_->value());
+    applyMarkupMode();
 }
 
 /*

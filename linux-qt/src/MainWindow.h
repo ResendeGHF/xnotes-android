@@ -73,6 +73,8 @@ private:
     QComboBox* eraseMode_;
     bool syncingWidth_ = false;
     QHash<QByteArray, double> widths_;
+    QByteArray markupMode_ = "select";  // select first, then mark from its menu
+    QHash<QByteArray, QAction*> markupModes_;
     QByteArray shapeKind_ = "rectangle";
     QAction* penAction_ = nullptr;   // the pen button: draws with the kind of pen picked on it
     QHash<QByteArray, QAction*> penKinds_;
@@ -90,6 +92,7 @@ private:
     void install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path);
     void buildUi();
     void applyKind();
+    void applyMarkupMode();
     /* Paper for pages without a colour of their own: the canvas's, in the panel and in exports. */
     xn_rgba paper() const { return dark_ ? 0x161616FFu : 0xFFFFFFFFu; }
     void refresh();

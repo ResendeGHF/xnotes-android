@@ -121,12 +121,16 @@ class NoteEditor(
         val cfg = controller.configFor(Tool.MARKUP)
         val made = Markups.of(sel, textOf, type, controller.inkColor, cfg.markupIntensity, epochMillisNow())
         texts.clear()
-        val steps = made.groupBy({ it.first }, { it.second })
+        val byPage = made.groupBy({ it.first }, { it.second })
+        val steps = byPage
             .mapNotNull { (i, marks) -> state.document.pages.getOrNull(i)?.let { AddMarkups(it, marks) } }
         if (steps.isEmpty()) return
         val edit = steps.singleOrNull() ?: CompositeCommand(steps)
         edit.redo()
         history.push(edit)
+        // The background layers hold the markups: repaint them, showing the new ones in the
+        // overlay until the fresh layers land, so nothing blinks while they render.
+        for ((i, marks) in byPage) state.document.pages.getOrNull(i)?.let { state.rebakeBackground(it, marks) }
         host.contentChanged()
         host.requestRender()
     }

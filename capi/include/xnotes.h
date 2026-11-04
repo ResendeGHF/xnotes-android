@@ -339,6 +339,9 @@ int xn_editor_pdf_selection_rect(const xn_editor* editor, double* out_xywh);
 /* Marks the selection (XN_MARK_*) on each page it covers, one undo step. */
 void xn_editor_pdf_mark(xn_editor* editor, int type);
 void xn_editor_pdf_clear(xn_editor* editor);
+/* The markup tool's mode ("select", "highlight", "underline", "strikeout", "squiggly"; free it), set by id. */
+char* xn_editor_markup_mode(const xn_editor* editor);
+void xn_editor_set_markup_mode(xn_editor* editor, const char* mode_id);
 
 /* Sticky notes. A fresh one centred on the viewport point (x, y), selected; collapse/expand the ones in the selection. */
 void xn_editor_insert_sticky(xn_editor* editor, double x, double y);

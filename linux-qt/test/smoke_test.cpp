@@ -601,6 +601,105 @@ private slots:
         }
     }
 
+    /* A select-mode markup drag settles a text selection that survives release, for its menu. */
+    void pdfMarkupSelectSettles() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        char* error = nullptr;
+        xn_note* note = xn_note_import_pdf(QFile::encodeName(path).constData(), canvas.host(), &error);
+        QVERIFY2(note, error);
+        canvas.setNote(note);
+        canvas.setTool("markup");
+        xn_editor_set_markup_mode(canvas.editor(), "select");
+        QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(120, 95));
+        QTest::qWait(1500);
+        for (int x = 140; x <= 330; x += 20) { QTest::mouseMove(&canvas, QPoint(x, 150)); QTest::qWait(20); }
+        QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(330, 150));
+        QTest::qWait(200);
+        QCOMPARE(xn_editor_pdf_has_selection(canvas.editor()), 1);
+        char* text = xn_editor_pdf_selected_text(canvas.editor());
+        QVERIFY(text != nullptr);
+        const QString selected = QString::fromUtf8(text);
+        xn_free_string(text);
+        QVERIFY2(selected.contains(QStringLiteral("Hello")), qPrintable(selected));
+        double xywh[4] = {};
+        QCOMPARE(xn_editor_pdf_selection_rect(canvas.editor(), xywh), 1);
+        QVERIFY(xywh[2] > 0 && xywh[3] > 0);
+        // Copy the selection, then mark it: both consume the settled selection.
+        xn_editor_pdf_mark(canvas.editor(), XN_MARK_UNDERLINE);
+        QTest::qWait(1500);
+        QCOMPARE(xn_editor_can_undo(canvas.editor()), 1);
+        canvas.setNote(nullptr);
+        xn_note_close(note);
+    }
+
+    /* A markup-tool drag over PDF text marks it on release (the default highlight mode). */
+    void pdfMarkupDragMarks() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        char* error = nullptr;
+        xn_note* note = xn_note_import_pdf(QFile::encodeName(path).constData(), canvas.host(), &error);
+        QVERIFY2(note, error);
+        QCOMPARE(xn_editor_can_undo(canvas.editor()), 0);
+        canvas.setNote(note);
+        canvas.setTool("markup");
+        QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(120, 95));
+        QTest::qWait(1500);  // the page's text reads on a worker meanwhile
+        QTest::mouseMove(&canvas, QPoint(200, 130));
+        QTest::qWait(200);
+        const int midDragSel = xn_editor_pdf_has_selection(canvas.editor());
+        for (int x = 220; x <= 330; x += 20) { QTest::mouseMove(&canvas, QPoint(x, 150)); QTest::qWait(20); }
+        const int preReleaseSel = xn_editor_pdf_has_selection(canvas.editor());
+        QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(330, 150));
+        QTest::qWait(200);
+        QCOMPARE(midDragSel, 1);
+        QCOMPARE(preReleaseSel, 1);
+        QCOMPARE(xn_editor_pdf_has_selection(canvas.editor()), 0);
+        QCOMPARE(xn_editor_can_undo(canvas.editor()), 1);
+        QTest::qWait(1500);  // background layers rebuild with the markup
+        const QImage shot = grab(canvas);
+        int marked = 0;
+        for (int y = 60; y < 220; y += 2)
+            for (int x = 60; x < 400; x += 2) {
+                const QColor c = shot.pixelColor(x, y);
+                // Paper is white, glyphs near-black: a highlight shifts a channel by a lot.
+                if (c.red() < 200 || c.green() < 200 || c.blue() < 200) marked++;
+            }
+        QVERIFY2(marked > 50, qPrintable(QStringLiteral("highlight paints, marked px=%1").arg(marked)));
+        canvas.setNote(nullptr);
+        xn_note_close(note);
+    }
+
+    /* A press held on PDF text with the pan tool selects its word (long press). */
+    void pdfPanLongPressSelects() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        char* error = nullptr;
+        xn_note* note = xn_note_import_pdf(QFile::encodeName(path).constData(), canvas.host(), &error);
+        QVERIFY2(note, error);
+        canvas.setNote(note);
+        canvas.setTool("pan");
+        QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(150, 100));
+        QTest::qWait(2500);  // past the long-press delay, with the text read meanwhile
+        const int heldSel = xn_editor_pdf_has_selection(canvas.editor());
+        QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(150, 100));
+        QTest::qWait(200);
+        const int releasedSel = xn_editor_pdf_has_selection(canvas.editor());
+        QCOMPARE(heldSel, 1);
+        QCOMPARE(releasedSel, 1);
+        canvas.setNote(nullptr);
+        xn_note_close(note);
+    }
+
     /* The scroll bars follow the view and move it. */
     void scrollBars() {
         MainWindow window;

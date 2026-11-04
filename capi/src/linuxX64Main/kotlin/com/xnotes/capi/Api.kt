@@ -7,6 +7,7 @@ import com.xnotes.canvas.CanvasState
 import com.xnotes.canvas.ChromePalette
 import com.xnotes.canvas.InteractionController
 import com.xnotes.canvas.MarkupOverlay
+import com.xnotes.core.tools.MarkupMode
 import com.xnotes.canvas.NoteIcons
 import com.xnotes.canvas.PdfPageFilter
 import com.xnotes.canvas.PdfTextController
@@ -1427,6 +1428,20 @@ fun xnEditorPdfMark(editor: COpaquePointer?, type: Int) = guard(Unit) {
 @CName("xn_editor_pdf_clear")
 fun xnEditorPdfClear(editor: COpaquePointer?) = guard(Unit) {
     editor!!.editor().pdfText.clear()
+}
+
+@CName("xn_editor_markup_mode")
+fun xnEditorMarkupMode(editor: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    strdup(editor!!.editor().controller.configFor(Tool.MARKUP).markupMode.id)
+}
+
+@CName("xn_editor_set_markup_mode")
+fun xnEditorSetMarkupMode(editor: COpaquePointer?, mode: String?) = guard(Unit) {
+    val ce = editor!!.editor()
+    val next = MarkupMode.entries.firstOrNull { it.id == mode } ?: return@guard
+    val config = ce.controller.configFor(Tool.MARKUP)
+    if (next == config.markupMode) return@guard
+    ce.controller.setToolConfig(Tool.MARKUP, config.copy(markupMode = next))
 }
 
 @CName("xn_editor_insert_sticky")
