@@ -1694,6 +1694,7 @@
     <string name="pref_share_files">Share files on the local network</string>
     <string name="pref_share_help">Serve notes over encrypted TLS so the desktop companion can view and edit them. The desktop sees each save within seconds. Works on public Wi-Fi and over a USB cable.</string>
     <string name="share_starting">Starting…</string>
+    <string name="share_off_hint">Sharing is off. Turn it on from the Connect screen.</string>
     <string name="share_fingerprint">Fingerprint %1$s</string>
     <string name="share_token">Token %1$s</string>
     <string name="share_show_token">Show</string>

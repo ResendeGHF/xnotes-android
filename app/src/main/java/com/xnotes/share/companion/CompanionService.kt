@@ -42,6 +42,11 @@ class CompanionService : Service() {
     private var pairing: PairingClient? = null
     private var engine: HostEngine? = null
     private var backend: ShareBackendImpl? = null
+    private var identity: ShareCrypto.ServerIdentity? = null
+    private var pins: CompanionPins? = null
+    private var deviceName: String = "Android"
+    private var targetHost: String = "127.0.0.1"
+    private var targetPort: Int = 42317
     private var starting = AtomicBoolean(false)
     private val approvals = HashMap<String, (Boolean) -> Unit>()
     private var approvalSeq = 0
@@ -64,6 +69,7 @@ class CompanionService : Service() {
     override fun onDestroy() {
         runningService = null
         CompanionEditors.onTracked = null
+        _active.value = false
         shutdown()
         _status.value = Status("Off", null, false)
     }
@@ -103,9 +109,14 @@ class CompanionService : Service() {
                 val policy = SharePolicy.of(shareDir)
                 val versions = File(shareDir, "sync_versions.json")
                 val prefs = getSharedPreferences(PREFS, 0)
-                val targetHost = prefs.getString(KEY_IP, "")?.ifEmpty { null }
+                val targetHost = prefs.getString(KEY_IP, "")?.ifEmpty { null } ?: "127.0.0.1"
                 val targetPort = prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 42317
                 val deviceName = android.os.Build.MODEL ?: "Android"
+                this.deviceName = deviceName
+                this.targetHost = targetHost
+                this.targetPort = targetPort
+                this.identity = identity
+                this.pins = pins
                 val host = object : HostEngine.HostEngineHost {
                     override fun send(msg: JSONObject) {
                         client?.send(msg)
@@ -150,37 +161,11 @@ class CompanionService : Service() {
                         postStatus(reason)
                     }
                 }
-                var pairingRef: PairingClient? = null
-                val client = CompanionClient(
-                    host = targetHost ?: "127.0.0.1",
-                    port = targetPort,
-                    identity = identity,
-                    pinnedFp = pins.all().firstOrNull()?.fp,
-                    autoReconnect = true,
-                )
-                val sender = PairingClient.Sender { msg -> client.send(msg) }
-                val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, ui, sender)
-                pairingRef = pairing
-                pairing.onPaired = { postStatus("Connected.") }
-                client.onConnected = { peerFp ->
-                    main.post {
-                        _status.value = Status("Connected. Pairing…", _status.value.paired, connected = true)
-                        pairing.onConnected(peerFp)
-                    }
-                }
-                client.onMessage = { msg -> main.post { route(msg, pairing, engine) } }
-                client.onDisconnected = { willRetry ->
-                    main.post {
-                        if (!willRetry) _status.value = Status("Disconnected.", _status.value.paired, connected = false)
-                    }
-                }
-                client.onError = { err -> postStatus(err) }
                 this.backend = backend
                 this.engine = engine
-                this.pairing = pairing
-                this.client = client
-                main.post { _status.value = Status("Connecting…", pins.all().firstOrNull()?.name, connected = false) }
-                client.connect()
+                this.ui = ui
+                _active.value = true
+                main.post { dialLocked() }
             } catch (e: Exception) {
                 postStatus("Start failed: ${e.message}")
                 starting.set(false)
@@ -189,18 +174,68 @@ class CompanionService : Service() {
         }, "companion-start").apply { isDaemon = true; start() }
     }
 
+    private var ui: PairingUi? = null
+
+    /** (Re)connect with the given companion address. Safe to call any time. */
+    fun reconnectTo(host: String, port: Int) {
+        targetHost = host
+        targetPort = port
+        dialLocked()
+    }
+
+    private fun dialLocked() {
+        val identity = identity ?: return
+        val pins = pins ?: return
+        runCatching { pairing?.close() }
+        runCatching { client?.disconnect() }
+        pairing = null
+        client = null
+        val host = targetHost
+        val port = targetPort
+        val sender = PairingClient.Sender { msg -> client?.send(msg) }
+        val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, ui ?: return, sender)
+        pairing.onPaired = { name ->
+            main.post { _status.value = Status("Connected to $name.", name, connected = true) }
+        }
+        val client = CompanionClient(
+            host = host,
+            port = port,
+            identity = identity,
+            pinnedFp = pins.all().firstOrNull()?.fp,
+            autoReconnect = true,
+        )
+        client.onConnected = { peerFp ->
+            main.post {
+                _status.value = Status("Connected. Pairing…", pins.nameFor(peerFp), connected = true)
+                pairing.onConnected(peerFp)
+            }
+        }
+        client.onMessage = { msg -> main.post { route(msg) } }
+        client.onDisconnected = { willRetry ->
+            main.post {
+                if (!willRetry) _status.value = Status("Disconnected.", _status.value.paired, connected = false)
+            }
+        }
+        client.onError = { err -> postStatus(err) }
+        this.pairing = pairing
+        this.client = client
+        main.post { _status.value = Status("Connecting…", pins.all().firstOrNull()?.name, connected = false) }
+        client.connect()
+    }
+
     private fun postStatus(s: String) {
         main.post { _status.value = Status(s, _status.value.paired, _status.value.connected) }
     }
 
-    private fun route(msg: JSONObject, pairing: PairingClient, engine: HostEngine) {
+    private fun route(msg: JSONObject) {
         when (msg.optString("t")) {
-            "hello_ack", "pair_result" -> pairing.onMessage(msg)
-            else -> engine.onMessage(msg)
+            "hello_ack", "pair_result" -> pairing?.onMessage(msg)
+            else -> engine?.onMessage(msg)
         }
     }
 
     private fun shutdown() {
+        _active.value = false
         starting.set(false)
         runCatching { pairing?.close() }
         runCatching { client?.disconnect() }
@@ -362,6 +397,8 @@ class CompanionService : Service() {
         val status: StateFlow<Status> = _status.asStateFlow()
         private val _codeNeeded = MutableStateFlow(false)
         val codeNeeded: StateFlow<Boolean> = _codeNeeded.asStateFlow()
+        private val _active = MutableStateFlow(false)
+        val active: StateFlow<Boolean> = _active.asStateFlow()
 
         const val PREFS = "companion"
         const val KEY_IP = "companion_last_ip"
@@ -373,7 +410,35 @@ class CompanionService : Service() {
                 ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
                 return
             }
-            svc.main.post { svc.pairing?.submitCode(code) }
+            svc.main.post { svc.pairing?.submitCode(code) ?: svc.postStatus("Not connected yet — try again in a moment.") }
+        }
+
+        /** Re-dial (same or new address) without stopping sharing. */
+        fun reconnect(context: Context, host: String, port: Int) {
+            val svc = runningService
+            if (svc == null) {
+                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+                return
+            }
+            svc.main.post {
+                svc.targetHost = host
+                svc.targetPort = port
+                if (svc.engine == null) {
+                    svc.startSession()
+                } else {
+                    svc.dialLocked()
+                }
+            }
+        }
+
+        fun disconnect() {
+            runningService?.let { svc ->
+                svc.main.post {
+                    svc.client?.autoReconnect = false
+                    svc.client?.disconnect()
+                    _status.value = Status("Disconnected.", _status.value.paired, connected = false)
+                }
+            }
         }
 
         fun unpair(context: Context, name: String) {

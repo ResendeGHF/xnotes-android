@@ -801,7 +801,7 @@ fun PreferencesPane(
             HorizontalDivider(color = palette.border.toComposeColor())
             Box(Modifier.searchAnchor(stringResource(R.string.search_keywords_port))) { PortSection(editor) }
             HorizontalDivider(color = palette.border.toComposeColor())
-            ShareSection(prefs.shareEnabled, { updateHome(prefs.copy(shareEnabled = it)) })
+            ShareSection()
             Spacer(Modifier.size(8.dp))
         }
         }
@@ -1154,33 +1154,27 @@ private fun PortSection(editor: Editor) {
  * is what the desktop checks on first connect (trust-on-first-use).
  */
 @Composable
-private fun ShareSection(enabled: Boolean, onToggle: (Boolean) -> Unit) {
+private fun ShareSection() {
     val palette = LocalPalette.current
-    val context = LocalContext.current
     val status by com.xnotes.share.companion.CompanionService.status.collectAsState()
+    val sharing by com.xnotes.share.companion.CompanionService.active.collectAsState()
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SectionTitle(stringResource(R.string.pref_sharing))
         Text(stringResource(R.string.pref_share_help), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
-        CheckRow(stringResource(R.string.pref_share_files), enabled) {
-            onToggle(it)
-            if (it) com.xnotes.share.companion.CompanionService.start(context)
-            else com.xnotes.share.companion.CompanionService.stop(context)
+        Text(
+            if (!sharing) stringResource(R.string.share_off_hint)
+            else status.text.ifEmpty { stringResource(R.string.share_starting) },
+            color = palette.textDim.toComposeColor(),
+            fontSize = 12.sp,
+        )
+        status.paired?.let { paired ->
+            Text(paired, color = palette.text.toComposeColor(), fontSize = 13.sp)
         }
-        if (enabled) {
-            Text(
-                status.text.ifEmpty { stringResource(R.string.share_starting) },
-                color = palette.textDim.toComposeColor(),
-                fontSize = 12.sp,
-            )
-            status.paired?.let { paired ->
-                Text(paired, color = palette.text.toComposeColor(), fontSize = 13.sp)
-            }
-            Text(
-                "Pair from the Connect screen; approve the desktop's popup, then pick files in the policy screen.",
-                color = palette.textDim.toComposeColor(),
-                fontSize = 12.sp,
-            )
-        }
+        Text(
+            "Turn sharing on and pair from the Connect screen.",
+            color = palette.textDim.toComposeColor(),
+            fontSize = 12.sp,
+        )
     }
 }
 
