@@ -15,6 +15,23 @@ with live stroke feedback in both directions, over a network neither trusts.
   stays reserved for later.
 - One TCP connection per pairing (multiplexed by `file` fields). Reconnect with
   resume (per-file versions, `resync` on mismatch).
+- **Android-to-Android (symmetric):** every phone both listens (hosts its own
+  files for peers) and dials (reads peers' files as guest). The listener tries
+  `42317` then bumps until free (`42317..42347`) and shows the bound port; the
+  dialer scans that range when no port is typed. One phone can host several
+  peers at once (per-peer grant gates, shared version store) and guest several
+  peers at once (one session each). The `hello` message carries `listen_port`
+  so a peer can dial back without a scan.
+
+## Pairing modes
+
+- Linux companion: code-entry (`pair_request` + desktop approval), as above.
+- Android-to-Android: **mutual-confirm SAS**. `hello_ack` carries
+  `pair_mode:"sas"` plus `sas` (6 digits, `SHA-256(min(fpA,fpB)|max(fpA,fpB))`,
+  order-independent so both ends agree). Both phones display the SAS; the
+  dialer sends `pair_confirm {device_name, host_cert_fp, sas}` after its user
+  taps Matches, and the host pins + answers `pair_result {ok}` after its user
+  taps Allow. A relay MITM cannot produce the same SAS on both ends.
 
 ## Security (hostile LAN)
 
