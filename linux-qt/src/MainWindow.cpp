@@ -31,6 +31,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
@@ -412,6 +413,47 @@ void MainWindow::buildUi() {
     colorAction_ = tools->addAction(QStringLiteral("Color…"), this, &MainWindow::chooseColor);
     tools->addSeparator();
     tools->addAction(QStringLiteral("Picture…"), this, &MainWindow::chooseImage);
+    tools->addSeparator();
+    tools->addAction(xnIcon(QStringLiteral("search")), QStringLiteral("Search"), QKeySequence::Find, this,
+                            [this] { toggleFind(findBar_ && !findBar_->isVisible()); });
+    tools->addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Sticky note"), QKeySequence(QStringLiteral("T")), this, [this] {
+        if (auto* e = canvas_->editor()) {
+            const QPointF dev = canvas_->toDevice(QPointF(canvas_->width() / 2.0, canvas_->height() / 3.0));
+            xn_editor_insert_sticky(e, dev.x(), dev.y());
+        }
+    });
+
+    // Find bar: in-note search, over the canvas like the selection bar.
+    findBar_ = addToolBar(QStringLiteral("Find"));
+    findBar_->setMovable(false);
+    findField_ = new QLineEdit(findBar_);
+    findField_->setPlaceholderText(QStringLiteral("Search in note"));
+    findField_->setClearButtonEnabled(true);
+    findField_->setMinimumWidth(220);
+    findBar_->addWidget(findField_);
+    connect(findField_, &QLineEdit::textChanged, this, &MainWindow::runFind);
+    findCase_ = findBar_->addAction(QStringLiteral("Aa"));
+    findCase_->setCheckable(true);
+    findCase_->setToolTip(QStringLiteral("Match case"));
+    connect(findCase_, &QAction::toggled, this, &MainWindow::runFind);
+    findWords_ = findBar_->addAction(QStringLiteral("ab|"));
+    findWords_->setCheckable(true);
+    findWords_->setToolTip(QStringLiteral("Whole words"));
+    connect(findWords_, &QAction::toggled, this, &MainWindow::runFind);
+    findCount_ = new QLabel(findBar_);
+    findCount_->setMinimumWidth(64);
+    findBar_->addWidget(findCount_);
+    findBar_->addAction(xnIcon(QStringLiteral("arrowUp")), QStringLiteral("Previous match"), this, [this] {
+        if (auto* e = canvas_->editor()) xn_editor_search_prev(e);
+    });
+    findBar_->addAction(xnIcon(QStringLiteral("arrowDown")), QStringLiteral("Next match"), this, [this] {
+        if (auto* e = canvas_->editor()) xn_editor_search_next(e);
+    });
+    findBar_->addAction(xnIcon(QStringLiteral("close")), QStringLiteral("Close search"), this, [this] { toggleFind(false); });
+    findPoll_ = new QTimer(this);
+    findPoll_->setInterval(200);
+    connect(findPoll_, &QTimer::timeout, this, &MainWindow::refreshFind);
+    findBar_->hide();
     colorAction_->setToolTip(QStringLiteral("Current color; click to choose another"));
 
     // Icons from the Android app's set; the words stay as tooltips (and as the actions' names).
@@ -611,6 +653,47 @@ void MainWindow::pasteAt(QPointF widget) {
     selectionBar_->refresh();
 }
 
+/* In-note search through the find bar. */
+void MainWindow::toggleFind(bool on) {
+    if (!findBar_) return;
+    findBar_->setVisible(on);
+    if (on) {
+        findField_->setFocus();
+        runFind();
+        findPoll_->start();
+    } else {
+        findPoll_->stop();
+        if (auto* e = canvas_->editor()) xn_editor_search_close(e);
+    }
+}
+
+void MainWindow::runFind() {
+    auto* e = canvas_->editor();
+    if (!e || !findBar_->isVisible()) return;
+    xn_editor_search(e, QFile::encodeName(findField_->text()).constData(), findCase_->isChecked() ? 1 : 0,
+                     findWords_->isChecked() ? 1 : 0);
+    refreshFind();
+}
+
+void MainWindow::refreshFind() {
+    auto* e = canvas_->editor();
+    if (!e || !findBar_->isVisible()) return;
+    const int count = xn_editor_search_count(e);
+    const int current = xn_editor_search_current(e);
+    findCount_->setText(count <= 0 ? QString() : QStringLiteral("%1/%2").arg(current + 1).arg(count));
+}
+
+/* Retype the selected sticky note. */
+void MainWindow::editStickyText(xn_editor* e) {
+    char* current = xn_editor_sticky_text(e);
+    const QString text = current ? QString::fromUtf8(current) : QString();
+    if (current) xn_free_string(current);
+    bool ok = false;
+    const QString next = QInputDialog::getMultiLineText(this, QStringLiteral("Sticky note"), QString(), text, &ok);
+    if (!ok) return;
+    xn_editor_set_sticky_text(e, QFile::encodeName(next).constData());
+}
+
 /* Edit the tapped markup's note (empty clears it). */
 void MainWindow::editMarkupNote(xn_editor* e, const QString& current) {
     bool ok = false;
@@ -687,7 +770,18 @@ void MainWindow::showContextMenu(QPointF at, bool onLocked) {
     const QMimeData* mime = QApplication::clipboard()->mimeData();
     paste->setEnabled(xn_editor_can_paste(e) || (mime && mime->hasImage()));
     if (onLocked) menu.addAction(xnIcon(QStringLiteral("unlock")), QStringLiteral("Unpin"), this, [e] { xn_editor_unlock_pressed(e); });
-    if (xn_editor_selection_has_sticky(e)) menu.addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Collapse/expand sticky"), this, [e] { xn_editor_toggle_sticky(e); });
+    if (xn_editor_selection_has_sticky(e)) {
+        menu.addAction(xnIcon(QStringLiteral("textBox")), QStringLiteral("Edit sticky text…"), this, [this, e] { editStickyText(e); });
+        auto* colors = menu.addMenu(QStringLiteral("Paper color"));
+        // Same papers as StickyNoteItem.PALETTE.
+        const QColor papers[] = {QColor(255, 241, 118), QColor(255, 205, 210), QColor(200, 230, 201),
+                                 QColor(187, 222, 251), QColor(255, 224, 178), QColor(225, 190, 231)};
+        for (const QColor& paper : papers) {
+            QAction* swatch = colors->addAction(swatchIcon(paper), paper.name());
+            connect(swatch, &QAction::triggered, this, [e, paper] { xn_editor_set_sticky_color(e, toRgba(paper)); });
+        }
+        menu.addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Collapse/expand sticky"), this, [e] { xn_editor_toggle_sticky(e); });
+    }
     menu.addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Sticky note"), this, [this, at] {
         if (auto* e = canvas_->editor()) {
             const QPointF dev = canvas_->toDevice(at);

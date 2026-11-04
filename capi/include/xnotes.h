@@ -197,6 +197,27 @@ typedef struct xn_host {
      * boxes four floats per entry.
      */
     int (*pdf_text)(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes);
+
+    /* --- v5. Unicode primitives for in-note search. Pure string math, thread-safe: the core
+       calls them on its own worker threads. Text is UTF-16 with explicit lengths (the core's
+       and QString's unit); codepoints are UTF-32. May be NULL (then search folds ASCII only). */
+
+    /*
+     * Normalize UTF-16 [in_text] ([in_len] units) into [out_text]: form 0 NFD, 1 NFC, 2 NFKC
+     * (KD, then C). Returns the units written; with NULL [out_text] (or capacity 0) the units
+     * needed. Returns -1 on an unknown form. When the normalized text does not fit, nothing is
+     * written and the units needed are returned.
+     */
+    int (*text_normalize)(void* ctx, int form, const uint16_t* in_text, int in_len, uint16_t* out_text, int out_cap);
+    /*
+     * Character buckets for the search fold: category 0 other, 1 control, 2 format, 3 surrogate,
+     * 4 unassigned, 5 private-use, 6 non-spacing mark, 7 spacing mark, 8 enclosing mark; script
+     * 0 other, 1 latin, 2 greek, 3 hebrew, 4 arabic; flags bit0 letter-or-digit, bit1 whitespace,
+     * bit2 space-char.
+     */
+    void (*text_char_info)(void* ctx, int cp, int* category, int* script, int* flags);
+    /* Lowercase mapping of one codepoint. */
+    int (*text_to_lower)(void* ctx, int cp);
 } xn_host;
 
 /* --- library -------------------------------------------------------------------------------- */
@@ -348,6 +369,11 @@ void xn_editor_insert_sticky(xn_editor* editor, double x, double y);
 void xn_editor_toggle_sticky(xn_editor* editor);
 /* 1 when the selection holds a sticky note (for offering collapse/expand). */
 int xn_editor_selection_has_sticky(const xn_editor* editor);
+/* The single selected sticky's text (free it; NULL when not exactly one), replaced as one undo step. */
+char* xn_editor_sticky_text(const xn_editor* editor);
+void xn_editor_set_sticky_text(xn_editor* editor, const char* utf8);
+/* Recolor the selected stickies. */
+void xn_editor_set_sticky_color(xn_editor* editor, xn_rgba color);
 
 /* The markup a tap landed on (PDF notes): 1 while one is held for its menu. Its note text
    (free with xn_free_string; NULL when it has none), replaced as one undo step, or the markup
@@ -358,6 +384,20 @@ void xn_editor_set_markup_note(xn_editor* editor, const char* utf8_note_or_null)
 void xn_editor_delete_markup(xn_editor* editor);
 /* The menu over the tapped markup closed without acting on it. */
 void xn_editor_clear_markup(xn_editor* editor);
+
+/* The note's embedded source PDF path (free it; NULL when the note has none), and a note
+   page's PDF page (or -1): navigating the PDF's outline to the note's pages. */
+char* xn_note_pdf_path(const xn_note* note);
+int xn_editor_page_pdf_index(const xn_editor* editor, int page);
+
+/* In-note search: look for [utf8_query] from the current page (toggles included); close it.
+   Count, 0-based current hit (-1 when none), and stepping through the matches. */
+void xn_editor_search(xn_editor* editor, const char* utf8_query, int match_case, int whole_words);
+void xn_editor_search_close(xn_editor* editor);
+int xn_editor_search_count(const xn_editor* editor);
+int xn_editor_search_current(const xn_editor* editor);
+void xn_editor_search_next(xn_editor* editor);
+void xn_editor_search_prev(xn_editor* editor);
 
 /* The armed tool's id (a static string). */
 const char* xn_editor_tool(const xn_editor* editor);

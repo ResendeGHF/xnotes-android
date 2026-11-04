@@ -6,6 +6,9 @@
 #include "CoreHost.h"
 #include "xnotes.h"
 
+#include <QPdfBookmarkModel>
+#include <QPdfDocument>
+
 #include <QHash>
 #include <QImage>
 #include <QList>
@@ -13,7 +16,9 @@
 #include <QWidget>
 
 class QListView;
+class QTabWidget;
 class QTimer;
+class QTreeView;
 class PageListModel;
 
 class PagesPanel : public QWidget {
@@ -44,6 +49,8 @@ public:
     int pendingThumbnails() const;
 
     QListView* list() const { return list_; }
+    QTreeView* outline() const { return outline_; }
+    int outlineEntries() const;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* e) override;
@@ -66,6 +73,10 @@ private:
     bool syncing_ = false;       // the panel itself moves the list's current row
     PageListModel* model_;
     QListView* list_;
+    QTabWidget* tabs_ = nullptr;
+    QTreeView* outline_ = nullptr;
+    QPdfBookmarkModel* outlineModel_ = nullptr;
+    QPdfDocument* outlineDoc_ = nullptr;  // the note's source PDF, for its outline
     QTimer* settle_;
     QTimer* renderTick_;
 

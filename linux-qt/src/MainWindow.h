@@ -14,6 +14,7 @@
 class CanvasWidget;
 class QCheckBox;
 class QComboBox;
+class QLineEdit;
 class QSlider;
 class QSpinBox;
 class QLabel;
@@ -87,6 +88,12 @@ private:
     bool clipboardIsNewer_ = false;
     QScrollBar* vbar_;
     QScrollBar* hbar_;
+    QToolBar* findBar_ = nullptr;
+    QLineEdit* findField_ = nullptr;
+    QLabel* findCount_ = nullptr;
+    QAction* findCase_ = nullptr;
+    QAction* findWords_ = nullptr;
+    QTimer* findPoll_ = nullptr;
     bool syncingBars_ = false;  // the system clipboard changed after the last in-app copy
 
     void install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path);
@@ -115,7 +122,11 @@ private:
     void pasteAt(QPointF widget);
     void selectAll();
     void showContextMenu(QPointF at, bool onLocked);
+    void toggleFind(bool on);
+    void runFind();
+    void refreshFind();
     void editMarkupNote(xn_editor* e, const QString& current);
+    void editStickyText(xn_editor* e);
     QString workFile(const QString& suffix);
     void chooseImage();
     bool insertImageFile(const QString& path, QPointF at, bool atPoint);

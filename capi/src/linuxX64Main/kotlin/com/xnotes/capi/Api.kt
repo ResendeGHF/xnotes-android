@@ -17,6 +17,16 @@ import com.xnotes.core.model.MarkupType
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.pdf.MarkupPainter
 import com.xnotes.core.platform.epochMillisNow
+import com.xnotes.core.search.SearchCorpus
+import com.xnotes.core.search.SearchHit
+import com.xnotes.core.search.SearchQuery
+import com.xnotes.core.search.SearchResults
+import com.xnotes.core.search.SearchSession
+import com.xnotes.core.search.SearchText
+import com.xnotes.core.search.SearchUnicode
+import com.xnotes.canvas.SearchTints
+import com.xnotes.core.search.TypedText
+import com.xnotes.core.search.TypedTexts
 import com.xnotes.capi.c.xn_host
 import com.xnotes.capi.c.xn_palette
 import com.xnotes.capi.c.xn_pointer
@@ -498,6 +508,81 @@ internal class CEditor(note: CNote, private val host: xn_host) {
         return pi to m
     }
 
+    /** Tinted search matches over the pages. */
+    val searchTints = SearchTints(
+        state, pdfTexts, frame = { null },
+        onViewChanged = { host.view_changed?.invoke(host.ctx) }, requestRender = { requestRender() },
+    ).also { controller.searchTints = it }
+
+    /** In-note search. */
+    private var searchSession: SearchSession? = null
+    var searchResults: SearchResults? = null
+        private set
+    var searchIndex = -1
+        private set
+
+    private val corpus = object : SearchCorpus {
+        override fun pdfPages(): IntArray = state.document.pages.map { it.pdfPage ?: -1 }.toIntArray()
+        override fun typedTexts(): List<TypedText> = TypedTexts.of(state.document.pages, state.document.flow, null)
+        override fun pdfText(index: Int): SearchText? {
+            // On the session's worker: read synchronously through the host (thread-safe).
+            val path = state.document.pdfFile?.pathString ?: return null
+            return readPdfPageText(host, path, index)?.let { SearchText.of(it) }
+        }
+    }
+
+    private val searchUi = object : com.xnotes.core.search.UiThread {
+        override fun post(r: Runnable) = state.postToMain { r.run() }
+        override fun postDelayed(r: Runnable, delayMs: Long) = scheduler.postDelayed(r, delayMs)
+        override fun cancel(r: Runnable) = scheduler.removeCallbacks(r)
+    }
+
+    private fun ensureSearchSession(): SearchSession {
+        searchSession?.let { return it }
+        return SearchSession(corpus, searchUi, state.runAsync).also { session ->
+            session.onResults = { res ->
+                searchResults = res
+                if (res == null) searchIndex = -1
+                else if (searchIndex < 0 || searchIndex >= res.count) {
+                    searchIndex = res.firstFrom(state.currentPageIndex())?.takeIf { it >= 0 } ?: -1
+                }
+                searchTints.show(res, currentSearchHit())
+                requestRender()
+            }
+            searchSession = session
+        }
+    }
+
+    private fun currentSearchHit(): SearchHit? {
+        val res = searchResults ?: return null
+        return if (searchIndex in 0 until res.count) res.hit(searchIndex) else null
+    }
+
+    fun searchSet(query: String, matchCase: Boolean, wholeWords: Boolean) {
+        ensureSearchSession().search(SearchQuery(query, matchCase, wholeWords), state.currentPageIndex())
+    }
+
+    fun searchClose() {
+        searchSession?.search(SearchQuery(""), 0)
+    }
+
+    private fun stepSearch(dir: Int) {
+        val res = searchResults ?: return
+        if (res.count == 0) return
+        searchIndex = if (searchIndex < 0) {
+            res.firstFrom(state.currentPageIndex())?.takeIf { it >= 0 } ?: return
+        } else {
+            (searchIndex + dir + res.count) % res.count
+        }
+        res.hit(searchIndex).let { searchTints.reveal(it) }
+        searchTints.show(res, currentSearchHit())
+        requestRender()
+    }
+
+    fun searchNext() = stepSearch(1)
+
+    fun searchPrev() = stepSearch(-1)
+
     private fun initMarkupNotes() {
         controller.markupOverlay = MarkupOverlay(state) { PdfPageFilter.NONE }
         controller.onMarkupTap = { at, _ ->
@@ -546,6 +631,7 @@ internal class CEditor(note: CNote, private val host: xn_host) {
             state.onCacheReady = { requestRender() }
         }
         controller.setTool(Tool.PEN)
+        SearchUnicode.current = HostSearchUnicode(host)
         initMarkupNotes()
     }
 
@@ -1460,6 +1546,22 @@ fun xnEditorSelectionHasSticky(editor: COpaquePointer?): Int = guard(0) {
     if (editor!!.editor().controller.selectionHasSticky()) 1 else 0
 }
 
+@CName("xn_editor_sticky_text")
+fun xnEditorStickyText(editor: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    editor!!.editor().controller.selectedStickyText()?.let { strdup(it) }
+}
+
+@CName("xn_editor_set_sticky_text")
+fun xnEditorSetStickyText(editor: COpaquePointer?, text: String?) = guard(Unit) {
+    editor!!.editor().controller.setSelectedStickyText(text ?: "")
+}
+
+@CName("xn_editor_set_sticky_color")
+fun xnEditorSetStickyColor(editor: COpaquePointer?, color: UInt) = guard(Unit) {
+    val c = color
+    editor!!.editor().controller.setSelectedStickyColor(Rgba((c shr 24).toInt(), (c shr 16).toInt() and 0xFF, (c shr 8).toInt() and 0xFF, c.toInt() and 0xFF))
+}
+
 @CName("xn_editor_has_markup")
 fun xnEditorHasMarkup(editor: COpaquePointer?): Int = guard(0) {
     if (editor!!.editor().pressedMarkup != null) 1 else 0
@@ -1483,6 +1585,46 @@ fun xnEditorDeleteMarkup(editor: COpaquePointer?) = guard(Unit) {
 @CName("xn_editor_clear_markup")
 fun xnEditorClearMarkup(editor: COpaquePointer?) = guard(Unit) {
     editor!!.editor().pressedMarkup = null
+}
+
+@CName("xn_note_pdf_path")
+fun xnNotePdfPath(note: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    note!!.note().document.pdfFile?.pathString?.let { strdup(it) }
+}
+
+@CName("xn_editor_page_pdf_index")
+fun xnEditorPagePdfIndex(editor: COpaquePointer?, page: Int): Int = guard(-1) {
+    editor!!.editor().state.document.pages.getOrNull(page)?.pdfPage ?: -1
+}
+
+@CName("xn_editor_search")
+fun xnEditorSearch(editor: COpaquePointer?, query: String?, matchCase: Int, wholeWords: Int) = guard(Unit) {
+    editor!!.editor().searchSet(query ?: "", matchCase != 0, wholeWords != 0)
+}
+
+@CName("xn_editor_search_close")
+fun xnEditorSearchClose(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().searchClose()
+}
+
+@CName("xn_editor_search_count")
+fun xnEditorSearchCount(editor: COpaquePointer?): Int = guard(0) {
+    editor!!.editor().searchResults?.count ?: 0
+}
+
+@CName("xn_editor_search_current")
+fun xnEditorSearchCurrent(editor: COpaquePointer?): Int = guard(-1) {
+    editor!!.editor().searchIndex
+}
+
+@CName("xn_editor_search_next")
+fun xnEditorSearchNext(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().searchNext()
+}
+
+@CName("xn_editor_search_prev")
+fun xnEditorSearchPrev(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().searchPrev()
 }
 
 @CName("xn_editor_copy")

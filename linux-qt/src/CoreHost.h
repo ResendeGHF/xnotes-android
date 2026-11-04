@@ -153,6 +153,9 @@ private:
     static int pdfPageCount(void* ctx, const char* path);
     static int pdfPageSize(void* ctx, const char* path, int page, double* w, double* h);
     static int pdfText(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes);
+    static int textNormalize(void* ctx, int form, const uint16_t* inText, int inLen, uint16_t* outText, int outCap);
+    static void textCharInfo(void* ctx, int cp, int* category, int* script, int* flags);
+    static int textToLower(void* ctx, int cp);
     static void wake(void* ctx);
     static int drawPdfPage(void* ctx, void* renderer, const char* path, int page, int fullW, int fullH, int rx, int ry,
                             int rw, int rh, double x, double y, double w, double h);

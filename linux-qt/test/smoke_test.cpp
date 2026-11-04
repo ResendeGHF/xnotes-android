@@ -29,6 +29,7 @@
 #include <QOpenGLPaintDevice>
 
 #include <QPdfDocument>
+#include <QTreeView>
 #include <QPdfWriter>
 
 #include <QPointingDevice>
@@ -674,6 +675,53 @@ private slots:
         QVERIFY2(marked > 50, qPrintable(QStringLiteral("highlight paints, marked px=%1").arg(marked)));
         canvas.setNote(nullptr);
         xn_note_close(note);
+    }
+
+    /* In-note search finds PDF text and steps through the matches. */
+    void pdfSearchFindsText() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        char* error = nullptr;
+        xn_note* note = xn_note_import_pdf(QFile::encodeName(path).constData(), canvas.host(), &error);
+        QVERIFY2(note, error);
+        canvas.setNote(note);
+        xn_editor_search(canvas.editor(), "Hello", 0, 0);
+        QTest::qWait(2500);
+        QCOMPARE(xn_editor_search_count(canvas.editor()) > 0, true);
+        xn_editor_search_next(canvas.editor());
+        QTest::qWait(500);
+        QCOMPARE(xn_editor_search_current(canvas.editor()), 0);
+        xn_editor_search(canvas.editor(), "xyzzy-no-such-word", 0, 0);
+        QTest::qWait(1500);
+        QCOMPARE(xn_editor_search_count(canvas.editor()), 0);
+        xn_editor_search_close(canvas.editor());
+        canvas.setNote(nullptr);
+        xn_note_close(note);
+    }
+
+    /* A PDF's outline lists its chapters; clicking one goes to its page. */
+    void pdfOutlineNavigates() {
+        const QString path = QFINDTESTDATA("data/outlined.pdf");
+        QVERIFY(!path.isEmpty());
+        MainWindow window;
+        QVERIFY(window.open(path));
+        window.resize(1100, 800);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto* panel = window.findChild<PagesPanel*>();
+        QVERIFY(panel);
+        QTRY_COMPARE(panel->outlineEntries(), 2);
+        auto* outline = panel->outline();
+        QVERIFY(outline);
+        const QModelIndex second = outline->model()->index(1, 0);
+        QVERIFY(second.isValid());
+        outline->scrollTo(second);
+        QTest::mouseClick(outline->viewport(), Qt::LeftButton, {}, outline->visualRect(second).center());
+        QTest::qWait(200);
+        QCOMPARE(panel->currentPage(), 1);
     }
 
     /* A press held on PDF text with the pan tool selects its word (long press). */

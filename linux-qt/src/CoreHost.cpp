@@ -441,6 +441,9 @@ CoreHost::CoreHost(bool background)
     host_.pdf_page_size = pdfPageSize;
     host_.draw_pdf_page = drawPdfPage;
     host_.pdf_text = pdfText;
+    host_.text_normalize = textNormalize;
+    host_.text_char_info = textCharInfo;
+    host_.text_to_lower = textToLower;
     if (background) host_.wake = wake;
 }
 
@@ -625,6 +628,61 @@ int CoreHost::pdfText(void* ctx, const char* path, int page, int capacity, uint3
     }
     return count;
 }
+
+int CoreHost::textNormalize(void* ctx, int form, const uint16_t* inText, int inLen, uint16_t* outText, int outCap) {
+    if (inLen < 0) return -1;
+    QString in;
+    if (inLen > 0) {
+        if (!inText) return -1;
+        in = QString::fromUtf16(reinterpret_cast<const char16_t*>(inText), inLen);
+    }
+    QString out;
+    switch (form) {
+    case 0: out = in.normalized(QString::NormalizationForm_D); break;
+    case 1: out = in.normalized(QString::NormalizationForm_C); break;
+    // NFKC is compatibility decomposition followed by canonical composition.
+    case 2: out = in.normalized(QString::NormalizationForm_KD).normalized(QString::NormalizationForm_C); break;
+    default: return -1;
+    }
+    if (!outText || outCap <= 0) return int(out.size());
+    if (out.size() > outCap) return int(out.size());
+    memcpy(outText, out.utf16(), sizeof(uint16_t) * size_t(out.size()));
+    return int(out.size());
+}
+
+void CoreHost::textCharInfo(void* ctx, int cp, int* category, int* script, int* flags) {
+    const uint c = uint(cp);
+    const QChar::Category cat = QChar::category(c);
+    int ck = 0;
+    switch (cat) {
+    case QChar::Other_Control: ck = 1; break;
+    case QChar::Other_Format: ck = 2; break;
+    case QChar::Other_Surrogate: ck = 3; break;
+    case QChar::Other_NotAssigned: ck = 4; break;
+    case QChar::Other_PrivateUse: ck = 5; break;
+    case QChar::Mark_NonSpacing: ck = 6; break;
+    case QChar::Mark_SpacingCombining: ck = 7; break;
+    case QChar::Mark_Enclosing: ck = 8; break;
+    default: break;
+    }
+    int sc = 0;
+    switch (QChar::script(c)) {
+    case QChar::Script_Latin: sc = 1; break;
+    case QChar::Script_Greek: sc = 2; break;
+    case QChar::Script_Hebrew: sc = 3; break;
+    case QChar::Script_Arabic: sc = 4; break;
+    default: break;
+    }
+    int fl = 0;
+    if (QChar::isLetterOrNumber(c)) fl |= 1;
+    if (QChar::isSpace(c)) fl |= 2;
+    if (cat == QChar::Separator_Space || cat == QChar::Separator_Line || cat == QChar::Separator_Paragraph) fl |= 4;
+    if (category) *category = ck;
+    if (script) *script = sc;
+    if (flags) *flags = fl;
+}
+
+int CoreHost::textToLower(void* ctx, int cp) { return int(QChar::toLower(uint(cp))); }
 
 int CoreHost::pdfPageSize(void* ctx, const char* path, int page, double* w, double* h) {
     QPdfDocument* doc = H(ctx)->pdf(path);

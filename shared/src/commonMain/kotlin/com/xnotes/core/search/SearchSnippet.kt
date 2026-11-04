@@ -11,12 +11,12 @@ class SearchSnippet(val text: String, val matchStart: Int, val matchEnd: Int) {
             var from = maxOf(0, hit.start - before)
             if (from > 0) {
                 val space = t.indexOf(' ', from)
-                if (space in from until hit.start) from = space + 1 else if (Character.isLowSurrogate(t[from])) from--
+                if (space in from until hit.start) from = space + 1 else if (t[from].isLowSurrogate()) from--
             }
             var to = minOf(t.length, hit.end + after)
             if (to < t.length) {
                 val space = t.lastIndexOf(' ', to)
-                if (space >= hit.end) to = space else if (Character.isLowSurrogate(t[to])) to++
+                if (space >= hit.end) to = space else if (t[to].isLowSurrogate()) to++
             }
             val lead = if (from > 0) ELLIPSIS else ""
             val tail = if (to < t.length) ELLIPSIS else ""

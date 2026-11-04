@@ -12,7 +12,9 @@
 #include <QPainter>
 #include <QSet>
 #include <QStyledItemDelegate>
+#include <QTabWidget>
 #include <QTimer>
+#include <QTreeView>
 #include <QToolButton>
 
 #include <algorithm>
@@ -143,7 +145,26 @@ PagesPanel::PagesPanel(QWidget* parent) : QWidget(parent) {
     list_->setContextMenuPolicy(Qt::CustomContextMenu);
     list_->setMinimumWidth(kThumbWidth + 2 * kPad + 24);
     list_->installEventFilter(this);
-    layout->addWidget(list_, 1);
+
+    // The PDF's outline beside the thumbnails, when the note has one.
+    outlineModel_ = new QPdfBookmarkModel(this);
+    outline_ = new QTreeView(this);
+    outline_->setModel(outlineModel_);
+    outline_->setHeaderHidden(true);
+    tabs_ = new QTabWidget(this);
+    tabs_->addTab(list_, QStringLiteral("Pages"));
+    tabs_->addTab(outline_, QStringLiteral("Contents"));
+    layout->addWidget(tabs_, 1);
+    connect(outline_, &QTreeView::clicked, this, [this](const QModelIndex& index) {
+        if (!editor_ || !note_) return;
+        const int pdfPage = outlineModel_->data(index, int(QPdfBookmarkModel::Role::Page)).toInt();
+        if (pdfPage < 0) return;
+        for (int p = 0, n = xn_note_page_count(note_); p < n; ++p)
+            if (xn_editor_page_pdf_index(editor_, p) == pdfPage) {
+                xn_editor_go_to_page(editor_, p);
+                return;
+            }
+    });
 
     // A plain click goes to the page (Ctrl and Shift only select); so do the arrow keys.
     connect(list_, &QListView::clicked, this, [this](const QModelIndex& index) {
@@ -173,6 +194,10 @@ PagesPanel::PagesPanel(QWidget* parent) : QWidget(parent) {
 
 PagesPanel::~PagesPanel() = default;
 
+int PagesPanel::outlineEntries() const {
+    return outlineModel_ ? outlineModel_->rowCount() : 0;
+}
+
 void PagesPanel::setDocument(xn_note* note, xn_editor* editor) {
     model_->reset([&] {
         note_ = note && !xn_note_is_canvas(note) ? note : nullptr;
@@ -182,6 +207,26 @@ void PagesPanel::setDocument(xn_note* note, xn_editor* editor) {
         thumbs_.clear();
         current_ = -1;
     });
+    // The note's source PDF, for its outline; nothing to show without one.
+    outlineModel_->setDocument(nullptr);
+    delete outlineDoc_;
+    outlineDoc_ = nullptr;
+    tabs_->setTabVisible(1, false);
+    if (char* pdfPath = note_ ? xn_note_pdf_path(note_) : nullptr) {
+        const QString path = QString::fromUtf8(pdfPath);
+        xn_free_string(pdfPath);
+        auto* doc = new QPdfDocument(this);
+        if (doc->load(path) == QPdfDocument::Error::None) {
+            outlineDoc_ = doc;
+            outlineModel_->setDocument(doc);
+            if (outlineModel_->rowCount() > 0) {
+                outline_->expandAll();
+                tabs_->setTabVisible(1, true);
+            }
+        } else {
+            delete doc;
+        }
+    }
     reload();
     viewChanged();
 }

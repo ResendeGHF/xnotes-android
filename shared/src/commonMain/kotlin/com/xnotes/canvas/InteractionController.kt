@@ -20,6 +20,8 @@ import com.xnotes.core.history.EditLabel
 import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.ReorderItems
 import com.xnotes.core.history.RemoveMarkup
+import com.xnotes.core.history.EditStickyText
+import com.xnotes.core.history.RecolorSticky
 import com.xnotes.core.history.ReplacePageItems
 import com.xnotes.core.history.SetStickyCollapsed
 import com.xnotes.core.history.ResizeItem
@@ -4499,6 +4501,35 @@ class InteractionController(
 
     /** Whether the selection holds a sticky note. */
     fun selectionHasSticky(): Boolean = selection.any { it.item is StickyNoteItem }
+
+    /** The text of the single selected sticky note, or null. */
+    fun selectedStickyText(): String? =
+        selection.mapNotNull { it.item as? StickyNoteItem }.singleOrNull()?.text
+
+    /** Retype the single selected sticky note's text, as one undo step. */
+    fun setSelectedStickyText(text: String) {
+        val item = selection.mapNotNull { it.item as? StickyNoteItem }.singleOrNull() ?: return
+        if (item.text == text) return
+        val old = item.text
+        item.text = text
+        history.push(EditStickyText(item, old, text))
+        state.document.dirty = true
+        state.document.pages.firstOrNull { p -> p.items.any { it === item } }?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Recolor the sticky notes in the selection, one entry per note, as one undo step. */
+    fun setSelectedStickyColor(color: Rgba) {
+        val entries = RecolorSticky.of(selection.mapNotNull { it.item as? StickyNoteItem }, color)
+        if (entries.isEmpty()) return
+        history.push(RecolorSticky(entries))
+        state.document.dirty = true
+        val pages = entries.mapNotNull { e -> state.document.pages.firstOrNull { p -> p.items.any { it === e.item } } }.toSet()
+        for (page in pages) state.invalidatePage(page)
+        onContentChanged()
+        requestRender()
+    }
 
     /** Collapse or expand the sticky notes in the selection, each as one undo step. */
     fun toggleSelectedStickies() {

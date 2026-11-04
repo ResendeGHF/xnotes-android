@@ -5,7 +5,6 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.util.concurrent.Executor
 
 class SearchSessionTest {
 
@@ -64,7 +63,7 @@ class SearchSessionTest {
     }
 
     private val ui = FakeUi()
-    private val inline = Executor { it.run() }
+    private val inline: (work: () -> Unit) -> Unit = { work -> work() }
 
     private fun session(corpus: SearchCorpus, maxHits: Int = SearchSession.MAX_HITS): Pair<SearchSession, MutableList<SearchResults?>> {
         val got = mutableListOf<SearchResults?>()

@@ -42,7 +42,7 @@ class SearchText private constructor(
     fun sourceStart(from: Int): Int = sourceIndex(from)
 
     /** Where in the source a match of chars [from, to) ends, exclusive. */
-    fun sourceEnd(to: Int): Int = sourceIndex(to - 1) + if (wide.isNotEmpty() && wide.binarySearch(to - 1) >= 0) 2 else 1
+    fun sourceEnd(to: Int): Int = sourceIndex(to - 1) + if (wide.contains(to - 1)) 2 else 1
 
     /**
      * Every match of [query] in order, none overlapping, as pairs of char indexes: start, then end
@@ -110,11 +110,11 @@ class SearchText private constructor(
                     for (c in SearchFold.expansion(cp)) if (c == ' ') space(src) else put(c, src)
                     if (lowSrc != src && sb.length > before) wide += sb.length - 1
                 }
-                else -> if (Character.isBmpCodePoint(cp)) {
+                else -> if (isBmpCodePoint(cp)) {
                     put(cp.toChar(), src)
                 } else {
-                    put(Character.highSurrogate(cp), src)
-                    put(Character.lowSurrogate(cp), lowSrc)
+                    put(highSurrogate(cp), src)
+                    put(lowSurrogate(cp), lowSrc)
                 }
             }
         }
@@ -169,7 +169,7 @@ class SearchText private constructor(
             var i = 0
             while (i < source.length) {
                 val cp = source.codePointAt(i)
-                val units = Character.charCount(cp)
+                val units = charCount(cp)
                 b.add(cp, i, i + units - 1)
                 i += units
             }

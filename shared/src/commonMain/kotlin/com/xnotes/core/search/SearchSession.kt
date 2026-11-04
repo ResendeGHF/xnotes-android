@@ -1,7 +1,10 @@
 package com.xnotes.core.search
 
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executor
+import com.xnotes.core.platform.Lock
+import com.xnotes.core.platform.Runnable
+import com.xnotes.core.platform.monotonicNanos
+import com.xnotes.core.platform.withLock
+import kotlin.concurrent.Volatile
 
 /** Typed text to search: [source] in [target], whose char i lies on note page [pageOf] (i). */
 class TypedText(val target: SearchTarget, val source: String, val pageOf: (Int) -> Int)
@@ -37,13 +40,14 @@ interface UiThread {
 class SearchSession(
     private val corpus: SearchCorpus,
     private val ui: UiThread,
-    private val worker: Executor,
+    private val worker: (work: () -> Unit) -> Unit,
     private val maxHits: Int = MAX_HITS,
 ) {
     /** The latest results, on the main thread; null once the query is empty. */
     var onResults: (SearchResults?) -> Unit = {}
 
-    private val pdfTexts = ConcurrentHashMap<Int, SearchText>()
+    private val pdfTexts = HashMap<Int, SearchText>()
+    private val pdfLock = Lock()
 
     /** Bumped by every scan and by [close]; a scan whose number moved on stops. */
     @Volatile private var generation = 0
@@ -78,14 +82,14 @@ class SearchSession(
         generation++
         pending = null
         ui.cancel(start)
-        pdfTexts.clear()
+        withLock(pdfLock) { pdfTexts.clear() }
     }
 
     private fun scan(query: SearchQuery, fromPage: Int) {
         val gen = ++generation
         val pdfPages = corpus.pdfPages()
         val typed = corpus.typedTexts()
-        worker.execute { Scan(gen, query, fromPage, pdfPages, typed).run() }
+        worker { Scan(gen, query, fromPage, pdfPages, typed).run() }
     }
 
     private inner class Scan(
@@ -132,7 +136,7 @@ class SearchSession(
                 val pdf = pdfPages[p]
                 if (pdf < 0) continue
                 if (!live) return
-                val text = pdfTexts[pdf] ?: corpus.pdfText(pdf)?.also { pdfTexts[pdf] = it }
+                val text = withLock(pdfLock) { pdfTexts[pdf] } ?: corpus.pdfText(pdf)?.also { withLock(pdfLock) { pdfTexts[pdf] = it } }
                 if (!live) return
                 val found = text?.find(query) ?: IntArray(0)
                 val hits = ArrayList<SearchHit>(found.size / 2 + byPage[p].size)
@@ -155,7 +159,7 @@ class SearchSession(
         }
 
         private fun publish(force: Boolean, done: Boolean = false) {
-            val now = System.nanoTime()
+            val now = monotonicNanos()
             if (!force && now - lastPublish < PUBLISH_NS) return
             lastPublish = now
             val results = SearchResults(query, byPage.copyOf(), complete.copyOf(), read, toRead, done, capped)
