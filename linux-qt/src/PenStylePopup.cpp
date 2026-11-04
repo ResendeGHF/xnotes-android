@@ -15,21 +15,21 @@ PenStylePopup::PenStylePopup(const QByteArray& tool, const xn_pen_style& style, 
     auto* col = new QVBoxLayout(this);
     const bool pressureKind = tool == "pen" || tool == "calligraphy" || tool == "speed" || tool == "taper";
     if (pressureKind) {
-        addSlider(QStringLiteral("Чувствительность к нажиму"), 0, 100, &style_.sensitivity, QStringLiteral("%"), style_.pressure != 0);
+        addSlider(QStringLiteral("Pressure sensitivity"), 0, 100, &style_.sensitivity, QStringLiteral("%"), style_.pressure != 0);
         if (!style_.pressure) {
-            auto* off = new QLabel(QStringLiteral("Нажим выключен на панели инструментов"), this);
+            auto* off = new QLabel(QStringLiteral("Pressure is off in the toolbar"), this);
             off->setEnabled(false);
             col->addWidget(off);
         }
     }
-    if (tool == "calligraphy") addSlider(QStringLiteral("Контраст пера (толстое к тонкому)"), 1, 5, &style_.multiplier, QStringLiteral("×"));
-    if (tool == "speed") addSlider(QStringLiteral("Утоньшение от скорости"), 0, 100, &style_.speed, QStringLiteral("%"));
-    if (tool == "taper") addSlider(QStringLiteral("Ширина кончика"), 0, 100, &style_.tip, QStringLiteral("%"));
+    if (tool == "calligraphy") addSlider(QStringLiteral("Nib contrast (thick to thin)"), 1, 5, &style_.multiplier, QStringLiteral("×"));
+    if (tool == "speed") addSlider(QStringLiteral("Speed taper"), 0, 100, &style_.speed, QStringLiteral("%"));
+    if (tool == "taper") addSlider(QStringLiteral("Tip width"), 0, 100, &style_.tip, QStringLiteral("%"));
     if (tool == "dashed") {
-        addSlider(QStringLiteral("Штрих"), 2, 40, &style_.dash, QStringLiteral(" px"));
-        addSlider(QStringLiteral("Промежуток"), 2, 40, &style_.gap, QStringLiteral(" px"));
+        addSlider(QStringLiteral("Dash"), 2, 40, &style_.dash, QStringLiteral(" px"));
+        addSlider(QStringLiteral("Gap"), 2, 40, &style_.gap, QStringLiteral(" px"));
     }
-    if (col->count() == 0) col->addWidget(new QLabel(QStringLiteral("У этого пера нет своих настроек"), this));
+    if (col->count() == 0) col->addWidget(new QLabel(QStringLiteral("This pen has no settings"), this));
 }
 
 void PenStylePopup::addSlider(const QString& label, double lo, double hi, double* field, const QString& unit, bool enabled) {

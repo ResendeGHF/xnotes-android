@@ -765,20 +765,20 @@ private slots:
                 if (b->text() == text) return b;
             return static_cast<QAbstractButton*>(nullptr);
         };
-        button(QStringLiteral("Клетка"))->click();
+        button(QStringLiteral("Grid"))->click();
         auto [across, down] = rules(grab(canvas));
         QVERIFY2(across > 3 && down > 3, qPrintable(QStringLiteral("grid: %1 across, %2 down").arg(across).arg(down)));
         QVERIFY(xn_note_is_dirty(note));
 
-        button(QStringLiteral("Текущая страница"))->click();
-        button(QStringLiteral("Линейка"))->click();
+        button(QStringLiteral("Current page"))->click();
+        button(QStringLiteral("Ruled"))->click();
         std::tie(across, down) = rules(grab(canvas));
         QVERIFY2(across > 3 && down == 0, qPrintable(QStringLiteral("lines: %1 across, %2 down").arg(across).arg(down)));
         xn_page_style all{};
         xn_editor_page_style(canvas.editor(), 1, &all);
         QCOMPARE(all.pattern, int(XN_PATTERN_GRID));
 
-        button(QStringLiteral("Все страницы"))->click();
+        button(QStringLiteral("All pages"))->click();
         xn_page_style cream{1, 0xF7F3E9FFu, XN_PATTERN_GRID, 0, 0, 0};
         xn_editor_set_page_style(canvas.editor(), 1, &cream);
         QCOMPARE(grab(canvas).pixelColor(160, 160), QColor(0xF7, 0xF3, 0xE9));
@@ -802,26 +802,26 @@ private slots:
         };
         QComboBox* mode = nullptr;
         for (QComboBox* c : window.findChildren<QComboBox*>())
-            if (c->findText(QStringLiteral("Область")) >= 0) mode = c;
+            if (c->findText(QStringLiteral("Area")) >= 0) mode = c;
         QVERIFY(mode);
         QSlider* size = nullptr;  // the toolbar's width slider: half-pixel steps
         for (QSlider* sl : window.findChildren<QSlider*>())
             if (sl->orientation() == Qt::Horizontal && sl->parentWidget() && sl->parentWidget()->inherits("QToolBar")) size = sl;
         QVERIFY(size);
 
-        action(QStringLiteral("Перо"))->trigger();
+        action(QStringLiteral("Pen"))->trigger();
         QTest::mousePress(canvas, Qt::LeftButton, {}, QPoint(300, 400));
         for (int i = 1; i <= 40; i++) QTest::mouseMove(canvas, QPoint(300 + i * 10, 400));
         QTest::mouseRelease(canvas, Qt::LeftButton, {}, QPoint(700, 400));
         QCOMPARE(xn_note_item_count(window.note(), 0), 1);
 
-        action(QStringLiteral("Ластик"))->trigger();
+        action(QStringLiteral("Eraser"))->trigger();
         QCOMPARE(QByteArray(xn_editor_tool(canvas->editor())), QByteArray("eraser"));
         QTest::qWait(50);  // the toolbar lays out its shown widgets on the next pass
         QVERIFY(mode->isVisibleTo(&window));
         QCOMPARE(size->value(), 48);   // radius 24
         QCOMPARE(size->maximum(), 160); // up to 80
-        mode->setCurrentIndex(mode->findText(QStringLiteral("Область")));
+        mode->setCurrentIndex(mode->findText(QStringLiteral("Area")));
         QCOMPARE(xn_editor_erase_mode(canvas->editor()), int(XN_ERASE_AREA));
         size->setValue(16);  // radius 8
         QCOMPARE(xn_editor_tool_width(canvas->editor(), "eraser"), 8.0);
@@ -830,12 +830,12 @@ private slots:
         QTest::mouseRelease(canvas, Qt::LeftButton, {}, QPoint(500, 430));
         QCOMPARE(xn_note_item_count(window.note(), 0), 2);  // cut in two
 
-        action(QStringLiteral("Перо"))->trigger();
+        action(QStringLiteral("Pen"))->trigger();
         QTest::qWait(50);
         QVERIFY(!mode->isVisibleTo(&window));
         QCOMPARE(size->value(), 6);      // the pen keeps its own width, 3
         QCOMPARE(size->maximum(), 40);   // up to 20
-        action(QStringLiteral("Маркер"))->trigger();
+        action(QStringLiteral("Highlighter"))->trigger();
         QCOMPARE(size->minimum(), 8);    // 4..40
         size->setValue(30);
         QCOMPARE(xn_editor_tool_width(canvas->editor(), "highlighter"), 15.0);
@@ -859,17 +859,17 @@ private slots:
             return static_cast<QAction*>(nullptr);
         };
         QVERIFY(xn_note_is_canvas(window.note()));
-        QVERIFY(!action(QStringLiteral("+ Страница"))->isVisible());
-        QVERIFY(!action(QStringLiteral("Текст"))->isVisible());
-        QVERIFY(action(QStringLiteral("Показать всё")));
-        QVERIFY(!action(QStringLiteral("Экспорт в PDF…"))->isEnabled());
+        QVERIFY(!action(QStringLiteral("+ Page"))->isVisible());
+        QVERIFY(!action(QStringLiteral("Text"))->isVisible());
+        QVERIFY(action(QStringLiteral("Show all")));
+        QVERIFY(!action(QStringLiteral("Export to PDF…"))->isEnabled());
 
         // Dark ink on white paper, with no ruling, so the ink is easy to find.
         canvas->setDark(false);
         xn_page_style plain{1, 0xFFFFFFFFu, XN_PATTERN_NONE, 0, 0, 0};
         xn_editor_set_page_style(canvas->editor(), 1, &plain);
         xn_editor_set_ink_color(canvas->editor(), 0xff0000ff);
-        action(QStringLiteral("Перо"))->trigger();
+        action(QStringLiteral("Pen"))->trigger();
         QTest::mousePress(canvas, Qt::LeftButton, {}, QPoint(300, 300));
         for (int i = 1; i <= 40; i++) QTest::mouseMove(canvas, QPoint(300 + i * 10, 300));
         QTest::mouseRelease(canvas, Qt::LeftButton, {}, QPoint(700, 300));
@@ -884,14 +884,14 @@ private slots:
         const double zoom = xn_editor_zoom(canvas->editor());
         action(QStringLiteral("+"))->trigger();
         QVERIFY(xn_editor_zoom(canvas->editor()) > zoom);
-        action(QStringLiteral("Показать всё"))->trigger();
+        action(QStringLiteral("Show all"))->trigger();
         QVERIFY(inkPixels(grab(*canvas), canvas->rect()) > 300);
 
         // Its background, through the dialog: one for the whole canvas.
         PageStylePopup dialog(canvas->editor(), true, nullptr);
         for (QAbstractButton* b : dialog.findChildren<QAbstractButton*>()) {
-            if (b->text() == QStringLiteral("Текущая страница")) QVERIFY(!b->isVisibleTo(&dialog));
-            if (b->text() == QStringLiteral("Точки")) b->click();
+            if (b->text() == QStringLiteral("Current page")) QVERIFY(!b->isVisibleTo(&dialog));
+            if (b->text() == QStringLiteral("Dotted")) b->click();
         }
         xn_page_style bg{};
         xn_editor_page_style(canvas->editor(), 1, &bg);
@@ -905,7 +905,7 @@ private slots:
         QCOMPARE(xn_note_item_count(window.note(), 0), 1);
         QVERIFY(inkPixels(grab(*canvas), canvas->rect()) > 100);
         window.newNote();
-        QVERIFY(action(QStringLiteral("+ Страница"))->isVisible());
+        QVERIFY(action(QStringLiteral("+ Page"))->isVisible());
     }
 
     /*
@@ -978,7 +978,7 @@ private slots:
 
         MainWindow window;
         window.newNote();
-        for (const char* tool : {"Рука", "Перо", "Маркер", "Ластик", "Лассо", "Выделение", "Фигура", "Текст"}) {
+        for (const char* tool : {"Pan", "Pen", "Highlighter", "Eraser", "Lasso", "Selection", "Shape", "Text"}) {
             QAction* found = nullptr;
             for (QAction* a : window.findChildren<QAction*>())
                 if (a->text() == QString::fromUtf8(tool)) found = a;
@@ -1240,7 +1240,7 @@ private slots:
 
         QAction* calligraphy = nullptr;
         for (QAction* a : window.findChildren<QAction*>())
-            if (a->text() == QStringLiteral("Каллиграфическое")) calligraphy = a;
+            if (a->text() == QStringLiteral("Calligraphy")) calligraphy = a;
         QVERIFY(calligraphy);
         calligraphy->trigger();
         QCOMPARE(QByteArray(xn_editor_tool(canvas->editor())), QByteArray("calligraphy"));
@@ -1281,7 +1281,7 @@ private slots:
 
         // The pen's own settings: the calligraphy nib's contrast, applied as the slider moves.
         for (QAction* a : window.findChildren<QAction*>())
-            if (a->text() == QStringLiteral("Настройки пера…")) a->trigger();
+            if (a->text() == QStringLiteral("Pen settings…")) a->trigger();
         auto* popup = window.findChild<PenStylePopup*>();
         QVERIFY(popup && popup->isVisible());
         const QList<QSlider*> sliders = popup->findChildren<QSlider*>();

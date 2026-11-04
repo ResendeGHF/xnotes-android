@@ -38,7 +38,7 @@ internal object PagePainter {
             if (page.pdfPage != null && document.pdfFile != null) {
                 // The PDF source will be painted by the next platform layer step.
                 painter.fillRect(Rect(0.0, 0.0, page.width, 30.0), Rgba(220, 225, 235, 255))
-                painter.drawTextRun("Фон PDF пока недоступен", 8.0, 21.0,
+                painter.drawTextRun("PDF background unavailable", 8.0, 21.0,
                     com.xnotes.core.pal.FontSpec(13.0), Rgba(60, 65, 75, 255))
             }
             for (item in page.items) if (item.paintBounds().intersects(visible)) item.paint(painter)

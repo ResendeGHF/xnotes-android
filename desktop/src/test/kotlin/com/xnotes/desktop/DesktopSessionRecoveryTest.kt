@@ -94,7 +94,7 @@ class DesktopSessionRecoveryTest {
         DesktopStorage(DesktopPaths(root)).use { storage ->
             val restored = storage.restoreSession()!!.document
             assertNull(restored.file)
-            assertEquals("Без имени", restored.title)
+            assertEquals("Untitled", restored.title)
         }
     }
 }

@@ -39,7 +39,7 @@ public:
     QVariant data(const QModelIndex& index, int role) const override {
         if (!index.isValid()) return {};
         if (role == Qt::DisplayRole) return index.row() + 1;
-        if (role == Qt::ToolTipRole) return QStringLiteral("Страница %1").arg(index.row() + 1);
+        if (role == Qt::ToolTipRole) return QStringLiteral("Page %1").arg(index.row() + 1);
         return {};
     }
 
@@ -118,12 +118,12 @@ PagesPanel::PagesPanel(QWidget* parent) : QWidget(parent) {
 
     auto* header = new QHBoxLayout;
     header->setContentsMargins(8, 2, 2, 2);
-    auto* title = new QLabel(QStringLiteral("Страницы"), this);
+    auto* title = new QLabel(QStringLiteral("Pages"), this);
     header->addWidget(title, 1);
-    QToolButton* add = toolButton(this, QStringLiteral("plus"), QStringLiteral("Добавить страницу после текущей"));
+    QToolButton* add = toolButton(this, QStringLiteral("plus"), QStringLiteral("Add page after current"));
     add->setObjectName(QStringLiteral("addPage"));
     connect(add, &QToolButton::clicked, this, [this] { addAfter(current_); });
-    QToolButton* del = toolButton(this, QStringLiteral("trash"), QStringLiteral("Удалить выбранные страницы (Delete)"));
+    QToolButton* del = toolButton(this, QStringLiteral("trash"), QStringLiteral("Delete selected pages (Delete)"));
     del->setObjectName(QStringLiteral("deletePages"));
     connect(del, &QToolButton::clicked, this, [this] { remove(targetPages()); });
     header->addWidget(add);
@@ -357,23 +357,23 @@ void PagesPanel::showMenu(const QPoint& at) {
     const bool canPaste = xn_editor_can_paste_pages(editor_);
     if (!index.isValid()) {
         const int last = pageCount() - 1;
-        menu.addAction(xnIcon(QStringLiteral("plus")), QStringLiteral("Добавить страницу в конец"), this, [this, last] { addAfter(last); });
-        menu.addAction(xnIcon(QStringLiteral("paste")), QStringLiteral("Вставить страницы в конец"), this, [this, last] { pasteAfter(last); })->setEnabled(canPaste);
+        menu.addAction(xnIcon(QStringLiteral("plus")), QStringLiteral("Add page at the end"), this, [this, last] { addAfter(last); });
+        menu.addAction(xnIcon(QStringLiteral("paste")), QStringLiteral("Paste pages at the end"), this, [this, last] { pasteAfter(last); })->setEnabled(canPaste);
     } else {
         // The menu acts on the selection the page belongs to, else on the page alone.
         const int page = index.row();
         if (!list_->selectionModel()->isSelected(index)) list_->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect);
         const QList<int> pages = targetPages();
         const QString count = pages.size() > 1 ? QStringLiteral(" (%1)").arg(pages.size()) : QString();
-        menu.addAction(xnIcon(QStringLiteral("plus")), QStringLiteral("Добавить страницу после"), this, [this, page] { addAfter(page); });
+        menu.addAction(xnIcon(QStringLiteral("plus")), QStringLiteral("Add page after"), this, [this, page] { addAfter(page); });
         menu.addSeparator();
-        menu.addAction(xnIcon(QStringLiteral("copy")), QStringLiteral("Копировать") + count, this, [this, pages] { copy(pages, false); });
-        menu.addAction(xnIcon(QStringLiteral("cut")), QStringLiteral("Вырезать") + count, this, [this, pages] { copy(pages, true); });
-        menu.addAction(xnIcon(QStringLiteral("paste")), QStringLiteral("Вставить после"), this, [this, page] { pasteAfter(page); })->setEnabled(canPaste);
+        menu.addAction(xnIcon(QStringLiteral("copy")), QStringLiteral("Copy") + count, this, [this, pages] { copy(pages, false); });
+        menu.addAction(xnIcon(QStringLiteral("cut")), QStringLiteral("Cut") + count, this, [this, pages] { copy(pages, true); });
+        menu.addAction(xnIcon(QStringLiteral("paste")), QStringLiteral("Paste after"), this, [this, page] { pasteAfter(page); })->setEnabled(canPaste);
         menu.addSeparator();
         if (pages.size() == 1)
-            menu.addAction(xnIcon(QStringLiteral("eraser")), QStringLiteral("Очистить страницу"), this, [this, page] { if (editor_) xn_editor_erase_page(editor_, page); });
-        menu.addAction(xnIcon(QStringLiteral("trash")), QStringLiteral("Удалить") + count, this, [this, pages] { remove(pages); });
+            menu.addAction(xnIcon(QStringLiteral("eraser")), QStringLiteral("Clear page"), this, [this, page] { if (editor_) xn_editor_erase_page(editor_, page); });
+        menu.addAction(xnIcon(QStringLiteral("trash")), QStringLiteral("Delete") + count, this, [this, pages] { remove(pages); });
     }
     menu.exec(list_->viewport()->mapToGlobal(at));
 }

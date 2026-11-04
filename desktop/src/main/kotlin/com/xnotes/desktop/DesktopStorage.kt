@@ -31,7 +31,7 @@ internal class DesktopPaths(private val overrideRoot: File? = null) {
 internal sealed interface OpenDocument {
     val file: File?
     val dirty: Boolean
-    val title: String get() = file?.name ?: "Без имени"
+    val title: String get() = file?.name ?: "Untitled"
 
     data class Note(override val file: File?, val value: Document) : OpenDocument {
         override val dirty get() = value.dirty
@@ -53,7 +53,7 @@ internal class DesktopStorage(private val paths: DesktopPaths = DesktopPaths()) 
     private var assets: File? = null
 
     fun open(file: File): OpenDocument {
-        require(file.isFile) { "Файл не найден: $file" }
+        require(file.isFile) { "File not found: $file" }
         return withWorkDir { work ->
             when (file.extension.lowercase()) {
                 "xnote" -> file.inputStream().buffered().use {
@@ -68,7 +68,7 @@ internal class DesktopStorage(private val paths: DesktopPaths = DesktopPaths()) 
                         displayName = file.name
                     })
                 }
-                else -> error("Поддерживаются только .xnote и .xcanvas")
+                else -> error("Only .xnote and .xcanvas are supported")
             }
         }
     }
@@ -122,10 +122,10 @@ internal class DesktopStorage(private val paths: DesktopPaths = DesktopPaths()) 
             is OpenDocument.Note -> "xnote"
             is OpenDocument.Canvas -> "xcanvas"
         }
-        require(target.extension.lowercase() == expected) { "Требуется расширение .$expected" }
+        require(target.extension.lowercase() == expected) { "Extension .$expected is required" }
         val absolute = target.absoluteFile
-        val parent = absolute.parentFile ?: error("Нет каталога назначения")
-        require(parent.isDirectory) { "Каталог не найден: $parent" }
+        val parent = absolute.parentFile ?: error("No destination directory")
+        require(parent.isDirectory) { "Directory not found: $parent" }
         val tmp = Files.createTempFile(parent.toPath(), ".xnotes-", ".tmp")
         try {
             Files.newOutputStream(tmp).buffered().use { out ->

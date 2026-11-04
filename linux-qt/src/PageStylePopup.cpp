@@ -34,8 +34,8 @@ struct PatternEntry {
 };
 
 const PatternEntry kPatterns[] = {
-    {XN_PATTERN_INHERIT, "По умолчанию"}, {XN_PATTERN_NONE, "Нет"}, {XN_PATTERN_LINES, "Линейка"},
-    {XN_PATTERN_DOTS, "Точки"}, {XN_PATTERN_GRID, "Клетка"},
+    {XN_PATTERN_INHERIT, "Default"}, {XN_PATTERN_NONE, "None"}, {XN_PATTERN_LINES, "Ruled"},
+    {XN_PATTERN_DOTS, "Dotted"}, {XN_PATTERN_GRID, "Grid"},
 };
 
 QToolButton* chip(const QString& text, QWidget* parent) {
@@ -67,13 +67,13 @@ QLabel* caption(const QString& text, QWidget* parent) {
 }  // namespace
 
 PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) : QDialog(parent), editor_(editor) {
-    setWindowTitle(canvas ? QStringLiteral("Фон холста") : QStringLiteral("Фон страниц"));
+    setWindowTitle(canvas ? QStringLiteral("Canvas background") : QStringLiteral("Page background"));
     auto* col = new QVBoxLayout(this);
 
     auto* scopeRow = new QHBoxLayout;
     scope_ = new QButtonGroup(this);
-    auto* all = new QRadioButton(QStringLiteral("Все страницы"), this);
-    auto* current = new QRadioButton(QStringLiteral("Текущая страница"), this);
+    auto* all = new QRadioButton(QStringLiteral("All pages"), this);
+    auto* current = new QRadioButton(QStringLiteral("Current page"), this);
     scope_->addButton(all, 1);
     scope_->addButton(current, 0);
     all->setChecked(true);
@@ -88,10 +88,10 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     });
 
     // Paper.
-    col->addWidget(caption(QStringLiteral("Бумага"), this));
+    col->addWidget(caption(QStringLiteral("Paper"), this));
     auto* paperRow = new QHBoxLayout;
     paper_ = new QButtonGroup(this);
-    auto* defaultPaper = chip(QStringLiteral("По умолчанию"), this);
+    auto* defaultPaper = chip(QStringLiteral("Default"), this);
     paper_->addButton(defaultPaper, kDefaultPaperId);
     paperRow->addWidget(defaultPaper);
     for (int i = 0; i < int(std::size(kPapers)); i++) {
@@ -100,7 +100,7 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
         paperRow->addWidget(b);
     }
     customPaper_ = chip(QStringLiteral("…"), this);
-    customPaper_->setToolTip(QStringLiteral("Другой цвет"));
+    customPaper_->setToolTip(QStringLiteral("Custom color"));
     paper_->addButton(customPaper_, kCustomPaperId);
     paperRow->addWidget(customPaper_);
     paperRow->addStretch();
@@ -110,7 +110,7 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
             style_.has_page_color = 0;
         } else if (id == kCustomPaperId) {
             const QColor c = QColorDialog::getColor(style_.has_page_color ? fromRgba(style_.page_color) : Qt::white, this,
-                                                    QStringLiteral("Цвет бумаги"));
+                                                    QStringLiteral("Paper color"));
             if (!c.isValid()) return load();
             style_.has_page_color = 1;
             style_.page_color = toRgba(c) | 0xFF;
@@ -122,7 +122,7 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     });
 
     // Ruling.
-    col->addWidget(caption(QStringLiteral("Узор"), this));
+    col->addWidget(caption(QStringLiteral("Pattern"), this));
     auto* patternRow = new QHBoxLayout;
     pattern_ = new QButtonGroup(this);
     for (const PatternEntry& p : kPatterns) {
@@ -140,7 +140,7 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     spacingLabel_ = new QLabel(this);
     col->addWidget(spacingLabel_);
     auto* spacingRow = new QHBoxLayout;
-    defaultSpacing_ = new QCheckBox(QStringLiteral("По умолчанию"), this);
+    defaultSpacing_ = new QCheckBox(QStringLiteral("Default"), this);
     spacing_ = new QSlider(Qt::Horizontal, this);
     spacing_->setRange(int(XN_PATTERN_MIN_SPACING), int(XN_PATTERN_MAX_SPACING));
     spacingRow->addWidget(defaultSpacing_);
@@ -158,11 +158,11 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     });
 
     // Line colour and opacity.
-    col->addWidget(caption(QStringLiteral("Цвет линий"), this));
+    col->addWidget(caption(QStringLiteral("Line color"), this));
     auto* lineRow = new QHBoxLayout;
-    defaultLineColor_ = new QCheckBox(QStringLiteral("По умолчанию"), this);
+    defaultLineColor_ = new QCheckBox(QStringLiteral("Default"), this);
     lineColor_ = new QToolButton(this);
-    lineColor_->setText(QStringLiteral("Выбрать…"));
+    lineColor_->setText(QStringLiteral("Choose…"));
     lineColor_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     lineRow->addWidget(defaultLineColor_);
     lineRow->addWidget(lineColor_);
@@ -180,7 +180,7 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     });
     connect(lineColor_, &QToolButton::clicked, this, [this] {
         const xn_rgba current = effectiveLineColor();
-        const QColor c = QColorDialog::getColor(fromRgba(current | 0xFF), this, QStringLiteral("Цвет линий"));
+        const QColor c = QColorDialog::getColor(fromRgba(current | 0xFF), this, QStringLiteral("Line color"));
         if (!c.isValid()) return;
         style_.has_pattern_color = 1;
         style_.pattern_color = (toRgba(c) & 0xFFFFFF00u) | (current & 0xFF);  // the opacity stays
@@ -226,12 +226,12 @@ void PageStylePopup::load() {
     const bool inherit = style_.spacing <= 0;
     defaultSpacing_->setChecked(inherit);
     spacing_->setValue(int(std::lround(inherit ? kDefaultSpacing : style_.spacing)));
-    spacingLabel_->setText(QStringLiteral("Шаг: %1 пикс.%2").arg(spacing_->value()).arg(inherit ? QStringLiteral(" (по умолчанию)") : QString()));
+    spacingLabel_->setText(QStringLiteral("Step: %1 px%2").arg(spacing_->value()).arg(inherit ? QStringLiteral(" (default)") : QString()));
     const xn_rgba line = effectiveLineColor();
     defaultLineColor_->setChecked(!style_.has_pattern_color);
     lineColor_->setIcon(swatchIcon(fromRgba(line | 0xFF), 16));
     opacity_->setValue(int(std::lround((line & 0xFF) / 2.55)));
-    opacityLabel_->setText(QStringLiteral("Непрозрачность линий: %1%").arg(opacity_->value()));
+    opacityLabel_->setText(QStringLiteral("Line opacity: %1%").arg(opacity_->value()));
     syncing_ = false;
 }
 

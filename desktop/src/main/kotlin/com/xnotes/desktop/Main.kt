@@ -41,13 +41,13 @@ private class DesktopWindow : JFrame("xnotes") {
     private val details = JTextArea()
     private val canvas = DesktopCanvasView()
     private val cards = JPanel(CardLayout())
-    private val pageLabel = JLabel("Страница 0/0")
+    private val pageLabel = JLabel("Page 0/0")
     private val zoomLabel = JLabel("100%")
-    private val undoButton = JButton("↶").apply { toolTipText = "Отменить (Ctrl+Z)" }
-    private val redoButton = JButton("↷").apply { toolTipText = "Повторить (Ctrl+Shift+Z)" }
-    private val colorButton = JButton("Цвет")
+    private val undoButton = JButton("↶").apply { toolTipText = "Undo (Ctrl+Z)" }
+    private val redoButton = JButton("↷").apply { toolTipText = "Redo (Ctrl+Shift+Z)" }
+    private val colorButton = JButton("Color")
     private val toolButtons = LinkedHashMap<Tool, JToggleButton>()
-    private val status = JLabel("Откройте файл .xnote или .xcanvas")
+    private val status = JLabel("Open an .xnote or .xcanvas file")
 
     /** Edits made since the last session checkpoint; the timer writes them out. */
     private var sessionPending = false
@@ -63,9 +63,9 @@ private class DesktopWindow : JFrame("xnotes") {
         details.wrapStyleWord = true
 
         val files = JPanel(FlowLayout(FlowLayout.LEADING, 4, 2)).apply {
-            add(JButton("Открыть…").apply { addActionListener { chooseOpen() } })
-            add(JButton("Сохранить").apply { addActionListener { save(false) } })
-            add(JButton("Сохранить как…").apply { addActionListener { save(true) } })
+            add(JButton("Open…").apply { addActionListener { chooseOpen() } })
+            add(JButton("Save").apply { addActionListener { save(false) } })
+            add(JButton("Save As…").apply { addActionListener { save(true) } })
             add(undoButton.apply { addActionListener { canvas.undo() } })
             add(redoButton.apply { addActionListener { canvas.redo() } })
             add(JButton("←").apply { addActionListener { navigate(-1) } })
@@ -74,16 +74,16 @@ private class DesktopWindow : JFrame("xnotes") {
             add(JButton("−").apply { addActionListener { canvas.zoomStep(false) } })
             add(zoomLabel)
             add(JButton("+").apply { addActionListener { canvas.zoomStep(true) } })
-            add(JButton("По ширине").apply { addActionListener { canvas.fitWidth() } })
-            add(JButton("+ Страница").apply {
-                toolTipText = "Вставить пустую страницу после текущей"
+            add(JButton("Fit width").apply { addActionListener { canvas.fitWidth() } })
+            add(JButton("+ Page").apply {
+                toolTipText = "Insert blank page after the current one"
                 addActionListener { if (document is OpenDocument.Note) canvas.editor.addPage() }
             })
-            add(JButton("− Страница").apply {
-                toolTipText = "Удалить текущую страницу"
+            add(JButton("- Page").apply {
+                toolTipText = "Delete current page"
                 addActionListener { if (document is OpenDocument.Note) canvas.editor.deleteCurrentPage() }
             })
-            add(JCheckBox("Тёмная бумага", true).apply {
+            add(JCheckBox("Dark paper", true).apply {
                 addActionListener { canvas.setDarkPaper(isSelected) }
             })
         }
@@ -114,8 +114,8 @@ private class DesktopWindow : JFrame("xnotes") {
         }
         canvas.onNotice = { notice ->
             status.text = when (notice) {
-                EditorNotice.KEEP_ONE_PAGE -> "В заметке должна остаться хотя бы одна страница"
-                EditorNotice.PAGE_ALREADY_EMPTY -> "Страница уже пуста"
+                EditorNotice.KEEP_ONE_PAGE -> "The note must keep at least one page"
+                EditorNotice.PAGE_ALREADY_EMPTY -> "Page is already empty"
             }
         }
         selectTool(Tool.PEN)
@@ -149,8 +149,8 @@ private class DesktopWindow : JFrame("xnotes") {
         val elsewhere = requested != null && requested.absoluteFile != restored.document.file?.absoluteFile
         if (elsewhere) {
             val choice = JOptionPane.showConfirmDialog(this,
-                "Есть несохранённые изменения в «${restored.document.title}».\nВосстановить их вместо открытия ${requested!!.name}?",
-                "Восстановление", JOptionPane.YES_NO_OPTION)
+                "There are unsaved changes in \"${restored.document.title}\".\nRestore them instead of opening ${requested!!.name}?",
+                "Recovery", JOptionPane.YES_NO_OPTION)
             if (choice != JOptionPane.YES_OPTION) {
                 storage.clearSession()
                 open(requested)
@@ -159,7 +159,7 @@ private class DesktopWindow : JFrame("xnotes") {
         }
         show(restored.document)
         if (restored.document is OpenDocument.Note) canvas.restoreView(restored.view)
-        status.text = "Восстановлены несохранённые изменения: ${restored.document.file?.absolutePath ?: restored.document.title}"
+        status.text = "Restored unsaved changes: ${restored.document.file?.absolutePath ?: restored.document.title}"
     }
 
     fun open(file: File) {
@@ -186,11 +186,11 @@ private class DesktopWindow : JFrame("xnotes") {
             }
             is OpenDocument.Canvas -> {
                 details.text = buildString {
-                    appendLine("Холст: ${opened.title}")
-                    appendLine("Элементов: ${opened.value.itemCount}")
-                    appendLine("Закладок: ${opened.value.waypoints.size}")
+                    appendLine("Canvas: ${opened.title}")
+                    appendLine("Items: ${opened.value.itemCount}")
+                    appendLine("Waypoints: ${opened.value.waypoints.size}")
                     appendLine()
-                    appendLine("Бесконечный холст на Linux пока только просматривается как сводка.")
+                    appendLine("Infinite canvas on Linux is currently previewed as a summary.")
                 }
                 (cards.layout as CardLayout).show(cards, "details")
             }
@@ -220,7 +220,7 @@ private class DesktopWindow : JFrame("xnotes") {
 
     private fun chooseColor() {
         val current = canvas.inkColor
-        val picked = JColorChooser.showDialog(this, "Цвет чернил", Color(current.r, current.g, current.b)) ?: return
+        val picked = JColorChooser.showDialog(this, "Ink color", Color(current.r, current.g, current.b)) ?: return
         canvas.inkColor = Rgba(picked.red, picked.green, picked.blue, 255)
         updateColorButton()
     }
@@ -228,7 +228,7 @@ private class DesktopWindow : JFrame("xnotes") {
     private fun updateColorButton() {
         val c = canvas.inkColor
         colorButton.foreground = Color(c.r, c.g, c.b)
-        colorButton.text = "● Цвет"
+        colorButton.text = "● Color"
     }
 
     private fun updateHistoryButtons() {
@@ -239,8 +239,8 @@ private class DesktopWindow : JFrame("xnotes") {
 
     private fun updateViewReadouts() {
         val note = document is OpenDocument.Note
-        pageLabel.text = if (!note || canvas.pageCount == 0) "Страница 0/0"
-            else "Страница ${canvas.currentPage() + 1}/${canvas.pageCount}"
+        pageLabel.text = if (!note || canvas.pageCount == 0) "Page 0/0"
+            else "Page ${canvas.currentPage() + 1}/${canvas.pageCount}"
         zoomLabel.text = if (note) "${canvas.zoomPercent}%" else "—"
     }
 
@@ -275,7 +275,7 @@ private class DesktopWindow : JFrame("xnotes") {
             storage.saveSession(d, currentView())
             sessionPending = false
         } catch (e: Exception) {
-            status.text = "Не удалось сохранить сессию: ${e.message}"
+            status.text = "Could not save session: ${e.message}"
         }
     }
 
@@ -298,7 +298,7 @@ private class DesktopWindow : JFrame("xnotes") {
     private fun confirmDiscard(): Boolean {
         val d = document ?: return true
         if (!d.dirty) return true
-        return JOptionPane.showConfirmDialog(this, "Отбросить несохранённые изменения в «${d.title}»?",
+        return JOptionPane.showConfirmDialog(this, "Discard unsaved changes in \"${d.title}\"?",
             "xnotes", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION
     }
 
@@ -328,7 +328,7 @@ private class DesktopWindow : JFrame("xnotes") {
             if (picked.extension.isEmpty()) File(picked.parentFile, "${picked.name}.$extension") else picked
         } else existing
         if (target.exists() && (asNew || target != existing)) {
-            val choice = JOptionPane.showConfirmDialog(this, "Заменить ${target.name}?", "Сохранение", JOptionPane.YES_NO_OPTION)
+            val choice = JOptionPane.showConfirmDialog(this, "Overwrite ${target.name}?", "Save", JOptionPane.YES_NO_OPTION)
             if (choice != JOptionPane.YES_OPTION) return
         }
         try {
@@ -341,7 +341,7 @@ private class DesktopWindow : JFrame("xnotes") {
             sessionPending = false
             storage.clearSession()
             updateTitle()
-            status.text = "Сохранено: ${target.absolutePath}"
+            status.text = "Saved: ${target.absolutePath}"
             runCatching { preferences.remember(target) }
         } catch (e: Exception) {
             showError(e)
@@ -349,7 +349,7 @@ private class DesktopWindow : JFrame("xnotes") {
     }
 
     private fun showError(error: Exception) {
-        status.text = error.message ?: "Ошибка"
+        status.text = error.message ?: "Error"
         JOptionPane.showMessageDialog(this, error.message ?: error.toString(), "xnotes", JOptionPane.ERROR_MESSAGE)
     }
 
@@ -358,11 +358,11 @@ private class DesktopWindow : JFrame("xnotes") {
 
         /** The toolbar's tools, in order; keys 1..N select them. */
         val TOOLS = listOf(
-            Tool.PAN to "Рука",
-            Tool.PEN to "Перо",
-            Tool.HIGHLIGHTER to "Маркер",
-            Tool.ERASER to "Ластик",
-            Tool.LASSO to "Лассо",
+            Tool.PAN to "Pan",
+            Tool.PEN to "Pen",
+            Tool.HIGHLIGHTER to "Highlighter",
+            Tool.ERASER to "Eraser",
+            Tool.LASSO to "Lasso",
         )
     }
 }

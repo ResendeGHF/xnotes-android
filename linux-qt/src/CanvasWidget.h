@@ -62,7 +62,7 @@ public:
     /* Page caches the core's threads are still drawing or have not handed over yet. */
     int pendingPages() const { return editor_ ? xn_editor_background_pending(editor_) : 0; }
     double lastFrameMs() const { return lastFrameMs_; }
-    /* What drew last: "перо", "ластик", "мышь" or "касание", and the pen's pressure. */
+    /* What drew last: "pen", "eraser", "mouse" or "touch", and the pen's pressure. */
     QString lastInput() const { return lastInput_; }
     double lastPressure() const { return lastPressure_; }
     /* The pen's barrel buttons now: bit 0 the first, bit 1 the second. */
