@@ -11,6 +11,8 @@ expandable to online later.
 - `linux-downstream` (this branch, fork of `DarkL0gos/xnotes-linux`
   master @ `e4e1f8f7`): the Linux host (KMP `shared/` → `libxnotes.so`
   via `capi/` → Qt 6 `linux-qt/` app). This is where active work happens.
+  No separate GitHub fork is needed: the branch lives in
+  `ResendeGHF/xnotes-android` and is pushed like any other branch.
 - `archive/share-jvm-spike`: the previous JVM-only share attempt (TLS
   server, op stream, Qt companion). Kept for reference — the protocol
   design below reuses its lessons, not its code.
@@ -23,12 +25,13 @@ expandable to online later.
 
 1. **Revert**: `android-downstream` == `44bbfd1e`; share work archived,
    not deleted.
-2. **Must work on Linux** (full editing): strokes, pencil engine, Samsung
-   notes format, PGP import/export (encrypted *folders* may stay
-   Android-only for now; single encrypted notes must round-trip).
+2. **Must work on Linux**: strokes, pencil engine, Samsung notes format,
+   PGP import/export (encrypted *folders* may stay Android-only for now;
+   single encrypted notes must round-trip), math studio, images and
+   canvas animations, audio items + stroke replay.
    **Preserve-only** (Linux must open without corrupting, no editor):
-   image scan, stroke tracing, math studio, and everything else
-   device-specific.
+   image scan, stroke tracing, sdocx import/export, handwriting
+   recognition.
 3. **Format compat is the gate**: a set of reference notes exercising the
    custom features must open identically on Android and Linux before any
    merge lands. (Owner to produce the set.)
@@ -58,6 +61,13 @@ expandable to online later.
   core both sides rewrote (`core/model`, `core/text`, `canvas`,
   `format`). NOT done — deferred until a working Qt build exists to
   verify against. The fork builds as-is; that is the baseline.
+- Model-level compat scan (fork `shared/` vs `android-downstream`):
+  our tree has 19 extra model files to account for (sticky notes, tape,
+  tables, audio, rooms, page turns, groups, template memory, z-order,
+  image crop, note links, sync marks, cut edges, erase rules, function
+  curves, page cargo/layers) and 3 extra format files (ForkShapes,
+  TemplatePackage, ZipTail). Canvas diffs are host-side only
+  (Android views vs. Qt — expected, not merged).
 - This sandbox has JDK/CMake/GCC but **no Qt6 headers**, so the Qt app
   itself can only be verified on the owner's machine. The KMP `shared`
   module (`:shared:jvmTest`, `:shared:linuxX64Test`) can be verified
