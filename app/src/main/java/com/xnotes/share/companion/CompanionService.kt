@@ -132,6 +132,16 @@ class CompanionService : Service() {
                         main.post { CompanionEditors.editorFor(uri)?.syncRepaint() }
                     }
 
+                    override fun repaintLive(uri: String) {
+                        main.post {
+                            val editor = CompanionEditors.editorFor(uri)
+                            editor?.syncLiveRender(editor.controller.remoteLive?.dirtyViewportRect())
+                        }
+                    }
+
+                    override fun editorState(uri: String): com.xnotes.canvas.CanvasState? =
+                        CompanionEditors.editorFor(uri)?.state
+
                     override fun liveOverlay(uri: String): RemoteLiveStrokes? =
                         CompanionEditors.editorFor(uri)?.controller?.remoteLive
 
@@ -263,14 +273,21 @@ class CompanionService : Service() {
             liveSample(editor, uri, page, x, y, p)
         }
         editor.controller.onStrokeCommitted = { page, stroke ->
-            pendingLive.remove(editor)
-            engine.submitLocalStroke(uri, page, stroke, newDedupe())
+            val live = pendingLive.remove(editor)
+            if (live != null) {
+                engine.finishStroke(uri, page, live.id, live.tool, live.width, live.color)
+                engine.submitLocalStroke(uri, page, stroke, live.id)
+            } else {
+                engine.submitLocalStroke(uri, page, stroke, newDedupe())
+            }
         }
         editor.controller.onStrokesErased = { page, strokes ->
             val ids = strokes.map { SyncWire.fingerprintOf(it) }
             if (ids.isNotEmpty()) engine.submitLocalErase(uri, page, ids, newDedupe())
         }
         editor.state.onPageChanged = { page -> engine.presence(uri, page) }
+        editor.onPageInserted = { index, w, h -> engine.submitLocalPageAdd(uri, index, w, h, newDedupe()) }
+        editor.onPageRemoved = { index -> engine.submitLocalPageRemove(uri, index, newDedupe()) }
         engine.presence(uri, editor.state.currentPageIndex())
     }
 
@@ -298,6 +315,8 @@ class CompanionService : Service() {
         editor.controller.onStrokeCommitted = null
         editor.controller.onStrokesErased = null
         editor.state.onPageChanged = null
+        editor.onPageInserted = null
+        editor.onPageRemoved = null
         editor.controller.remoteLive = null
         pendingLive.remove(editor)
     }

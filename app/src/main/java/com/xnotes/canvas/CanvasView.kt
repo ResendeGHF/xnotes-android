@@ -873,6 +873,18 @@ class CanvasView @JvmOverloads constructor(
     fun requestRender() = postInvalidateOnAnimation()
 
     /**
+     * Repaint just the live overlay's damage (in view px): a 120 Hz pointer
+     * stream from the far side invalidates a small rect instead of the view.
+     */
+    fun requestLiveRender(rect: com.xnotes.core.geometry.Rect?) {
+        if (rect == null) {
+            requestRender()
+            return
+        }
+        postInvalidate(rect.left.toInt() - 1, rect.top.toInt() - 1, rect.right.toInt() + 1, rect.bottom.toInt() + 1)
+    }
+
+    /**
      * Repaint, and run [action] once that frame has been handed to the compositor.
      *
      * The front buffer's handover needs it: the pad may only come down after the canvas has

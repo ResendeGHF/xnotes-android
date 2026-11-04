@@ -56,6 +56,10 @@ class HostEngine(
         fun snapshotBytes(doc: Document): ByteArray?
         /** Repaint the open document for [uri] (remote apply or live). */
         fun repaintDocument(uri: String)
+        /** Repaint just the live overlay's damage for [uri] (cheap partial frame). */
+        fun repaintLive(uri: String)
+        /** The open document's canvas state for [uri], or null. */
+        fun editorState(uri: String): com.xnotes.canvas.CanvasState?
         /** The open document's live overlay for [uri], or null. */
         fun liveOverlay(uri: String): com.xnotes.canvas.RemoteLiveStrokes?
         fun onApproval(kind: String, device: String, name: String, respond: (Boolean) -> Unit)
@@ -256,12 +260,22 @@ class HostEngine(
                     val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: continue
                     if (applyErase(file, op.optInt("page", 0), ids)) changed = true
                 }
+                "add_page" -> {
+                    if (applyPageAdd(file, op.optInt("index", 0), op.optDouble("width", 0.0), op.optDouble("height", 0.0))) changed = true
+                }
+                "remove_page" -> {
+                    if (applyPageRemove(file, op.optInt("index", -1))) changed = true
+                }
                 else -> Unit
             }
         }
+        // The commit supersedes its live run even when the done frame was lost.
+        if (dedupe.isNotEmpty()) host.liveOverlay(file)?.finish(dedupe)
         val version = if (!changed) head else bumpVersion(file)
         if (changed) {
-            broadcastOp(file, version, ops, dedupe + ":fanned")
+            // Same dedupe end to end: the sender recognizes its own echo and
+            // drops it instead of applying the strokes twice.
+            broadcastOp(file, version, ops, dedupe)
         }
         send(JSONObject().put("t", "op_ack").put("file", file).put("version", version))
     }
@@ -271,6 +285,20 @@ class HostEngine(
         val ops = JSONArray().put(
             JSONObject().put("op", "add_stroke").put("page", page).put("stroke", SyncWire.toWire(stroke)),
         )
+        submitLocalOps(uri, ops, dedupe)
+    }
+
+    /** A local page insert to broadcast (blank page shell; sizes in page px). */
+    fun submitLocalPageAdd(uri: String, index: Int, width: Double, height: Double, dedupe: String) {
+        val ops = JSONArray().put(
+            JSONObject().put("op", "add_page").put("index", index).put("width", width).put("height", height),
+        )
+        submitLocalOps(uri, ops, dedupe)
+    }
+
+    /** A local page removal to broadcast. */
+    fun submitLocalPageRemove(uri: String, index: Int, dedupe: String) {
+        val ops = JSONArray().put(JSONObject().put("op", "remove_page").put("index", index))
         submitLocalOps(uri, ops, dedupe)
     }
 
@@ -302,6 +330,9 @@ class HostEngine(
             val pg = doc.pages.getOrNull(page) ?: return false
             pg.items.add(stroke)
             doc.dirty = true
+            // Bake into the warm cache in place (highlighters composite live, so
+            // appendToCache skips them by design); never a full-page rebake.
+            host.editorState(file)?.appendToCache(pg, stroke)
             host.repaintDocument(file)
             return true
         }
@@ -319,8 +350,12 @@ class HostEngine(
             val pg = doc.pages.getOrNull(page) ?: return false
             val targets = pg.items.filterIsInstance<Stroke>().filter { SyncWire.fingerprintOf(it) in ids }
             if (targets.isEmpty()) return false
+            val dirty = targets.map { it.paintBounds() }.reduce { a, b -> a.union(b) }.outset(2.0)
             pg.items.removeAll(targets.toSet())
             doc.dirty = true
+            // Patch just the erased area in the warm cache, like the local eraser.
+            val st = host.editorState(file)
+            if (st == null || !st.repairRegion(pg, dirty)) st?.invalidatePage(pg)
             host.repaintDocument(file)
             return true
         }
@@ -331,6 +366,44 @@ class HostEngine(
             pg.items.removeAll(targets.toSet())
             true
         }
+    }
+
+    /** Insert a blank remote page; bypasses undo like all remote ops. */
+    private fun applyPageAdd(file: String, index: Int, width: Double, height: Double): Boolean {
+        val doc = host.openDocument(file) ?: return modifyFile(file) { d ->
+            val at = index.coerceIn(0, d.pages.size)
+            val ref = d.pages.getOrNull(at) ?: d.pages.lastOrNull()
+            d.pages.add(at, Page(if (width > 0) width else ref?.width ?: 595.0, if (height > 0) height else ref?.height ?: 842.0))
+            true
+        }
+        val st = host.editorState(file)
+        val ref = doc.pages.getOrNull(index.coerceIn(0, doc.pages.size)) ?: doc.pages.lastOrNull()
+        val at = index.coerceIn(0, doc.pages.size)
+        doc.pages.add(at, Page(if (width > 0) width else ref?.width ?: 595.0, if (height > 0) height else ref?.height ?: 842.0))
+        doc.dirty = true
+        st?.relayout()
+        st?.clampScroll()
+        host.repaintDocument(file)
+        return true
+    }
+
+    /** Remove a remote page; never empties the note. */
+    private fun applyPageRemove(file: String, index: Int): Boolean {
+        val doc = host.openDocument(file) ?: return modifyFile(file) { d ->
+            if (d.pages.size <= 1 || index !in d.pages.indices) return@modifyFile false
+            d.pages.removeAt(index)
+            true
+        }
+        if (doc.pages.size <= 1 || index !in doc.pages.indices) return false
+        val page = doc.pages.removeAt(index)
+        doc.dirty = true
+        host.editorState(file)?.let { st ->
+            st.invalidatePage(page)
+            st.relayout()
+            st.clampScroll()
+        }
+        host.repaintDocument(file)
+        return true
     }
 
     private val codec by lazy {
@@ -398,7 +471,7 @@ class HostEngine(
         val page = msg.optInt("page", 0)
         if (page !in doc.pages.indices) return
         overlay.update(file, page, msg.optString("stroke_id"), msg.optDouble("width", 3.0), color, pts, msg.optBoolean("done", false))
-        host.repaintDocument(file)
+        host.repaintLive(file)
     }
 
     // --- create / delete (host approves in UI) ---

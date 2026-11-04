@@ -1,6 +1,7 @@
 package com.xnotes.canvas
 
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.Renderer
@@ -10,7 +11,7 @@ import com.xnotes.core.pal.Renderer
  * keyed by stroke id. The committed op drops the run as soon as its model
  * lands, so a pen-up never double-draws. Painted in the interaction overlay.
  */
-class RemoteLiveStrokes(private val state: CanvasState) {
+open class RemoteLiveStrokes(private val state: CanvasState) {
     class Run(
         val file: String,
         val page: Int,
@@ -25,7 +26,7 @@ class RemoteLiveStrokes(private val state: CanvasState) {
     private val runs = LinkedHashMap<String, Run>()
 
     /** Append [samples] (page-local) to [strokeId]'s run, starting it first. */
-    fun update(file: String, page: Int, strokeId: String, width: Double, color: Rgba, samples: List<Pt>, done: Boolean) {
+    open fun update(file: String, page: Int, strokeId: String, width: Double, color: Rgba, samples: List<Pt>, done: Boolean) {
         if (done) {
             runs.remove(strokeId)
             return
@@ -36,28 +37,63 @@ class RemoteLiveStrokes(private val state: CanvasState) {
     }
 
     /** Drop the run (its model landed). */
-    fun finish(strokeId: String) {
+    open fun finish(strokeId: String) {
         runs.remove(strokeId)
     }
 
     /** Drop every run of [file] (it closed or resynced). */
-    fun clearFile(file: String) {
+    open fun clearFile(file: String) {
         runs.entries.removeIf { it.value.file == file }
     }
 
-    fun clear() = runs.clear()
+    open fun clear() = runs.clear()
 
-    fun draw(r: Renderer) {
+    open fun draw(r: Renderer) {
         val showing = showingFile ?: return
         for ((_, run) in runs) {
             if (run.file != showing || run.points.size < 2) continue
             val pr = state.pageRects.getOrNull(run.page) ?: continue
+            // NOTE: the caller (drawOverlay) already translated to content space
+            // (origin + zoom); page coords only need the page offset + transform.
             r.withSave {
                 r.translate(pr.left, pr.top)
                 state.applyPageTransform(r, state.document.pages[run.page])
                 r.strokePolyline(run.points, Pen(run.color, run.width, cosmetic = false))
             }
         }
+    }
+
+    /**
+     * Union of all runs' bounds in viewport px (for partial-damage repaints):
+     * page-space point bounds → content → viewport, padded for width/AA.
+     */
+    open fun dirtyViewportRect(): Rect? {
+        val showing = showingFile ?: return null
+        var out: Rect? = null
+        for ((_, run) in runs) {
+            if (run.file != showing || run.points.size < 2) continue
+            if (state.pageRects.getOrNull(run.page) == null) continue
+            var l = Double.MAX_VALUE
+            var t = Double.MAX_VALUE
+            var rr = -Double.MAX_VALUE
+            var b = -Double.MAX_VALUE
+            for (p in run.points) {
+                if (p.x < l) l = p.x
+                if (p.y < t) t = p.y
+                if (p.x > rr) rr = p.x
+                if (p.y > b) b = p.y
+            }
+            val pad = run.width / 2.0 + 2.0
+            val content = state.fromPageSpaceRect(run.page, Rect(l - pad, t - pad, rr - l + pad * 2, b - t + pad * 2))
+            val corners = listOf(
+                Pt(content.left, content.top),
+                Pt(content.right, content.top),
+                Pt(content.left, content.bottom),
+                Pt(content.right, content.bottom),
+            ).map { state.contentToViewport(it) }
+            out = Rect.bounding(corners).outset(3.0).let { if (out == null) it else out.union(it) }
+        }
+        return out
     }
 
     companion object {

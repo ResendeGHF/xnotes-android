@@ -6210,13 +6210,14 @@ class InteractionController(
 
             // Room on the pages, the cut a hovering pen would make, while Insert space is armed.
             if (tool == Tool.INSERT_SPACE || insertSpace.active) insertSpace.drawOverlay(r, state.visibleContentRect())
+
+            // The far side's live runs, over content and chrome but in content space
+            // (the page offset + transform only make sense under origin + zoom).
+            remoteLive?.draw(r)
         }
 
         // Note icons: chrome of one size at any zoom, so in viewport space.
         noteIcons?.draw(r)
-
-        // The far side's live runs, over everything while they draw.
-        remoteLive?.draw(r)
 
         // Each room's close button while Insert space is armed, and the room's height beside the pen while it drags.
         if (tool == Tool.INSERT_SPACE || insertSpace.active) insertSpace.drawViewport(r)

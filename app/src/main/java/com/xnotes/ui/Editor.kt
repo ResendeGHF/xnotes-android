@@ -5130,6 +5130,11 @@ class Editor(
         view.requestRender()
     }
 
+    /** Repaint just the remote live overlay's damage (cheap partial frame). */
+    fun syncLiveRender(rect: com.xnotes.core.geometry.Rect?) {
+        view.requestLiveRender(rect)
+    }
+
     fun save(output: OutputStream, uri: String, name: String? = null) {
         try {
             synchronized(saveLock) { codec.write(state.document, output) }
@@ -9972,6 +9977,7 @@ class Editor(
         state.relayout()
         refreshContent()
         view.requestRender()
+        onPageInserted?.invoke(at, w, h)
         return at
     }
 
@@ -10032,6 +10038,13 @@ class Editor(
         view.requestRender()
     }
 
+    /**
+     * Sync hook: fired for explicit local blank-page add/remove so the companion
+     * bridge can submit matching ops. Remote page ops never fire these.
+     */
+    var onPageInserted: ((index: Int, width: Double, height: Double) -> Unit)? = null
+    var onPageRemoved: ((index: Int) -> Unit)? = null
+
     /** Toolbar "Add page": insert a blank page right after the current one (sized from it) and go to it. */
     fun addPage() {
         val current = state.currentPageIndex()
@@ -10061,6 +10074,7 @@ class Editor(
         state.relayout()
         refreshContent()
         view.requestRender()
+        onPageRemoved?.invoke(index)
     }
 
     // --- side-panel page operations (operate on explicit page indices) ---
@@ -10287,6 +10301,9 @@ class Editor(
         history.push(CompositeCommand(cmds))
         afterPageEdit()
         goToPage(firstAt)
+        // Shell only: pasted items are not mirrored in v1, but the page count
+        // stays aligned so later stroke ops land on the right pages.
+        for ((n, page) in pages.withIndex()) onPageInserted?.invoke(firstAt + n, page.width, page.height)
     }
 
     /**
@@ -10631,6 +10648,7 @@ class Editor(
         history.push(CompositeCommand(cmds))
         clearPageSelection()
         afterPageEdit()
+        for (i in targets) onPageRemoved?.invoke(i)
     }
 
     /**

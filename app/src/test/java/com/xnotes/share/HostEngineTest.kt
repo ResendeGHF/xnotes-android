@@ -77,7 +77,15 @@ class HostEngineTest {
         override fun openDocument(uri: String): Document? = docs[uri]
         override fun snapshotBytes(doc: Document): ByteArray? = null
         override fun repaintDocument(uri: String) = Unit
-        override fun liveOverlay(uri: String): RemoteLiveStrokes? = null
+        override fun repaintLive(uri: String) {
+            liveRepaints += uri
+        }
+        override fun editorState(uri: String): com.xnotes.canvas.CanvasState? = states[uri]
+        override fun liveOverlay(uri: String): RemoteLiveStrokes? = overlays[uri]
+
+        val liveRepaints = ArrayList<String>()
+        val states = HashMap<String, com.xnotes.canvas.CanvasState>()
+        val overlays = HashMap<String, RemoteLiveStrokes>()
         override fun onApproval(kind: String, device: String, name: String, respond: (Boolean) -> Unit) {
             approval?.invoke(kind, device, name, respond)
         }
@@ -140,6 +148,55 @@ class HostEngineTest {
         assertEquals("f1", fwd.getString("file"))
         // Same dedupe twice: second is dropped.
         e.onMessage(JSONObject().put("t", "op").put("seq", 2).put("file", "f1").put("base_version", 2).put("dedupe", "a")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_stroke").put("page", 0).put("stroke", wire))))
+        assertEquals(1, doc.pages[0].items.size)
+    }
+
+    @Test fun pageOpsApplyAndFanSameDedupe() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["f1"] = doc
+        e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "f1").put("base_version", 1).put("dedupe", "pg1")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_page").put("index", 1).put("width", 300.0).put("height", 200.0))))
+        assertEquals(2, doc.pages.size)
+        assertEquals(300.0, doc.pages[1].width, 0.001)
+        val fwd = h.lastOfType("op")
+        // Same dedupe end to end: the sender recognizes its echo and drops it.
+        assertEquals("pg1", fwd.getString("dedupe"))
+        e.onMessage(JSONObject().put("t", "op").put("seq", 2).put("file", "f1").put("base_version", 2).put("dedupe", "pg2")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "remove_page").put("index", 1))))
+        assertEquals(1, doc.pages.size)
+        // Never empties the note.
+        e.onMessage(JSONObject().put("t", "op").put("seq", 3).put("file", "f1").put("base_version", 3).put("dedupe", "pg3")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "remove_page").put("index", 0))))
+        assertEquals(1, doc.pages.size)
+    }
+
+    @Test fun opFinishesLiveRunAndLiveRepaintsPartial() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["f1"] = doc
+        val overlay = RemoteLiveStrokes(
+            com.xnotes.canvas.CanvasState(doc, com.xnotes.core.FakeSurfaceFactory(), com.xnotes.ui.theme.Palette.DEFAULT),
+        )
+        overlay.update("f1", 0, "run-1", 3.0, com.xnotes.core.model.Rgba(0, 0, 0, 255),
+            listOf(com.xnotes.core.geometry.Pt(1.0, 1.0), com.xnotes.core.geometry.Pt(2.0, 2.0)), false)
+        h.overlays["f1"] = overlay
+        e.onMessage(JSONObject().put("t", "live").put("seq", 1).put("file", "f1").put("page", 0)
+            .put("stroke_id", "run-2").put("width", 3.0).put("color", "#000000")
+            .put("samples", org.json.JSONArray().put(org.json.JSONArray().put(5.0).put(5.0).put(1.0))).put("done", false))
+        assertEquals(listOf("f1"), h.liveRepaints)
+        // The commit drops its live run even without a done frame.
+        val wire = SyncWire.toWire(stroke())
+        e.onMessage(JSONObject().put("t", "op").put("seq", 2).put("file", "f1").put("base_version", 1).put("dedupe", "run-1")
             .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_stroke").put("page", 0).put("stroke", wire))))
         assertEquals(1, doc.pages[0].items.size)
     }
