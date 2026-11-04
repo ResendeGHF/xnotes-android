@@ -340,6 +340,22 @@ int xn_editor_pdf_selection_rect(const xn_editor* editor, double* out_xywh);
 void xn_editor_pdf_mark(xn_editor* editor, int type);
 void xn_editor_pdf_clear(xn_editor* editor);
 
+/* Sticky notes. A fresh one centred on the viewport point (x, y), selected; collapse/expand the ones in the selection. */
+void xn_editor_insert_sticky(xn_editor* editor, double x, double y);
+void xn_editor_toggle_sticky(xn_editor* editor);
+/* 1 when the selection holds a sticky note (for offering collapse/expand). */
+int xn_editor_selection_has_sticky(const xn_editor* editor);
+
+/* The markup a tap landed on (PDF notes): 1 while one is held for its menu. Its note text
+   (free with xn_free_string; NULL when it has none), replaced as one undo step, or the markup
+   taken off its page. */
+int xn_editor_has_markup(const xn_editor* editor);
+char* xn_editor_markup_note(const xn_editor* editor);
+void xn_editor_set_markup_note(xn_editor* editor, const char* utf8_note_or_null);
+void xn_editor_delete_markup(xn_editor* editor);
+/* The menu over the tapped markup closed without acting on it. */
+void xn_editor_clear_markup(xn_editor* editor);
+
 /* The armed tool's id (a static string). */
 const char* xn_editor_tool(const xn_editor* editor);
 

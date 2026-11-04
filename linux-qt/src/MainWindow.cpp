@@ -577,6 +577,14 @@ void MainWindow::pasteAt(QPointF widget) {
     selectionBar_->refresh();
 }
 
+/* Edit the tapped markup's note (empty clears it). */
+void MainWindow::editMarkupNote(xn_editor* e, const QString& current) {
+    bool ok = false;
+    const QString text = QInputDialog::getMultiLineText(this, QStringLiteral("Markup note"), QString(), current, &ok);
+    if (!ok) return;
+    xn_editor_set_markup_note(e, text.isEmpty() ? nullptr : QFile::encodeName(text).constData());
+}
+
 /* A fresh file name in the note's work folder, which lives as long as the note. */
 QString MainWindow::workFile(const QString& suffix) {
     if (!workDir_ || !workDir_->isValid()) workDir_ = std::make_unique<QTemporaryDir>();
@@ -625,10 +633,33 @@ void MainWindow::showContextMenu(QPointF at, bool onLocked) {
     auto* e = canvas_->editor();
     if (!e) return;
     QMenu menu(this);
+    const bool onMarkup = xn_editor_has_markup(e) != 0;
+    if (onMarkup) {
+        if (char* note = xn_editor_markup_note(e)) {
+            const QString text = QString::fromUtf8(note);
+            xn_free_string(note);
+            menu.addAction(xnIcon(QStringLiteral("textBox")), QStringLiteral("Note: %1").arg(text.left(40)), this, [this, e, text] {
+                editMarkupNote(e, text);
+            });
+        } else {
+            menu.addAction(xnIcon(QStringLiteral("textBox")), QStringLiteral("Add note…"), this, [this, e] { editMarkupNote(e, {}); });
+        }
+        menu.addAction(xnIcon(QStringLiteral("trash")), QStringLiteral("Delete markup"), this, [e] { xn_editor_delete_markup(e); });
+        menu.exec(canvas_->mapToGlobal(at.toPoint()));
+        xn_editor_clear_markup(e);
+        return;
+    }
     QAction* paste = menu.addAction(xnIcon(QStringLiteral("paste")), QStringLiteral("Paste"), this, [this, at] { pasteAt(at); });
     const QMimeData* mime = QApplication::clipboard()->mimeData();
     paste->setEnabled(xn_editor_can_paste(e) || (mime && mime->hasImage()));
     if (onLocked) menu.addAction(xnIcon(QStringLiteral("unlock")), QStringLiteral("Unpin"), this, [e] { xn_editor_unlock_pressed(e); });
+    if (xn_editor_selection_has_sticky(e)) menu.addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Collapse/expand sticky"), this, [e] { xn_editor_toggle_sticky(e); });
+    menu.addAction(xnIcon(QStringLiteral("pin")), QStringLiteral("Sticky note"), this, [this, at] {
+        if (auto* e = canvas_->editor()) {
+            const QPointF dev = canvas_->toDevice(at);
+            xn_editor_insert_sticky(e, dev.x(), dev.y());
+        }
+    });
     menu.addAction(xnIcon(QStringLiteral("select")), QStringLiteral("Select all"), this, &MainWindow::selectAll);
     menu.exec(canvas_->mapToGlobal(at.toPoint()));
 }
@@ -794,7 +825,7 @@ bool MainWindow::save(bool askPath) {
         // A canvas is saved as .xcanvas, a note as .xnote: the format follows the document.
         const bool canvas = xn_note_is_canvas(note_);
         const QString ext = canvas ? QStringLiteral(".xcanvas") : QStringLiteral(".xnote");
-        const QString start = !path.isEmpty() ? path : !suggestedName_.isEmpty() ? suggestedName_ : (canvas ? QStringLiteral("canvas") : QStringLiteral("note")) + ext;
+        const QString start = !path.isEmpty() ? path : !suggestedName_.isEmpty() ? suggestedName_ : (canvas ? QStringLiteral("canvas") : QStringLiteral("pin")) + ext;
         path = QFileDialog::getSaveFileName(this, canvas ? QStringLiteral("Save canvas") : QStringLiteral("Save note"), start,
                                             canvas ? QStringLiteral("xnotes canvases (*.xcanvas)") : QStringLiteral("xnotes notes (*.xnote)"));
         if (path.isEmpty()) return false;

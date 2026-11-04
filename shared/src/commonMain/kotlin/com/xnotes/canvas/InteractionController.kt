@@ -21,6 +21,7 @@ import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.ReorderItems
 import com.xnotes.core.history.RemoveMarkup
 import com.xnotes.core.history.ReplacePageItems
+import com.xnotes.core.history.SetStickyCollapsed
 import com.xnotes.core.history.ResizeItem
 import com.xnotes.core.history.RestyleItems
 import com.xnotes.core.history.RestyleText
@@ -46,6 +47,7 @@ import com.xnotes.core.model.Glue
 import com.xnotes.core.model.GlueFollow
 import com.xnotes.core.model.Labelled
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.ShapeLabel
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextHandle
@@ -1028,6 +1030,8 @@ class InteractionController(
         if (onMarkupTap?.invoke(state.contentToViewport(content), true) == true) return true
         val cb = onLinkTap ?: return false
         val pageIndex = state.pageIndexAtContent(content) ?: return false
+        // A collapsed sticky's icon (or an expanded one's x) toggles before links do.
+        if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return true
         return cb(pageIndex, state.toPageSpace(pageIndex, content))
     }
 
@@ -1035,6 +1039,9 @@ class InteractionController(
 
     private fun beginDraw(content: Pt, pressure: Double, drawTool: Tool, timeMs: Long, downViewport: Pt) {
         val pageIndex = state.pageIndexAtContent(content) ?: return
+        // A pen press on a collapsed icon expands it (or on an expanded x collapses it)
+        // instead of starting a stroke.
+        if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return
         // Reaching here with a live selection means the press landed off it (on it the stylus would
         // have grabbed it): dismiss it. A bare tap that only dismissed is dropped in endDraw.
         strokeDismissedSelection = hasSelection
@@ -4441,6 +4448,100 @@ class InteractionController(
         r.fillRect(Rect(left, top, w, h), pal.menuBg.scaleAlpha(0.92))
         r.strokeRect(Rect(left, top, w, h), Pen(pal.textDim, 1.2, cosmetic = true))
         r.drawText(text, Rect(left + padX, top + padY, textW + 2.0, textH), font, pal.text)
+    }
+
+    // --- STICKY NOTE ---
+
+    /** The topmost sticky on page [pi] containing page point [local], or null. */
+    private fun stickyAt(pi: Int, local: Pt): StickyNoteItem? =
+        state.document.pages.getOrNull(pi)?.items?.lastOrNull {
+            it is StickyNoteItem && !it.locked && it.contains(local)
+        } as? StickyNoteItem
+
+    /**
+     * Toggle a sticky at page point [local] on page [pi]: a collapsed icon expands, the
+     * expanded paper's x collapses. True when a toggle happened (the tap is consumed).
+     */
+    fun stickyToggleAt(pi: Int, local: Pt): Boolean {
+        val item = stickyAt(pi, local) ?: return false
+        val page = state.document.pages[pi]
+        // Repair the union of both states: collapsing leaves the paper's pixels behind
+        // if only the icon is repainted, and expanding leaves the icon's.
+        val was = item.paintBounds()
+        if (item.collapsed) {
+            val before = item.collapsed
+            val rectBefore = item.rect
+            // An icon parked at the page's far right/bottom would otherwise open its paper
+            // off the page; shift it minimally so the whole note stays visible.
+            val fitted = StickyNoteItem.fitExpanded(item.rect, state.footprint(page))
+            item.collapsed = false
+            item.rect = fitted
+            val rectShift = if (fitted != rectBefore) fitted else null
+            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, false, rectBefore, rectShift))))
+            state.document.dirty = true
+            repairRegion(page, was.union(item.paintBounds()))
+            onContentChanged()
+            requestRender()
+            return true
+        }
+        if (item.isCollapseHit(local)) {
+            val before = item.collapsed
+            item.collapsed = true
+            history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, true))))
+            state.document.dirty = true
+            repairRegion(page, was.union(item.paintBounds()))
+            onContentChanged()
+            requestRender()
+            return true
+        }
+        return false
+    }
+
+    /** Whether the selection holds a sticky note. */
+    fun selectionHasSticky(): Boolean = selection.any { it.item is StickyNoteItem }
+
+    /** Collapse or expand the sticky notes in the selection, each as one undo step. */
+    fun toggleSelectedStickies() {
+        for (s in selection.mapNotNull { it.item as? StickyNoteItem }) toggleStickyCollapsed(s)
+    }
+
+    /** Collapse or expand [item], wherever it sits, as one undo step. */
+    fun toggleStickyCollapsed(item: StickyNoteItem) {
+        val page = state.document.pages.firstOrNull { p -> p.items.any { it === item } } ?: return
+        val next = !item.collapsed
+        val before = item.collapsed
+        val rectBefore = item.rect
+        item.collapsed = next
+        var rectAfter: Rect? = null
+        if (!next) {
+            // Expanding from the far edge must not open the paper off the page.
+            val fitted = StickyNoteItem.fitExpanded(item.rect, state.footprint(page))
+            item.rect = fitted
+            if (fitted != rectBefore) rectAfter = fitted
+        }
+        history.push(SetStickyCollapsed(listOf(SetStickyCollapsed.Entry(item, before, next, rectBefore, rectAfter))))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        onContentChanged()
+        requestRender()
+    }
+
+    /** Place a fresh sticky note centred on content point [content], selected, as one undo step. */
+    fun placeStickyNoteAt(content: Pt, color: Rgba = StickyNoteItem.DEFAULT_COLOR): StickyNoteItem? {
+        val (pi, local) = state.pagePointAt(content) ?: return null
+        val page = state.document.pages.getOrNull(pi) ?: return null
+        val rect = Rect(local.x - StickyNoteItem.DEFAULT_WIDTH / 2.0, local.y - StickyNoteItem.DEFAULT_HEIGHT / 2.0,
+            StickyNoteItem.DEFAULT_WIDTH, StickyNoteItem.DEFAULT_HEIGHT)
+        val item = StickyNoteItem(rect, color, collapsed = false, measurer = textMeasurer)
+        page.items.add(item)
+        history.push(AddItem(page, item))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        setSelection(listOf(Selected(pi, item)))
+        refreshSelectionMenu()
+        onContentChanged()
+        requestRender()
+        return item
     }
 
     companion object {

@@ -73,6 +73,28 @@ class CompatNotesTest {
     }
 
     @Test
+    fun stickyNoteSurvivesRoundTrip() {
+        val tmpImg = Files_createTempDir("compat-sticky")
+        val tmpPdf = File.createTempFile("compat-src", ".pdf").apply { deleteOnExit() }
+        val doc = fixture("example-note-created-by-note.xnote").inputStream()
+            .use { codec.read(it, tmpPdf.parentFile, tmpImg) }
+        val stickies = doc.pages.flatMap { it.items }.filterIsInstance<com.xnotes.core.model.StickyNoteItem>()
+        assertEquals("expected the example note's sticky", 1, stickies.size)
+        val sticky = stickies[0]
+        val out = ByteArrayOutputStream()
+        codec.write(doc, out)
+        val doc2 = out.toByteArray().inputStream()
+            .use { codec.read(it, tmpPdf.parentFile, Files_createTempDir("compat-sticky2")) }
+        val stickies2 = doc2.pages.flatMap { it.items }.filterIsInstance<com.xnotes.core.model.StickyNoteItem>()
+        assertEquals(1, stickies2.size)
+        assertEquals(sticky.rect, stickies2[0].rect)
+        assertEquals(sticky.color, stickies2[0].color)
+        assertEquals(sticky.collapsed, stickies2[0].collapsed)
+        assertEquals(sticky.text, stickies2[0].text)
+        assertEquals(sticky.ink.size, stickies2[0].ink.size)
+    }
+
+    @Test
     fun mathStudioWorkspaceSurvivesRoundTrip() {
         val tmpPdf = File.createTempFile("compat-src", ".pdf").apply { deleteOnExit() }
         val doc = fixture("example-note-created-by-note.xnote").inputStream()

@@ -20,6 +20,7 @@ import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.ShapeLabel
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextItem
@@ -283,6 +284,7 @@ class DocumentCodec(
                 is TextItem -> writeText(j, item, ids[item])
                 is ShapeItem -> writeShape(j, item, ids[item])
                 is ConnectorItem -> writeConnector(j, item, ids)
+                is StickyNoteItem -> writeSticky(j, item, ids[item])
                 else -> {} // unrecognized kind: not written
             }
         }
@@ -344,6 +346,64 @@ class DocumentCodec(
         // Straight-line strokes must reload un-smoothed, else the EMA pulls their far end inward.
         if (s.straight) j.name("straight").value(true)
         if (s.locked) j.name("locked").value(true)
+        j.endObject()
+    }
+
+    /** A sticky note: paper box, paper color, collapsed flag, text and note-local ink. */
+    private fun writeSticky(j: JsonWrite, item: StickyNoteItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(StickyNoteItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("rect").beginArray().value(item.rect.x).value(item.rect.y).value(item.rect.w).value(item.rect.h).endArray()
+        j.name("color")
+        writeRgba(j, item.color)
+        if (item.collapsed) j.name("collapsed").value(true)
+        if (item.text.isNotEmpty()) j.name("text").value(item.text)
+        if (item.ink.isNotEmpty()) {
+            j.name("ink").beginArray()
+            for (stroke in item.ink) writeStickyStroke(j, stroke)
+            j.endArray()
+        }
+        if (item.locked) j.name("locked").value(true)
+        j.endObject()
+    }
+
+    /** A stroke inside a sticky note: same fields as a top-level stroke, note-local. */
+    private fun writeStickyStroke(j: JsonWrite, s: Stroke) {
+        val withTime = s.config.speedStrength > 0.0
+        j.beginObject()
+        j.name("tool").value(s.tool.id)
+        j.name("config").beginObject()
+        j.name("base_width").value(s.config.baseWidth)
+        j.name("pressure_enabled").value(s.config.pressureEnabled)
+        j.name("pressure_min_factor").value(s.config.pressureMinFactor)
+        j.name("direction_strength").value(s.config.directionStrength)
+        j.name("rgba")
+        writeRgba(j, s.config.rgba)
+        if (s.config.speedStrength != 0.0) j.name("speed_strength").value(s.config.speedStrength)
+        if (s.config.taperEnabled) {
+            j.name("taper_enabled").value(true)
+            j.name("taper_min_factor").value(s.config.taperMinFactor)
+        }
+        if (s.config.neon) {
+            j.name("neon").value(true)
+            j.name("neon_strength").value(s.config.neonStrength)
+        }
+        if (s.tool == Tool.DASHED) {
+            j.name("dash_length").value(s.config.dashLength)
+            j.name("dash_gap").value(s.config.dashGap)
+        }
+        if (s.tool == Tool.HIGHLIGHTER) {
+            j.name("highlighter_alpha").value(s.config.highlighterAlpha)
+            if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
+        }
+        j.endObject()
+        j.name("samples").beginArray()
+        for (sm in s.samples) j.samplePoint(sm.x, sm.y, sm.pressure, if (withTime) sm.t else null)
+        j.endArray()
+        if (withTime) j.name("speed_scale").value(s.speedScale)
+        if (s.smoothScale != 1.0) j.name("smooth_scale").value(s.smoothScale)
+        if (s.straight) j.name("straight").value(true)
         j.endObject()
     }
 
@@ -961,6 +1021,9 @@ class DocumentCodec(
         var dashed = false
         var dashLength = 10.0
         var dashGap = 8.0
+        var linkColor: Rgba? = null
+        var collapsed = false
+        var stickyInk: MutableList<Stroke>? = null
     }
 
     /** Stroke config fields as written; null = absent, so defaults resolve exactly as before. */
@@ -1029,6 +1092,9 @@ class DocumentCodec(
                 "dashed" -> s.dashed = boolOr(p, false)
                 "dash_length" -> s.dashLength = doubleOr(p, 10.0)
                 "dash_gap" -> s.dashGap = doubleOr(p, 8.0)
+                "color" -> s.linkColor = rgbaOrNull(p)
+                "collapsed" -> s.collapsed = boolOr(p, false)
+                "ink" -> s.stickyInk = parseStickyInk(p)
                 "locked" -> s.locked = boolOr(p, false)
                 else -> p.skipValue()
             }
@@ -1060,6 +1126,7 @@ class DocumentCodec(
                     measurer = textMeasurer,
                 ),
             )
+            StickyNoteItem.KIND -> buildSticky(s)?.let { items.add(it) }
             ShapeItem.KIND, ShapeItem.GLYPHS_KIND -> {
                 val c = s.connector
                 items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
@@ -1069,6 +1136,81 @@ class DocumentCodec(
         if (items.size > before) glue.named(items[before], s.id)
         // Absent on every note written before locking existed, which reads back as unlocked.
         if (s.locked && items.size > before) items[before].locked = true
+    }
+
+    private fun buildSticky(s: ItemScratch): StickyNoteItem? {
+        val rect = s.rect ?: return null
+        if (!(rect.w.isFinite() && rect.h.isFinite() && rect.w > 0.0 && rect.h > 0.0)) return null
+        return StickyNoteItem(
+            rect = rect,
+            color = s.linkColor ?: StickyNoteItem.DEFAULT_COLOR,
+            collapsed = s.collapsed,
+            text = s.text,
+            ink = (s.stickyInk ?: mutableListOf()).mapTo(mutableListOf()) { Stroke(it) },
+            measurer = textMeasurer,
+        )
+    }
+
+    /** Note-local ink array of a sticky note; malformed entries are skipped. */
+    private fun parseStickyInk(p: JsonPull): MutableList<Stroke>? {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return null
+        }
+        val out = mutableListOf<Stroke>()
+        p.beginArray()
+        while (p.hasNext()) parseStickyStroke(p)?.let { out.add(it) }
+        p.endArray()
+        return out
+    }
+
+    private fun parseStickyStroke(p: JsonPull): Stroke? {
+        if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+            p.skipValue()
+            return null
+        }
+        var tool: String? = null
+        var config: ConfigScratch? = null
+        var samples: RawSamples? = null
+        var speedScale = 1.0
+        var smoothScale = 1.0
+        var straight = false
+        p.beginObject()
+        while (p.hasNext()) {
+            when (p.nextName()) {
+                "tool" -> tool = stringOr(p, "")
+                "config" -> config = parseConfig(p)
+                "samples" -> samples = parseSamples(p)
+                "speed_scale" -> speedScale = doubleOr(p, 1.0)
+                "smooth_scale" -> smoothScale = doubleOr(p, 1.0)
+                "straight" -> straight = boolOr(p, false)
+                else -> p.skipValue()
+            }
+        }
+        p.endObject()
+        val t = Tool.fromId(tool) ?: return null
+        val c = config
+        val def = ToolConfig()
+        val cfg = ToolConfig(
+            baseWidth = c?.baseWidth ?: def.baseWidth,
+            pressureEnabled = c?.pressureEnabled ?: def.pressureEnabled,
+            pressureMinFactor = c?.pressureMinFactor ?: def.pressureMinFactor,
+            directionStrength = c?.directionStrength ?: def.directionStrength,
+            rgba = c?.rgba ?: def.rgba,
+            speedStrength = c?.speedStrength ?: def.speedStrength,
+            taperEnabled = c?.let { it.taperEnabled ?: ((it.taperLength ?: 0.0) > 0.0) } ?: def.taperEnabled,
+            taperMinFactor = c?.taperMinFactor ?: ToolDefaults.LEGACY_TAPER_TIP,
+            neon = c?.neon ?: def.neon,
+            neonStrength = c?.neonStrength ?: def.neonStrength,
+            dashLength = c?.dashLength ?: def.dashLength,
+            dashGap = c?.dashGap ?: def.dashGap,
+            highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
+            highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
+        )
+        val stroke = Stroke(t, cfg, emptyList(), speedScale, straight, smoothScale)
+        samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
+        if (stroke.isEmpty) return null
+        return stroke
     }
 
     private fun buildStroke(s: ItemScratch): Stroke {

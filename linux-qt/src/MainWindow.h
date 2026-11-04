@@ -112,6 +112,7 @@ private:
     void pasteAt(QPointF widget);
     void selectAll();
     void showContextMenu(QPointF at, bool onLocked);
+    void editMarkupNote(xn_editor* e, const QString& current);
     QString workFile(const QString& suffix);
     void chooseImage();
     bool insertImageFile(const QString& path, QPointF at, bool atPoint);

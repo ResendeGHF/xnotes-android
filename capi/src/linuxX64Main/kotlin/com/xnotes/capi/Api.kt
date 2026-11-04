@@ -6,8 +6,16 @@ import com.xnotes.canvas.CanvasFramePainter
 import com.xnotes.canvas.CanvasState
 import com.xnotes.canvas.ChromePalette
 import com.xnotes.canvas.InteractionController
+import com.xnotes.canvas.MarkupOverlay
+import com.xnotes.canvas.NoteIcons
+import com.xnotes.canvas.PdfPageFilter
 import com.xnotes.canvas.PdfTextController
+import com.xnotes.core.history.RemoveMarkup
+import com.xnotes.core.history.ReplaceMarkup
 import com.xnotes.core.model.MarkupType
+import com.xnotes.core.model.TextMarkup
+import com.xnotes.core.pdf.MarkupPainter
+import com.xnotes.core.platform.epochMillisNow
 import com.xnotes.capi.c.xn_host
 import com.xnotes.capi.c.xn_palette
 import com.xnotes.capi.c.xn_pointer
@@ -433,6 +441,7 @@ internal class CEditor(note: CNote, private val host: xn_host) {
 
     /** The locked item the last context menu was opened on. */
     var pressedLocked: CanvasItem? = null
+
     val editor = NoteEditor(state, history, controller, CTextMeasurer(host), object : NoteEditorHost {
         override fun requestRender() = this@CEditor.requestRender()
         override fun contentChanged() = host.content_changed!!.invoke(host.ctx)
@@ -468,6 +477,63 @@ internal class CEditor(note: CNote, private val host: xn_host) {
     private fun showTextMenu(rect: Rect?) =
         host.selection_menu?.invoke(host.ctx, if (rect != null) 1 else 0, rect?.x ?: 0.0, rect?.y ?: 0.0, rect?.w ?: 0.0, rect?.h ?: 0.0)
 
+    /** Text markups painted before the background rebuild lands, and icons over noted ones. */
+    val noteIcons = NoteIcons(state).also { controller.noteIcons = it }
+
+    /** The markup the last tap landed on, for its menu; cleared when the menu closes. */
+    var pressedMarkup: Pair<Page, TextMarkup>? = null
+
+    /** The markup a tap at viewport [at] lands on: a note icon first, then the topmost markup there. */
+    private fun markupHit(at: Pt): Pair<Int, TextMarkup>? {
+        noteIcons.at(at)?.let { return it.page to it.markup }
+        val content = state.viewportToContent(at)
+        val pi = state.pageIndexAtContent(content) ?: return null
+        val page = state.document.pages.getOrNull(pi) ?: return null
+        if (page.markups.isEmpty()) return null
+        val local = state.toPageSpace(pi, content)
+        val ptPerPx = 72.0 / state.document.dpi
+        val slop = 4.0 * state.devicePxPerDp / state.zoom * ptPerPx
+        val m = MarkupPainter.markupAt(page.markups, local.x * ptPerPx, local.y * ptPerPx, slop) ?: return null
+        return pi to m
+    }
+
+    private fun initMarkupNotes() {
+        controller.markupOverlay = MarkupOverlay(state) { PdfPageFilter.NONE }
+        controller.onMarkupTap = { at, _ ->
+            val hit = markupHit(at)
+            if (hit != null) {
+                pressedMarkup = state.document.pages[hit.first] to hit.second
+                host.context_menu?.invoke(host.ctx, at.x, at.y, 0)
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /** The tapped markup's note text replaced by [text] (null clears it), as one undo step. */
+    fun setPressedMarkupNote(text: String?) {
+        val (page, before) = pressedMarkup ?: return
+        val note = text?.takeIf { it.isNotEmpty() }
+        if (note == before.note) return
+        history.push(ReplaceMarkup(page, before, before.copy(note = note, modified = epochMillisNow())))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        host.content_changed!!.invoke(host.ctx)
+        requestRender()
+    }
+
+    /** The tapped markup taken off its page, as one undo step. */
+    fun deletePressedMarkup() {
+        val (page, markup) = pressedMarkup ?: return
+        history.push(RemoveMarkup(page, markup))
+        pressedMarkup = null
+        state.document.dirty = true
+        state.invalidatePage(page)
+        host.content_changed!!.invoke(host.ctx)
+        requestRender()
+    }
+
     init {
         state.paintPageBackground = { page, renderer, res, region ->
             if (!paintPdfBackground(host, state.document, page, renderer, res, region)) withLock(standInLock) { standIns.add(page) }
@@ -479,6 +545,7 @@ internal class CEditor(note: CNote, private val host: xn_host) {
             state.onCacheReady = { requestRender() }
         }
         controller.setTool(Tool.PEN)
+        initMarkupNotes()
     }
 
     // --- frame damage ---
@@ -1360,6 +1427,47 @@ fun xnEditorPdfMark(editor: COpaquePointer?, type: Int) = guard(Unit) {
 @CName("xn_editor_pdf_clear")
 fun xnEditorPdfClear(editor: COpaquePointer?) = guard(Unit) {
     editor!!.editor().pdfText.clear()
+}
+
+@CName("xn_editor_insert_sticky")
+fun xnEditorInsertSticky(editor: COpaquePointer?, x: Double, y: Double) = guard(Unit) {
+    val e = editor!!.editor()
+    e.controller.placeStickyNoteAt(e.state.viewportToContent(Pt(x, y)))
+}
+
+@CName("xn_editor_toggle_sticky")
+fun xnEditorToggleSticky(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().controller.toggleSelectedStickies()
+}
+
+@CName("xn_editor_selection_has_sticky")
+fun xnEditorSelectionHasSticky(editor: COpaquePointer?): Int = guard(0) {
+    if (editor!!.editor().controller.selectionHasSticky()) 1 else 0
+}
+
+@CName("xn_editor_has_markup")
+fun xnEditorHasMarkup(editor: COpaquePointer?): Int = guard(0) {
+    if (editor!!.editor().pressedMarkup != null) 1 else 0
+}
+
+@CName("xn_editor_markup_note")
+fun xnEditorMarkupNote(editor: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    editor!!.editor().pressedMarkup?.let { (_, m) -> m.note?.let { strdup(it) } }
+}
+
+@CName("xn_editor_set_markup_note")
+fun xnEditorSetMarkupNote(editor: COpaquePointer?, note: String?) = guard(Unit) {
+    editor!!.editor().setPressedMarkupNote(note)
+}
+
+@CName("xn_editor_delete_markup")
+fun xnEditorDeleteMarkup(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().deletePressedMarkup()
+}
+
+@CName("xn_editor_clear_markup")
+fun xnEditorClearMarkup(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().pressedMarkup = null
 }
 
 @CName("xn_editor_copy")
