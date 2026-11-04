@@ -159,22 +159,41 @@ class HostEngine(
         }
     }
 
+    /**
+     * Coalesced index work: rapid refreshes collapse into one build loop, and a
+     * refresh landing mid-build schedules one more pass so nothing goes stale.
+     */
+    private val indexDirty = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun sendIndex(full: Boolean) {
-        val files = JSONArray()
-        val ids = HashSet<String>()
-        for (f in buildIndex()) {
-            ids += f.id
-            synchronized(lock) { idPaths[f.id] = f.path }
-            files.put(
-                JSONObject().put("id", f.id).put("path", f.path).put("kind", f.kind)
-                    .put("version", f.version).put("size", f.size),
-            )
-        }
+        // Seed coverage from the policy at once so ops landing before the walk
+        // finishes are still gated correctly; the walk refines it right after.
         synchronized(lock) {
             coveredIds.clear()
-            coveredIds.addAll(ids)
+            coveredIds.addAll(policy.sharedUris())
         }
-        send(JSONObject().put("t", "index").put("full", full).put("files", files))
+        // The tree walk + JSON encode runs on the single sync IO thread: doing it
+        // on the caller (often the main thread) froze the policy screen per tap.
+        if (!indexDirty.compareAndSet(false, true)) return
+        io.execute {
+            while (indexDirty.compareAndSet(true, false)) {
+                val files = JSONArray()
+                val ids = HashSet<String>()
+                for (f in buildIndex()) {
+                    ids += f.id
+                    synchronized(lock) { idPaths[f.id] = f.path }
+                    files.put(
+                        JSONObject().put("id", f.id).put("path", f.path).put("kind", f.kind)
+                            .put("version", f.version).put("size", f.size),
+                    )
+                }
+                synchronized(lock) {
+                    coveredIds.clear()
+                    coveredIds.addAll(ids)
+                }
+                send(JSONObject().put("t", "index").put("full", full).put("files", files))
+            }
+        }
     }
 
     fun pushIndexDelta() = sendIndex(full = true)
@@ -837,9 +856,13 @@ class HostEngine(
 
     // --- versions / dedupe / policy ---
 
-    /** Head version of [id], registering new files at 1. */
+    /** Head version of [id], registering new files at 1 (and only then persisting). */
     fun headVersion(id: String): Long = synchronized(lock) {
-        versions.getOrPut(id) { 1L }.also { saveVersionsLocked() }
+        versions[id] ?: run {
+            versions[id] = 1L
+            saveVersionsLocked()
+            1L
+        }
     }
 
     private fun bumpVersion(id: String): Long = synchronized(lock) {
@@ -860,8 +883,9 @@ class HostEngine(
 
     private fun policyAllows(id: String): Boolean = synchronized(lock) { id in coveredIds }
 
-    private fun displayName(id: String): String = synchronized(lock) {
-        idPaths[id]?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: id
+    private fun displayName(id: String): String {
+        val p = synchronized(lock) { idPaths[id] }
+        return p?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: id
     }
 
     private fun dropFile(id: String) {

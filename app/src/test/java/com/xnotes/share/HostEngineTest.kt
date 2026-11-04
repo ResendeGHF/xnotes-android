@@ -65,7 +65,7 @@ class HostEngineTest {
     }
 
     private class FakeHost : HostEngine.HostEngineHost {
-        val sent = ArrayList<JSONObject>()
+        val sent = java.util.Collections.synchronizedList(ArrayList<JSONObject>())
         val docs = HashMap<String, Document>()
         var approval: ((kind: String, device: String, name: String, respond: (Boolean) -> Unit) -> Unit)? = null
         var error: String? = null
@@ -114,7 +114,9 @@ class HostEngineTest {
             error = reason
         }
 
-        fun lastOfType(t: String): JSONObject = sent.last { it.optString("t") == t }
+        fun lastOfType(t: String): JSONObject = synchronized(sent) { sent.last { it.optString("t") == t } }
+
+        fun countOfType(t: String): Int = synchronized(sent) { sent.count { it.optString("t") == t } }
     }
 
     private data class Fixture(val engine: HostEngine, val host: FakeHost, val backend: FakeBackend, val policy: SharePolicy)
@@ -318,6 +320,38 @@ class HostEngineTest {
         val s = lives.last().getJSONArray("samples")
         assertEquals(1, s.length())
         assertEquals(3, s.getJSONArray(0).length())
+    }
+
+    @Test fun refreshPolicyCoversImmediatelyAndIndexesAsync() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "a.xnote", bytes = ByteArray(10))
+        b.addFile("f2", "b.xnote", bytes = ByteArray(10))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.sent.clear()
+        // Toggle f2 on (as the pane's IO persist does), then refresh.
+        f.policy.setShared("f2", true)
+        e.refreshPolicy()
+        // Coverage is immediate: an op on f2 applies without waiting for the walk.
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["f2"] = doc
+        val wire = SyncWire.toWire(stroke())
+        e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "f2").put("base_version", 1).put("dedupe", "cov-1")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_stroke").put("page", 0).put("stroke", wire))))
+        assertEquals(1, doc.pages[0].items.size)
+        // And the rebuilt index still arrives (async).
+        val deadline = System.currentTimeMillis() + 5000
+        var idx: JSONObject? = null
+        while (System.currentTimeMillis() < deadline) {
+            idx = h.sent.lastOrNull { it.optString("t") == "index" }
+            if (idx != null) break
+            Thread.sleep(25)
+        }
+        assertTrue(idx != null)
+        assertTrue(idx!!.optJSONArray("files")?.let { arr ->
+            (0 until arr.length()).any { arr.optJSONObject(it)?.optString("id") == "f2" }
+        } == true)
     }
 
     @Test fun staleBaseGetsResync() {

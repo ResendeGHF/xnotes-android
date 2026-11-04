@@ -559,6 +559,15 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         }
     }.getOrNull()
 
+    /** Name/size/mtime/kind for one URI, without walking the tree (for the policy screen). */
+    fun statEntry(uri: String): ShareServer.ShareBackend.Entry? {
+        if (!isUnderTree(uri, browseRoot() ?: return null)) return null
+        val name = displayNameOf(uri) ?: return null
+        if (name.startsWith(".")) return null
+        val (size, mtime) = stampOf(uri) ?: (-1L to 0L)
+        return ShareServer.ShareBackend.Entry(uri, name, size, mtime, kindOf(name))
+    }
+
     private fun displayNameOf(uri: String): String? = runCatching {
         appContext.contentResolver.query(
             Uri.parse(uri),

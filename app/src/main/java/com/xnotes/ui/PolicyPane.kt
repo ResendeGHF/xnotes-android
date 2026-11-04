@@ -16,11 +16,16 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateSetOf
+import androidx.compose.runtime.snapshots.SnapshotStateSet
+import android.content.Context
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -34,65 +39,110 @@ import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
 
 /**
- * Which files the LAN server may expose. Lists every file under the granted
- * explorer root (name + metadata only, no thumbnails) with a search box; a
- * ticked file becomes visible to the paired desktop, an unticked one behaves
- * as if it did not exist (the server answers 404). Nothing is shared until
- * the user ticks it here.
+ * Which files the companion may expose. Shared files list first; the rest
+ * streams in as the tree walk proceeds, so the screen is usable at once.
+ * A tick flips instantly (local state) and persists + notifies off the main
+ * thread — toggling never walks the tree or touches disk on the UI thread.
  */
 @Composable
 fun PolicyPane(editor: Editor) {
     val palette = LocalPalette.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val policy = remember { SharePolicy.of(File(context.filesDir, "share")) }
     var query by remember { mutableStateOf("") }
     var entries by remember { mutableStateOf<List<ShareServerEntry>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var ticks by remember { mutableStateOf(0) } // bump to re-read the policy after a toggle
+    var scanning by remember { mutableStateOf(false) }
+    var scanned by remember { mutableStateOf(0) }
+    // The checkbox state lives here, not in the policy: a toggle flips one row
+    // without refiltering the list or re-reading the policy file.
+    val shared: SnapshotStateSet<String> = remember { mutableStateSetOf<String>().apply { addAll(policy.sharedUris()) } }
+    var refreshJob by remember { mutableStateOf<Job?>(null) }
+
+    fun notifyChanged() {
+        // One notification per burst of taps: the engine rebuilds the index off
+        // the main thread and coalesces rapid refreshes itself.
+        refreshJob?.cancel()
+        refreshJob = scope.launch {
+            delay(400)
+            withContext(Dispatchers.IO) {
+                com.xnotes.share.companion.CompanionService.refreshPolicy(context)
+            }
+        }
+    }
 
     val root = editor.browseRoot
     LaunchedEffect(root) {
-        loading = true
-        entries = withContext(Dispatchers.IO) {
-            if (root == null) {
-                emptyList()
-            } else {
-                runCatching {
-                    val backend = ShareBackendImpl(context.applicationContext)
-                    val out = ArrayList<ShareServerEntry>()
-                    val queue = ArrayDeque<String?>(listOf(null))
-                    val seen = HashSet<String>()
-                    while (queue.isNotEmpty()) {
-                        val dir = queue.removeFirst()
-                        for (e in backend.listEntries(dir, onlyShared = false)) {
-                            if (!seen.add(e.uri)) continue
-                            if (e.isDir) {
-                                queue.add(e.uri)
-                            } else {
-                                out.add(ShareServerEntry(e.uri, e.name, e.size, e.mtime, e.kind))
-                            }
+        if (root == null) return@LaunchedEffect
+        scanning = true
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val backend = ShareBackendImpl(context.applicationContext)
+                val sharedNow = policy.sharedUris()
+                // Phase 1: the shared files, by direct stat — no tree walk.
+                val first = sharedNow.mapNotNull { uri ->
+                    backend.statEntry(uri)?.let { ShareServerEntry(it.uri, it.name, it.size, it.mtime, it.kind) }
+                }.sortedBy { it.lower }
+                entries = first
+                scanned = first.size
+                // Phase 2: everything else, published in chunks so the list
+                // stays responsive while a big tree is walked.
+                val seen = HashSet<String>(first.size * 2)
+                first.forEach { seen.add(it.uri) }
+                val rest = ArrayList<ShareServerEntry>()
+                val queue = ArrayDeque<String?>(listOf(null))
+                while (queue.isNotEmpty()) {
+                    val dir = queue.removeFirst()
+                    for (e in backend.listEntries(dir, onlyShared = false)) {
+                        if (!seen.add(e.uri)) continue
+                        if (e.isDir) {
+                            queue.add(e.uri)
+                        } else {
+                            rest.add(ShareServerEntry(e.uri, e.name, e.size, e.mtime, e.kind))
                         }
                     }
-                    out.sortedBy { it.name.lowercase() }
-                }.getOrDefault(emptyList())
+                    if (rest.size >= 250) {
+                        val snap = (first + rest).sortedWith(sharedFirst(sharedNow))
+                        entries = snap
+                        scanned = snap.size
+                    }
+                }
+                val all = (first + rest).sortedWith(sharedFirst(sharedNow))
+                entries = all
+                scanned = all.size
+                // Selections pointing at deleted files are dropped on sight.
+                if (policy.pruneMissing(all.map { it.uri }.toSet()) > 0) {
+                    val keep = policy.sharedUris()
+                    shared.removeAll { it !in keep }
+                }
             }
         }
-        // Selections pointing at deleted files are dropped on sight.
-        if (root != null) policy.pruneMissing(entries.map { it.uri }.toSet())
-        ticks++
-        loading = false
+        scanning = false
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            // Never lose the last tap in a burst to a cancelled debounce.
+            refreshJob?.let { job ->
+                if (job.isActive) {
+                    job.cancel()
+                    CompanionServiceFlush.refreshPolicyNow(context)
+                }
+            }
+        }
     }
 
     val q = query.trim().lowercase()
-    val shown = remember(entries, q, ticks) {
-        entries.filter { q.isEmpty() || it.name.lowercase().contains(q) }
+    val shown = remember(entries, q) {
+        if (q.isEmpty()) entries else entries.filter { it.lower.contains(q) }
     }
-    val sharedCount = remember(entries, ticks) { entries.count { policy.isShared(it.uri) } }
 
     Column(Modifier.fillMaxSize()) {
         Text(
@@ -102,7 +152,7 @@ fun PolicyPane(editor: Editor) {
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            stringResource(R.string.policy_help, sharedCount),
+            stringResource(R.string.policy_help, shared.size),
             color = palette.textDim.toComposeColor(),
             fontSize = 12.sp,
         )
@@ -123,9 +173,7 @@ fun PolicyPane(editor: Editor) {
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(4.dp))
-        if (loading) {
-            Text(stringResource(R.string.share_starting), color = palette.textDim.toComposeColor(), fontSize = 13.sp)
-        } else if (shown.isEmpty()) {
+        if (shown.isEmpty() && !scanning) {
             Text(
                 stringResource(if (entries.isEmpty()) R.string.policy_empty else R.string.policy_no_match),
                 color = palette.textDim.toComposeColor(),
@@ -134,21 +182,21 @@ fun PolicyPane(editor: Editor) {
         } else {
             LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 items(shown, key = { it.uri }) { e ->
-                    val shared = policy.isShared(e.uri)
+                    val isShared = e.uri in shared
                     Row(
                         Modifier.fillMaxWidth().clickable {
-                            policy.setShared(e.uri, !shared)
-                            com.xnotes.share.companion.CompanionService.refreshPolicy(context)
-                            ticks++
+                            if (isShared) shared.remove(e.uri) else shared.add(e.uri)
+                            scope.launch(Dispatchers.IO) { policy.setShared(e.uri, !isShared) }
+                            notifyChanged()
                         }.padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Checkbox(
-                            checked = shared,
+                            checked = isShared,
                             onCheckedChange = {
-                                policy.setShared(e.uri, it)
-                                com.xnotes.share.companion.CompanionService.refreshPolicy(context)
-                                ticks++
+                                if (it) shared.add(e.uri) else shared.remove(e.uri)
+                                scope.launch(Dispatchers.IO) { policy.setShared(e.uri, it) }
+                                notifyChanged()
                             },
                         )
                         Spacer(Modifier.width(6.dp))
@@ -163,19 +211,45 @@ fun PolicyPane(editor: Editor) {
                         }
                     }
                 }
+                if (scanning) {
+                    item {
+                        Text(
+                            stringResource(R.string.share_starting) + " ($scanned)",
+                            color = palette.textDim.toComposeColor(),
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(vertical = 4.dp),
+                        )
+                    }
+                }
             }
         }
     }
 }
 
+/** Shared files first (as selected when the list loaded), then by name. Order is fixed after load so rows never jump under the finger. */
+internal fun sharedFirst(shared: Set<String>): Comparator<ShareServerEntry> =
+    compareByDescending<ShareServerEntry> { it.uri in shared }.thenBy { it.lower }
+
 /** A shareable file row: identity, display facts, no preview pixels (by design). */
-private data class ShareServerEntry(
+internal data class ShareServerEntry(
     val uri: String,
     val name: String,
     val size: Long,
     val mtime: Long,
     val kind: String,
-)
+) {
+    /** Lowercased once, so searching never re-lowercases the whole list per keystroke. */
+    val lower: String = name.lowercase()
+}
+
+/** Flush a pending policy notification synchronously (pane teardown). */
+private object CompanionServiceFlush {
+    fun refreshPolicyNow(context: Context) {
+        runCatching {
+            com.xnotes.share.companion.CompanionService.refreshPolicy(context)
+        }
+    }
+}
 
 private fun formatBytes(size: Long): String = when {
     size < 0 -> "?"
