@@ -4275,13 +4275,14 @@ class InteractionController(
 
             // Where a connector can glue, while one is armed or an end is being dragged.
             if (marking) drawConnectionMarks(r)
+
+            // The far side's live runs, over content and chrome but in content space
+            // (the page offset + transform only make sense under origin + zoom).
+            remoteLive?.draw(r)
         }
 
         // Note icons: chrome of one size at any zoom, so in viewport space.
         noteIcons?.draw(r)
-
-        // The far side's live runs, over everything while they draw.
-        remoteLive?.draw(r)
 
         // Eraser cursor (viewport space, after the transform is restored).
         eraserCursor?.let {

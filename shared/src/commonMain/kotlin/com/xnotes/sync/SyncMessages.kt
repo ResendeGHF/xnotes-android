@@ -30,6 +30,10 @@ data class WireStroke(
 sealed interface SyncOp {
     data class AddStroke(val page: Int, val stroke: WireStroke) : SyncOp
     data class EraseStrokes(val page: Int, val ids: List<String>) : SyncOp
+    /** Insert a blank page at [index] ([width]/[height] in page px, from the sender's page). */
+    data class AddPage(val index: Int, val width: Double, val height: Double) : SyncOp
+    /** Remove the page at [index]; no-op when it would empty the note or is out of range. */
+    data class RemovePage(val index: Int) : SyncOp
     data class Unknown(val name: String) : SyncOp
 }
 
@@ -369,6 +373,20 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.endArray()
             w.endObject()
         }
+        is SyncOp.AddPage -> {
+            w.beginObject()
+            w.name("op").value("add_page")
+            w.name("index").value(op.index)
+            w.name("width").value(op.width)
+            w.name("height").value(op.height)
+            w.endObject()
+        }
+        is SyncOp.RemovePage -> {
+            w.beginObject()
+            w.name("op").value("remove_page")
+            w.name("index").value(op.index)
+            w.endObject()
+        }
         is SyncOp.Unknown -> {
             w.beginObject()
             w.name("op").value(op.name)
@@ -463,15 +481,20 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var page = 0
         var tool = ""
         var width = 0.0
+        var height = 0.0
         var color = ""
         var pressure = false
         var samples: List<WireSample>? = null
         var ids: List<String>? = null
+        var index = 0
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
                 "op" -> name = stringOrNull(p)
                 "page" -> page = intOr(p, 0)
+                "index" -> index = intOr(p, 0)
+                "width" -> width = doubleOr(p, 0.0)
+                "height" -> height = doubleOr(p, 0.0)
                 "stroke" -> if (p.peek() == JsonPull.Token.BEGIN_OBJECT) {
                     p.beginObject()
                     while (p.hasNext()) {
@@ -503,6 +526,8 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         out += when (name) {
             "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList()))
             "erase_strokes" -> SyncOp.EraseStrokes(page, ids ?: emptyList())
+            "add_page" -> SyncOp.AddPage(index, width, height)
+            "remove_page" -> SyncOp.RemovePage(index)
             else -> SyncOp.Unknown(name ?: "")
         }
     }

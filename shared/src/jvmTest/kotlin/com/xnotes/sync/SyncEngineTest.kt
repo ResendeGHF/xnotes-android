@@ -19,6 +19,8 @@ class SyncEngineTest {
         var liveDirty = 0
         val strokes = ArrayList<Triple<String, Int, WireStroke>>()
         val erases = ArrayList<Triple<String, Int, List<String>>>()
+        val pageAdds = ArrayList<Triple<String, Int, Pair<Double, Double>>>()
+        val pageRemoves = ArrayList<Pair<String, Int>>()
         var resynced: Pair<String, Long>? = null
 
         override fun onBytes(data: ByteArray) {
@@ -62,6 +64,14 @@ class SyncEngineTest {
 
         override fun applyRemoteErase(fileId: String, page: Int, ids: List<String>) {
             erases += Triple(fileId, page, ids)
+        }
+
+        override fun applyRemotePageAdd(fileId: String, index: Int, width: Double, height: Double) {
+            pageAdds += Triple(fileId, index, width to height)
+        }
+
+        override fun applyRemotePageRemove(fileId: String, index: Int) {
+            pageRemoves += fileId to index
         }
 
         override fun applyResync(fileId: String, version: Long) {
@@ -154,6 +164,39 @@ class SyncEngineTest {
         e.bytesReceived(SyncFrames.encode(SyncMsg.Resync(6, "u1", 50L)))
         assertEquals("u1" to 50L, h.resynced)
         assertTrue(h.lastSent() is SyncMsg.Fetch)
+    }
+
+    @Test fun pageOpsApplyAndEchoIsDropped() {
+        val (e, h) = engine()
+        e.onConnected()
+        h.out.clear()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        assertEquals(7L, e.fileVersion("u1"))
+        // A host page add applies and moves the head.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(2, "u1", 7L, 8L, "p-1", listOf(SyncOp.AddPage(1, 595.0, 842.0)))))
+        assertEquals(listOf(Triple("u1", 1, 595.0 to 842.0)), h.pageAdds)
+        assertEquals(8L, e.fileVersion("u1"))
+        // A host page remove applies too.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(3, "u1", 8L, 9L, "p-2", listOf(SyncOp.RemovePage(1)))))
+        assertEquals(listOf("u1" to 1), h.pageRemoves)
+        assertEquals(9L, e.fileVersion("u1"))
+        // Our own submitted batch is remembered: the host's fan-out echo
+        // (same dedupe, or with the :fanned suffix) moves the head but never
+        // re-applies.
+        e.submitOp("u1", 9L, "l-1", listOf(SyncOp.AddStroke(0, WireStroke("pen", 3.0, "#000000", true, emptyList()))))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(4, "u1", 9L, 10L, "l-1", listOf(SyncOp.AddStroke(0, WireStroke("pen", 3.0, "#000000", true, emptyList()))))))
+        assertTrue(h.strokes.isEmpty())
+        assertEquals(10L, e.fileVersion("u1"))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 10L, 11L, "l-1:fanned", listOf(SyncOp.AddStroke(0, WireStroke("pen", 3.0, "#000000", true, emptyList()))))))
+        assertTrue(h.strokes.isEmpty())
+        assertEquals(11L, e.fileVersion("u1"))
+    }
+
+    @Test fun pageOpsRoundTripCodec() {
+        val ops = listOf(SyncOp.AddPage(2, 595.0, 842.0), SyncOp.RemovePage(0))
+        val msg = SyncMsg.Op(1, "u1", 3L, 4L, "d", ops)
+        val back = SyncFrames.Decoder().feed(SyncFrames.encode(msg)).single() as SyncMsg.Op
+        assertEquals(ops, back.ops)
     }
 
     @Test fun liveFrameUpdatesOverlay() {

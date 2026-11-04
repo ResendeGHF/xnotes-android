@@ -4,6 +4,7 @@ package com.xnotes.capi
 
 import com.xnotes.capi.c.xn_host
 import com.xnotes.canvas.RemoteLiveStrokes
+import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.tools.Tool
@@ -69,6 +70,8 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     fun unbindEditor(editor: CEditor) {
         val fileId = reverse.remove(editor) ?: return
+        editor.editor.onPageInserted = null
+        editor.editor.onPageRemoved = null
         bindings.remove(fileId)
         active.remove(editor)
         if (editor.controller.remoteLive === engine.liveOverlay) editor.controller.remoteLive = null
@@ -83,6 +86,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         c.onStrokeSample = { page, x, y, p -> onSample(editor, page, x, y, p) }
         c.onStrokeCommitted = { page, stroke -> onCommitted(editor, page, stroke) }
         c.onStrokesErased = { page, strokes -> onErased(editor, page, strokes) }
+        // Explicit local page edits submit matching ops; remote ones never fire these.
+        editor.editor.onPageInserted = { index, w, h -> onPageInserted(editor, index, w, h) }
+        editor.editor.onPageRemoved = { index -> onPageRemoved(editor, index) }
     }
 
     // --- local gestures out ---
@@ -131,6 +137,18 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val ids = strokes.map { SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) }
         if (ids.isEmpty()) return
         engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.EraseStrokes(page, ids)))
+    }
+
+    private fun onPageInserted(editor: CEditor, index: Int, w: Double, h: Double) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddPage(index, w, h)))
+    }
+
+    private fun onPageRemoved(editor: CEditor, index: Int) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemovePage(index)))
     }
 
     // --- SyncEngineHost (remote in) ---
@@ -192,7 +210,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     }
 
     override fun onLiveDirty() {
-        for (e in bindings.values) e.requestRender()
+        for (e in bindings.values) e.requestOverlayRender()
         host.sync_live_dirty?.invoke(host.ctx)
     }
 
@@ -204,9 +222,12 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             engine.requestOpen(fileId)
             return
         }
-        pg.items.add(strokeToNative(stroke))
+        val native = strokeToNative(stroke)
+        pg.items.add(native)
         doc.dirty = true
-        ce.state.invalidatePage(pg)
+        // Bake into the warm cache in place: dropping it blanks the page for a
+        // frame (the commit blink). Falls back to a rebuild when uncached.
+        ce.state.appendToCache(pg, native)
         ce.requestRender()
     }
 
@@ -218,9 +239,40 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) in ids
         }
         if (targets.isEmpty()) return
+        val dirty = targets.map { it.paintBounds() }.reduce { a, b -> a.union(b) }.outset(2.0)
         pg.items.removeAll(targets)
         doc.dirty = true
-        ce.state.invalidatePage(pg)
+        // Patch just the erased area in the warm cache, like the local eraser.
+        if (!ce.state.repairRegion(pg, dirty)) ce.state.invalidatePage(pg)
+        ce.requestRender()
+    }
+
+    override fun applyRemotePageAdd(fileId: String, index: Int, width: Double, height: Double) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val ref = doc.pages.getOrNull(index.coerceIn(0, doc.pages.size))
+            ?: doc.pages.lastOrNull()
+        val w = if (width > 0) width else ref?.width ?: 595.0
+        val h = if (height > 0) height else ref?.height ?: 842.0
+        val at = index.coerceIn(0, doc.pages.size)
+        ce.controller.clearSelection()
+        doc.pages.add(at, Page(w, h))
+        doc.dirty = true
+        ce.state.relayout()
+        ce.state.clampScroll()
+        ce.requestRender()
+    }
+
+    override fun applyRemotePageRemove(fileId: String, index: Int) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        if (doc.pages.size <= 1 || index !in doc.pages.indices) return
+        val page = doc.pages.removeAt(index)
+        ce.controller.clearSelection()
+        doc.dirty = true
+        ce.state.invalidatePage(page)
+        ce.state.relayout()
+        ce.state.clampScroll()
         ce.requestRender()
     }
 

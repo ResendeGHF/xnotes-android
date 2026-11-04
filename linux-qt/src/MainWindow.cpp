@@ -220,6 +220,13 @@ MainWindow::~MainWindow() {
 void MainWindow::buildUi() {
     QToolBar* bar = addToolBar(QStringLiteral("Main"));
     bar->setMovable(false);
+    // Back to Home: the canvas is entered from Browse/Shared, so there must be
+    // a way back without picking the sidebar. Lives with the editor bars, which
+    // are only visible on the canvas (see showPage()).
+    QAction* back = bar->addAction(xnIcon(QStringLiteral("prev")), QStringLiteral("Back"));
+    back->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Left));
+    back->setToolTip(QStringLiteral("Back to Home (Alt+Left)"));
+    connect(back, &QAction::triggered, this, &MainWindow::showHome);
     pagesAction_ = bar->addAction(xnIcon(QStringLiteral("sidebar")), QStringLiteral("Pages"));
     pagesAction_->setCheckable(true);
     pagesAction_->setChecked(true);

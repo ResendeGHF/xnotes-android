@@ -11,6 +11,7 @@ import com.xnotes.core.tools.MarkupMode
 import com.xnotes.canvas.NoteIcons
 import com.xnotes.canvas.PdfPageFilter
 import com.xnotes.canvas.PdfTextController
+import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.core.history.RemoveMarkup
 import com.xnotes.core.history.ReplaceMarkup
 import com.xnotes.core.model.MarkupType
@@ -723,6 +724,22 @@ internal class CEditor(note: CNote, private val host: xn_host) {
 
     fun requestRender() {
         fullFrame = true
+        host.request_render!!.invoke(host.ctx)
+    }
+
+    /**
+     * Repaint just the remote live runs: union their viewport bounds into the
+     * damage rect instead of flagging a full frame, so a 120 Hz pointer stream
+     * from the far side blits the warm caches instead of repainting the widget.
+     * Falls back to a full frame when there is nothing (or too much) to bound.
+     */
+    fun requestOverlayRender() {
+        val r = (controller.remoteLive as? RemoteLiveStrokes)?.dirtyViewportRect()
+        if (r == null) {
+            requestRender()
+            return
+        }
+        damage = listOfNotNull(damage, r).reduce { a, b -> a.union(b) }
         host.request_render!!.invoke(host.ctx)
     }
 

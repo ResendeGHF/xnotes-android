@@ -44,6 +44,12 @@ interface SyncEngineHost {
     /** Apply a committed remote erase to the open document for [fileId]. */
     fun applyRemoteErase(fileId: String, page: Int, ids: List<String>)
 
+    /** Insert a blank remote page at [index] ([width]/[height] in page px). */
+    fun applyRemotePageAdd(fileId: String, index: Int, width: Double, height: Double)
+
+    /** Remove the remote page at [index]. */
+    fun applyRemotePageRemove(fileId: String, index: Int)
+
     /**
      * [fileId]'s head moved under us: drop the open document's state and
      * refetch. The engine already queued the fetch.

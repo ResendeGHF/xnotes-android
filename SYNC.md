@@ -105,14 +105,24 @@ S -> C  resync {file, version}                          # base_version stale; re
 ```
 
 - `dedupe`: client-generated UUID per batch; a retried batch never double-applies.
+  One id per batch end to end: the host fans a batch back with the *same*
+  `dedupe`, so the sender recognizes its own echo (head moves, live run drops,
+  model untouched) and a retry converges. A `:fanned` suffix from older hosts
+  is tolerated the same way.
 - Host applies a companion batch iff `base_version == head`; else `resync`.
 - Companion applies host batches unconditionally (host is authority), including
   full-file `resync` (drop open doc state for that file, reload bytes).
 - Mirror-first: each side applies accepted ops to its open document immediately,
   then persists (host) / marks dirty (companion, host persists on op receipt —
-  companion never writes the host's files directly).
+  companion never writes the host's files directly). Remote stroke adds bake
+  into the warm ink cache in place (`appendToCache`), remote erases patch just
+  the erased area (`repairRegion`); neither drops the page cache, so a remote
+  commit never blanks the page for a frame.
+- Receivers paint live runs in content space (inside the origin + zoom
+  transform, like all page content); the committed `add_stroke` op follows
+  through the normal path.
 
-Op set v1 (strokes first; pages/text/markups follow the same envelope):
+Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
 
 - `add_stroke {page, stroke:{tool, width, color, pressure, samples:[[x,y,p]...]}}`
   in page px. `tool`: `pen|highlighter|...`; `color`: `#rrggbb`; `width`: pt.
@@ -122,8 +132,12 @@ Op set v1 (strokes first; pages/text/markups follow the same envelope):
   → `11812f53989ff4dc`. Retries and double-delivery converge.
 - `erase_strokes {page, ids:[fingerprint...]}`: exact fingerprint match applies;
   no match = no-op (never an error).
-- Page add/remove, text-box add, markup add: same `{file, base_version, ops}`
-  envelope, defined when implemented; unknown op names are skipped with a log.
+- `add_page {index, width, height}`: insert a blank page at `index` (page px
+  sizes from the sender's page); out-of-range clamps. `remove_page {index}`:
+  remove the page at `index`; no-op when it would empty the note or is out of
+  range. Both bypass undo and relayout; page content beyond the blank shell
+  (pasted items, PDF joins, reorder) is not carried in v1.
+- Unknown op names are skipped with a log.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
 companion undo sends a compensating op, e.g. `erase_strokes` for your stroke).
@@ -136,11 +150,13 @@ C <-> S  live {file, page, stroke_id, tool, width, color, samples:[[x,y,p]...], 
 
 - Streaming is **per sample, no batching timer**: every pointer sample goes
   out on the socket as it happens (TCP_NODELAY both ends), and receivers paint
-  it immediately. `tool`/`width`/`color` ride along so the far side renders the
-  run exactly as drawn.
+  it immediately — a partial damage rect covering just the runs, never a full
+  frame. `tool`/`width`/`color` ride along so the far side renders the run
+  exactly as drawn.
 - Receivers show the run as an overlay keyed by `(sender, stroke_id)`,
-  *appending* each frame's samples. `done:true` ends the run; the overlay is
-  dropped as soon as the matching committed `add_stroke` lands.
+  *appending* each frame's samples. `done:true` ends the run; the matching
+  committed `add_stroke` (same id as dedupe) also drops it, so a lost `done`
+  frame can never leave a stale duplicate beside the committed stroke.
 - Live frames never touch the model or versions; the committed `add_stroke`
   op follows through the normal path (dedupe keys this to the live `stroke_id`
   so pen-up never double-draws).
@@ -172,9 +188,10 @@ View-only grants, kick/revoke mid-session, multi-companion fan-out beyond one,
 binary frames, mDNS discovery, online relay, text/markup/page ops, conflict-free
 undo across sides.
 
-v1 syncs strokes and erases only: local undo of a synced stroke does not
-propagate (re-sync by refetching), area-erase splits and sticky-note ink stay
-local, and non-stroke item types are not mirrored.
+v1 syncs strokes, erases and blank page add/remove: local undo of a synced op
+does not propagate (re-sync by refetching), area-erase splits and sticky-note
+ink stay local, undo/redo of page commands is local, and non-stroke item types
+(text, markup, shapes, pasted page content) are not mirrored.
 
 ## Conformance
 

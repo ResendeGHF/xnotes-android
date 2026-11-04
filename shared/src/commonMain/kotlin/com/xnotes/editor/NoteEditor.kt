@@ -90,6 +90,15 @@ class NoteEditor(
 
     fun pageAt(index: Int): Page? = state.document.pages.getOrNull(index)
 
+    /**
+     * Sync hook: fired for every explicit local page add/remove (toolbar, pages
+     * panel, pull-past-the-end, paste/cut) so the bridge can submit matching
+     * `add_page`/`remove_page` ops. Remote page ops apply directly and never
+     * fire these. Undo/redo of page commands is local-only (like strokes).
+     */
+    var onPageInserted: ((index: Int, width: Double, height: Double) -> Unit)? = null
+    var onPageRemoved: ((index: Int) -> Unit)? = null
+
     // --- document ---
 
     /**
@@ -268,6 +277,7 @@ class NoteEditor(
         state.relayout()
         host.contentChanged()
         host.requestRender()
+        onPageInserted?.invoke(at, w, h)
         return at
     }
 
@@ -310,6 +320,7 @@ class NoteEditor(
         state.relayout()
         host.contentChanged()
         host.requestRender()
+        onPageRemoved?.invoke(index)
     }
 
     /** Insert a blank page right after [index] (sized from it) and reveal it. */
@@ -363,6 +374,7 @@ class NoteEditor(
         history.push(CompositeCommand(cmds))
         afterPageEdit()
         goToPage(firstAt)
+        for ((i, src) in pageClipboard.withIndex()) onPageInserted?.invoke(firstAt + i, src.width, src.height)
     }
 
     /** Delete [indices] as one undoable edit, refusing to empty the note. */
@@ -384,6 +396,7 @@ class NoteEditor(
         history.push(CompositeCommand(cmds))
         clearPageSelection()
         afterPageEdit()
+        for (i in targets) onPageRemoved?.invoke(i)
     }
 
     // --- images ---

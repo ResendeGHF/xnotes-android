@@ -67,12 +67,59 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
         for ((_, run) in runs) {
             if (run.file != showing || run.points.size < 2) continue
             val pr = state.pageRects.getOrNull(run.page) ?: continue
+            // NOTE: the caller (drawOverlay) already translated to content space
+            // (origin + zoom); page coords only need the page offset + transform.
             r.withSave {
                 r.translate(pr.left, pr.top)
                 state.applyPageTransform(r, state.document.pages[run.page])
                 r.strokePolyline(run.points, Pen(run.color, run.width, cosmetic = false))
             }
         }
+    }
+
+    /**
+     * Union of all runs' bounds in viewport px (for partial damage repaints):
+     * page-space point bounds → content → viewport, padded for width/AA.
+     */
+    fun dirtyViewportRect(): com.xnotes.core.geometry.Rect? {
+        val showing = showingFile ?: return null
+        var out: com.xnotes.core.geometry.Rect? = null
+        for ((_, run) in runs) {
+            if (run.file != showing || run.points.size < 2) continue
+            if (state.pageRects.getOrNull(run.page) == null) continue
+            var l = Double.MAX_VALUE
+            var t = Double.MAX_VALUE
+            var rr = -Double.MAX_VALUE
+            var b = -Double.MAX_VALUE
+            for (p in run.points) {
+                if (p.x < l) l = p.x
+                if (p.y < t) t = p.y
+                if (p.x > rr) rr = p.x
+                if (p.y > b) b = p.y
+            }
+            val pad = run.width / 2.0 + 2.0
+            val content = state.fromPageSpaceRect(run.page, com.xnotes.core.geometry.Rect(l - pad, t - pad, rr - l + pad * 2, b - t + pad * 2))
+            val corners = listOf(
+                com.xnotes.core.geometry.Pt(content.left, content.top),
+                com.xnotes.core.geometry.Pt(content.right, content.top),
+                com.xnotes.core.geometry.Pt(content.left, content.bottom),
+                com.xnotes.core.geometry.Pt(content.right, content.bottom),
+            ).map { state.contentToViewport(it) }
+            var vl = Double.MAX_VALUE
+            var vt = Double.MAX_VALUE
+            var vr = -Double.MAX_VALUE
+            var vb = -Double.MAX_VALUE
+            for (c in corners) {
+                if (c.x < vl) vl = c.x
+                if (c.y < vt) vt = c.y
+                if (c.x > vr) vr = c.x
+                if (c.y > vb) vb = c.y
+            }
+            val padV = 3.0
+            val r = com.xnotes.core.geometry.Rect(vl - padV, vt - padV, vr - vl + padV * 2, vb - vt + padV * 2)
+            out = if (out == null) r else out.union(r)
+        }
+        return out
     }
 
     /** Parse `#rrggbb` (or `#rrggbbaa`); null when malformed. */

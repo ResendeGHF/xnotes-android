@@ -205,9 +205,12 @@ class CompanionEngine(
 
     /**
      * Submit a locally committed batch. [baseVersion] is the head the edit was
-     * made against; a `resync` answer means refetch and retry once.
+     * made against; a `resync` answer means refetch and retry once. The dedupe
+     * is remembered at once so the host's fan-out echo of our own batch is
+     * dropped instead of applied twice.
      */
     fun submitOp(fileId: String, baseVersion: Long, dedupe: String, ops: List<SyncOp>) {
+        markDedupe(fileId, dedupe)
         send(SyncMsg.Op(nextSeq(), fileId, baseVersion, 0L, dedupe, ops))
     }
 
@@ -374,16 +377,23 @@ class CompanionEngine(
 
     private fun onOp(m: SyncMsg.Op) {
         // Host broadcasts its commits (and fans ours back): apply, track the head.
-        if (!markDedupe(m.file, m.dedupe)) return
+        // The host fans our own batch back with `dedupe + ":fanned"`; that echo
+        // must move the head and drop the live run, never re-apply the strokes.
+        val echo = m.dedupe.endsWith(FAN_SUFFIX) && m.dedupe.length > FAN_SUFFIX.length
+        val key = if (echo) m.dedupe.dropLast(FAN_SUFFIX.length) else m.dedupe
+        val fresh = markDedupe(m.file, key)
         withLock(lock) { versions[m.file] = m.version }
+        liveOverlay?.finish(key)
+        if (!fresh) return
         for (op in m.ops) {
             when (op) {
                 is SyncOp.AddStroke -> host.applyRemoteStroke(m.file, op.page, op.stroke)
                 is SyncOp.EraseStrokes -> host.applyRemoteErase(m.file, op.page, op.ids)
+                is SyncOp.AddPage -> host.applyRemotePageAdd(m.file, op.index, op.width, op.height)
+                is SyncOp.RemovePage -> host.applyRemotePageRemove(m.file, op.index)
                 is SyncOp.Unknown -> Unit
             }
         }
-        liveOverlay?.finish(m.dedupe)
     }
 
     private fun onOpAck(m: SyncMsg.OpAck) {
@@ -419,6 +429,9 @@ class CompanionEngine(
     private fun nowMs(): Long = monotonicNanos() / 1_000_000L
 
     companion object {
+        /** Suffix the host appends when fanning our batch back (tolerated either way). */
+        const val FAN_SUFFIX = ":fanned"
+
         /** Heartbeat every 20 s; silence over 60 s drops the connection. */
         const val HEARTBEAT_MS = 20_000L
         const val TIMEOUT_MS = 60_000L
