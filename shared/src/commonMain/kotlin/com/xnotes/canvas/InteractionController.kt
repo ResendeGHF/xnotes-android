@@ -20,6 +20,7 @@ import com.xnotes.core.history.EditLabel
 import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.ReorderItems
 import com.xnotes.core.history.RemoveMarkup
+import com.xnotes.core.history.EditStickyInk
 import com.xnotes.core.history.EditStickyText
 import com.xnotes.core.history.RecolorSticky
 import com.xnotes.core.history.ReplacePageItems
@@ -196,6 +197,14 @@ class InteractionController(
 
     /** A stroke started on [page] by the local pointer. */
     var onStrokeStarted: ((page: Int) -> Unit)? = null
+
+    /** A press drawing into an expanded sticky: its note, or null. */
+    private var stickyDrawTarget: StickyNoteItem? = null
+    private var stickyDrawPage = -1
+    private var stickyDrawBefore: List<Stroke>? = null
+
+    /** Note-local ink an eraser gesture took: snapshots taken before it cut. */
+    private val eraseStickySnapshots = linkedMapOf<StickyNoteItem, List<Stroke>>()
     /** A finished stroke committed to [page] by the local pointer (pen-up, crossings included). */
     var onStrokeCommitted: ((page: Int, stroke: Stroke) -> Unit)? = null
     /** Strokes the local eraser took off [page]. Area-erase splits are not reported. */
@@ -1046,6 +1055,8 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content) ?: return false
         // A collapsed sticky's icon (or an expanded one's x) toggles before links do.
         if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return true
+        // The expanded paper's color dot cycles its paper.
+        if (stickyColorTapAt(pageIndex, state.toPageSpace(pageIndex, content))) return true
         return cb(pageIndex, state.toPageSpace(pageIndex, content))
     }
 
@@ -1056,6 +1067,17 @@ class InteractionController(
         // A pen press on a collapsed icon expands it (or on an expanded x collapses it)
         // instead of starting a stroke.
         if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return
+        // Ink starting inside an expanded sticky belongs to the sticky (note-local).
+        stickyDrawTarget = null
+        stickyDrawPage = -1
+        stickyDrawBefore = null
+        stickyAt(pageIndex, state.toPageSpace(pageIndex, content))
+            ?.takeIf { !it.collapsed && !it.locked && it.rect.contains(state.toPageSpace(pageIndex, content)) }
+            ?.let {
+                stickyDrawTarget = it
+                stickyDrawPage = pageIndex
+                stickyDrawBefore = it.ink.map { s -> Stroke(s) }
+            }
         // Reaching here with a live selection means the press landed off it (on it the stylus would
         // have grabbed it): dismiss it. A bare tap that only dismissed is dropped in endDraw.
         strokeDismissedSelection = hasSelection
@@ -1290,7 +1312,10 @@ class InteractionController(
                     stopFade()
                     fadeAlpha = 1.0
                     scheduleFade()
+                    stickyDrawTarget = null
+                    stickyDrawBefore = null
                 }
+                stickyDrawTarget != null && pi == stickyDrawPage -> fileStickyStroke(stroke, stickyDrawTarget!!, stickyDrawPage, stickyDrawBefore ?: emptyList())
                 else -> pushStrokeEdit(fileStroke(stroke, pi))
             }
         }
@@ -1300,6 +1325,8 @@ class InteractionController(
         strokeDismissedSelection = false
         liveStroke = null
         strokePageIndex = null
+        stickyDrawTarget = null
+        stickyDrawBefore = null
         snapEngaged = false
         snapRunStartEdge = null
         snapCurrentEdge = null
@@ -1401,6 +1428,7 @@ class InteractionController(
         eraseRemovals.clear()
         eraseSnapshots.clear()
         eraseMarkups.clear()
+        eraseStickySnapshots.clear()
         mode = PointerMode.ERASE
         eraseAt(vx, vy)
     }
@@ -1447,15 +1475,16 @@ class InteractionController(
         return true
     }
 
-    /** STROKE mode: remove every stroke/shape the eraser circle touches. Images and text boxes are
-     *  deliberately-placed and protected (delete those via select + delete). Returns the repaint
-     *  region, or null if nothing changed. */
+    /** STROKE mode: remove every stroke/shape the eraser circle touches. Images, text boxes and
+     *  expanded stickies themselves are deliberately-placed and protected (delete those via select +
+     *  delete); an expanded sticky's note-local ink erases instead. Returns the repaint region,
+     *  or null if nothing changed. */
     private fun eraseStrokesFromPage(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
+        var dirty: Rect? = eraseStickyInk(page, cx, cy, radius)
         val toRemove = page.items.filter {
-            !it.locked && it !is ImageItem && it !is TextItem && it.intersectsCircle(cx, cy, radius)
+            !it.locked && it !is ImageItem && it !is TextItem && it !is StickyNoteItem && it.intersectsCircle(cx, cy, radius)
         }
-        if (toRemove.isEmpty()) return null
-        var dirty: Rect? = null
+        if (toRemove.isEmpty()) return dirty
         for (item in toRemove) {
             page.items.remove(item)
             eraseRemovals.add(page to item)
@@ -1469,7 +1498,7 @@ class InteractionController(
      *  circle, spliced in at the original's z-position. Text and images are left untouched. Returns
      *  the repaint region, or null if nothing changed. */
     private fun eraseAreaFromPage(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
-        var dirty: Rect? = null
+        var dirty: Rect? = eraseStickyInk(page, cx, cy, radius)
         var i = 0
         while (i < page.items.size) {
             val item = page.items[i]
@@ -1500,6 +1529,53 @@ class InteractionController(
         return dirty
     }
 
+    /** Commit a finished stroke into an expanded sticky's note-local ink. */
+    private fun fileStickyStroke(stroke: Stroke, target: StickyNoteItem, pageIndex: Int, before: List<Stroke>) {
+        val page = state.document.pages.getOrNull(pageIndex)
+        // Page-local samples become note-local, clamped to the paper so no run can live
+        // on the page outside the note.
+        val local = stroke.samples.map {
+            val cx = it.x.coerceIn(target.rect.left, target.rect.right)
+            val cy = it.y.coerceIn(target.rect.top, target.rect.bottom)
+            Sample(cx - target.rect.x, cy - target.rect.y, it.pressure, it.t)
+        }
+        val committed = Stroke(stroke.tool, stroke.config, local, stroke.speedScale, stroke.straight, stroke.smoothScale)
+        committed.finished = true
+        if (page != null) target.ink.add(committed)
+        val after = target.ink.map { Stroke(it) }
+        history.push(EditStickyInk(target, before, after))
+        state.document.dirty = true
+        if (page != null) {
+            // The front buffer still shows this stroke: hold it out of the cache like a
+            // finished page stroke, so the frame never draws it twice. The settle paints
+            // the sticky (now holding the ink) over the cache once the pad lets go.
+            if (frontInk?.hold(target, page) != true) {
+                if (!state.repairRegion(page, target.paintBounds().outset(REPAIR_PAD))) state.invalidatePage(page)
+            }
+        }
+        onContentChanged()
+        stickyDrawTarget = null
+        stickyDrawBefore = null
+    }
+
+    /** Erase the note-local ink of expanded stickies the eraser circle touches; the repaint region, or null. */
+    private fun eraseStickyInk(page: Page, cx: Double, cy: Double, radius: Double): Rect? {
+        var dirty: Rect? = null
+        for (item in page.items) {
+            if (item !is StickyNoteItem || item.collapsed || item.ink.isEmpty()) continue
+            // Circle in note-local coordinates.
+            val lx = cx - item.rect.x
+            val ly = cy - item.rect.y
+            val hit = item.ink.filter { it.intersectsCircle(lx, ly, radius) }
+            if (hit.isEmpty()) continue
+            if (!eraseStickySnapshots.containsKey(item)) eraseStickySnapshots[item] = item.ink.map { Stroke(it) }
+            for (h in hit) item.ink.remove(h)
+            val b = item.paintBounds()
+            dirty = dirty?.union(b) ?: b
+        }
+        return dirty
+    }
+
     private fun endErase() {
         val cmds = ArrayList<Command>()
         if (areaErase()) {
@@ -1517,6 +1593,11 @@ class InteractionController(
             }
         }
         cmds += eraseMarkups
+        // Sticky note-local ink erased this gesture, one entry per note.
+        for ((item, before) in eraseStickySnapshots) {
+            val after = item.ink.map { Stroke(it) }
+            if (after != before) cmds += EditStickyInk(item, before, after)
+        }
         if (cmds.isNotEmpty()) {
             history.push(cmds.singleOrNull() ?: CompositeCommand(cmds))
             state.document.dirty = true
@@ -1525,6 +1606,7 @@ class InteractionController(
         eraseRemovals.clear()
         eraseSnapshots.clear()
         eraseMarkups.clear()
+        eraseStickySnapshots.clear()
         eraserCursor = null
         mode = PointerMode.IDLE
         requestRender()
@@ -4557,6 +4639,29 @@ class InteractionController(
     /** Collapse or expand the sticky notes in the selection, each as one undo step. */
     fun toggleSelectedStickies() {
         for (s in selection.mapNotNull { it.item as? StickyNoteItem }) toggleStickyCollapsed(s)
+    }
+
+    /**
+     * The paper-color dot of the expanded sticky at page point [local] on page [pi]:
+     * cycle its paper. True when a dot took the tap.
+     */
+    fun stickyColorTapAt(pi: Int, local: Pt): Boolean {
+        val item = stickyAt(pi, local)?.takeIf { !it.collapsed && it.isColorHit(local) } ?: return false
+        cycleStickyColor(item)
+        return true
+    }
+
+    /** Recolor [item] to the next cycle paper, as one undo step. */
+    fun cycleStickyColor(item: StickyNoteItem) {
+        val before = item.color
+        val after = StickyNoteItem.nextCycleColor(before)
+        if (after == before) return
+        item.color = after
+        history.push(RecolorSticky(listOf(RecolorSticky.Entry(item, before, after))))
+        state.document.dirty = true
+        state.document.pages.firstOrNull { p -> p.items.any { it === item } }?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
     }
 
     /** Collapse or expand [item], wherever it sits, as one undo step. */

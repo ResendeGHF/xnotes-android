@@ -633,8 +633,27 @@ private slots:
         QCOMPARE(xn_editor_pdf_selection_rect(canvas.editor(), xywh), 1);
         QVERIFY(xywh[2] > 0 && xywh[3] > 0);
         // Copy the selection, then mark it: both consume the settled selection.
-        xn_editor_pdf_mark(canvas.editor(), XN_MARK_UNDERLINE);
+        xn_editor_set_ink_color(canvas.editor(), 0xFFFF00FFu);  // yellow before marking
+        const int undoBefore = xn_editor_can_undo(canvas.editor());
+        xn_editor_pdf_mark(canvas.editor(), XN_MARK_HIGHLIGHT);
+        const int undoAfter = xn_editor_can_undo(canvas.editor());
         QTest::qWait(1500);
+        const QImage marked = grab(canvas);
+        int yellow = 0;
+        for (int y = 60; y < 220; y += 2)
+            for (int x = 60; x < 400; x += 2) {
+                const QColor c = marked.pixelColor(x, y);
+                if (c.red() > 200 && c.green() > 200 && c.blue() < 150) yellow++;
+            }
+        int green = 0, dark = 0;
+        for (int y = 60; y < 220; y += 2)
+            for (int x = 60; x < 400; x += 2) {
+                const QColor c = marked.pixelColor(x, y);
+                if (c.green() > 150 && c.red() < 150 && c.blue() < 150) green++;
+                if (c.red() < 200 || c.green() < 200 || c.blue() < 200) dark++;
+            }
+        QVERIFY2(yellow > 50, qPrintable(QStringLiteral("undo %1->%2 yellow=%3 green=%4 dark=%5").arg(undoBefore).arg(undoAfter).arg(yellow).arg(green).arg(dark)));
+        QCOMPARE(xn_editor_pdf_has_selection(canvas.editor()), 0);
         QCOMPARE(xn_editor_can_undo(canvas.editor()), 1);
         canvas.setNote(nullptr);
         xn_note_close(note);

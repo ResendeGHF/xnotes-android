@@ -15,6 +15,7 @@ import com.xnotes.core.model.PageTemplates
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextMarkup
+import com.xnotes.core.pdf.MarkupPainter
 import com.xnotes.core.model.insets
 import com.xnotes.core.model.paintMarginPattern
 import com.xnotes.core.model.paintPagePattern
@@ -704,6 +705,15 @@ class CanvasState(
      * covers a blank note page whole; on an imported PDF page it rules the margins only, so the
      * page itself is never drawn over.
      */
+    /**
+     * The page's text markups baked into its background layer, under the ruling:
+     * quads are in points as displayed, the renderer already maps page px.
+     */
+    fun paintBakedMarkups(page: Page, r: Renderer) {
+        if (page.markups.isEmpty()) return
+        MarkupPainter.paint(r, page.markups, document.dpi / 72.0)
+    }
+
     fun paintRuling(page: Page, renderer: Renderer, region: Rect) {
         // The built-in templates are the classic rulings; others are drawn by a template painter.
         val pattern = PagePattern.fromId(effectiveTemplate(page))?.takeIf { it != PagePattern.NONE } ?: return

@@ -628,6 +628,7 @@ internal class CEditor(note: CNote, private val host: xn_host) {
     init {
         state.paintPageBackground = { page, renderer, res, region ->
             if (!paintPdfBackground(host, state.document, page, renderer, res, region)) withLock(standInLock) { standIns.add(page) }
+            state.paintBakedMarkups(page, renderer)
             state.paintRuling(page, renderer, region)
         }
         background?.let { bg ->

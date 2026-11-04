@@ -253,6 +253,29 @@ class StickyNoteItem(
             Rgba(225, 190, 231, 255), // purple
         )
 
+        /**
+         * The papers the Linux color dot cycles with each tap (Android's picker
+         * stays free-form). Ten distinct papers starting from the default.
+         */
+        val CYCLE = listOf(
+            Rgba(255, 241, 118, 255), // yellow
+            Rgba(255, 205, 210, 255), // pink
+            Rgba(200, 230, 201, 255), // green
+            Rgba(187, 222, 251, 255), // blue
+            Rgba(255, 224, 178, 255), // orange
+            Rgba(225, 190, 231, 255), // purple
+            Rgba(178, 223, 219, 255), // teal
+            Rgba(255, 249, 196, 255), // lemon
+            Rgba(215, 204, 200, 255), // taupe
+            Rgba(207, 216, 220, 255), // grey blue
+        )
+
+        /** The paper after [after]: the next cycle preset, wrapping around. */
+        fun nextCycleColor(after: Rgba): Rgba {
+            val i = CYCLE.indexOfFirst { it == after }
+            return CYCLE[(i + 1).mod(CYCLE.size)]
+        }
+
         const val DEFAULT_WIDTH = 300.0
         const val DEFAULT_HEIGHT = 300.0
         const val MIN_WIDTH = 120.0
