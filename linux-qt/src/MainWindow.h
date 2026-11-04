@@ -13,6 +13,12 @@
 
 class CanvasWidget;
 class QCheckBox;
+class QStackedWidget;
+
+namespace xn {
+class CompanionServer;
+class HomeScreen;
+}
 class QComboBox;
 class QLineEdit;
 class QSlider;
@@ -35,12 +41,29 @@ public:
     bool open(const QString& path);
     void newNote();
     void newCanvas();
+    void showHome();
+    void refreshHome();
+    void refreshHomeFiles();
+    void refreshHomeDevices();
+    void approvePairing(const QString& device, const QString& fp);
+    void openSharedFile(const QString& id);
+    void openSharedReady(const QString& id);
+    void reopenSharedFile(const QString& id);
+    void syncPresence();
+    void setupCompanion();
     xn_note* note() const { return note_; }
 
 protected:
     void closeEvent(QCloseEvent* e) override;
 
 private:
+    QStackedWidget* stack_ = nullptr;
+    xn::HomeScreen* home_ = nullptr;
+    xn::CompanionServer* companion_ = nullptr;
+    QString pendingOpenId_;
+    QString boundFileId_;
+    int lastPresencePage_ = -2;
+
     CanvasWidget* canvas_;
     xn_note* note_ = nullptr;
     std::unique_ptr<QTemporaryDir> workDir_;

@@ -42,12 +42,17 @@ import com.xnotes.capi.c.xn_text_field
 import com.xnotes.canvas.EditingField
 import com.xnotes.core.pal.FontFace
 import com.xnotes.core.platform.Lock
+import com.xnotes.core.platform.asFile
+import com.xnotes.core.platform.asPath
+import com.xnotes.core.platform.createTempFile
 import com.xnotes.core.platform.withLock
 import kotlinx.cinterop.UShortVar
 import kotlinx.cinterop.memScoped
 import com.xnotes.core.tools.EraseMode
 import com.xnotes.core.tools.ShapeConfig
 import kotlinx.cinterop.DoubleVar
+import kotlinx.cinterop.LongVar
+import kotlinx.cinterop.UByteVar
 import kotlinx.cinterop.UIntVar
 import kotlinx.cinterop.IntVar
 import com.xnotes.core.geometry.Pt
@@ -1625,6 +1630,146 @@ fun xnEditorSearchNext(editor: COpaquePointer?) = guard(Unit) {
 @CName("xn_editor_search_prev")
 fun xnEditorSearchPrev(editor: COpaquePointer?) = guard(Unit) {
     editor!!.editor().searchPrev()
+}
+
+// --- companion sync --------------------------------------------------------------------------------
+
+private fun COpaquePointer.sync(): SyncBridge = asStableRef<SyncBridge>().get()
+
+@CName("xn_sync_create")
+fun xnSyncCreate(host: CPointer<xn_host>?, pinsDir: String?, deviceName: String?, ownFp: String?): COpaquePointer? = guard(null) {
+    StableRef.create(SyncBridge(host!!.pointed, pinsDir ?: "", deviceName ?: "", ownFp ?: "")).asCPointer()
+}
+
+@CName("xn_sync_destroy")
+fun xnSyncDestroy(sync: COpaquePointer?) {
+    runCatching { sync?.asStableRef<SyncBridge>()?.dispose() }
+}
+
+@CName("xn_sync_feed")
+fun xnSyncFeed(sync: COpaquePointer?, bytes: CPointer<UByteVar>?, len: Int) = guard(Unit) {
+    if (bytes == null || len <= 0) return@guard
+    val data = ByteArray(len) { bytes[it].toByte() }
+    sync!!.sync().engine.bytesReceived(data)
+}
+
+@CName("xn_sync_tick")
+fun xnSyncTick(sync: COpaquePointer?) = guard(Unit) {
+    sync!!.sync().engine.tick()
+}
+
+@CName("xn_sync_hello")
+fun xnSyncHello(sync: COpaquePointer?) = guard(Unit) {
+    sync!!.sync().engine.startHandshake()
+}
+
+@CName("xn_sync_reset")
+fun xnSyncReset(sync: COpaquePointer?) = guard(Unit) {
+    sync!!.sync().engine.onDisconnected()
+}
+
+@CName("xn_sync_unpair")
+fun xnSyncUnpair(sync: COpaquePointer?, name: String?) = guard(Unit) {
+    sync!!.sync().engine.unpair(name ?: return@guard)
+}
+
+@CName("xn_sync_pin_count")
+fun xnSyncPinCount(sync: COpaquePointer?): Int = guard(0) {
+    sync!!.sync().engine.pins().size
+}
+
+@CName("xn_sync_pin_name")
+fun xnSyncPinName(sync: COpaquePointer?, index: Int): CPointer<ByteVar>? = guard(null) {
+    sync!!.sync().engine.pins().getOrNull(index)?.let { strdup(it.name) }
+}
+
+@CName("xn_sync_pair_begin")
+fun xnSyncPairBegin(sync: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    strdup(sync!!.sync().engine.beginPairing())
+}
+
+@CName("xn_sync_pair_decide")
+fun xnSyncPairDecide(sync: COpaquePointer?, accept: Int) = guard(Unit) {
+    sync!!.sync().engine.decidePairing(accept != 0)
+}
+
+@CName("xn_sync_paired")
+fun xnSyncPaired(sync: COpaquePointer?): Int = guard(0) {
+    if (sync!!.sync().engine.pairedDevice() != null) 1 else 0
+}
+
+@CName("xn_sync_paired_name")
+fun xnSyncPairedName(sync: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    sync!!.sync().engine.pairedDevice()?.let { strdup(it) }
+}
+
+@CName("xn_sync_file_count")
+fun xnSyncFileCount(sync: COpaquePointer?): Int = guard(0) {
+    sync!!.sync().engine.files().size
+}
+
+@CName("xn_sync_file_info")
+fun xnSyncFileInfo(
+    sync: COpaquePointer?,
+    index: Int,
+    id: CPointer<CPointerVar<ByteVar>>?,
+    path: CPointer<CPointerVar<ByteVar>>?,
+    kind: CPointer<IntVar>?,
+    version: CPointer<LongVar>?,
+    size: CPointer<LongVar>?,
+): Int = guard(0) {
+    val f = sync!!.sync().engine.files().getOrNull(index) ?: return@guard 0
+    id?.set(0, strdup(f.id))
+    path?.set(0, strdup(f.path))
+    kind?.set(0, f.kind)
+    version?.set(0, f.version)
+    size?.set(0, f.size)
+    1
+}
+
+@CName("xn_sync_file_path")
+fun xnSyncFilePath(sync: COpaquePointer?, id: String?): CPointer<ByteVar>? = guard(null) {
+    val bridge = sync!!.sync()
+    val bytes = bridge.engine.fileBytes(id ?: return@guard null) ?: return@guard null
+    // Cached bytes to a temp file the Qt side opens as a note.
+    val tmp = createTempFile("sync", ".xnote", okio.FileSystem.SYSTEM_TEMPORARY_DIRECTORY.asFile())
+    okio.FileSystem.SYSTEM.write(tmp.asPath()) { write(bytes) }
+    strdup(tmp.pathString)
+}
+
+@CName("xn_sync_open")
+fun xnSyncOpen(sync: COpaquePointer?, id: String?) = guard(Unit) {
+    sync!!.sync().engine.requestOpen(id ?: return@guard)
+}
+
+@CName("xn_sync_close_file")
+fun xnSyncCloseFile(sync: COpaquePointer?, id: String?) = guard(Unit) {
+    sync!!.sync().engine.closeFile(id ?: return@guard)
+}
+
+@CName("xn_sync_presence")
+fun xnSyncPresence(sync: COpaquePointer?, id: String?, page: Int) = guard(Unit) {
+    sync!!.sync().engine.presence(id ?: return@guard, page)
+}
+
+@CName("xn_sync_request_delete")
+fun xnSyncRequestDelete(sync: COpaquePointer?, id: String?) = guard(Unit) {
+    sync!!.sync().engine.requestDelete(id ?: return@guard)
+}
+
+@CName("xn_sync_request_create")
+fun xnSyncRequestCreate(sync: COpaquePointer?, dirId: String?, name: String?, kind: Int) = guard(Unit) {
+    sync!!.sync().engine.requestCreate(dirId, name ?: return@guard, kind)
+}
+
+@CName("xn_sync_bind")
+fun xnSyncBind(sync: COpaquePointer?, editor: COpaquePointer?, fileId: String?) = guard(Unit) {
+    sync!!.sync().bind(editor!!.editor(), fileId ?: return@guard)
+}
+
+@CName("xn_sync_unbind_editor")
+fun xnSyncUnbindEditor(sync: COpaquePointer?, editor: COpaquePointer?) = guard(Unit) {
+    sync!!.sync().unbindEditor(editor!!.editor())
 }
 
 @CName("xn_editor_copy")

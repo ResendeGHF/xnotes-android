@@ -9,6 +9,9 @@
 #include "NoteFinder.h"
 #include "PageStylePopup.h"
 #include "PagesPanel.h"
+#include "CompanionServer.h"
+#include "HomeScreen.h"
+#include <QStackedWidget>
 #include "PenStylePopup.h"
 #include "PdfText.h"
 #include "Icons.h"
@@ -700,6 +703,25 @@ private slots:
         xn_editor_search_close(canvas.editor());
         canvas.setNote(nullptr);
         xn_note_close(note);
+    }
+
+    /* The home screen shows the companion link and pairs with a code. */
+    void companionHomeAndPairCode() {
+        MainWindow window;
+        window.showHome();
+        window.resize(1100, 800);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto* home = window.findChild<QStackedWidget*>();
+        QVERIFY(home);
+        QCOMPARE(home->currentIndex(), 1);
+        auto* server = window.findChild<xn::CompanionServer*>();
+        QVERIFY(server);
+        QVERIFY(server->running());
+        QVERIFY(!server->certFingerprint().isEmpty());
+        const QString code = server->pairBegin();
+        QCOMPARE(code.size(), 6);
+        window.showHome();  // still home, nothing crashes on teardown paths
     }
 
     /* A PDF's outline lists its chapters; clicking one goes to its page. */

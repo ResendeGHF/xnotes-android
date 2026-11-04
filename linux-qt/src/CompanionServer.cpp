@@ -1,0 +1,294 @@
+#include "CompanionServer.h"
+
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QHostInfo>
+#include <QNetworkInterface>
+#include <QProcess>
+#include <QSslCertificate>
+#include <QSslKey>
+#include <QSslServer>
+#include <QSslSocket>
+#include <QStandardPaths>
+#include <QSslConfiguration>
+#include <QTimer>
+
+namespace xn {
+
+CompanionServer::CompanionServer(QObject* parent) : QObject(parent), deviceName_(QSysInfo::machineHostName()) {
+    host_.ctx = this;
+    host_.sync_send = sendThunk;
+    host_.sync_pair_request = pairRequestThunk;
+    host_.sync_paired = pairedThunk;
+    host_.sync_index_changed = indexChangedThunk;
+    host_.sync_file_changed = fileChangedThunk;
+    host_.sync_file_gone = fileGoneThunk;
+    host_.sync_resync = resyncThunk;
+    host_.sync_live_dirty = liveDirtyThunk;
+    host_.sync_delete_result = deleteResultThunk;
+    host_.sync_create_result = createResultThunk;
+    host_.sync_error = errorThunk;
+}
+
+CompanionServer::~CompanionServer() {
+    blockSignals(true);  // the home screen may already be gone
+    stop();
+}
+
+QString CompanionServer::configDir() const {
+    return QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+}
+
+bool CompanionServer::ensureIdentity() {
+    const QString dir = configDir();
+    if (!QDir().mkpath(dir)) {
+        status_ = QStringLiteral("Could not create %1").arg(dir);
+        emit statusChanged(status_);
+        return false;
+    }
+    const QString key = dir + QStringLiteral("/companion.key");
+    const QString crt = dir + QStringLiteral("/companion.crt");
+    if (!QFile::exists(key) || !QFile::exists(crt)) {
+        const QString openssl = QStandardPaths::findExecutable(QStringLiteral("openssl"));
+        if (openssl.isEmpty()) {
+            status_ = QStringLiteral("openssl not found: cannot mint the companion identity");
+            emit statusChanged(status_);
+            return false;
+        }
+        status_ = QStringLiteral("Minting the companion identity…");
+        emit statusChanged(status_);
+        QProcess proc;
+        proc.start(openssl, {QStringLiteral("req"), QStringLiteral("-x509"), QStringLiteral("-newkey"),
+                             QStringLiteral("rsa:2048"), QStringLiteral("-nodes"), QStringLiteral("-keyout"), key,
+                             QStringLiteral("-out"), crt, QStringLiteral("-days"), QStringLiteral("3650"),
+                             QStringLiteral("-subj"), QStringLiteral("/CN=xnotes-share")});
+        if (!proc.waitForFinished(60000) || proc.exitCode() != 0) {
+            status_ = QStringLiteral("openssl failed: %1").arg(QString::fromUtf8(proc.readAllStandardError()));
+            emit statusChanged(status_);
+            return false;
+        }
+    }
+    const QList<QSslCertificate> chain = QSslCertificate::fromPath(crt);
+    if (chain.isEmpty()) {
+        status_ = QStringLiteral("Could not read %1").arg(crt);
+        emit statusChanged(status_);
+        return false;
+    }
+    certFp_ = QString::fromLatin1(chain.first().digest(QCryptographicHash::Sha256).toHex());
+    return true;
+}
+
+bool CompanionServer::start() {
+    if (server_) return true;
+    if (!ensureIdentity()) return false;
+    auto* server = new QSslServer(this);
+    QSslConfiguration conf = server->sslConfiguration();
+    conf.setLocalCertificateChain(QSslCertificate::fromPath(configDir() + QStringLiteral("/companion.crt")));
+    QFile keyFile(configDir() + QStringLiteral("/companion.key"));
+    if (!keyFile.open(QIODevice::ReadOnly)) {
+        status_ = QStringLiteral("Could not read the companion key");
+        emit statusChanged(status_);
+        delete server;
+        return false;
+    }
+    conf.setPrivateKey(QSslKey(keyFile.readAll(), QSsl::Rsa));
+    conf.setProtocol(QSsl::TlsV1_2OrLater);
+    server->setSslConfiguration(conf);
+    if (!server->listen(QHostAddress::Any, kPort)) {
+        status_ = QStringLiteral("Could not listen on %1: %2").arg(kPort).arg(server->errorString());
+        emit statusChanged(status_);
+        delete server;
+        return false;
+    }
+    server_ = server;
+    connect(server_, &QTcpServer::newConnection, this, &CompanionServer::onNewConnection);
+    const QByteArray pins = QFile::encodeName(configDir());
+    const QByteArray name = deviceName_.toUtf8();
+    const QByteArray fp = certFp_.toLatin1();
+    sync_ = xn_sync_create(&host_, pins.constData(), name.constData(), fp.constData());
+    tick_ = new QTimer(this);
+    tick_->setInterval(5000);
+    connect(tick_, &QTimer::timeout, this, &CompanionServer::onTick);
+    tick_->start();
+    status_ = QStringLiteral("Listening");
+    emit statusChanged(status_);
+    return true;
+}
+
+void CompanionServer::stop() {
+    if (tick_) {
+        tick_->stop();
+        tick_->deleteLater();
+        tick_ = nullptr;
+    }
+    if (socket_) {
+        socket_->disconnectFromHost();
+        socket_->deleteLater();
+        socket_ = nullptr;
+    }
+    if (server_) {
+        server_->close();
+        server_->deleteLater();
+        server_ = nullptr;
+    }
+    if (sync_) {
+        xn_sync_destroy(sync_);
+        sync_ = nullptr;
+    }
+    status_ = QStringLiteral("Off");
+    emit statusChanged(status_);
+}
+
+QStringList CompanionServer::lanAddresses() const {
+    QStringList out;
+    for (const QHostAddress& a : QNetworkInterface::allAddresses()) {
+        if (a.protocol() == QHostAddress::IPv4Protocol && !a.isLoopback() && !a.isMulticast()) out << a.toString();
+    }
+    return out;
+}
+
+QString CompanionServer::pairBegin() {
+    if (!sync_) return {};
+    char* code = xn_sync_pair_begin(sync_);
+    const QString out = code ? QString::fromUtf8(code) : QString();
+    if (code) xn_free_string(code);
+    return out;
+}
+
+void CompanionServer::pairDecide(bool accept) {
+    if (sync_) xn_sync_pair_decide(sync_, accept ? 1 : 0);
+}
+
+void CompanionServer::unpair(const QString& name) {
+    if (sync_) xn_sync_unpair(sync_, QFile::encodeName(name).constData());
+    emit indexChanged();
+}
+
+void CompanionServer::openFile(const QString& id) const {
+    if (sync_) xn_sync_open(sync_, QFile::encodeName(id).constData());
+}
+
+void CompanionServer::requestDelete(const QString& id) const {
+    if (sync_) xn_sync_request_delete(sync_, QFile::encodeName(id).constData());
+}
+
+void CompanionServer::requestCreate(const QString& dirId, const QString& name, int kind) const {
+    if (!sync_) return;
+    const QByteArray dir = QFile::encodeName(dirId);
+    xn_sync_request_create(sync_, dirId.isEmpty() ? nullptr : dir.constData(), QFile::encodeName(name).constData(), kind);
+}
+
+void CompanionServer::closeFile(const QString& id) const {
+    if (sync_) xn_sync_close_file(sync_, QFile::encodeName(id).constData());
+}
+
+void CompanionServer::presence(const QString& id, int page) const {
+    if (sync_) xn_sync_presence(sync_, QFile::encodeName(id).constData(), page);
+}
+
+void CompanionServer::bindEditor(xn_editor* editor, const QString& id) const {
+    if (sync_ && editor) xn_sync_bind(sync_, editor, QFile::encodeName(id).constData());
+}
+
+void CompanionServer::unbindEditor(xn_editor* editor) const {
+    if (sync_ && editor) xn_sync_unbind_editor(sync_, editor);
+}
+
+void CompanionServer::onNewConnection() {
+    if (!server_) return;
+    // One host at a time: a new dial replaces the old one.
+    if (socket_) {
+        socket_->disconnectFromHost();
+        socket_->deleteLater();
+        socket_ = nullptr;
+    }
+    socket_ = qobject_cast<QSslSocket*>(server_->nextPendingConnection());
+    if (!socket_) return;
+    socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+    connect(socket_, &QSslSocket::encrypted, this, &CompanionServer::onEncrypted);
+    connect(socket_, &QSslSocket::readyRead, this, &CompanionServer::onReadyRead);
+    connect(socket_, &QSslSocket::disconnected, this, &CompanionServer::onDisconnected);
+    connect(socket_, &QSslSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        if (socket_ && socket_->state() == QAbstractSocket::UnconnectedState) onDisconnected();
+    });
+    socket_->startServerEncryption();
+}
+
+void CompanionServer::onEncrypted() {
+    if (socket_ && sync_) xn_sync_hello(sync_);
+}
+
+void CompanionServer::onReadyRead() {
+    if (!socket_ || !sync_) return;
+    const QByteArray bytes = socket_->readAll();
+    if (!bytes.isEmpty()) xn_sync_feed(sync_, reinterpret_cast<const uint8_t*>(bytes.constData()), bytes.size());
+}
+
+void CompanionServer::onDisconnected() {
+    if (socket_) {
+        socket_->deleteLater();
+        socket_ = nullptr;
+    }
+    if (sync_) xn_sync_reset(sync_);
+    status_ = server_ ? QStringLiteral("Listening") : status_;
+    emit statusChanged(status_);
+}
+
+void CompanionServer::onTick() {
+    if (sync_) xn_sync_tick(sync_);
+}
+
+void CompanionServer::sendThunk(void* ctx, const uint8_t* data, int len) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    if (self->socket_ && data && len > 0) {
+        self->socket_->write(reinterpret_cast<const char*>(data), len);
+    }
+}
+
+void CompanionServer::pairRequestThunk(void* ctx, const char* device, const char* fp) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    emit self->pairRequested(QString::fromUtf8(device), QString::fromUtf8(fp));
+}
+
+void CompanionServer::pairedThunk(void* ctx, const char* device) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    emit self->paired(QString::fromUtf8(device));
+}
+
+void CompanionServer::indexChangedThunk(void* ctx) {
+    emit static_cast<CompanionServer*>(ctx)->indexChanged();
+}
+
+void CompanionServer::fileChangedThunk(void* ctx, const char* id) {
+    emit static_cast<CompanionServer*>(ctx)->fileReady(QString::fromUtf8(id));
+}
+
+void CompanionServer::fileGoneThunk(void* ctx, const char* id) {
+    emit static_cast<CompanionServer*>(ctx)->fileGone(QString::fromUtf8(id));
+}
+
+void CompanionServer::resyncThunk(void* ctx, const char* id, long long version) {
+    emit static_cast<CompanionServer*>(ctx)->resync(QString::fromUtf8(id), version);
+}
+
+void CompanionServer::liveDirtyThunk(void* ctx) {
+    emit static_cast<CompanionServer*>(ctx)->paint();
+}
+
+void CompanionServer::deleteResultThunk(void* ctx, int ok, const char* reason) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    emit self->deleteAnswered(ok != 0, reason ? QString::fromUtf8(reason) : QString());
+}
+
+void CompanionServer::createResultThunk(void* ctx, int ok, const char* id, const char* reason) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    emit self->createAnswered(ok != 0, id ? QString::fromUtf8(id) : QString(), reason ? QString::fromUtf8(reason) : QString());
+}
+
+void CompanionServer::errorThunk(void* ctx, const char* reason) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    emit self->error(QString::fromUtf8(reason));
+}
+
+}  // namespace xn

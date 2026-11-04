@@ -40,7 +40,13 @@ int main(int argc, char** argv) {
     }
 
     MainWindow window;
-    if (args.isEmpty() || !window.open(args.first())) window.newNote();
+    if (!args.isEmpty() && window.open(args.first())) {
+        // Showing the requested note.
+    } else if (!args.isEmpty()) {
+        window.newNote();
+    } else {
+        window.showHome();
+    }
     window.show();
     return QApplication::exec();
 }

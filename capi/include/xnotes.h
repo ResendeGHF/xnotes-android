@@ -218,7 +218,68 @@ typedef struct xn_host {
     void (*text_char_info)(void* ctx, int cp, int* category, int* script, int* flags);
     /* Lowercase mapping of one codepoint. */
     int (*text_to_lower)(void* ctx, int cp);
+
+    /* --- sync (SYNC.md v1). All may be NULL (then the companion stays offline). --- */
+
+    /* A frame for the socket: write it at once (TCP_NODELAY). */
+    void (*sync_send)(void* ctx, const uint8_t* data, int len);
+    /* The host asks to pair: approve (or not) with xn_sync_pair_decide. Strings valid during the call. */
+    void (*sync_pair_request)(void* ctx, const char* device, const char* fp_hex);
+    /* Pairing finished (device pinned). */
+    void (*sync_paired)(void* ctx, const char* device);
+    /* The shared-file list changed; re-read it with xn_sync_file_*. */
+    void (*sync_index_changed)(void* ctx);
+    /* A fetched file's bytes are complete (open it) or it left the set. */
+    void (*sync_file_changed)(void* ctx, const char* file_id);
+    void (*sync_file_gone)(void* ctx, const char* file_id);
+    /* The open document must drop its state and refetch (host moved the head). */
+    void (*sync_resync)(void* ctx, const char* file_id, long long version);
+    /* A live frame changed the overlay: repaint. */
+    void (*sync_live_dirty)(void* ctx);
+    /* Answers to create/delete requests. */
+    void (*sync_delete_result)(void* ctx, int ok, const char* reason_or_null);
+    void (*sync_create_result)(void* ctx, int ok, const char* id_or_null, const char* reason_or_null);
+    /* Fatal: close the socket and show the reason. */
+    void (*sync_error)(void* ctx, const char* reason);
 } xn_host;
+
+/* --- companion sync (SYNC.md v1) ---------------------------------------------------- */
+
+typedef struct xn_sync xn_sync; /* the companion sync engine */
+
+/* Create over the host (for sync_* callbacks), the pins dir, this device's name and own cert fp. */
+xn_sync* xn_sync_create(const xn_host* host, const char* pins_dir, const char* device_name, const char* own_fp);
+void xn_sync_destroy(xn_sync* sync);
+/* Socket bytes into the engine; call often (5 s) for heartbeat/timeout/pairing expiry. */
+void xn_sync_feed(xn_sync* sync, const uint8_t* bytes, int len);
+void xn_sync_tick(xn_sync* sync);
+/* Connected: introduce ourselves. Call again on every reconnect; forget live runs on drop. */
+void xn_sync_hello(xn_sync* sync);
+void xn_sync_reset(xn_sync* sync);
+/* Forget a pinned device (unpair). */
+void xn_sync_unpair(xn_sync* sync, const char* name);
+int xn_sync_pin_count(const xn_sync* sync);
+char* xn_sync_pin_name(const xn_sync* sync, int index);
+
+/* Pairing: show the returned code (free it) on this screen; the user answers the popup. */
+char* xn_sync_pair_begin(xn_sync* sync);
+void xn_sync_pair_decide(xn_sync* sync, int accept);
+int xn_sync_paired(const xn_sync* sync);
+char* xn_sync_paired_name(const xn_sync* sync);
+
+/* Shared files: count, row (strings freed by the caller), cached-bytes path (free it; NULL when absent). */
+int xn_sync_file_count(const xn_sync* sync);
+int xn_sync_file_info(const xn_sync* sync, int index, char** id, char** path, int* kind, long long* version, long long* size);
+char* xn_sync_file_path(xn_sync* sync, const char* id);
+void xn_sync_open(xn_sync* sync, const char* id);
+void xn_sync_close_file(xn_sync* sync, const char* id);
+void xn_sync_presence(xn_sync* sync, const char* id, int page);
+void xn_sync_request_delete(xn_sync* sync, const char* id);
+void xn_sync_request_create(xn_sync* sync, const char* dir_id_or_null, const char* name, int kind);
+
+/* Tie an open editor to a sync file (local edits submit, remote ops apply). */
+void xn_sync_bind(xn_sync* sync, xn_editor* editor, const char* file_id);
+void xn_sync_unbind_editor(xn_sync* sync, xn_editor* editor);
 
 /* --- library -------------------------------------------------------------------------------- */
 

@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets Pdf Test)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Network OpenGL OpenGLWidgets Pdf Test)
 find_package(ZLIB REQUIRED)
 
 set(XNOTES_CAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../capi" CACHE PATH "The capi module (header and Gradle build output)")
@@ -43,6 +43,8 @@ add_library(xnotes_host STATIC
     src/CanvasWidget.cpp src/CanvasWidget.h
     src/MainWindow.cpp src/MainWindow.h
     src/SelectionBar.cpp src/SelectionBar.h
+    src/CompanionServer.cpp src/CompanionServer.h
+    src/HomeScreen.cpp src/HomeScreen.h
     src/PdfText.cpp src/PdfText.h
     src/TextOverlay.cpp src/TextOverlay.h
     src/PdfExport.cpp src/PdfExport.h
@@ -57,7 +59,7 @@ target_include_directories(xnotes_host PUBLIC src)
 # The icons, from linux-qt/icons/generate.py, as :/icons/<name>.svg.
 file(GLOB XNOTES_ICONS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS icons/svg/*.svg)
 qt_add_resources(xnotes_host "xnotes_icons" PREFIX "/icons" BASE icons/svg FILES ${XNOTES_ICONS})
-target_link_libraries(xnotes_host PUBLIC Qt6::Widgets Qt6::OpenGLWidgets Qt6::Pdf ZLIB::ZLIB xnotes_core)
+target_link_libraries(xnotes_host PUBLIC Qt6::Widgets Qt6::Network Qt6::OpenGLWidgets Qt6::Pdf ZLIB::ZLIB xnotes_core)
 target_compile_options(xnotes_host PRIVATE -Wall -Wextra)
 
 add_executable(xnotes-qt src/main.cpp)

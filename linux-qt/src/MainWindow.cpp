@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 
 #include "CanvasWidget.h"
+#include "CompanionServer.h"
+#include "HomeScreen.h"
 #include "Icons.h"
 #include "NoteFinder.h"
 #include "PageStylePopup.h"
@@ -34,6 +36,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPainter>
+#include <QStackedWidget>
 #include <QPixmap>
 #include <QStatusBar>
 #include <QTimer>
@@ -133,7 +136,11 @@ MainWindow::MainWindow() {
     grid->addWidget(canvas_, 0, 0);
     grid->addWidget(vbar_, 0, 1);
     grid->addWidget(hbar_, 1, 0);
-    setCentralWidget(central);
+    stack_ = new QStackedWidget(this);
+    stack_->addWidget(central);
+    home_ = new xn::HomeScreen(stack_);
+    stack_->addWidget(home_);
+    setCentralWidget(stack_);
     auto scrolled = [this] {
         if (syncingBars_ || !canvas_->editor()) return;
         xn_editor_scroll_to(canvas_->editor(), hbar_->value(), vbar_->value());
@@ -173,6 +180,7 @@ MainWindow::MainWindow() {
                              (interval > 0 ? QStringLiteral(", %1 fps").arg(int(std::lround(1000 / interval))) : QString()));
     });
     stats->start(250);
+    setupCompanion();
     resize(1200, 900);
 }
 
@@ -185,6 +193,8 @@ MainWindow::~MainWindow() {
 void MainWindow::buildUi() {
     QToolBar* bar = addToolBar(QStringLiteral("Main"));
     bar->setMovable(false);
+    bar->addAction(xnIcon(QStringLiteral("home")), QStringLiteral("Home"), this, &MainWindow::showHome);
+    bar->addSeparator();
     pagesAction_ = bar->addAction(xnIcon(QStringLiteral("sidebar")), QStringLiteral("Pages"));
     pagesAction_->setCheckable(true);
     pagesAction_->setChecked(true);
@@ -793,6 +803,11 @@ void MainWindow::showContextMenu(QPointF at, bool onLocked) {
 }
 
 void MainWindow::install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path) {
+    if (!boundFileId_.isEmpty() && canvas_->editor()) {
+        companion_->closeFile(boundFileId_);
+        companion_->unbindEditor(canvas_->editor());
+        boundFileId_.clear();
+    }
     suggestedName_.clear();
     if (pageStyle_) pageStyle_->close();  // it edits the editor going away
     pages_->setDocument(nullptr, nullptr);
@@ -809,11 +824,188 @@ void MainWindow::install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, 
     pages_->setPaper(paper());
     pages_->setDocument(note_, canvas_->editor());
     if (QAction* tool = tools_->checkedAction()) canvas_->setTool(tool->data().toByteArray().constData());
+    stack_->setCurrentWidget(stack_->widget(0));
     if (colorAction_->data().isValid()) setInk(colorAction_->data().value<QColor>());
     applyToolSettings();
     syncWidth();
     refresh();
     refreshView();
+    stack_->setCurrentWidget(stack_->widget(0));
+    pagesDock_->setVisible(pagesAction_->isChecked() && !(note_ && xn_note_is_canvas(note_)));
+}
+
+/* --- companion home (SYNC.md v1) --- */
+
+void MainWindow::setupCompanion() {
+    companion_ = new xn::CompanionServer(this);
+    connect(home_, &xn::HomeScreen::newNote, this, [this] { if (confirmDiscard()) newNote(); });
+    connect(home_, &xn::HomeScreen::openFile, this, [this] { chooseOpen(); });
+    connect(home_, &xn::HomeScreen::openShared, this, [this](const QString& id) { openSharedFile(id); });
+    connect(home_, &xn::HomeScreen::serverToggled, this, [this](bool on) {
+        if (on) companion_->start();
+        else companion_->stop();
+        refreshHome();
+    });
+    connect(home_, &xn::HomeScreen::pairBegin, this, [this] { home_->setPairCode(companion_->pairBegin()); });
+    connect(home_, &xn::HomeScreen::unpair, this, [this](const QString& name) {
+        companion_->unpair(name);
+        refreshHomeDevices();
+    });
+    connect(home_, &xn::HomeScreen::deleteShared, this, [this](const QString& id) {
+        if (QMessageBox::question(this, QStringLiteral("Delete"),
+                                  QStringLiteral("Ask the host to delete this file? This cannot be undone."),
+                                  QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
+        companion_->requestDelete(id);
+    });
+    connect(home_, &xn::HomeScreen::createShared, this, [this](const QString& dirId, const QString& name, int kind) {
+        companion_->requestCreate(dirId, name, kind);
+    });
+    connect(companion_, &xn::CompanionServer::statusChanged, this, [this](const QString&) { refreshHome(); });
+    connect(companion_, &xn::CompanionServer::pairRequested, this, &MainWindow::approvePairing);
+    connect(companion_, &xn::CompanionServer::paired, this, [this](const QString&) {
+        home_->setPairCode({});
+        refreshHome();
+    });
+    connect(companion_, &xn::CompanionServer::indexChanged, this, &MainWindow::refreshHomeFiles);
+    connect(companion_, &xn::CompanionServer::fileReady, this, &MainWindow::openSharedReady);
+    connect(companion_, &xn::CompanionServer::fileGone, this, [this](const QString& id) {
+        if (boundFileId_ == id) {
+            boundFileId_.clear();
+            showHome();
+            statusBar()->showMessage(QStringLiteral("The host unshared the open file"), 4000);
+        }
+        refreshHomeFiles();
+    });
+    connect(companion_, &xn::CompanionServer::resync, this, [this](const QString& id, long long) { reopenSharedFile(id); });
+    connect(companion_, &xn::CompanionServer::paint, this, [this] { canvas_->update(); });
+    connect(companion_, &xn::CompanionServer::deleteAnswered, this, [this](bool ok, const QString& reason) {
+        statusBar()->showMessage(ok ? QStringLiteral("Deleted on the host") : QStringLiteral("Host declined: %1").arg(reason), 4000);
+    });
+    connect(companion_, &xn::CompanionServer::createAnswered, this, [this](bool ok, const QString&, const QString& reason) {
+        if (!ok) statusBar()->showMessage(QStringLiteral("Host declined: %1").arg(reason), 4000);
+    });
+    connect(companion_, &xn::CompanionServer::error, this, [this](const QString& reason) {
+        statusBar()->showMessage(reason, 6000);
+    });
+    companion_->start();
+    refreshHome();
+}
+
+void MainWindow::showHome() {
+    stack_->setCurrentWidget(home_);
+    pagesDock_->hide();
+    refreshHome();
+}
+
+void MainWindow::refreshHome() {
+    if (!companion_ || !companion_->sync()) {
+        home_->setStatus(QStringLiteral("Companion is off."));
+        home_->setConnected({});
+        home_->setSharing(false);
+        return;
+    }
+    const QStringList addrs = companion_->lanAddresses();
+    QString status = QStringLiteral("Listening on %1:%2").arg(addrs.isEmpty() ? QStringLiteral("…") : addrs.join(QStringLiteral(", "))).arg(xn::CompanionServer::kPort);
+    char* paired = xn_sync_paired_name(companion_->sync());
+    const QString device = paired ? QString::fromUtf8(paired) : QString();
+    if (paired) xn_free_string(paired);
+    if (!device.isEmpty()) status += QStringLiteral(" — connected: %1").arg(device);
+    home_->setStatus(status);
+    home_->setConnected(device);
+    home_->setSharing(true);
+    refreshHomeDevices();
+    refreshHomeFiles();
+}
+
+void MainWindow::refreshHomeDevices() {
+    QStringList names;
+    if (auto* s = companion_ ? companion_->sync() : nullptr) {
+        const int n = xn_sync_pin_count(s);
+        for (int i = 0; i < n; ++i) {
+            char* name = xn_sync_pin_name(s, i);
+            if (name) {
+                names << QString::fromUtf8(name);
+                xn_free_string(name);
+            }
+        }
+    }
+    home_->setDevices(names);
+}
+
+void MainWindow::refreshHomeFiles() {
+    QList<xn::SharedFile> files;
+    if (auto* s = companion_ ? companion_->sync() : nullptr) {
+        const int n = xn_sync_file_count(s);
+        for (int i = 0; i < n; ++i) {
+            char *id = nullptr, *path = nullptr;
+            int kind = 0;
+            long long version = 0, size = 0;
+            if (!xn_sync_file_info(s, i, &id, &path, &kind, &version, &size)) continue;
+            files << xn::SharedFile{QString::fromUtf8(id), QString::fromUtf8(path), kind, version, size};
+            xn_free_string(id);
+            xn_free_string(path);
+        }
+    }
+    home_->setFiles(files);
+}
+
+void MainWindow::approvePairing(const QString& device, const QString& fp) {
+    QString grouped;
+    for (int i = 0; i + 1 < fp.size(); i += 2) {
+        if (!grouped.isEmpty()) grouped += QLatin1Char(':');
+        grouped += fp.mid(i, 2).toUpper();
+    }
+    const bool yes =
+        QMessageBox::question(this, QStringLiteral("Pair device"),
+                              QStringLiteral("Allow %1 to share notes?\nFingerprint: %2\nOnly approve if you just asked to pair.")
+                                  .arg(device, grouped),
+                              QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
+    companion_->pairDecide(yes);
+    if (yes) home_->setPairCode({});
+}
+
+void MainWindow::openSharedFile(const QString& id) {
+    if (!confirmDiscard()) return;
+    pendingOpenId_ = id;
+    statusBar()->showMessage(QStringLiteral("Fetching…"), 2000);
+    companion_->openFile(id);
+}
+
+void MainWindow::openSharedReady(const QString& id) {
+    if (id != pendingOpenId_) return;
+    pendingOpenId_.clear();
+    char* path = xn_sync_file_path(companion_->sync(), QFile::encodeName(id).constData());
+    if (!path) {
+        statusBar()->showMessage(QStringLiteral("Fetch failed"), 4000);
+        return;
+    }
+    const QString local = QString::fromUtf8(path);
+    xn_free_string(path);
+    if (!open(local)) return;
+    companion_->bindEditor(canvas_->editor(), id);
+    boundFileId_ = id;
+    lastPresencePage_ = -2;
+    syncPresence();
+}
+
+void MainWindow::reopenSharedFile(const QString& id) {
+    if (boundFileId_ != id) return;
+    if (canvas_->editor()) companion_->unbindEditor(canvas_->editor());
+    boundFileId_.clear();
+    statusBar()->showMessage(QStringLiteral("Reloading the shared file…"), 2000);
+    install(nullptr, std::make_unique<QTemporaryDir>(), QString());
+    showHome();
+    pendingOpenId_ = id;
+    // The engine already queued the fetch on resync.
+}
+
+void MainWindow::syncPresence() {
+    if (boundFileId_.isEmpty() || !canvas_->editor()) return;
+    const int page = xn_editor_current_page(canvas_->editor());
+    if (page == lastPresencePage_) return;
+    lastPresencePage_ = page;
+    companion_->presence(boundFileId_, page);
 }
 
 void MainWindow::newNote() { install(xn_note_new(1), std::make_unique<QTemporaryDir>(), QString()); }
@@ -1027,6 +1219,7 @@ void MainWindow::refreshView() {
     syncScrollBars();
     auto* e = canvas_->editor();
     if (!e || !note_) return;
+    syncPresence();
     if (!xn_note_is_canvas(note_))
         pageLabel_->setText(QStringLiteral("%1 / %2").arg(xn_editor_current_page(e) + 1).arg(xn_note_page_count(note_)));
     zoomLabel_->setText(QStringLiteral("%1%").arg(int(xn_editor_zoom(e) * 100)));

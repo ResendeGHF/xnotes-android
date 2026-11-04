@@ -18,13 +18,7 @@ object SyncFrames {
     fun encode(msg: SyncMsg): ByteArray {
         val sink = StringSink(StringBuilder())
         val w = JsonWrite(sink)
-        when (msg) {
-            is SyncMsg.Hello -> writeHello(w, msg)
-            is SyncMsg.HelloAck -> writeHelloAck(w, msg)
-            is SyncMsg.PairRequest -> writePairRequest(w, msg)
-            is SyncMsg.PairResult -> writePairResult(w, msg)
-            is SyncMsg.Unknown -> writeUnknown(w, msg)
-        }
+        writeSyncBody(w, msg)
         sink.flush()
         val body = sink.sb.toString().encodeToByteArray()
         require(body.size in 1..MAX_FRAME) { "frame size ${body.size}" }
@@ -38,10 +32,7 @@ object SyncFrames {
     }
 
     /** One message from its JSON bytes. */
-    fun decode(bytes: ByteArray): SyncMsg {
-        val p = JsonPull(StringSource(bytes.decodeToString()))
-        return readMsg(p)
-    }
+    fun decode(bytes: ByteArray): SyncMsg = parseSyncBody(JsonPull(StringSource(bytes.decodeToString())))
 
     /**
      * Incremental decoder for socket reads: feed whatever arrived, take whole
@@ -69,118 +60,6 @@ object SyncFrames {
         }
     }
 
-    private fun readMsg(p: JsonPull): SyncMsg {
-        var t: String? = null
-        var seq = 0
-        var replyTo = -1
-        var app = ""
-        var version = 0
-        var deviceName = ""
-        var hostFp = ""
-        var companionFp = ""
-        var paired = false
-        var codeRequired = false
-        var code = ""
-        var ok = false
-        var reason: String? = null
-        p.beginObject()
-        while (p.hasNext()) {
-            when (p.nextName()) {
-                "t" -> t = stringOrNull(p)
-                "seq" -> seq = intOr(p, 0)
-                "in_reply_to" -> replyTo = intOr(p, -1)
-                "app" -> app = stringOr(p, "")
-                "version" -> version = intOr(p, 0)
-                "device_name" -> deviceName = stringOr(p, "")
-                "host_cert_fp" -> hostFp = stringOr(p, "")
-                "companion_cert_fp" -> companionFp = stringOr(p, "")
-                "paired" -> paired = boolOr(p, false)
-                "code_required" -> codeRequired = boolOr(p, false)
-                "code" -> code = stringOr(p, "")
-                "ok" -> ok = boolOr(p, false)
-                "reason" -> reason = stringOrNull(p)
-                else -> p.skipValue()
-            }
-        }
-        p.endObject()
-        return when (t) {
-            "hello" -> SyncMsg.Hello(seq, app, version, deviceName, hostFp)
-            "hello_ack" -> SyncMsg.HelloAck(seq, replyTo, companionFp, paired, codeRequired)
-            "pair_request" -> SyncMsg.PairRequest(seq, deviceName, hostFp, code)
-            "pair_result" -> SyncMsg.PairResult(seq, replyTo, ok, reason)
-            else -> SyncMsg.Unknown(t ?: "", seq)
-        }
-    }
-
-    private fun stringOr(p: JsonPull, def: String): String = stringOrNull(p) ?: def
-
-    private fun stringOrNull(p: JsonPull): String? =
-        if (p.peek() == JsonPull.Token.STRING) p.nextString() else {
-            p.skipValue()
-            null
-        }
-
-    private fun intOr(p: JsonPull, def: Int): Int =
-        if (p.peek() == JsonPull.Token.NUMBER) p.nextInt() else {
-            p.skipValue()
-            def
-        }
-
-    private fun boolOr(p: JsonPull, def: Boolean): Boolean =
-        if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else {
-            p.skipValue()
-            def
-        }
-
-    private fun writeHello(w: JsonWrite, m: SyncMsg.Hello) {
-        w.beginObject()
-        w.name("t").value("hello")
-        w.name("seq").value(m.seq)
-        w.name("app").value(m.app)
-        w.name("version").value(m.version)
-        w.name("device_name").value(m.deviceName)
-        w.name("host_cert_fp").value(m.hostCertFp)
-        w.endObject()
-    }
-
-    private fun writeHelloAck(w: JsonWrite, m: SyncMsg.HelloAck) {
-        w.beginObject()
-        w.name("t").value("hello_ack")
-        w.name("seq").value(m.seq)
-        w.name("in_reply_to").value(m.inReplyTo)
-        w.name("companion_cert_fp").value(m.companionCertFp)
-        w.name("paired").value(m.paired)
-        w.name("code_required").value(m.codeRequired)
-        w.endObject()
-    }
-
-    private fun writePairRequest(w: JsonWrite, m: SyncMsg.PairRequest) {
-        w.beginObject()
-        w.name("t").value("pair_request")
-        w.name("seq").value(m.seq)
-        w.name("device_name").value(m.deviceName)
-        w.name("host_cert_fp").value(m.hostCertFp)
-        w.name("code").value(m.code)
-        w.endObject()
-    }
-
-    private fun writePairResult(w: JsonWrite, m: SyncMsg.PairResult) {
-        w.beginObject()
-        w.name("t").value("pair_result")
-        w.name("seq").value(m.seq)
-        w.name("in_reply_to").value(m.inReplyTo)
-        w.name("ok").value(m.ok)
-        m.reason?.let { w.name("reason").value(it) }
-        w.endObject()
-    }
-
-    private fun writeUnknown(w: JsonWrite, m: SyncMsg.Unknown) {
-        w.beginObject()
-        w.name("t").value(m.t)
-        w.name("seq").value(m.seq)
-        w.endObject()
-    }
-
     private class StringSink(val sb: StringBuilder) : CharSink {
         override fun write(s: String) {
             sb.append(s)
@@ -191,7 +70,7 @@ object SyncFrames {
         }
 
         override fun write(chars: CharArray, offset: Int, length: Int) {
-            sb.append(chars, offset, length)
+            sb.appendRange(chars, offset, offset + length)
         }
 
         override fun flush() = Unit
@@ -246,4 +125,95 @@ sealed interface SyncMsg {
 
     data class Unknown(val t: String, override val seq: Int) : SyncMsg
 
+    data class Index(
+        override val seq: Int,
+        val inReplyTo: Int,
+        val full: Boolean,
+        val files: List<SyncFileEntry>,
+    ) : SyncMsg
+
+    data class Fetch(
+        override val seq: Int,
+        val id: String,
+        val offset: Long,
+        val length: Long,
+    ) : SyncMsg
+
+    data class FileChunk(
+        override val seq: Int,
+        val id: String,
+        val version: Long,
+        val total: Long,
+        val offset: Long,
+        val data: String,
+        val last: Boolean,
+    ) : SyncMsg
+
+    data class Op(
+        override val seq: Int,
+        val file: String,
+        val baseVersion: Long,
+        val version: Long,
+        val dedupe: String,
+        val ops: List<SyncOp>,
+    ) : SyncMsg
+
+    data class OpAck(
+        override val seq: Int,
+        val inReplyTo: Int,
+        val file: String,
+        val version: Long,
+    ) : SyncMsg
+
+    data class Resync(
+        override val seq: Int,
+        val file: String,
+        val version: Long,
+    ) : SyncMsg
+
+    data class Live(
+        override val seq: Int,
+        val file: String,
+        val page: Int,
+        val strokeId: String,
+        val tool: String,
+        val width: Double,
+        val color: String,
+        val samples: List<WireSample>,
+        val done: Boolean,
+    ) : SyncMsg
+
+    data class Presence(
+        override val seq: Int,
+        val file: String,
+        val page: Int,
+    ) : SyncMsg
+
+    data class Heartbeat(override val seq: Int) : SyncMsg
+
+    data class IndexSubscribe(override val seq: Int) : SyncMsg
+
+    data class DeleteRequest(override val seq: Int, val id: String) : SyncMsg
+
+    data class DeleteResult(
+        override val seq: Int,
+        val inReplyTo: Int,
+        val ok: Boolean,
+        val reason: String?,
+    ) : SyncMsg
+
+    data class CreateRequest(
+        override val seq: Int,
+        val dirId: String?,
+        val name: String,
+        val kind: Int,
+    ) : SyncMsg
+
+    data class CreateResult(
+        override val seq: Int,
+        val inReplyTo: Int,
+        val ok: Boolean,
+        val id: String?,
+        val reason: String?,
+    ) : SyncMsg
 }

@@ -64,10 +64,16 @@ for not-yet-paired devices (paired ones show their pinned name).
 
 ## Files
 
-- `id`: path relative to the shared root, `/`-separated (`notes/todo.xnote`,
-  `pdfs/book.pdf`). Stable and human-meaningful. A shared **folder** shares its
-  whole subtree: the index lists the dir, and new files under it appear in
-  later `index` deltas (`full:false`).
+- `id`: host-assigned **stable file identity**, never a path. It survives
+  renames and moves; deleting the file retires its id, and a new file created
+  at the same path gets a fresh id and is unshared by default (no policy
+  inheritance by name). On Android the id is the document URI (stable across
+  rename/move inside its provider); the index also carries the current
+  `path` (relative, `/`-separated, for display and navigation) and `name`,
+  which change on move/rename while `id` does not.
+- A shared **folder** shares its whole subtree by id-prefix: the index lists
+  the dir id, and new files under it appear in later `index` deltas
+  (`full:false`) with fresh ids, already shared.
 - `version`: host's per-file commit counter (integer, starts at 1, +1 per
   committed batch). Companion caches `(id -> version, bytes)`.
 - Fetch: `C -> S fetch {id, offset?, length?}` / `S -> C file {id, version,
@@ -76,11 +82,22 @@ for not-yet-paired devices (paired ones show their pinned name).
   through the same codec, so a file the companion never edits stays
   byte-identical.
 
+## Companion-requested create/delete (host approves in UI)
+
+- The companion cannot change the file set on its own. It asks:
+  `C -> S delete_request {id}` / `create_request {dir_id?, name, kind}`.
+- The host shows a popup (Approve / Deny) with the file name and the
+  companion's device name. Deny (or timeout) replies
+  `S -> C delete_result / create_result {ok:false}` and nothing changes.
+- Approve applies the change on the host, then `S -> C {ok:true, ...}` plus
+  an `index` delta; a created file arrives with its fresh id (shared from
+  birth when made under a shared folder, else unshared — the host decides).
+
 ## Committed ops (both directions, host-authoritative)
 
 ```
 C -> S  op {file, base_version, ops:[...], dedupe}
-S -> C  op {file, base_version, ops:[...], dedupe}     # host's own commits + fan-out
+S -> C  op {file, base_version, version, ops:[...], dedupe}  # host's own commits + fan-out; version = new head
 S -> C  op_ack {file, version}                          # accepted; version is the new head
 S -> C  resync {file, version}                          # base_version stale; refetch, then retry once
 ```
@@ -97,8 +114,10 @@ Op set v1 (strokes first; pages/text/markups follow the same envelope):
 
 - `add_stroke {page, stroke:{tool, width, color, pressure, samples:[[x,y,p]...]}}`
   in page px. `tool`: `pen|highlighter|...`; `color`: `#rrggbb`; `width`: pt.
-  Identity = content fingerprint (SHA-256 of canonical encoding, first 16 hex):
-  retries and double-delivery converge.
+  Identity = content fingerprint: SHA-256 hex (first 16) of
+  `tool|width(%.3f)|color|samples`, samples as `x.2f,y.2f,p.3f` joined by `;`
+  (`,` within). Test vector: `pen|3.000|#00e676|10.00,20.00,0.500;11.50,21.00,0.600`
+  → `11812f53989ff4dc`. Retries and double-delivery converge.
 - `erase_strokes {page, ids:[fingerprint...]}`: exact fingerprint match applies;
   no match = no-op (never an error).
 - Page add/remove, text-box add, markup add: same `{file, base_version, ops}`
@@ -107,20 +126,24 @@ Op set v1 (strokes first; pages/text/markups follow the same envelope):
 Undo of a remote op is local-only (undo removes what *you* committed; a
 companion undo sends a compensating op, e.g. `erase_strokes` for your stroke).
 
-## Live strokes (ephemeral, both directions)
+## Live strokes (true streaming, both directions)
 
 ```
-C <-> S  live {file, page, stroke_id, samples:[[x,y]...], done}
+C <-> S  live {file, page, stroke_id, tool, width, color, samples:[[x,y,p]...], done}
 ```
 
-- While drawing, the drawer emits its **full current run** ~20 Hz
-  (`done:false`); receivers show it as an overlay keyed by `(sender, stroke_id)`,
-  *replacing* the previous batch. `done:true` carries the final run.
-- Live batches never touch the model or versions; the committed `add_stroke`
+- Streaming is **per sample, no batching timer**: every pointer sample goes
+  out on the socket as it happens (TCP_NODELAY both ends), and receivers paint
+  it immediately. `tool`/`width`/`color` ride along so the far side renders the
+  run exactly as drawn.
+- Receivers show the run as an overlay keyed by `(sender, stroke_id)`,
+  *appending* each frame's samples. `done:true` ends the run; the overlay is
+  dropped as soon as the matching committed `add_stroke` lands.
+- Live frames never touch the model or versions; the committed `add_stroke`
   op follows through the normal path (dedupe keys this to the live `stroke_id`
   so pen-up never double-draws).
-- Only for the file(s) both sides have open. Stale batches (older `seq` for the
-  same `stroke_id`) are dropped.
+- Only for the file(s) both sides have open. Frames for a closed file, or a
+  `stroke_id` never started, are dropped.
 
 ## Presence and keepalive
 
@@ -131,8 +154,12 @@ C <-> S  live {file, page, stroke_id, samples:[[x,y]...], done}
 
 ## Policy (host side)
 
-- Default-deny per-file/per-folder set, persisted as `{"shared": [...]}` —
-  the existing `SharePolicy` model. The index only ever lists shared ids.
+- Default-deny set of **stable file/folder ids** (never paths), persisted as
+  `{"shared": [...]}` — the existing `SharePolicy` model, keyed by id.
+  The index only ever lists shared ids.
+- Rename/move keeps the id: the file stays shared and the companion sees it
+  at its new path. Delete retires the id (policy entry pruned); a later file
+  at the same path is a new id and stays unshared.
 - Unshare mid-session: host sends `index` delta; companion drops the file
   (dirty companion-only state is kept locally, never pushed).
 - View-only grants and kick/revoke: v2 (lease + grant in `hello_ack`).

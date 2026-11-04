@@ -194,6 +194,18 @@ class InteractionController(
      */
     var onMarkupTap: ((at: Pt, withLink: Boolean) -> Boolean)? = null
 
+    /** A stroke started on [page] by the local pointer. */
+    var onStrokeStarted: ((page: Int) -> Unit)? = null
+    /** A finished stroke committed to [page] by the local pointer (pen-up, crossings included). */
+    var onStrokeCommitted: ((page: Int, stroke: Stroke) -> Unit)? = null
+    /** Strokes the local eraser took off [page]. Area-erase splits are not reported. */
+    var onStrokesErased: ((page: Int, strokes: List<Stroke>) -> Unit)? = null
+    /** A pointer sample in page space, as drawn (for live streaming). */
+    var onStrokeSample: ((page: Int, x: Double, y: Double, p: Double) -> Unit)? = null
+
+    /** The far side's live runs, painted in the overlay (installed by the sync bridge). */
+    var remoteLive: RemoteLiveStrokes? = null
+
     /** A pan tap or a markup tool tap at viewport point [at], told before anything acts on it. */
     var onTap: ((at: Pt) -> Unit)? = null
 
@@ -1094,6 +1106,7 @@ class InteractionController(
         liveStroke = stroke
         strokePageIndex = pageIndex
         mode = PointerMode.DRAW
+        if (drawTool.isStroke) onStrokeStarted?.invoke(pageIndex)
         // Shape snap: only solid ink pens (not the highlighter or its straight-line mode) arm the
         // "hold still → shape" timer — and never while the ruler is up (you're drawing straight lines),
         // nor under the wand, whose strokes are ephemeral and must never commit a shape to the page.
@@ -1150,6 +1163,7 @@ class InteractionController(
             val start = stroke.samples.firstOrNull()
             val end = if (start != null && !ruler.visible) ResizeMath.snapAxis(Pt(start.x, start.y), local) else local
             stroke.setStraightEnd(Sample(end.x, end.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()))
+            onStrokeSample?.invoke(pi, end.x, end.y, pressure.coerceIn(0.0, 1.0))
             return
         }
         val last = stroke.samples.lastOrNull()
@@ -1160,6 +1174,7 @@ class InteractionController(
         val gate = (MIN_SAMPLE_DIST / state.zoom).coerceAtMost(MIN_SAMPLE_DIST)
         if (force || last == null || Pt(last.x, last.y).manhattanTo(local) >= gate) {
             stroke.addSample(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()))
+            onStrokeSample?.invoke(pi, local.x, local.y, pressure.coerceIn(0.0, 1.0))
         }
         // Real movement restarts the hold-to-snap clock; staying within the slop lets it mature,
         // so the snap fires only once the pen has actually come to rest. (Sub-slop jitter is ignored
@@ -1243,6 +1258,7 @@ class InteractionController(
         // antialiased edges over each other. It goes into the cache once the pad has let go.
         if (frontInk?.hold(stroke, page) != true) state.appendToCache(page, stroke)
         state.document.dirty = true
+        onStrokeCommitted?.invoke(pageIndex, stroke)
         return AddItem(page, stroke)
     }
 
@@ -1495,6 +1511,10 @@ class InteractionController(
             }
         } else if (eraseRemovals.isNotEmpty()) {
             cmds += EraseItems(eraseRemovals.toList())
+            val erased = eraseRemovals.mapNotNull { (page, item) -> (item as? Stroke)?.let { page to it } }
+            for ((page, strokes) in erased.groupBy({ it.first }, { it.second })) {
+                if (strokes.isNotEmpty()) onStrokesErased?.invoke(state.document.pages.indexOf(page), strokes)
+            }
         }
         cmds += eraseMarkups
         if (cmds.isNotEmpty()) {
@@ -4177,6 +4197,9 @@ class InteractionController(
 
         // Note icons: chrome of one size at any zoom, so in viewport space.
         noteIcons?.draw(r)
+
+        // The far side's live runs, over everything while they draw.
+        remoteLive?.draw(r)
 
         // Eraser cursor (viewport space, after the transform is restored).
         eraserCursor?.let {
