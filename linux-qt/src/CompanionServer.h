@@ -45,6 +45,10 @@ public:
     QString pairBegin();
     void pairDecide(bool accept);
     void unpair(const QString& name);
+    /* This companion's nickname, shown to the host in requests. Empty restores the hostname. */
+    void setDeviceName(const QString& name);
+    /* Rename a remembered host (alias shown instead of its device name). False when unknown. */
+    bool renameDevice(const QString& oldName, const QString& newName);
 
     /* Files: fetch one for opening, ask the host to delete/create. */
     void openFile(const QString& id) const;
@@ -95,6 +99,7 @@ private:
 
     /* ~/.config/xnotes, holding companion.{key,crt} and the pins file. */
     QString configDir() const;
+    QString loadDeviceName() const;
     /* Make the identity if missing; loads it into certFp_. False with status(). */
     bool ensureIdentity();
 

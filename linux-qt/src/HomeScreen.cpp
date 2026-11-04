@@ -74,12 +74,46 @@ HomeScreen::HomeScreen(QWidget* parent) : QWidget(parent) {
     code_->setVisible(false);
     outer->addWidget(code_);
 
+    auto* selfRow = new QHBoxLayout;
+    selfName_ = new QLabel(this);
+    selfRow->addWidget(selfName_, 1);
+    auto* selfRename = new QPushButton(QStringLiteral("Rename this device…"), this);
+    selfRow->addWidget(selfRename);
+    outer->addLayout(selfRow);
+    connect(selfRename, &QPushButton::clicked, this, &HomeScreen::renameSelf);
+
     devices_ = new QListWidget(this);
     devices_->setMaximumHeight(96);
     devices_->setVisible(false);
     outer->addWidget(devices_);
+    auto* devRow = new QHBoxLayout;
+    forgetButton_ = new QPushButton(QStringLiteral("Forget…"), this);
+    renameButton_ = new QPushButton(QStringLiteral("Rename…"), this);
+    forgetButton_->setEnabled(false);
+    renameButton_->setEnabled(false);
+    devRow->addWidget(forgetButton_);
+    devRow->addWidget(renameButton_);
+    devRow->addStretch(1);
+    outer->addLayout(devRow);
+    auto selectedDevice = [this]() -> QString {
+        auto* item = devices_->currentItem();
+        return item ? item->text() : QString();
+    };
+    connect(devices_, &QListWidget::itemSelectionChanged, this, [this] {
+        const bool has = devices_->currentRow() >= 0;
+        forgetButton_->setEnabled(has);
+        renameButton_->setEnabled(has);
+    });
     connect(devices_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
         if (item) emit unpair(item->text());
+    });
+    connect(forgetButton_, &QPushButton::clicked, this, [this, selectedDevice] {
+        const QString name = selectedDevice();
+        if (!name.isEmpty()) emit unpair(name);
+    });
+    connect(renameButton_, &QPushButton::clicked, this, [this, selectedDevice] {
+        const QString name = selectedDevice();
+        if (!name.isEmpty()) emit renameDevice(name);
     });
 
     // --- recents ---
@@ -140,6 +174,10 @@ void HomeScreen::setDevices(const QStringList& names) {
     devices_->clear();
     devices_->addItems(names);
     devices_->setVisible(!names.isEmpty());
+}
+
+void HomeScreen::setSelfName(const QString& name) {
+    selfName_->setText(QStringLiteral("This device: %1").arg(name.isEmpty() ? QStringLiteral("?") : name));
 }
 
 void HomeScreen::setSharing(bool sharing) {

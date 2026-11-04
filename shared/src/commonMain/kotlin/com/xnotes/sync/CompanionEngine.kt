@@ -21,7 +21,7 @@ class CompanionEngine(
     private val host: SyncEngineHost,
     pinsDir: File,
     /** Shown to the host at pairing (`Guest-<device-name>` until pinned). */
-    val deviceName: String,
+    var deviceName: String,
     /** Our own certificate fingerprint (lowercase hex), sent in `hello`. */
     val ownCertFp: String,
 ) {
@@ -159,6 +159,15 @@ class CompanionEngine(
             pairedName = null
         }
         return pins.unpin(name)
+    }
+
+    /** Rename a remembered host (user alias); the live session keeps its label too. */
+    fun renamePin(oldName: String, newName: String): Boolean = withLock(lock) {
+        val fp = pins.fpFor(oldName) ?: return false
+        if (pairedName == oldName) pairedName = newName
+        pins.unpin(oldName)
+        pins.pin(newName, fp)
+        true
     }
 
     // --- files ---

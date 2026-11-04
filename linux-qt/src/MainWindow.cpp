@@ -906,8 +906,31 @@ void MainWindow::setupCompanion() {
     });
     connect(home_, &xn::HomeScreen::pairBegin, this, [this] { home_->setPairCode(companion_->pairBegin()); });
     connect(home_, &xn::HomeScreen::unpair, this, [this](const QString& name) {
+        if (QMessageBox::question(this, QStringLiteral("Forget device"),
+                                  QStringLiteral("Forget %1? It will have to pair again to connect.").arg(name),
+                                  QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
         companion_->unpair(name);
         refreshHomeDevices();
+    });
+    connect(home_, &xn::HomeScreen::renameDevice, this, [this](const QString& oldName) {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("Rename device"),
+                                                   QStringLiteral("Alias for %1 (shown instead of its name):").arg(oldName),
+                                                   QLineEdit::Normal, oldName, &ok);
+        if (!ok || name.trimmed().isEmpty() || name == oldName) return;
+        if (!companion_->renameDevice(oldName, name.trimmed()))
+            statusBar()->showMessage(QStringLiteral("Could not rename %1").arg(oldName), 4000);
+        refreshHomeDevices();
+    });
+    connect(home_, &xn::HomeScreen::renameSelf, this, [this] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("This device's nickname"),
+                                                   QStringLiteral("Shown to the host in requests (empty restores the host name):"),
+                                                   QLineEdit::Normal, companion_->deviceName(), &ok);
+        if (!ok) return;
+        companion_->setDeviceName(name);
+        home_->setSelfName(companion_->deviceName());
     });
     connect(shared_, &xn::SharedPage::deleteShared, this, [this](const QString& id) {
         if (QMessageBox::question(this, QStringLiteral("Delete"),
@@ -972,6 +995,7 @@ void MainWindow::refreshHome() {
     home_->setStatus(status);
     home_->setConnected(device);
     home_->setSharing(true);
+    home_->setSelfName(companion_->deviceName());
     refreshHomeDevices();
     refreshHomeFiles();
 }

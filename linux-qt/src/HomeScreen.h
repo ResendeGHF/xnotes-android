@@ -27,6 +27,8 @@ signals:
     void serverToggled(bool on);
     void pairBegin();
     void unpair(const QString& name);
+    void renameDevice(const QString& oldName);
+    void renameSelf();
 
 public slots:
     /* Listening/connectivity line, e.g. "Listening on 192.168.1.5:42317". */
@@ -37,6 +39,8 @@ public slots:
     void setPairCode(const QString& code);
     void setDevices(const QStringList& names);
     void setSharing(bool sharing);
+    /* This companion's own nickname, shown to the host in requests. */
+    void setSelfName(const QString& name);
     /* Rebuild the recents grid from stored recents. */
     void refreshRecents();
 
@@ -47,6 +51,9 @@ private:
     QPushButton* serverButton_ = nullptr;
     QPushButton* pairButton_ = nullptr;
     QListWidget* devices_ = nullptr;
+    QPushButton* forgetButton_ = nullptr;
+    QPushButton* renameButton_ = nullptr;
+    QLabel* selfName_ = nullptr;
     QGridLayout* recentGrid_ = nullptr;
     QLabel* sharedRecentLabel_ = nullptr;
     QScrollArea* sharedRecentScroll_ = nullptr;

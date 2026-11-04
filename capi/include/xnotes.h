@@ -262,6 +262,8 @@ void xn_sync_hello(xn_sync* sync);
 void xn_sync_reset(xn_sync* sync);
 /* Forget a pinned device (unpair). */
 void xn_sync_unpair(xn_sync* sync, const char* name);
+int xn_sync_rename(xn_sync* sync, const char* old_name, const char* new_name);
+void xn_sync_set_device_name(xn_sync* sync, const char* name);
 int xn_sync_pin_count(const xn_sync* sync);
 char* xn_sync_pin_name(const xn_sync* sync, int index);
 

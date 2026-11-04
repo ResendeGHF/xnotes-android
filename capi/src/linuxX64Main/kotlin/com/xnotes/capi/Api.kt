@@ -1701,6 +1701,17 @@ fun xnSyncUnpair(sync: COpaquePointer?, name: String?) = guard(Unit) {
     sync!!.sync().engine.unpair(name ?: return@guard)
 }
 
+@CName("xn_sync_rename")
+fun xnSyncRename(sync: COpaquePointer?, old: String?, new: String?): Int = guard(0) {
+    if (sync!!.sync().engine.renamePin(old ?: return@guard 0, new ?: return@guard 0)) 1 else 0
+}
+
+@CName("xn_sync_set_device_name")
+fun xnSyncSetDeviceName(sync: COpaquePointer?, name: String?) = guard(Unit) {
+    val n = name?.takeIf { it.isNotBlank() } ?: return@guard
+    sync!!.sync().engine.deviceName = n
+}
+
 @CName("xn_sync_pin_count")
 fun xnSyncPinCount(sync: COpaquePointer?): Int = guard(0) {
     sync!!.sync().engine.pins().size

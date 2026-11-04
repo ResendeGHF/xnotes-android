@@ -62,7 +62,10 @@ HOST -> COMP index {files:[{id, path, kind:file|dir, version, size}], full:true}
 
 `host_cert_fp` / `companion_cert_fp`: lowercase hex SHA-256 of cert DER.
 `device_name`: e.g. `Pixel 8`; the companion shows `Guest-<device-name>` only
-for not-yet-paired devices (paired ones show their pinned name).
+for not-yet-paired devices (paired ones show their pinned name). Both sides
+may rename themselves (a user-set nickname travels as `device_name`) and
+keep a local alias per peer; identity is always the certificate fingerprint,
+never the name.
 
 ## Files
 
@@ -192,9 +195,13 @@ C <-> S  room_live {file, page, sideways, split, resume, shift, live_id, done}
 
 ## Policy (host side)
 
-- Default-deny set of **stable file/folder ids** (never paths), persisted as
-  `{"shared": [...]}` — the existing `SharePolicy` model, keyed by id.
-  The index only ever lists shared ids.
+- Default-deny set of **stable file/folder ids** (never paths). Grants are
+  per paired device: the host keeps one shared set per companion fingerprint
+  (SQLite, `devices` + `grants` tables, migrated once from the old global
+  `{"shared": [...]}` file) and only the active companion's grants gate the
+  index, ops and file serving. Sharing a folder shares its whole subtree,
+  present and future files.
+- The index only ever lists shared ids.
 - Rename/move keeps the id: the file stays shared and the companion sees it
   at its new path. Delete retires the id (policy entry pruned); a later file
   at the same path is a new id and stays unshared.

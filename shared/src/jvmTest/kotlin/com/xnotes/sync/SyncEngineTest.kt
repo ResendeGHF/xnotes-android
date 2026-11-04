@@ -3,6 +3,7 @@ package com.xnotes.sync
 import com.xnotes.core.platform.fileOf
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -232,6 +233,25 @@ class SyncEngineTest {
         // A full listing still retires what it omits.
         e.bytesReceived(SyncFrames.encode(SyncMsg.Index(3, -1, true, listOf(SyncFileEntry("u1", "a.xnote", 0, 9L, 12L)))))
         assertEquals(listOf("u1"), e.files().map { it.id })
+    }
+
+    @Test fun renamePinKeepsGrant() {
+        val (e, h) = engine()
+        e.onConnected()
+        h.out.clear()
+        // Unknown name: nothing happens.
+        assertFalse(e.renamePin("ghost", "poltergeist"))
+        // Pair a host through the full flow, then rename it.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Hello(1, "xnotes-android", 1, "Pixel 8", "bb".repeat(32))))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.PairRequest(2, "Pixel 8", "bb".repeat(32), e.beginPairing())))
+        e.decidePairing(true)
+        assertEquals("Pixel 8", e.pairedDevice())
+        assertTrue(e.renamePin("Pixel 8", "Tablet"))
+        assertEquals("Tablet", e.pairedDevice())
+        assertEquals(listOf("Tablet"), e.pins().map { it.name })
+        // Old name is gone.
+        assertFalse(e.renamePin("Pixel 8", "Phone"))
+        h.out.clear()
     }
 
     @Test fun pageOpsRoundTripCodec() {

@@ -16,7 +16,7 @@
 
 namespace xn {
 
-CompanionServer::CompanionServer(QObject* parent) : QObject(parent), deviceName_(QSysInfo::machineHostName()) {
+CompanionServer::CompanionServer(QObject* parent) : QObject(parent), deviceName_(loadDeviceName()) {
     host_.ctx = this;
     host_.sync_send = sendThunk;
     host_.sync_pair_request = pairRequestThunk;
@@ -38,6 +38,38 @@ CompanionServer::~CompanionServer() {
 
 QString CompanionServer::configDir() const {
     return QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+}
+
+QString CompanionServer::loadDeviceName() const {
+    QFile f(configDir() + QStringLiteral("/device_name"));
+    if (f.open(QIODevice::ReadOnly)) {
+        const QString saved = QString::fromUtf8(f.readAll()).trimmed();
+        if (!saved.isEmpty()) return saved;
+    }
+    return QSysInfo::machineHostName();
+}
+
+void CompanionServer::setDeviceName(const QString& name) {
+    const QString next = name.trimmed();
+    QFile f(configDir() + QStringLiteral("/device_name"));
+    if (next.isEmpty()) {
+        f.remove();
+    } else if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        f.write(next.toUtf8());
+    }
+    deviceName_ = next.isEmpty() ? QSysInfo::machineHostName() : next;
+    if (sync_) {
+        const QByteArray own = deviceName_.toUtf8();
+        xn_sync_set_device_name(sync_, own.constData());
+    }
+    emit statusChanged(status_);
+}
+
+bool CompanionServer::renameDevice(const QString& oldName, const QString& newName) {
+    if (sync_ && !oldName.isEmpty() && !newName.trimmed().isEmpty()) {
+        return xn_sync_rename(sync_, QFile::encodeName(oldName).constData(), QFile::encodeName(newName.trimmed()).constData()) != 0;
+    }
+    return false;
 }
 
 bool CompanionServer::ensureIdentity() {
