@@ -33,6 +33,10 @@
 
 #include <QPdfDocument>
 #include <QTreeView>
+#include <QSslSocket>
+#include <QSignalSpy>
+#include <QJsonDocument>
+#include <QDataStream>
 #include <QPdfWriter>
 
 #include <QPointingDevice>
@@ -757,6 +761,47 @@ private slots:
         navAction(QStringLiteral("Home"))->trigger();
         QTest::qWait(100);
         QCOMPARE(home->currentIndex(), 1);
+    }
+
+    /* A TLS client completes a handshake with the companion server and gets hello_ack. */
+    void companionTlsHandshake() {
+        xn::CompanionServer server;
+        QVERIFY(server.start());
+        qInfo("DBG test server running");
+        QSslSocket client;
+        client.setProtocol(QSsl::TlsV1_2OrLater);
+        client.setPeerVerifyMode(QSslSocket::VerifyNone);
+        client.ignoreSslErrors();
+        QSignalSpy clientEncrypted(&client, &QSslSocket::encrypted);
+        QString clientError;
+        QObject::connect(&client, &QSslSocket::errorOccurred, [&](QAbstractSocket::SocketError) { clientError = client.errorString(); });
+        client.connectToHostEncrypted(QStringLiteral("127.0.0.1"), xn::CompanionServer::kPort);
+        QVERIFY2(clientEncrypted.wait(10000), qPrintable(QStringLiteral("client handshake failed: %1 state=%2").arg(clientError).arg(client.state())));
+        QVERIFY(client.isEncrypted());
+        // Speak SYNC hello; the server must answer hello_ack.
+        const QByteArray hello = QStringLiteral(
+            "{\"t\":\"hello\",\"seq\":1,\"app\":\"test\",\"version\":1,"
+            "\"device_name\":\"probe\",\"host_cert_fp\":\"aa\"}").toUtf8();
+        QByteArray frame;
+        QDataStream ds(&frame, QIODevice::WriteOnly);
+        ds.setByteOrder(QDataStream::BigEndian);
+        ds << qint32(hello.size());
+        frame += hello;
+        QVERIFY(client.write(frame) == frame.size());
+        QVERIFY(client.waitForBytesWritten(5000));
+        QByteArray reply;
+        QElapsedTimer replyTimer;
+        replyTimer.start();
+        while (replyTimer.elapsed() < 5000 && reply.isEmpty()) {
+            QTest::qWait(50);
+            reply += client.readAll();
+        }
+        QVERIFY2(reply.size() > 4, qPrintable(QStringLiteral("short reply %1").arg(reply.size())));
+        const int n = (quint8(reply[0]) << 24) | (quint8(reply[1]) << 16) | (quint8(reply[2]) << 8) | quint8(reply[3]);
+        QVERIFY(reply.size() - 4 >= n);
+        const QJsonDocument doc = QJsonDocument::fromJson(reply.mid(4, n));
+        QCOMPARE(doc.object().value(QStringLiteral("t")).toString(), QStringLiteral("hello_ack"));
+        client.disconnectFromHost();
     }
 
     /* A PDF's outline lists its chapters; clicking one goes to its page. */

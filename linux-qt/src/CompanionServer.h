@@ -71,7 +71,9 @@ signals:
 
 private slots:
     void onNewConnection();
+    void onHandshakeStarted(QSslSocket* socket);
     void onEncrypted();
+    void takeSocket(QSslSocket* socket);
     void onReadyRead();
     void onDisconnected();
     void onTick();

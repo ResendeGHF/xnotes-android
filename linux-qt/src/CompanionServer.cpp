@@ -102,7 +102,11 @@ bool CompanionServer::start() {
         return false;
     }
     server_ = server;
+    connect(server_, &QSslServer::startedEncryptionHandshake, this, &CompanionServer::onHandshakeStarted);
     connect(server_, &QTcpServer::newConnection, this, &CompanionServer::onNewConnection);
+    connect(server_, &QSslServer::handshakeInterruptedOnError, this, [this](QSslSocket* socket, const QSslError&) {
+        if (socket != nullptr && socket == socket_) onDisconnected();
+    });
     const QByteArray pins = QFile::encodeName(configDir());
     const QByteArray name = deviceName_.toUtf8();
     const QByteArray fp = certFp_.toLatin1();
@@ -195,24 +199,42 @@ void CompanionServer::unbindEditor(xn_editor* editor) const {
     if (sync_ && editor) xn_sync_unbind_editor(sync_, editor);
 }
 
-void CompanionServer::onNewConnection() {
-    if (!server_) return;
+void CompanionServer::takeSocket(QSslSocket* socket) {
     // One host at a time: a new dial replaces the old one.
     if (socket_) {
         socket_->disconnectFromHost();
         socket_->deleteLater();
         socket_ = nullptr;
     }
-    socket_ = qobject_cast<QSslSocket*>(server_->nextPendingConnection());
+    socket_ = socket;
     if (!socket_) return;
     socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     connect(socket_, &QSslSocket::encrypted, this, &CompanionServer::onEncrypted);
     connect(socket_, &QSslSocket::readyRead, this, &CompanionServer::onReadyRead);
     connect(socket_, &QSslSocket::disconnected, this, &CompanionServer::onDisconnected);
-    connect(socket_, &QSslSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
-        if (socket_ && socket_->state() == QAbstractSocket::UnconnectedState) onDisconnected();
-    });
-    socket_->startServerEncryption();
+    connect(socket_, &QSslSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) { onDisconnected(); });
+    if (socket_->isEncrypted()) onEncrypted();
+}
+
+void CompanionServer::onHandshakeStarted(QSslSocket* socket) {
+    if (!server_ || socket == nullptr) return;
+    takeSocket(socket);
+}
+
+void CompanionServer::onNewConnection() {
+    if (!server_) return;
+    // QSslServer hands accepted sockets out through startedEncryptionHandshake with the
+    // handshake already running; the base-class queue is only a fallback for builds
+    // without auto-start.
+    if (!server_->hasPendingConnections()) return;
+    if (auto* socket = qobject_cast<QSslSocket*>(server_->nextPendingConnection())) {
+        if (socket->mode() == QSslSocket::UnencryptedMode) {
+            takeSocket(socket);
+            socket->startServerEncryption();
+        } else {
+            socket->deleteLater();
+        }
+    }
 }
 
 void CompanionServer::onEncrypted() {
