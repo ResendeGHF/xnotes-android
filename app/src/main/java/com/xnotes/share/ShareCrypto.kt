@@ -121,6 +121,48 @@ object ShareCrypto {
     fun pinningSslContextFor(identity: ServerIdentity): SSLContext =
         pinningSslContext(identity.fingerprintHex)
 
+    /**
+     * Trust manager for the companion client (SYNC.md v1 §Security). Presents
+     * no platform CAs: when [expectedFp] is set, only the peer whose live
+     * certificate fingerprints to it is accepted (pinned mutual TLS). When it
+     * is null (TOFU first connect), any peer is accepted but its fingerprint
+     * is recorded in [lastPeerFp] for the caller to show/pin. Either way every
+     * observed peer fingerprint lands in [lastPeerFp].
+     */
+    class ClientTrust(expectedFp: String?) : X509TrustManager {
+        @Volatile var expected: String? = expectedFp
+        @Volatile var lastPeerFp: String? = null
+            private set
+
+        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+            val leaf = chain.firstOrNull() ?: throw java.security.cert.CertificateException("empty chain")
+            val got = fingerprintOf(leaf)
+            lastPeerFp = got
+            val want = expected
+            if (want != null && !ShareProtocol.tokensEqual(got, want.lowercase())) {
+                throw java.security.cert.CertificateException("certificate fingerprint mismatch")
+            }
+        }
+    }
+
+    /**
+     * TLS client context that presents [identity]'s certificate (mutual TLS:
+     * the companion verifies the host too) and pins the server via [trust].
+     * Trust behavior matches [pinningSslContext]; see [ClientTrust].
+     */
+    fun clientSslContext(identity: ServerIdentity, trust: ClientTrust): SSLContext {
+        val ks = KeyStore.getInstance("PKCS12")
+        ks.load(null, null)
+        ks.setKeyEntry("share", identity.privateKey, CharArray(0), arrayOf(identity.certificate))
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+        kmf.init(ks, CharArray(0))
+        return SSLContext.getInstance("TLS").apply {
+            init(kmf.keyManagers, arrayOf(trust), SecureRandom())
+        }
+    }
+
     /** Trust managers of the platform default (for tests that need a baseline). */
     fun platformTrustManagers(): Array<X509TrustManager> {
         val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
