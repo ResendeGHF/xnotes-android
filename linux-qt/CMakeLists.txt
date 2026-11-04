@@ -45,6 +45,11 @@ add_library(xnotes_host STATIC
     src/SelectionBar.cpp src/SelectionBar.h
     src/CompanionServer.cpp src/CompanionServer.h
     src/HomeScreen.cpp src/HomeScreen.h
+    src/BrowsePage.cpp src/BrowsePage.h
+    src/SharedPage.cpp src/SharedPage.h
+    src/TileButton.cpp src/TileButton.h
+    src/NoteThumb.cpp src/NoteThumb.h
+    src/Recents.cpp src/Recents.h
     src/PdfText.cpp src/PdfText.h
     src/TextOverlay.cpp src/TextOverlay.h
     src/PdfExport.cpp src/PdfExport.h

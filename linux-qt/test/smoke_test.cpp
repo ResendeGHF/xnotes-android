@@ -740,7 +740,23 @@ private slots:
         QVERIFY(!server->certFingerprint().isEmpty());
         const QString code = server->pairBegin();
         QCOMPARE(code.size(), 6);
-        window.showHome();  // still home, nothing crashes on teardown paths
+        // Sidebar navigation: Home, Browse, Shared files.
+        auto navAction = [&](const QString& text) {
+            for (QAction* a : window.findChildren<QAction*>())
+                if (a->text() == text) return a;
+            return static_cast<QAction*>(nullptr);
+        };
+        QVERIFY(navAction(QStringLiteral("Browse")) != nullptr);
+        QVERIFY(navAction(QStringLiteral("Shared files")) != nullptr);
+        navAction(QStringLiteral("Browse"))->trigger();
+        QTest::qWait(100);
+        QCOMPARE(home->currentIndex(), 2);
+        navAction(QStringLiteral("Shared files"))->trigger();
+        QTest::qWait(100);
+        QCOMPARE(home->currentIndex(), 3);
+        navAction(QStringLiteral("Home"))->trigger();
+        QTest::qWait(100);
+        QCOMPARE(home->currentIndex(), 1);
     }
 
     /* A PDF's outline lists its chapters; clicking one goes to its page. */

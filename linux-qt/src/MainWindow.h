@@ -16,8 +16,10 @@ class QCheckBox;
 class QStackedWidget;
 
 namespace xn {
+class BrowsePage;
 class CompanionServer;
 class HomeScreen;
+class SharedPage;
 }
 class QComboBox;
 class QLineEdit;
@@ -57,8 +59,18 @@ protected:
     void closeEvent(QCloseEvent* e) override;
 
 private:
+    void showPage(int index);
+    void refreshSharedPage();
+    QString syncFilePath(const QString& id) const;
+
     QStackedWidget* stack_ = nullptr;
     xn::HomeScreen* home_ = nullptr;
+    xn::BrowsePage* browse_ = nullptr;
+    xn::SharedPage* shared_ = nullptr;
+    QAction* navHome_ = nullptr;
+    QAction* navBrowse_ = nullptr;
+    QAction* navShared_ = nullptr;
+    QList<QToolBar*> editorBars_;
     xn::CompanionServer* companion_ = nullptr;
     QString pendingOpenId_;
     QString boundFileId_;

@@ -1,8 +1,11 @@
 #include "MainWindow.h"
 
 #include "CanvasWidget.h"
+#include "BrowsePage.h"
 #include "CompanionServer.h"
 #include "HomeScreen.h"
+#include "Recents.h"
+#include "SharedPage.h"
 #include "Icons.h"
 #include "NoteFinder.h"
 #include "PageStylePopup.h"
@@ -16,6 +19,7 @@
 #include <QClipboard>
 #include <QColorDialog>
 #include <QDateTime>
+#include <QDir>
 #include <QDockWidget>
 #include <QGridLayout>
 #include <QInputDialog>
@@ -136,11 +140,34 @@ MainWindow::MainWindow() {
     grid->addWidget(canvas_, 0, 0);
     grid->addWidget(vbar_, 0, 1);
     grid->addWidget(hbar_, 1, 0);
+    // Sidebar navigation: Home, Browse, Shared files. The canvas is page 0.
+    auto* nav = new QToolBar(tr("Navigate"), this);
+    nav->setOrientation(Qt::Vertical);
+    nav->setMovable(false);
+    nav->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+    navHome_ = nav->addAction(xnIcon(QStringLiteral("home")), QStringLiteral("Home"));
+    navBrowse_ = nav->addAction(xnIcon(QStringLiteral("folder")), QStringLiteral("Browse"));
+    navShared_ = nav->addAction(xnIcon(QStringLiteral("share")), QStringLiteral("Shared files"));
+    for (QAction* a : {navHome_, navBrowse_, navShared_}) a->setCheckable(true);
+    connect(navHome_, &QAction::triggered, this, [this] { showHome(); });
+    connect(navBrowse_, &QAction::triggered, this, [this] { showPage(2); });
+    connect(navShared_, &QAction::triggered, this, [this] { showPage(3); });
+
     stack_ = new QStackedWidget(this);
     stack_->addWidget(central);
     home_ = new xn::HomeScreen(stack_);
     stack_->addWidget(home_);
-    setCentralWidget(stack_);
+    browse_ = new xn::BrowsePage(stack_);
+    stack_->addWidget(browse_);
+    shared_ = new xn::SharedPage(stack_);
+    stack_->addWidget(shared_);
+    auto* middle = new QWidget(this);
+    auto* row = new QHBoxLayout(middle);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(0);
+    row->addWidget(nav);
+    row->addWidget(stack_, 1);
+    setCentralWidget(middle);
     auto scrolled = [this] {
         if (syncingBars_ || !canvas_->editor()) return;
         xn_editor_scroll_to(canvas_->editor(), hbar_->value(), vbar_->value());
@@ -193,8 +220,6 @@ MainWindow::~MainWindow() {
 void MainWindow::buildUi() {
     QToolBar* bar = addToolBar(QStringLiteral("Main"));
     bar->setMovable(false);
-    bar->addAction(xnIcon(QStringLiteral("home")), QStringLiteral("Home"), this, &MainWindow::showHome);
-    bar->addSeparator();
     pagesAction_ = bar->addAction(xnIcon(QStringLiteral("sidebar")), QStringLiteral("Pages"));
     pagesAction_->setCheckable(true);
     pagesAction_->setChecked(true);
@@ -271,6 +296,7 @@ void MainWindow::buildUi() {
     // Second row: tools and their style.
     addToolBarBreak();
     QToolBar* tools = addToolBar(QStringLiteral("Tools"));
+    editorBars_ << bar << tools;
     tools->setMovable(false);
     tools_ = new QActionGroup(this);
     for (const ToolEntry& t : kTools) {
@@ -436,6 +462,7 @@ void MainWindow::buildUi() {
     // Find bar: in-note search, over the canvas like the selection bar.
     findBar_ = addToolBar(QStringLiteral("Find"));
     findBar_->setMovable(false);
+    editorBars_ << findBar_;
     findField_ = new QLineEdit(findBar_);
     findField_->setPlaceholderText(QStringLiteral("Search in note"));
     findField_->setClearButtonEnabled(true);
@@ -824,14 +851,33 @@ void MainWindow::install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, 
     pages_->setPaper(paper());
     pages_->setDocument(note_, canvas_->editor());
     if (QAction* tool = tools_->checkedAction()) canvas_->setTool(tool->data().toByteArray().constData());
-    stack_->setCurrentWidget(stack_->widget(0));
+    if (!path.isEmpty() && !QDir(path).absolutePath().startsWith(QDir::tempPath() + QLatin1Char('/')))
+        xn::Recents::touchLocal(path);
     if (colorAction_->data().isValid()) setInk(colorAction_->data().value<QColor>());
     applyToolSettings();
     syncWidth();
     refresh();
     refreshView();
-    stack_->setCurrentWidget(stack_->widget(0));
-    pagesDock_->setVisible(pagesAction_->isChecked() && !(note_ && xn_note_is_canvas(note_)));
+    showPage(0);
+}
+
+/* Sidebar navigation: Home, Browse, Shared files, or the open note's canvas. */
+void MainWindow::showPage(int index) {
+    stack_->setCurrentWidget(stack_->widget(index));
+    const bool onCanvas = index == 0;
+    for (QToolBar* bar : std::as_const(editorBars_)) bar->setVisible(onCanvas);
+    pagesDock_->setVisible(onCanvas && pagesAction_->isChecked() && !(note_ && xn_note_is_canvas(note_)));
+    navHome_->setChecked(index == 1);
+    navBrowse_->setChecked(index == 2);
+    navShared_->setChecked(index == 3);
+    if (index == 1) {
+        home_->refreshRecents();
+        refreshHome();
+    } else if (index == 2) {
+        browse_->refresh();
+    } else if (index == 3) {
+        refreshSharedPage();
+    }
 }
 
 /* --- companion home (SYNC.md v1) --- */
@@ -840,7 +886,11 @@ void MainWindow::setupCompanion() {
     companion_ = new xn::CompanionServer(this);
     connect(home_, &xn::HomeScreen::newNote, this, [this] { if (confirmDiscard()) newNote(); });
     connect(home_, &xn::HomeScreen::openFile, this, [this] { chooseOpen(); });
+    connect(home_, &xn::HomeScreen::openLocal, this, [this](const QString& path) { open(path); });
     connect(home_, &xn::HomeScreen::openShared, this, [this](const QString& id) { openSharedFile(id); });
+    connect(browse_, &xn::BrowsePage::newNote, this, [this] { if (confirmDiscard()) newNote(); });
+    connect(browse_, &xn::BrowsePage::openLocal, this, [this](const QString& path) { open(path); });
+    connect(shared_, &xn::SharedPage::openShared, this, [this](const QString& id) { openSharedFile(id); });
     connect(home_, &xn::HomeScreen::serverToggled, this, [this](bool on) {
         if (on) companion_->start();
         else companion_->stop();
@@ -851,14 +901,14 @@ void MainWindow::setupCompanion() {
         companion_->unpair(name);
         refreshHomeDevices();
     });
-    connect(home_, &xn::HomeScreen::deleteShared, this, [this](const QString& id) {
+    connect(shared_, &xn::SharedPage::deleteShared, this, [this](const QString& id) {
         if (QMessageBox::question(this, QStringLiteral("Delete"),
                                   QStringLiteral("Ask the host to delete this file? This cannot be undone."),
                                   QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
             return;
         companion_->requestDelete(id);
     });
-    connect(home_, &xn::HomeScreen::createShared, this, [this](const QString& dirId, const QString& name, int kind) {
+    connect(shared_, &xn::SharedPage::createShared, this, [this](const QString& dirId, const QString& name, int kind) {
         companion_->requestCreate(dirId, name, kind);
     });
     connect(companion_, &xn::CompanionServer::statusChanged, this, [this](const QString&) { refreshHome(); });
@@ -875,6 +925,7 @@ void MainWindow::setupCompanion() {
             showHome();
             statusBar()->showMessage(QStringLiteral("The host unshared the open file"), 4000);
         }
+        xn::Recents::forgetShared(id);
         refreshHomeFiles();
     });
     connect(companion_, &xn::CompanionServer::resync, this, [this](const QString& id, long long) { reopenSharedFile(id); });
@@ -893,8 +944,7 @@ void MainWindow::setupCompanion() {
 }
 
 void MainWindow::showHome() {
-    stack_->setCurrentWidget(home_);
-    pagesDock_->hide();
+    showPage(1);
     refreshHome();
 }
 
@@ -933,7 +983,7 @@ void MainWindow::refreshHomeDevices() {
     home_->setDevices(names);
 }
 
-void MainWindow::refreshHomeFiles() {
+void MainWindow::refreshSharedPage() {
     QList<xn::SharedFile> files;
     if (auto* s = companion_ ? companion_->sync() : nullptr) {
         const int n = xn_sync_file_count(s);
@@ -947,7 +997,27 @@ void MainWindow::refreshHomeFiles() {
             xn_free_string(path);
         }
     }
-    home_->setFiles(files);
+    shared_->setFiles(files);
+}
+
+void MainWindow::refreshHomeFiles() { refreshSharedPage(); }
+
+QString MainWindow::syncFilePath(const QString& id) const {
+    if (auto* s = companion_ ? companion_->sync() : nullptr) {
+        const int n = xn_sync_file_count(s);
+        for (int i = 0; i < n; ++i) {
+            char *fid = nullptr, *fpath = nullptr;
+            int kind = 0;
+            long long version = 0, size = 0;
+            if (!xn_sync_file_info(s, i, &fid, &fpath, &kind, &version, &size)) continue;
+            const bool match = id == QString::fromUtf8(fid);
+            const QString path = QString::fromUtf8(fpath);
+            xn_free_string(fid);
+            xn_free_string(fpath);
+            if (match) return path;
+        }
+    }
+    return id;
 }
 
 void MainWindow::approvePairing(const QString& device, const QString& fp) {
@@ -983,6 +1053,7 @@ void MainWindow::openSharedReady(const QString& id) {
     const QString local = QString::fromUtf8(path);
     xn_free_string(path);
     if (!open(local)) return;
+    xn::Recents::touchShared(id, syncFilePath(id));
     companion_->bindEditor(canvas_->editor(), id);
     boundFileId_ = id;
     lastPresencePage_ = -2;
@@ -1157,6 +1228,7 @@ bool MainWindow::save(bool askPath) {
         return false;
     }
     path_ = path;
+    if (!path.startsWith(QDir::tempPath() + QLatin1Char('/'))) xn::Recents::touchLocal(path);
     statusBar()->showMessage(QStringLiteral("Saved: %1").arg(path), 3000);
     refresh();
     return true;
