@@ -89,7 +89,13 @@ expandable to online later.
   module (`:shared:jvmTest`, `:shared:linuxX64Test`) can be verified
   here, and all sync logic must live there with tests on both targets.
 
-## Sync protocol (fresh design, draft v0)
+## Sync protocol (fresh implementation; the full wire spec lives in SYNC.md v1)
+
+Companion pivot (Nov 2026): Linux is the companion, not a full port. The Android
+app owns files/policy/authority and dials; the Linux companion listens, pairs
+(TLS + pinned self-signed certs + 6-digit code, TOFU), lists shared files, and
+both sides edit simultaneously with live strokes both ways. Details in SYNC.md;
+this section keeps the original threat model and semantics.
 
 Transport: TLS 1.2+ only, no plaintext listener. TOFU server cert
 pinning + per-device identity certs; every request carries a bearer
