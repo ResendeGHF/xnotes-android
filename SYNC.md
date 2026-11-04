@@ -80,6 +80,15 @@ for not-yet-paired devices (paired ones show their pinned name).
   committed batch). Companion caches `(id -> version, bytes)`.
 - Fetch: `C -> S fetch {id, offset?, length?}` / `S -> C file {id, version,
   total, offset, data(base64), last?}`. Chunked (256 KiB) so big PDFs stream.
+- Images ride the same chunking as their own message: `image_data {file,
+  image_id, total, offset, data(base64), last?}` (256 KiB), sent before the
+  `add_image` op that keys off `image_id`. Receivers hold the op until the
+  last chunk lands (bounded), then materialize the file and place the item.
+- Changes ops cannot carry (a joined PDF, a cover page) go as a whole-file
+  `file` push from the side that made them: current bytes (live document
+  when open), head bumped once, index delta alongside. The far side replaces
+  its bytes and reloads the file if open. Rare and explicit, never silent:
+  only a PDF join or a cover change sends one.
 - The companion opens a fetched file as a normal note; its bytes round-trip
   through the same codec, so a file the companion never edits stays
   byte-identical.
@@ -141,6 +150,11 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   the page when `sideways`); `close_room {page, sideways, a, b}`: close the
   strip `a` to `b`. Both sides re-execute the same deterministic cut
   (same base version ⇒ same result); no-op when the page or room is gone.
+- `add_image {page, image_id, width, height, rect:[x,y,w,h], orientation,
+  angle, flip_x?, flip_y?, part?}`: place an image on `page`. The bytes travel
+  first as `image_data` chunks (below); the op applies once they are in, and
+  waits for them when they are still in flight. Eraser-protected images are
+  never erased; select-delete of any non-stroke item is not synced in v1.
   Unknown op names are skipped with a log.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
@@ -194,11 +208,12 @@ View-only grants, kick/revoke mid-session, multi-companion fan-out beyond one,
 binary frames, mDNS discovery, online relay, text/markup ops, conflict-free
 undo across sides.
 
-v1 syncs strokes, erases, blank page add/remove and room open/close: local
-undo of a synced op
-does not propagate (re-sync by refetching), area-erase splits and sticky-note
-ink stay local, undo/redo of page commands is local, and non-stroke item types
-(text, markup, shapes, pasted page content) are not mirrored.
+v1 syncs strokes, erases, blank page add/remove, room open/close and image
+placement: local undo of a synced op does not propagate (re-sync by
+refetching), area-erase splits and sticky-note ink stay local, undo/redo of
+page commands is local, select-delete of non-stroke items is not mirrored,
+and pasted page content, cover flags and page reorder are not carried as ops
+(cover/PDF joins push whole-file bytes instead).
 
 ## Conformance
 

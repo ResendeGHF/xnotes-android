@@ -99,6 +99,13 @@ class NoteEditor(
     var onPageInserted: ((index: Int, width: Double, height: Double) -> Unit)? = null
     var onPageRemoved: ((index: Int) -> Unit)? = null
 
+    /**
+     * Sync hook: fired for every explicit local image insert so the bridge can
+     * send the bytes and submit a matching `add_image` op. Remote image ops
+     * apply directly and never fire this.
+     */
+    var onImageInserted: ((pageIndex: Int, item: ImageItem) -> Unit)? = null
+
     // --- document ---
 
     /**
@@ -431,6 +438,7 @@ class NoteEditor(
         state.document.dirty = true
         host.contentChanged()
         host.requestRender()
+        onImageInserted?.invoke(index, item)
         return item
     }
 

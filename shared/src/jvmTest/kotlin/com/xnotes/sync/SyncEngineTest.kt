@@ -26,7 +26,9 @@ class SyncEngineTest {
         val roomEdits = ArrayList<RoomEditRec>()
         val roomPreviews = ArrayList<RoomPreviewRec>()
         val roomPreviewClears = ArrayList<String>()
+        val images = ArrayList<ImageRec>()
         var resynced: Pair<String, Long>? = null
+        data class ImageRec(val file: String, val page: Int, val image: WireImage, val bytes: ByteArray)
 
         override fun onBytes(data: ByteArray) {
             SyncFrames.Decoder().feed(data).forEach { out += it }
@@ -88,6 +90,10 @@ class SyncEngineTest {
 
         override fun clearRemoteRoomPreview(fileId: String) {
             roomPreviewClears += fileId
+        }
+
+        override fun applyRemoteImage(fileId: String, page: Int, image: WireImage, bytes: ByteArray) {
+            images += ImageRec(fileId, page, image, bytes)
         }
 
         override fun applyResync(fileId: String, version: Long) {
@@ -269,6 +275,35 @@ class SyncEngineTest {
         e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 8L, 9L, "r-11", listOf(SyncOp.CloseRoom(0, true, 10.0, 60.0)))))
         assertEquals(2, h.roomEdits.size)
         assertEquals(SyncEngineTest.FakeHost.RoomEditRec("u1", 0, true, false, 10.0, 60.0), h.roomEdits.last())
+    }
+
+    @Test fun imageOpRoundTripAppliesAfterChunks() {
+        val (e, h) = engine()
+        e.onConnected()
+        h.out.clear()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        val bytes = ByteArray(300 * 1024) { (it % 251).toByte() } // spans two chunks
+        // Op before bytes: held, then applied once the last chunk lands.
+        val img = WireImage("i-1", 100, 80, 10.0, 20.0, 50.0, 40.0, 0, 0.0, false, false, null)
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(2, "u1", 7L, 8L, "i-1", listOf(SyncOp.AddImage(0, img)))))
+        assertTrue(h.images.isEmpty())
+        e.sendImageData("u1", "i-1", bytes)
+        // Drain what the engine queued for the socket back into itself.
+        val frames = h.out.toList()
+        h.out.clear()
+        for (m in frames) e.bytesReceived(SyncFrames.encode(m))
+        assertEquals(1, h.images.size)
+        assertEquals("u1", h.images.single().file)
+        assertEquals(img, h.images.single().image)
+        assertTrue(h.images.single().bytes.contentEquals(bytes))
+        assertEquals(8L, e.fileVersion("u1"))
+    }
+
+    @Test fun imageOpCodecRoundTrip() {
+        val img = WireImage("i-7", 640, 480, 1.0, 2.0, 3.0, 4.0, 90, 0.5, true, false, listOf(0.0, 0.0, 1.0, 0.5))
+        val msg = SyncMsg.Op(1, "u1", 3L, 4L, "d", listOf(SyncOp.AddImage(2, img)))
+        val back = SyncFrames.Decoder().feed(SyncFrames.encode(msg)).single() as SyncMsg.Op
+        assertEquals(listOf(SyncOp.AddImage(2, img)), back.ops)
     }
 
     @Test fun liveFrameUpdatesOverlay() {

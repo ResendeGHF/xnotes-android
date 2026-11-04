@@ -5,17 +5,25 @@ package com.xnotes.capi
 import com.xnotes.capi.c.xn_host
 import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.canvas.RoomEdit
+import com.xnotes.core.geometry.Flip
+import com.xnotes.core.geometry.Rect
+import com.xnotes.core.model.ImageData
+import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
-import com.xnotes.core.tools.Tool
+import com.xnotes.core.platform.File
+import com.xnotes.core.platform.asPath
 import com.xnotes.core.platform.fileOf
+import com.xnotes.core.platform.pathString
+import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 import com.xnotes.sync.CompanionEngine
 import com.xnotes.sync.SyncEngineHost
 import com.xnotes.sync.SyncFileEntry
 import com.xnotes.sync.SyncFingerprint
 import com.xnotes.sync.SyncOp
+import com.xnotes.sync.WireImage
 import com.xnotes.sync.WireSample
 import com.xnotes.sync.WireStroke
 import kotlinx.cinterop.CPointer
@@ -60,6 +68,20 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     private class ActiveRoom(val fileId: String, val page: Int, val id: String)
     private var activeRoom: ActiveRoom? = null
 
+    /** Received image files by sync file id, so unshare/close can drop them. */
+    private val imageFiles = HashMap<String, ArrayList<File>>()
+    private val imageDir: File = fileOf(fileOf(pinsDir), "sync-images").also {
+        // Stale from a previous run: nothing is bound this early, so nothing can reference them.
+        runCatching {
+            val fs = okio.FileSystem.SYSTEM
+            if (fs.exists(it.asPath())) {
+                fs.list(it.asPath()).forEach { p -> runCatching { fs.deleteRecursively(p) } }
+            } else {
+                fs.createDirectories(it.asPath())
+            }
+        }
+    }
+
     // --- binding ---
 
     fun bind(editor: CEditor, fileId: String) {
@@ -77,8 +99,11 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val fileId = reverse.remove(editor) ?: return
         editor.editor.onPageInserted = null
         editor.editor.onPageRemoved = null
+        editor.editor.onImageInserted = null
+        dropImageFiles(fileId)
         bindings.remove(fileId)
         active.remove(editor)
+        if (activeRoom?.fileId == fileId) activeRoom = null
         if (editor.controller.remoteLive === engine.liveOverlay) editor.controller.remoteLive = null
     }
 
@@ -97,6 +122,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         // Explicit local page edits submit matching ops; remote ones never fire these.
         editor.editor.onPageInserted = { index, w, h -> onPageInserted(editor, index, w, h) }
         editor.editor.onPageRemoved = { index -> onPageRemoved(editor, index) }
+        editor.editor.onImageInserted = { page, item -> onImageInserted(editor, page, item) }
     }
 
     // --- local gestures out ---
@@ -189,6 +215,37 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         engine.finishRoom(r.fileId, r.page, r.id, false, 0.0, 0.0, 0.0)
     }
 
+    private fun onImageInserted(editor: CEditor, page: Int, item: ImageItem) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val bytes = runCatching {
+            okio.FileSystem.SYSTEM.read(item.image.file.asPath()) { readByteArray() }
+        }.getOrNull() ?: return
+        val imageId = "i${dedupeCounter++}-${Random.nextInt().toString(16)}"
+        engine.sendImageData(fileId, imageId, bytes)
+        val part = item.part?.let { listOf(it.x, it.y, it.right, it.bottom) }
+        engine.submitOp(
+            fileId, base, imageId,
+            listOf(
+                SyncOp.AddImage(
+                    page,
+                    WireImage(
+                        imageId, item.image.width, item.image.height,
+                        item.rect.x, item.rect.y, item.rect.w, item.rect.h,
+                        item.orientation, item.angle, item.flip.x, item.flip.y, part,
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /** Drop received image files of [fileId] (unshare/close); the model owns applied ones. */
+    private fun dropImageFiles(fileId: String) {
+        val files = imageFiles.remove(fileId) ?: return
+        val fs = okio.FileSystem.SYSTEM
+        for (f in files) runCatching { fs.delete(f.asPath()) }
+    }
+
     // --- SyncEngineHost (remote in) ---
 
     override fun onBytes(data: ByteArray) {
@@ -223,7 +280,14 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     }
 
     override fun onFileGone(id: String) {
-        bindings.remove(id)?.let { reverse.remove(it) }
+        bindings.remove(id)?.let {
+            reverse.remove(it)
+            it.editor.onPageInserted = null
+            it.editor.onPageRemoved = null
+            it.editor.onImageInserted = null
+            activeRoom?.takeIf { r -> r.fileId == id }?.let { activeRoom = null }
+        }
+        dropImageFiles(id)
         memScoped {
             host.sync_file_gone?.invoke(host.ctx, id.cstr.ptr)
         }
@@ -298,6 +362,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         doc.dirty = true
         ce.state.relayout()
         ce.state.clampScroll()
+        host.content_changed?.invoke(host.ctx)
         ce.requestRender()
     }
 
@@ -311,6 +376,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         ce.state.invalidatePage(page)
         ce.state.relayout()
         ce.state.clampScroll()
+        host.content_changed?.invoke(host.ctx)
         ce.requestRender()
     }
 
@@ -319,7 +385,42 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         if (!ce.controller.applyRemoteRoomEdit(page, sideways, open, a, b)) {
             // Page or room gone (concurrent edit): refetch the whole file.
             engine.requestOpen(fileId)
+        } else {
+            host.content_changed?.invoke(host.ctx)
         }
+    }
+
+    override fun applyRemoteImage(fileId: String, page: Int, image: WireImage, bytes: ByteArray) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: run {
+            // The host moved on: refetch the whole file (it carries the image in its assets).
+            engine.requestOpen(fileId)
+            return
+        }
+        if (image.w <= 0 || image.h <= 0) return
+        val safeId = image.imageId.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(64).ifEmpty { "img" }
+        val safeFile = fileId.filter { it.isLetterOrDigit() }.take(24) + fileId.hashCode().toString(16)
+        val dest = fileOf(fileOf(imageDir, safeFile), "$safeId.bin")
+        runCatching {
+            val fs = okio.FileSystem.SYSTEM
+            fs.createDirectories(fileOf(imageDir, safeFile).asPath())
+            fs.write(dest.asPath()) { write(bytes) }
+        }.getOrNull() ?: return
+        imageFiles.getOrPut(fileId) { ArrayList() } += dest
+        val part = image.part?.takeIf { it.size == 4 }?.let { Rect(it[0], it[1], it[2] - it[0], it[3] - it[1]) }
+        val native = ImageItem(
+            ImageData(dest, image.width, image.height),
+            Rect(image.x, image.y, image.w, image.h),
+            orientation = image.orientation,
+            angle = image.angle,
+            flip = Flip.of(image.flipX, image.flipY),
+            part = part,
+        )
+        pg.items.add(native)
+        doc.dirty = true
+        ce.state.appendToCache(pg, native)
+        ce.requestRender()
     }
 
     override fun previewRemoteRoom(fileId: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {

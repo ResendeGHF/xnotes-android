@@ -146,7 +146,11 @@ class CompanionEngine(
     /** The socket dropped: forget live runs and half-fetched chunks. */
     fun onDisconnected() {
         liveOverlay?.clear()
-        withLock(lock) { assemblers.clear() }
+        withLock(lock) {
+            assemblers.clear()
+            imageAsm.clear()
+            pendingImages.clear()
+        }
     }
 
     fun unpair(name: String): Boolean {
@@ -257,6 +261,58 @@ class CompanionEngine(
         send(SyncMsg.RoomLive(nextSeq(), fileId, page, sideways, split, resume, shift, liveId, done = true))
     }
 
+    // --- images (chunked bytes first, then the placing op) ---
+
+    /** Largest single image accepted, so a bad peer cannot OOM the assembler. */
+    private val IMAGE_MAX_BYTES = 64L * 1024 * 1024
+
+    /** Chunks an image's encoded bytes; the `add_image` op follows on the same stream. */
+    fun sendImageData(fileId: String, imageId: String, bytes: ByteArray) {
+        if (bytes.isEmpty()) {
+            send(SyncMsg.ImageChunk(nextSeq(), fileId, imageId, 0L, 0L, "", last = true))
+            return
+        }
+        var off = 0
+        while (off < bytes.size) {
+            val n = minOf(IMAGE_CHUNK_BYTES, bytes.size - off)
+            send(
+                SyncMsg.ImageChunk(
+                    nextSeq(), fileId, imageId, bytes.size.toLong(), off.toLong(),
+                    base64Of(bytes.copyOfRange(off, off + n)), last = off + n >= bytes.size,
+                ),
+            )
+            off += n
+        }
+    }
+
+    private class ImageAsm(val file: String, val total: Long, val buf: ByteArray, var filled: Long = 0)
+    private data class PendingImage(val file: String, val op: SyncOp.AddImage)
+    private data class ImageBytes(val file: String, val bytes: ByteArray)
+    private val imageAsm = HashMap<String, ImageAsm>()
+    private val pendingImages = HashMap<String, ArrayList<PendingImage>>()
+    private val imageBytes = HashMap<String, ImageBytes>()
+    private val imageOrder = ArrayDeque<String>()
+
+    private fun rememberImageBytes(imageId: String, file: String, bytes: ByteArray) {
+        withLock(lock) {
+            imageBytes[imageId] = ImageBytes(file, bytes)
+            imageOrder.remove(imageId)
+            imageOrder.addLast(imageId)
+            while (imageOrder.size > IMAGE_KEPT || imageBytes.values.sumOf { it.bytes.size.toLong() } > IMAGE_KEPT_BYTES) {
+                val oldest = imageOrder.removeFirstOrNull() ?: break
+                if (imageBytes.size <= 1) break
+                imageBytes.remove(oldest)
+            }
+        }
+    }
+
+    private fun dropImageLocked(imageId: String) {
+        imageAsm.remove(imageId)
+        pendingImages.remove(imageId)
+        imageBytes.remove(imageId)
+        imageOrder.remove(imageId)
+    }
+
     // --- inbound ---
 
     private fun onMessage(msg: SyncMsg) {
@@ -271,6 +327,7 @@ class CompanionEngine(
             is SyncMsg.Resync -> onResync(msg)
             is SyncMsg.Live -> onLive(msg)
             is SyncMsg.RoomLive -> onRoomLive(msg)
+            is SyncMsg.ImageChunk -> onImageChunk(msg)
             is SyncMsg.Presence -> withLock(lock) { hostPresence[msg.file] = msg.page }
             is SyncMsg.IndexSubscribe -> Unit // we send it; the host answers an index
             is SyncMsg.HelloAck -> Unit // the host never sends one; we answer hellos
@@ -427,6 +484,7 @@ class CompanionEngine(
                 is SyncOp.RemovePage -> host.applyRemotePageRemove(m.file, op.index)
                 is SyncOp.OpenRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, true, op.at, op.at + op.size)
                 is SyncOp.CloseRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, false, op.a, op.b)
+                is SyncOp.AddImage -> onRemoteImage(m.file, op)
                 is SyncOp.Unknown -> Unit
             }
         }
@@ -451,15 +509,79 @@ class CompanionEngine(
         if (m.samples.isEmpty() && !m.done) return
         liveOverlay?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done)
         host.onLiveDirty()
-    }
-
-    private fun onRoomLive(m: SyncMsg.RoomLive) {
+    }    private fun onRoomLive(m: SyncMsg.RoomLive) {
         if (m.done) {
             host.clearRemoteRoomPreview(m.file)
         } else {
             host.previewRemoteRoom(m.file, m.page, m.sideways, m.split, m.resume, m.shift)
         }
         host.onLiveDirty()
+    }
+
+    private fun onImageChunk(m: SyncMsg.ImageChunk) {
+        // Bytes precede their op on the same stream; a mismatch drops the transfer.
+        if (m.total < 0 || m.total > IMAGE_MAX_BYTES || m.offset < 0 || m.offset > m.total) {
+            withLock(lock) { dropImageLocked(m.imageId) }
+            return
+        }
+        if (m.total == 0L) {
+            if (!m.last) {
+                withLock(lock) { dropImageLocked(m.imageId) }
+                return
+            }
+            rememberImageBytes(m.imageId, m.file, ByteArray(0))
+            flushImage(m.imageId)
+            return
+        }
+        val asm = withLock(lock) { imageAsm.getOrPut(m.imageId) { ImageAsm(m.file, m.total, ByteArray(m.total.toInt())) } }
+        if (asm.total != m.total || asm.file != m.file) {
+            withLock(lock) { dropImageLocked(m.imageId) }
+            return
+        }
+        val bytes = bytesOfBase64(m.data) ?: run {
+            withLock(lock) { dropImageLocked(m.imageId) }
+            return
+        }
+        if (m.offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            withLock(lock) { dropImageLocked(m.imageId) }
+            return
+        }
+        bytes.copyInto(asm.buf, asm.filled.toInt())
+        asm.filled += bytes.size
+        if (!m.last && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            withLock(lock) { dropImageLocked(m.imageId) }
+            return
+        }
+        val data = asm.buf.copyOf(asm.filled.toInt())
+        withLock(lock) { imageAsm.remove(m.imageId) }
+        rememberImageBytes(m.imageId, m.file, data)
+        flushImage(m.imageId)
+    }
+
+    /** An `add_image` op: apply at once when the bytes are in, else hold for them. */
+    private fun onRemoteImage(file: String, op: SyncOp.AddImage) {
+        val ready = withLock(lock) { imageBytes[op.image.imageId]?.takeIf { it.file == file } }
+        if (ready != null) {
+            host.applyRemoteImage(file, op.page, op.image, ready.bytes)
+            return
+        }
+        withLock(lock) {
+            val pend = pendingImages.getOrPut(op.image.imageId) { ArrayList() }
+            pend += PendingImage(file, op)
+            while (pendingImages.values.sumOf { it.size } > IMAGE_PENDING_MAX) {
+                val first = pendingImages.keys.firstOrNull() ?: break
+                val list = pendingImages[first]!!
+                list.removeAt(0)
+                if (list.isEmpty()) pendingImages.remove(first)
+            }
+        }
+    }
+
+    private fun flushImage(imageId: String) {
+        val pend = withLock(lock) { pendingImages.remove(imageId) } ?: return
+        val ready = withLock(lock) { imageBytes[imageId] } ?: return
+        for (p in pend) host.applyRemoteImage(p.file, p.op.page, p.op.image, ready.bytes)
     }
 
     private fun markDedupe(file: String, dedupe: String): Boolean = withLock(lock) {
@@ -476,6 +598,16 @@ class CompanionEngine(
     companion object {
         /** Suffix the host appends when fanning our batch back (tolerated either way). */
         const val FAN_SUFFIX = ":fanned"
+
+        /** Image bytes chunked at the same size as file chunks. */
+        const val IMAGE_CHUNK_BYTES = 256 * 1024
+
+        /** Completed images remembered, for ops that arrive after their bytes. */
+        const val IMAGE_KEPT = 8
+        const val IMAGE_KEPT_BYTES = 64L * 1024 * 1024
+
+        /** Image ops held for bytes still in flight, across all files. */
+        const val IMAGE_PENDING_MAX = 16
 
         /** Heartbeat every 20 s; silence over 60 s drops the connection. */
         const val HEARTBEAT_MS = 20_000L

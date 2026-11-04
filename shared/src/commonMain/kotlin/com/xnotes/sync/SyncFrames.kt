@@ -149,6 +149,20 @@ sealed interface SyncMsg {
         val last: Boolean,
     ) : SyncMsg
 
+    /**
+     * One chunk of an image's encoded bytes, keyed by [imageId]. Chunks precede
+     * the `add_image` op on the wire; the op applies once all bytes are in.
+     */
+    data class ImageChunk(
+        override val seq: Int,
+        val file: String,
+        val imageId: String,
+        val total: Long,
+        val offset: Long,
+        val data: String,
+        val last: Boolean,
+    ) : SyncMsg
+
     data class Op(
         override val seq: Int,
         val file: String,

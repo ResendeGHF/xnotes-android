@@ -64,6 +64,12 @@ interface SyncEngineHost {
     fun clearRemoteRoomPreview(fileId: String)
 
     /**
+     * Place a committed remote image on [page]: [bytes] are its encoded file
+     * (PNG/JPEG/SVG as sent). Applies to the open document, bypassing undo.
+     */
+    fun applyRemoteImage(fileId: String, page: Int, image: WireImage, bytes: ByteArray)
+
+    /**
      * [fileId]'s head moved under us: drop the open document's state and
      * refetch. The engine already queued the fetch.
      */

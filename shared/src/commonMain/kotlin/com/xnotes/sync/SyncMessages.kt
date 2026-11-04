@@ -26,6 +26,26 @@ data class WireStroke(
     val samples: List<WireSample>,
 )
 
+/**
+ * An image as it crosses the wire. The bytes travel separately in `image_data`
+ * chunks keyed by [imageId]; the op applies once they are complete.
+ */
+data class WireImage(
+    val imageId: String,
+    val width: Int,
+    val height: Int,
+    val x: Double,
+    val y: Double,
+    val w: Double,
+    val h: Double,
+    val orientation: Int,
+    val angle: Double,
+    val flipX: Boolean,
+    val flipY: Boolean,
+    /** Part fractions [l, t, r, b], or null for the whole image. */
+    val part: List<Double>?,
+)
+
 /** Committed ops inside an `op` frame. */
 sealed interface SyncOp {
     data class AddStroke(val page: Int, val stroke: WireStroke) : SyncOp
@@ -38,6 +58,8 @@ sealed interface SyncOp {
     data class OpenRoom(val page: Int, val sideways: Boolean, val at: Double, val size: Double) : SyncOp
     /** Close the strip [a] to [b] of a room on [page]. */
     data class CloseRoom(val page: Int, val sideways: Boolean, val a: Double, val b: Double) : SyncOp
+    /** Place an image on [page]; its bytes arrive in `image_data` chunks keyed by id. */
+    data class AddImage(val page: Int, val image: WireImage) : SyncOp
     data class Unknown(val name: String) : SyncOp
 }
 
@@ -76,6 +98,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
     var resume = 0.0
     var shift = 0.0
     var liveId = ""
+    var imageId = ""
     var dirId: String? = null
     var name = ""
     var kind = 0
@@ -120,6 +143,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "resume" -> resume = doubleOr(p, 0.0)
             "shift" -> shift = doubleOr(p, 0.0)
             "live_id" -> liveId = stringOr(p, "")
+            "image_id" -> imageId = stringOr(p, "")
             "dir_id" -> dirId = stringOrNull(p)
             "name" -> name = stringOr(p, "")
             "kind" -> kind = intOr(p, 0)
@@ -140,6 +164,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "index" -> SyncMsg.Index(seq, replyTo, full, files ?: emptyList())
         "fetch" -> SyncMsg.Fetch(seq, id, offset, length)
         "file" -> SyncMsg.FileChunk(seq, id, version, total, offset, data, last)
+        "image_data" -> SyncMsg.ImageChunk(seq, id, imageId, total, offset, data, last)
         "op" -> SyncMsg.Op(seq, id, baseVersion, version, dedupe, ops ?: emptyList())
         "op_ack" -> SyncMsg.OpAck(seq, replyTo, id, version)
         "resync" -> SyncMsg.Resync(seq, id, version)
@@ -237,6 +262,18 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.name("seq").value(msg.seq)
             w.name("id").value(msg.id)
             w.name("version").value(msg.version.toDouble())
+            w.name("total").value(msg.total.toDouble())
+            w.name("offset").value(msg.offset.toDouble())
+            w.name("data").value(msg.data)
+            w.name("last").value(msg.last)
+            w.endObject()
+        }
+        is SyncMsg.ImageChunk -> {
+            w.beginObject()
+            w.name("t").value("image_data")
+            w.name("seq").value(msg.seq)
+            w.name("file").value(msg.file)
+            w.name("image_id").value(msg.imageId)
             w.name("total").value(msg.total.toDouble())
             w.name("offset").value(msg.offset.toDouble())
             w.name("data").value(msg.data)
@@ -434,6 +471,30 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.name("b").value(op.b)
             w.endObject()
         }
+        is SyncOp.AddImage -> {
+            w.beginObject()
+            w.name("op").value("add_image")
+            w.name("page").value(op.page)
+            w.name("image_id").value(op.image.imageId)
+            w.name("width").value(op.image.width.toDouble())
+            w.name("height").value(op.image.height.toDouble())
+            w.name("rect").beginArray()
+            w.value(op.image.x)
+            w.value(op.image.y)
+            w.value(op.image.w)
+            w.value(op.image.h)
+            w.endArray()
+            w.name("orientation").value(op.image.orientation)
+            w.name("angle").value(op.image.angle)
+            if (op.image.flipX) w.name("flip_x").value(true)
+            if (op.image.flipY) w.name("flip_y").value(true)
+            op.image.part?.let { p ->
+                w.name("part").beginArray()
+                for (v in p) w.value(v)
+                w.endArray()
+            }
+            w.endObject()
+        }
         is SyncOp.Unknown -> {
             w.beginObject()
             w.name("op").value(op.name)
@@ -539,6 +600,13 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var size = 0.0
         var a = 0.0
         var b = 0.0
+        var imageId = ""
+        var rect: List<Double>? = null
+        var orientation = 0
+        var angle = 0.0
+        var flipX = false
+        var flipY = false
+        var part: List<Double>? = null
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
@@ -552,6 +620,13 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                 "size" -> size = doubleOr(p, 0.0)
                 "a" -> a = doubleOr(p, 0.0)
                 "b" -> b = doubleOr(p, 0.0)
+                "image_id" -> imageId = stringOr(p, "")
+                "rect" -> rect = numberListOr(p)
+                "orientation" -> orientation = intOr(p, 0)
+                "angle" -> angle = doubleOr(p, 0.0)
+                "flip_x" -> flipX = boolOr(p, false)
+                "flip_y" -> flipY = boolOr(p, false)
+                "part" -> part = numberListOr(p)
                 "stroke" -> if (p.peek() == JsonPull.Token.BEGIN_OBJECT) {
                     p.beginObject()
                     while (p.hasNext()) {
@@ -587,8 +662,36 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
             "remove_page" -> SyncOp.RemovePage(index)
             "open_room" -> SyncOp.OpenRoom(page, sideways, at, size)
             "close_room" -> SyncOp.CloseRoom(page, sideways, a, b)
+            "add_image" -> {
+                val r = rect ?: emptyList()
+                SyncOp.AddImage(
+                    page,
+                    WireImage(
+                        imageId, width.toInt(), height.toInt(),
+                        r.getOrElse(0) { 0.0 }, r.getOrElse(1) { 0.0 },
+                        r.getOrElse(2) { 0.0 }, r.getOrElse(3) { 0.0 },
+                        orientation, angle, flipX, flipY,
+                        part?.takeIf { it.size == 4 },
+                    ),
+                )
+            }
             else -> SyncOp.Unknown(name ?: "")
         }
+    }
+    p.endArray()
+    return out
+}
+
+/** A JSON array of numbers, or null when not an array. */
+private fun numberListOr(p: JsonPull): List<Double>? {
+    if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+        p.skipValue()
+        return null
+    }
+    val out = ArrayList<Double>()
+    p.beginArray()
+    while (p.hasNext()) {
+        if (p.peek() == JsonPull.Token.NUMBER) out += p.nextDouble() else p.skipValue()
     }
     p.endArray()
     return out
