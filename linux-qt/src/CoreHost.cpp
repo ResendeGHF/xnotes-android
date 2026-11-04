@@ -1,6 +1,7 @@
 #include "CoreHost.h"
 
 #include "PdfPages.h"
+#include "PdfText.h"
 
 #include <QFontMetricsF>
 #include <QPdfDocument>
@@ -11,12 +12,15 @@
 #include <QTimer>
 
 #include <cmath>
+#include <cstring>
 
 namespace xn {
 
 // --- layers ------------------------------------------------------------------------------------
 
 namespace {
+/* The PDF pages whose text is kept. */
+constexpr int kKeptPageTexts = 48;
 constexpr QPainter::RenderHints kHints = QPainter::Antialiasing | QPainter::SmoothPixmapTransform | QPainter::TextAntialiasing;
 }
 
@@ -433,6 +437,7 @@ CoreHost::CoreHost(bool background)
     host_.pdf_page_count = pdfPageCount;
     host_.pdf_page_size = pdfPageSize;
     host_.draw_pdf_page = drawPdfPage;
+    host_.pdf_text = pdfText;
     if (background) host_.wake = wake;
 }
 
@@ -566,6 +571,25 @@ QPdfDocument* CoreHost::pdf(const char* path) {
 int CoreHost::pdfPageCount(void* ctx, const char* path) {
     QPdfDocument* doc = H(ctx)->pdf(path);
     return doc ? doc->pageCount() : -1;
+}
+
+int CoreHost::pdfText(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes) {
+    CoreHost* self = H(ctx);
+    QPdfDocument* doc = self->pdf(path);
+    if (!doc || page < 0 || page >= doc->pageCount()) return -1;
+    const QString key = QString::fromUtf8(path) + QLatin1Char('#') + QString::number(page);
+    auto it = self->pageText_.find(key);
+    if (it == self->pageText_.end()) {
+        // The pages read last are kept: a reader works on a few at a time.
+        if (self->pageText_.size() >= kKeptPageTexts) self->pageText_.clear();
+        it = self->pageText_.insert(key, pdftext::read(doc, page));
+    }
+    const int count = int(it->codepoints.size());
+    if (count > 0 && capacity >= count && codepoints && boxes) {
+        memcpy(codepoints, it->codepoints.constData(), sizeof(uint32_t) * size_t(count));
+        memcpy(boxes, it->boxes.constData(), sizeof(float) * 4 * size_t(count));
+    }
+    return count;
 }
 
 int CoreHost::pdfPageSize(void* ctx, const char* path, int page, double* w, double* h) {

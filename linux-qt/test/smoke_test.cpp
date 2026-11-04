@@ -10,6 +10,7 @@
 #include "PageStylePopup.h"
 #include "PagesPanel.h"
 #include "PenStylePopup.h"
+#include "PdfText.h"
 #include "Icons.h"
 
 #include <QAbstractButton>
@@ -543,6 +544,25 @@ private slots:
 
         canvas.setNote(nullptr);
         xn_note_close(note);
+    }
+
+    /* PDF text is read per character with its box, the input to selecting and marking it. */
+    void pdfTextReadsCharacters() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        QPdfDocument doc;
+        QCOMPARE(doc.load(path), QPdfDocument::Error::None);
+        const xn::pdftext::Page page = xn::pdftext::read(&doc, 0);
+        QString text;
+        for (uint32_t cp : page.codepoints) text += QString::fromUcs4(reinterpret_cast<const char32_t*>(&cp), 1);
+        QCOMPARE(text, QStringLiteral("Hello xnotes world\nSecond line here"));
+        QCOMPARE(page.boxes.size(), page.codepoints.size() * 4);
+        // The H of the first line starts at x = 72 points (its ink starts a little inside the box).
+        QVERIFY(qAbs(page.boxes[0] - 72) < 3);
+        QVERIFY(page.boxes[2] > page.boxes[0]);
+        // The space after Hello has no box, so it selects nothing.
+        QCOMPARE(text.at(5), QLatin1Char(' '));
+        QVERIFY(page.boxes[4 * 5 + 2] <= page.boxes[4 * 5]);
     }
 
     /* The scroll bars follow the view and move it. */

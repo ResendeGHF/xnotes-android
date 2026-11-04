@@ -21,6 +21,7 @@ class QScrollBar;
 class PageStylePopup;
 class PagesPanel;
 class QDockWidget;
+class PdfTextBar;
 class SelectionBar;
 
 class MainWindow : public QMainWindow {
@@ -59,6 +60,7 @@ private:
     QLabel* inputLabel_;
     bool dark_ = true;
     SelectionBar* selectionBar_;
+    PdfTextBar* textBar_;
     QPointer<PageStylePopup> pageStyle_;
     QSlider* width_;
     QLabel* widthValue_;

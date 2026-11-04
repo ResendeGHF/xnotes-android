@@ -185,6 +185,18 @@ typedef struct xn_host {
      * then calls xn_editor_take_results there, soon (a queued call, not from inside wake).
      */
     void (*wake)(void* ctx);
+
+    /* --- v4. May be NULL (then the PDFs have no selectable text). --- */
+
+    /*
+     * A PDF page's text in reading order: one entry per character, its codepoint (UTF-32; a
+     * space or line break where the page has one, with an empty box) and its box (left, top,
+     * right, bottom in points, top-left origin, the page as displayed). Returns the number of
+     * entries, or -1 when the page cannot be read. Writes only when capacity >= the count, so
+     * call with capacity 0 to ask for the count first. codepoints holds one value per entry,
+     * boxes four floats per entry.
+     */
+    int (*pdf_text)(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes);
 } xn_host;
 
 /* --- library -------------------------------------------------------------------------------- */
@@ -316,6 +328,17 @@ int xn_editor_can_undo(const xn_editor* editor);
 int xn_editor_can_redo(const xn_editor* editor);
 void xn_editor_escape(xn_editor* editor);
 void xn_editor_delete_selection(xn_editor* editor);
+
+/* PDF text selection (v4): the selection a long press or the markup tool's drag made. */
+enum { XN_MARK_HIGHLIGHT = 0, XN_MARK_UNDERLINE = 1, XN_MARK_STRIKEOUT = 2, XN_MARK_SQUIGGLY = 3 };
+int xn_editor_pdf_has_selection(const xn_editor* editor);
+/* The selected text as UTF-8 (free with xn_free_string), or NULL when nothing is selected. */
+char* xn_editor_pdf_selected_text(const xn_editor* editor);
+/* The selection's viewport rect (x, y, w, h) for its menu; 0 when none shows. */
+int xn_editor_pdf_selection_rect(const xn_editor* editor, double* out_xywh);
+/* Marks the selection (XN_MARK_*) on each page it covers, one undo step. */
+void xn_editor_pdf_mark(xn_editor* editor, int type);
+void xn_editor_pdf_clear(xn_editor* editor);
 
 /* The armed tool's id (a static string). */
 const char* xn_editor_tool(const xn_editor* editor);

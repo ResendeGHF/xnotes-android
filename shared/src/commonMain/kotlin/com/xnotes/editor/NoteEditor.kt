@@ -2,9 +2,11 @@ package com.xnotes.editor
 
 import com.xnotes.canvas.CanvasState
 import com.xnotes.canvas.InteractionController
+import com.xnotes.canvas.PdfTextController
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.history.AddItem
+import com.xnotes.core.history.AddMarkups
 import com.xnotes.core.history.AddPage
 import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
@@ -20,9 +22,14 @@ import com.xnotes.core.model.Page
 import com.xnotes.core.model.PageMargins
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageStyle
+import com.xnotes.core.model.MarkupType
 import com.xnotes.core.model.deepCopy
 import com.xnotes.core.pal.TextMeasurer
+import com.xnotes.core.pdf.Markups
+import com.xnotes.core.pdf.PageText
+import com.xnotes.core.pdf.TextSelection
 import com.xnotes.core.platform.File
+import com.xnotes.core.platform.epochMillisNow
 import com.xnotes.core.tools.Tool
 
 /** Something the editor refused or had nothing to do for; the host words it for the user. */
@@ -102,6 +109,26 @@ class NoteEditor(
         history.clear()
         state.invalidateAllCaches()
         state.relayout()
+    }
+
+    // --- PDF text ---
+
+    /**
+     * Marks the PDF text [sel] as [type] in the ink colour at the markup intensity: one markup on each
+     * note page it covers, as one undo step. [texts] drops its selection once the marks are made.
+     */
+    fun markText(texts: PdfTextController, sel: TextSelection, type: MarkupType, textOf: (Int) -> PageText?) {
+        val cfg = controller.configFor(Tool.MARKUP)
+        val made = Markups.of(sel, textOf, type, controller.inkColor, cfg.markupIntensity, epochMillisNow())
+        texts.clear()
+        val steps = made.groupBy({ it.first }, { it.second })
+            .mapNotNull { (i, marks) -> state.document.pages.getOrNull(i)?.let { AddMarkups(it, marks) } }
+        if (steps.isEmpty()) return
+        val edit = steps.singleOrNull() ?: CompositeCommand(steps)
+        edit.redo()
+        history.push(edit)
+        host.contentChanged()
+        host.requestRender()
     }
 
     // --- tools ---

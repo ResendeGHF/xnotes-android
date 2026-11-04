@@ -43,6 +43,7 @@ add_library(xnotes_host STATIC
     src/CanvasWidget.cpp src/CanvasWidget.h
     src/MainWindow.cpp src/MainWindow.h
     src/SelectionBar.cpp src/SelectionBar.h
+    src/PdfText.cpp src/PdfText.h
     src/TextOverlay.cpp src/TextOverlay.h
     src/PdfExport.cpp src/PdfExport.h
     src/NoteFinder.cpp src/NoteFinder.h

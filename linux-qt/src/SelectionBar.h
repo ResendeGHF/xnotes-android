@@ -33,6 +33,23 @@ private:
     void showStyle();
 };
 
+/* The bar over a settled PDF text selection: its marks and copy (the Android text selection menu). */
+class PdfTextBar : public QFrame {
+    Q_OBJECT
+public:
+    explicit PdfTextBar(CanvasWidget* canvas);
+
+    /* Show over the text selection while the core has one, else hide. */
+    void refresh();
+    /* The core's selection_menu: a text selection shows, or clears, here. */
+    void onMenu(bool shown) { if (shown) refresh(); else hide(); }
+
+private:
+    CanvasWidget* canvas_;
+
+    xn_editor* editor() const;
+};
+
 /* Colour and thickness of the selection's strokes and shapes, applied live. */
 class StylePopup : public QFrame {
     Q_OBJECT

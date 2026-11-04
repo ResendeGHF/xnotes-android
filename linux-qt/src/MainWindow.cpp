@@ -56,6 +56,7 @@ const ToolEntry kTools[] = {
     {"select", "Selection", "6", "select"},
     {"shape", "Shape", "7", "shape"},
     {"text_box", "Text", "8", "textBox"},
+    {"markup", "Markup", "9", "ic_stroke_highlighter"},
 };
 
 /* Kinds of pen (the Android stroke tools), drawn by the pen button. */
@@ -429,6 +430,10 @@ void MainWindow::buildUi() {
     connect(canvas_, &CanvasWidget::selectionMenu, this, [this](bool shown, QRectF) { selectionBar_->onMenu(shown); });
     connect(canvas_, &CanvasWidget::viewChanged, selectionBar_, &SelectionBar::refresh);
     connect(canvas_, &CanvasWidget::contentChanged, selectionBar_, &SelectionBar::refresh);
+    textBar_ = new PdfTextBar(canvas_);
+    connect(canvas_, &CanvasWidget::selectionMenu, this, [this](bool shown, QRectF) { textBar_->onMenu(shown); });
+    connect(canvas_, &CanvasWidget::viewChanged, textBar_, &PdfTextBar::refresh);
+    connect(canvas_, &CanvasWidget::contentChanged, textBar_, &PdfTextBar::refresh);
     connect(canvas_, &CanvasWidget::contextMenu, this, &MainWindow::showContextMenu);
     connect(canvas_, &CanvasWidget::toolChanged, this, [this](const QString& id) {
         if (installing_) return;

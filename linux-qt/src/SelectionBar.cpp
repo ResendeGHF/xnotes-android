@@ -4,6 +4,8 @@
 #include "Icons.h"
 
 #include <QColorDialog>
+#include <QGuiApplication>
+#include <QClipboard>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -97,6 +99,53 @@ void SelectionBar::refresh() {
     const int gap = 10;
     const QSize size = sizeHint();
     // Above the selection, or below it when there is no room; always inside the canvas.
+    double x = sel.center().x() - size.width() / 2.0;
+    double y = sel.top() - size.height() - gap;
+    if (y < 4) y = sel.bottom() + gap;
+    x = std::clamp(x, 4.0, std::max(4.0, double(canvas_->width() - size.width() - 4)));
+    y = std::clamp(y, 4.0, std::max(4.0, double(canvas_->height() - size.height() - 4)));
+    move(int(x), int(y));
+    resize(size);
+    show();
+    raise();
+}
+
+// --- the PDF text bar ----------------------------------------------------------------------------
+
+PdfTextBar::PdfTextBar(CanvasWidget* canvas) : QFrame(canvas), canvas_(canvas) {
+    setFrameShape(QFrame::StyledPanel);
+    setAutoFillBackground(true);
+    auto* row = new QHBoxLayout(this);
+    row->setContentsMargins(4, 2, 4, 2);
+    row->setSpacing(0);
+    auto mark = [this](int type) { return [this, type] { if (auto* e = editor()) xn_editor_pdf_mark(e, type); }; };
+    row->addWidget(actionButton(this, "ic_stroke_highlighter", QStringLiteral("Highlight"), mark(XN_MARK_HIGHLIGHT)));
+    row->addWidget(actionButton(this, "underline", QStringLiteral("Underline"), mark(XN_MARK_UNDERLINE)));
+    row->addWidget(actionButton(this, "strikethrough", QStringLiteral("Strikeout"), mark(XN_MARK_STRIKEOUT)));
+    row->addWidget(actionButton(this, "text", QStringLiteral("Squiggly underline"), mark(XN_MARK_SQUIGGLY)));
+    row->addWidget(actionButton(this, "copy", QStringLiteral("Copy"), [this] {
+        auto* e = editor();
+        if (!e) return;
+        char* text = xn_editor_pdf_selected_text(e);
+        if (!text) return;
+        QGuiApplication::clipboard()->setText(QString::fromUtf8(text));
+        xn_free_string(text);
+    }));
+    hide();
+}
+
+xn_editor* PdfTextBar::editor() const { return canvas_->editor(); }
+
+void PdfTextBar::refresh() {
+    double xywh[4] = {0, 0, 0, 0};
+    if (!editor() || xn_editor_pdf_has_selection(editor()) == 0 || xn_editor_pdf_selection_rect(editor(), xywh) == 0) {
+        hide();
+        return;
+    }
+    const QRectF sel(xywh[0], xywh[1], xywh[2], xywh[3]);
+    adjustSize();
+    const int gap = 10;
+    const QSize size = sizeHint();
     double x = sel.center().x() - size.width() / 2.0;
     double y = sel.top() - size.height() - gap;
     if (y < 4) y = sel.bottom() + gap;

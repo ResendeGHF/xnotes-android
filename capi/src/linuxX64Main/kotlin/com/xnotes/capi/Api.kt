@@ -6,6 +6,8 @@ import com.xnotes.canvas.CanvasFramePainter
 import com.xnotes.canvas.CanvasState
 import com.xnotes.canvas.ChromePalette
 import com.xnotes.canvas.InteractionController
+import com.xnotes.canvas.PdfTextController
+import com.xnotes.core.model.MarkupType
 import com.xnotes.capi.c.xn_host
 import com.xnotes.capi.c.xn_palette
 import com.xnotes.capi.c.xn_pointer
@@ -445,6 +447,26 @@ internal class CEditor(note: CNote, private val host: xn_host) {
     })
     private val sharpSettle = Runnable { state.requestSharpViewport() }
     val images = CImageCodec(host)
+
+    /** The PDF text of the note's pages, read through the host. */
+    val pdfTexts = CPdfTexts(host, state)
+
+    /** PDF text selection and marking: a settled selection shows its menu, the markup tool's drag marks as it lifts. */
+    val pdfText = PdfTextController(
+        state, pdfTexts, onViewChanged = { host.view_changed?.invoke(host.ctx) }, requestRender = { requestRender() }, scheduler = scheduler,
+    ).also { ctrl ->
+        controller.pdfText = ctrl
+        ctrl.onSettled = { showTextMenu(ctrl.menuAnchor()) }
+        ctrl.onCleared = { showTextMenu(null) }
+        ctrl.onMarked = { sel ->
+            controller.configFor(Tool.MARKUP).markupMode.type?.let { type ->
+                editor.markText(ctrl, sel, type) { page -> pdfTexts.peek(page) }
+            }
+        }
+    }
+
+    private fun showTextMenu(rect: Rect?) =
+        host.selection_menu?.invoke(host.ctx, if (rect != null) 1 else 0, rect?.x ?: 0.0, rect?.y ?: 0.0, rect?.w ?: 0.0, rect?.h ?: 0.0)
 
     init {
         state.paintPageBackground = { page, renderer, res, region ->
@@ -1304,6 +1326,41 @@ fun xnEditorCut(editor: COpaquePointer?) = guard(Unit) {
         return@guard
     }
     editor!!.editor().controller.cutSelection() }
+
+@CName("xn_editor_pdf_has_selection")
+fun xnEditorPdfHasSelection(editor: COpaquePointer?): Int = guard(0) {
+    if (editor!!.editor().pdfText.selection != null) 1 else 0
+}
+
+@CName("xn_editor_pdf_selected_text")
+fun xnEditorPdfSelectedText(editor: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    val ce = editor!!.editor()
+    val sel = ce.pdfText.selection ?: return@guard null
+    strdup(sel.text { ce.pdfTexts.peek(it) })
+}
+
+@CName("xn_editor_pdf_selection_rect")
+fun xnEditorPdfSelectionRect(editor: COpaquePointer?, out: CPointer<DoubleVar>?): Int = guard(0) {
+    val r = editor!!.editor().pdfText.menuAnchor() ?: return@guard 0
+    out!![0] = r.x
+    out[1] = r.y
+    out[2] = r.w
+    out[3] = r.h
+    1
+}
+
+@CName("xn_editor_pdf_mark")
+fun xnEditorPdfMark(editor: COpaquePointer?, type: Int) = guard(Unit) {
+    val ce = editor!!.editor()
+    val sel = ce.pdfText.selection ?: return@guard
+    val markup = MarkupType.entries.getOrNull(type) ?: return@guard
+    ce.editor.markText(ce.pdfText, sel, markup) { page -> ce.pdfTexts.peek(page) }
+}
+
+@CName("xn_editor_pdf_clear")
+fun xnEditorPdfClear(editor: COpaquePointer?) = guard(Unit) {
+    editor!!.editor().pdfText.clear()
+}
 
 @CName("xn_editor_copy")
 fun xnEditorCopy(editor: COpaquePointer?) = guard(Unit) {

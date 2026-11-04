@@ -2,6 +2,7 @@
 // QImages, text measurement with QFont, image probing, and timers on the Qt event loop.
 #pragma once
 
+#include "PdfText.h"
 #include "xnotes.h"
 
 #include <QCache>
@@ -119,6 +120,8 @@ private:
     /* Open PDFs by path, loaded on first use and kept while the host lives. */
     QHash<QString, QPdfDocument*> pdfs_;
     std::unique_ptr<PdfPages> pages_;
+    /* The text of the PDF pages read last, by path and page. */
+    QHash<QString, pdftext::Page> pageText_;
 
     QPdfDocument* pdf(const char* path);
 
@@ -143,6 +146,7 @@ private:
     static void textEdit(void* ctx, const xn_text_field* field);
     static int pdfPageCount(void* ctx, const char* path);
     static int pdfPageSize(void* ctx, const char* path, int page, double* w, double* h);
+    static int pdfText(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes);
     static void wake(void* ctx);
     static int drawPdfPage(void* ctx, void* renderer, const char* path, int page, int fullW, int fullH, int rx, int ry,
                             int rw, int rh, double x, double y, double w, double h);
