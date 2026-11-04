@@ -168,6 +168,9 @@ class MainActivity : ComponentActivity() {
         if (com.xnotes.settings.LiveSettings.get(settingsRepo).prefs.shareEnabled) {
             com.xnotes.share.ShareService.start(this)
         }
+        // Resume companion sync across restarts when sharing was left on: the
+        // service redials the active paired companion on its own.
+        com.xnotes.share.companion.CompanionService.startIfEnabled(this)
         if (!orphanTabStoragePurged) {
             orphanTabStoragePurged = true
             purgeOrphanedTabStorage()

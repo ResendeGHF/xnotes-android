@@ -119,13 +119,19 @@ class HostEngineTest {
         fun countOfType(t: String): Int = synchronized(sent) { sent.count { it.optString("t") == t } }
     }
 
+    private class FakeGrants(val policy: SharePolicy) : com.xnotes.share.db.GrantSource {
+        override fun isShared(uri: String): Boolean = policy.isShared(uri)
+        override fun sharedUris(): Set<String> = policy.sharedUris()
+        override fun setGranted(uri: String, granted: Boolean) = policy.setShared(uri, granted)
+    }
+
     private data class Fixture(val engine: HostEngine, val host: FakeHost, val backend: FakeBackend, val policy: SharePolicy)
 
     private fun engine(host: FakeHost = FakeHost(), backend: FakeBackend = FakeBackend(), dir: File? = null): Fixture {
         val d = dir ?: File(System.getProperty("java.io.tmpdir"), "sync-host-${System.nanoTime()}").apply { mkdirs() }
         val policy = SharePolicy.of(File(d, "share"))
         val versions = File(d, "versions.json")
-        val e = HostEngine(backend, FakeFiles(backend.files), policy, versions, host, "Pixel 8")
+        val e = HostEngine(backend, FakeFiles(backend.files), FakeGrants(policy), versions, host, "Pixel 8")
         return Fixture(e, host, backend, policy)
     }
 

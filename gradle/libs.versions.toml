@@ -17,6 +17,8 @@ latex = "1.5.0-kt2.1.0"
 onnxruntime = "1.30.0"
 lottie = "6.4.0"
 bouncyCastle = "1.79"
+room = "2.7.1"
+ksp = "2.2.21-2.0.4"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -51,6 +53,9 @@ lottie-compose = { module = "com.airbnb.android:lottie-compose", version.ref = "
 bouncycastle-prov = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncyCastle" }
 bouncycastle-bcpg = { group = "org.bouncycastle", name = "bcpg-jdk18on", version.ref = "bouncyCastle" }
 bouncycastle-bcpkix = { group = "org.bouncycastle", name = "bcpkix-jdk18on", version.ref = "bouncyCastle" }
+androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
+androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
 commonmark-footnotes = { group = "org.commonmark", name = "commonmark-ext-footnotes", version.ref = "commonmark" }
 commonmark-frontmatter = { group = "org.commonmark", name = "commonmark-ext-yaml-front-matter", version.ref = "commonmark" }
 commonmark-alerts = { group = "org.commonmark", name = "commonmark-ext-gfm-alerts", version.ref = "commonmark" }
@@ -59,3 +64,4 @@ commonmark-alerts = { group = "org.commonmark", name = "commonmark-ext-gfm-alert
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }

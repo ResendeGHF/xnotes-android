@@ -18,7 +18,6 @@ import com.xnotes.R
 import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.share.ShareBackendImpl
 import com.xnotes.share.ShareCrypto
-import com.xnotes.share.SharePolicy
 import com.xnotes.ui.Editor
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -44,6 +43,8 @@ class CompanionService : Service() {
     private var backend: ShareBackendImpl? = null
     private var identity: ShareCrypto.ServerIdentity? = null
     private var pins: CompanionPins? = null
+    private var store: com.xnotes.share.db.ShareStore? = null
+    private var grants: com.xnotes.share.db.DeviceGrants? = null
     private var deviceName: String = "Android"
     private var targetHost: String = "127.0.0.1"
     private var targetPort: Int = 42317
@@ -105,18 +106,27 @@ class CompanionService : Service() {
                 val identity = ShareCrypto.loadOrCreate(filesDir)
                 val shareDir = File(filesDir, "share").apply { mkdirs() }
                 val pins = CompanionPins.of(shareDir)
+                val store = com.xnotes.share.db.ShareStore.of(applicationContext)
+                val grants = com.xnotes.share.db.DeviceGrants.of(applicationContext)
                 val backend = ShareBackendImpl(applicationContext)
-                val policy = SharePolicy.of(shareDir)
                 val versions = File(shareDir, "sync_versions.json")
                 val prefs = getSharedPreferences(PREFS, 0)
-                val targetHost = prefs.getString(KEY_IP, "")?.ifEmpty { null } ?: "127.0.0.1"
-                val targetPort = prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 42317
-                val deviceName = android.os.Build.MODEL ?: "Android"
+                // One-time import from the pre-Room files; afterwards Room owns devices + grants.
+                kotlinx.coroutines.runBlocking {
+                    store.migrateLegacy(
+                        prefs.getString(KEY_IP, "") ?: "",
+                        prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 0,
+                    )
+                }
+                val deviceName = prefs.getString(KEY_NAME, "")?.ifBlank { null }
+                    ?: android.os.Build.MODEL ?: "Android"
                 this.deviceName = deviceName
-                this.targetHost = targetHost
-                this.targetPort = targetPort
+                this.targetHost = prefs.getString(KEY_IP, "")?.ifEmpty { null } ?: "127.0.0.1"
+                this.targetPort = prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 42317
                 this.identity = identity
                 this.pins = pins
+                this.store = store
+                this.grants = grants
                 val host = object : HostEngine.HostEngineHost {
                     override fun send(msg: JSONObject) {
                         client?.send(msg)
@@ -177,7 +187,7 @@ class CompanionService : Service() {
                     }
                 }
                 val engine = HostEngine(
-                    backend, BackendFiles(backend), policy, versions, host, deviceName,
+                    backend, BackendFiles(backend), grants, versions, host, deviceName,
                     imageDir = File(cacheDir, "sync-images").apply { mkdirs() },
                 )
                 val ui = object : PairingUi {
@@ -208,7 +218,8 @@ class CompanionService : Service() {
                         val uri = CompanionEditors.uriFor(e) ?: continue
                         attachEditor(e, uri)
                     }
-                    dialLocked()
+                    // Redial the active companion (or the remembered address).
+                    dialActive()
                 }
             } catch (e: Exception) {
                 postStatus("Start failed: ${e.message}")
@@ -224,35 +235,107 @@ class CompanionService : Service() {
     fun reconnectTo(host: String, port: Int) {
         targetHost = host
         targetPort = port
-        dialLocked()
+        dialDevice(null)
     }
 
-    private fun dialLocked() {
+    /** Dial the active companion (or the remembered raw address when none is set). */
+    private fun dialActive() {
+        val store = store ?: return
+        Thread({
+            runCatching {
+                val active = kotlinx.coroutines.runBlocking { store.activeDeviceOnce() }
+                val dev = if (active == null) null
+                    else kotlinx.coroutines.runBlocking { store.device(active.fp) }
+                main.post { dialDevice(dev) }
+            }
+        }, "companion-dial").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Dial one companion by fingerprint, or an ad-hoc address when [fp] is null
+     * (pairing then registers it). The previous session is torn down first, so
+     * at most one companion is ever connected. Blocking store reads happen off
+     * the main thread; the actual dial runs on it.
+     */
+    private fun dialStored(fp: String?) {
+        val store = store ?: return
+        Thread({
+            runCatching {
+                val dev = if (fp == null) null else kotlinx.coroutines.runBlocking { store.device(fp) }
+                main.post { dialDevice(dev) }
+            }
+        }, "companion-dial").apply { isDaemon = true; start() }
+    }
+
+    private fun dialDevice(dev: com.xnotes.share.db.DeviceEntity?) {
         val identity = identity ?: return
         val pins = pins ?: return
+        val store = store ?: return
+        val grants = grants ?: return
+        if (store == null || grants == null) return
         runCatching { pairing?.close() }
         runCatching { client?.disconnect() }
         pairing = null
         client = null
-        val host = targetHost
-        val port = targetPort
+        val host = if (!dev?.host.isNullOrEmpty()) dev.host else targetHost
+        val port = if (dev != null && dev.port in 1..65535) dev.port else targetPort
+        if (dev != null) {
+            targetHost = host
+            targetPort = port
+            getSharedPreferences(PREFS, 0).edit()
+                .putString(KEY_IP, host).putString(KEY_PORT, port.toString()).apply()
+        }
         val sender = PairingClient.Sender { msg -> client?.send(msg) }
         val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, ui ?: return, sender)
         pairing.onPaired = { name ->
-            main.post { _status.value = Status("Connected to $name.", name, connected = true) }
+            val peerFp = pairing.peerFingerprint
+            if (peerFp != null) {
+                Thread({
+                    runCatching {
+                        kotlinx.coroutines.runBlocking {
+                            store.remember(peerFp, name, host, port)
+                            // First companion ever becomes active; otherwise the
+                            // active one keeps its slot.
+                            if (store.activeDeviceOnce() == null) {
+                                store.setActive(peerFp)
+                            }
+                        }
+                        grants.activeFp = peerFp
+                        kotlinx.coroutines.runBlocking { grants.refreshBlocking(peerFp) }
+                        val dev = kotlinx.coroutines.runBlocking { store.device(peerFp) }
+                        main.post { _status.value = Status("Connected to ${dev?.displayName ?: name}.", dev?.displayName ?: name, connected = true) }
+                    }
+                }, "companion-remember").apply { isDaemon = true; start() }
+            } else {
+                main.post { _status.value = Status("Connected to $name.", name, connected = true) }
+            }
         }
         val client = CompanionClient(
             host = host,
             port = port,
             identity = identity,
-            pinnedFp = pins.all().firstOrNull()?.fp,
+            // Per-device pin: a known companion must present its pinned cert;
+            // an unknown address uses TOFU (the 6-digit code + desktop approval
+            // is the actual authentication) so a second companion can pair.
+            pinnedFp = dev?.fp,
             autoReconnect = true,
         )
         client.onConnected = { peerFp ->
-            main.post {
-                _status.value = Status("Connected. Pairing…", pins.nameFor(peerFp), connected = true)
-                pairing.onConnected(peerFp)
-            }
+            Thread({
+                runCatching {
+                    val known = kotlinx.coroutines.runBlocking { store.device(peerFp) }
+                    if (known != null) {
+                        kotlinx.coroutines.runBlocking { store.touch(peerFp, host, port, known.name) }
+                        grants.activeFp = peerFp
+                        kotlinx.coroutines.runBlocking { grants.refreshBlocking(peerFp) }
+                    }
+                    val label = known?.displayName ?: pins.nameFor(peerFp)
+                    main.post {
+                        _status.value = Status("Connected. Pairing…", label, connected = true)
+                        pairing.onConnected(peerFp)
+                    }
+                }
+            }, "companion-touch").apply { isDaemon = true; start() }
         }
         client.onMessage = { msg -> main.post { route(msg) } }
         client.onDisconnected = { willRetry ->
@@ -263,7 +346,10 @@ class CompanionService : Service() {
         client.onError = { err -> postStatus(err) }
         this.pairing = pairing
         this.client = client
-        main.post { _status.value = Status("Connecting…", pins.all().firstOrNull()?.name, connected = false) }
+        main.post {
+            val label = dev?.displayName ?: pins.all().firstOrNull()?.name
+            _status.value = Status("Connecting…", label, connected = false)
+        }
         client.connect()
     }
 
@@ -506,6 +592,18 @@ class CompanionService : Service() {
         const val PREFS = "companion"
         const val KEY_IP = "companion_last_ip"
         const val KEY_PORT = "companion_last_port"
+        const val KEY_ENABLED = "companion_enabled"
+        const val KEY_NAME = "companion_own_name"
+
+        /** Start the service on app launch when sharing was left on. */
+        fun startIfEnabled(context: Context) {
+            val on = try {
+                context.getSharedPreferences(PREFS, 0).getBoolean(KEY_ENABLED, false)
+            } catch (_: Exception) {
+                false
+            }
+            if (on) start(context)
+        }
 
         fun submitCode(context: Context, code: String) {
             val svc = runningService
@@ -516,7 +614,7 @@ class CompanionService : Service() {
             svc.main.post { svc.pairing?.submitCode(code) ?: svc.postStatus("Not connected yet — try again in a moment.") }
         }
 
-        /** Re-dial (same or new address) without stopping sharing. */
+        /** Re-dial an ad-hoc address without stopping sharing (pairing then registers it). */
         fun reconnect(context: Context, host: String, port: Int) {
             val svc = runningService
             if (svc == null) {
@@ -529,8 +627,111 @@ class CompanionService : Service() {
                 if (svc.engine == null) {
                     svc.startSession()
                 } else {
-                    svc.dialLocked()
+                    svc.dialDevice(null)
                 }
+            }
+        }
+
+        /** Make [fp] the active companion and dial it, parking the others. */
+        fun switchDevice(context: Context, fp: String) {
+            val svc = runningService
+            if (svc == null) {
+                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+                // The fresh session dials the active device on its own.
+                Thread({
+                    runCatching {
+                        kotlinx.coroutines.runBlocking {
+                            com.xnotes.share.db.ShareStore.of(context).setActive(fp)
+                        }
+                    }
+                }, "companion-switch").apply { isDaemon = true; start() }
+                return
+            }
+            svc.main.post {
+                Thread({
+                    runCatching {
+                        kotlinx.coroutines.runBlocking { svc.store?.setActive(fp) }
+                        val dev = kotlinx.coroutines.runBlocking { svc.store?.device(fp) }
+                        if (dev != null) {
+                            svc.grants?.activeFp = fp
+                            kotlinx.coroutines.runBlocking { svc.grants?.refreshBlocking(fp) }
+                        }
+                        svc.main.post { svc.dialStored(fp) }
+                    }
+                }, "companion-switch").apply { isDaemon = true; start() }
+            }
+        }
+
+        /** Forget a companion: drop its TLS pin and grants, disconnect if it was active. */
+        fun forgetDevice(context: Context, fp: String) {
+            Thread({
+                runCatching {
+                    val store = com.xnotes.share.db.ShareStore.of(context)
+                    val dev = kotlinx.coroutines.runBlocking { store.device(fp) }
+                    if (dev != null) {
+                        CompanionPins.of(File(context.filesDir, "share")).unpin(dev.name)
+                    }
+                    // The pin file is keyed by name; unpin every alias just in case.
+                    kotlinx.coroutines.runBlocking { store.forget(fp) }
+                }
+                runningService?.let { svc ->
+                    svc.main.post {
+                        if (svc.grants?.activeFp == fp) {
+                            svc.grants?.activeFp = null
+                            svc.client?.disconnect()
+                            _status.value = Status("Forgot companion.", null, connected = false)
+                        }
+                    }
+                }
+            }, "companion-forget").apply { isDaemon = true; start() }
+        }
+
+        /** Change a remembered companion's address (e.g. after DHCP moves it); reconnects if active. */
+    fun editDevice(context: Context, fp: String, host: String, port: Int) {
+        Thread({
+            runCatching {
+                val store = com.xnotes.share.db.ShareStore.of(context)
+                val dev = kotlinx.coroutines.runBlocking { store.device(fp) }
+                if (dev != null) kotlinx.coroutines.runBlocking { store.touch(fp, host, port, dev.name) }
+                runningService?.let { svc ->
+                    svc.main.post {
+                        if (svc.grants?.activeFp == fp) {
+                            svc.targetHost = host
+                            svc.targetPort = port
+                            svc.dialStored(fp)
+                        }
+                    }
+                }
+            }
+        }, "companion-edit").apply { isDaemon = true; start() }
+    }
+
+    /** Rename a companion locally (alias shown instead of its device name). */
+        fun renameDevice(context: Context, fp: String, nickname: String) {
+            Thread({
+                runCatching {
+                    val store = com.xnotes.share.db.ShareStore.of(context)
+                    kotlinx.coroutines.runBlocking { store.rename(fp, nickname) }
+                    val dev = kotlinx.coroutines.runBlocking { store.device(fp) }
+                    runningService?.let { svc ->
+                        svc.main.post {
+                            if (svc.grants?.activeFp == fp && dev != null) {
+                                _status.value = _status.value.copy(paired = dev.displayName)
+                            }
+                        }
+                    }
+                }
+            }, "companion-rename").apply { isDaemon = true; start() }
+        }
+
+        /** This phone's own nickname, sent as its device name when pairing. */
+        fun setOwnName(context: Context, name: String) {
+            try {
+                context.getSharedPreferences(PREFS, 0).edit().putString(KEY_NAME, name).apply()
+            } catch (_: Exception) {
+            }
+            runningService?.let { svc ->
+                svc.main.post { svc.deviceName = name.ifBlank { android.os.Build.MODEL ?: "Android" } }
             }
         }
 
@@ -544,29 +745,22 @@ class CompanionService : Service() {
             }
         }
 
-        fun unpair(context: Context, name: String) {
-            Thread({
-                runCatching {
-                    val pins = CompanionPins.of(File(context.filesDir, "share"))
-                    pins.unpin(name)
-                }
-                runningService?.let { svc ->
-                    svc.main.post {
-                        svc.client?.disconnect()
-                        _status.value = Status("Unpaired $name.", null, connected = false)
-                    }
-                }
-            }, "companion-unpair").apply { isDaemon = true; start() }
-        }
-
         @Volatile private var runningService: CompanionService? = null
 
         fun start(context: Context) {
             ensureChannel(context)
+            try {
+                context.getSharedPreferences(PREFS, 0).edit().putBoolean(KEY_ENABLED, true).apply()
+            } catch (_: Exception) {
+            }
             ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
         }
 
         fun stop(context: Context) {
+            try {
+                context.getSharedPreferences(PREFS, 0).edit().putBoolean(KEY_ENABLED, false).apply()
+            } catch (_: Exception) {
+            }
             context.stopService(Intent(context, CompanionService::class.java))
         }
 

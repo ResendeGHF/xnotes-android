@@ -8,7 +8,6 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
 import com.xnotes.format.DocumentCodec
 import com.xnotes.share.ShareBackendImpl
-import com.xnotes.share.SharePolicy
 import com.xnotes.share.ShareServer
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -43,7 +42,7 @@ interface SyncFiles {
 class HostEngine(
     private val backend: ShareServer.ShareBackend,
     private val files: SyncFiles,
-    private val policy: SharePolicy,
+    private val grants: com.xnotes.share.db.GrantSource,
     private val versionsFile: File,
     private val host: HostEngineHost,
     val deviceName: String,
@@ -135,7 +134,7 @@ class HostEngine(
             for (e in backend.listEntries(dir, onlyShared = false)) {
                 if (!seen.add(e.uri)) continue
                 val path = if (prefix.isEmpty()) e.name else "$prefix/${e.name}"
-                val covered = inherited || policy.isShared(e.uri)
+                val covered = inherited || grants.isShared(e.uri)
                 if (e.isDir) {
                     // Shared folders share their whole subtree; unshared dirs with
                     // shared files beneath still list, for navigation.
@@ -155,7 +154,7 @@ class HostEngine(
     private fun subtreeHasShared(uri: String, depth: Int): Boolean {
         if (depth <= 0) return false
         return backend.listEntries(uri, onlyShared = false).any {
-            if (it.isDir) subtreeHasShared(it.uri, depth - 1) else policy.isShared(it.uri)
+            if (it.isDir) subtreeHasShared(it.uri, depth - 1) else grants.isShared(it.uri)
         }
     }
 
@@ -170,7 +169,7 @@ class HostEngine(
         // finishes are still gated correctly; the walk refines it right after.
         synchronized(lock) {
             coveredIds.clear()
-            coveredIds.addAll(policy.sharedUris())
+            coveredIds.addAll(grants.sharedUris())
         }
         // The tree walk + JSON encode runs on the single sync IO thread: doing it
         // on the caller (often the main thread) froze the policy screen per tap.
@@ -818,7 +817,7 @@ class HostEngine(
             val ok = files.delete(id)
             if (ok) {
                 dropFile(id)
-                policy.setShared(id, false)
+                grants.setGranted(id, false)
                 pushIndexDelta()
             }
             send(JSONObject().put("t", "delete_result").put("in_reply_to", msg.optInt("seq", -1)).put("ok", ok))
@@ -847,7 +846,7 @@ class HostEngine(
                 return@onApproval
             }
             // An approved creation is shared from birth.
-            policy.setShared(id, true)
+            grants.setGranted(id, true)
             headVersion(id) // registers at 1
             pushIndexDelta()
             send(JSONObject().put("t", "create_result").put("in_reply_to", msg.optInt("seq", -1)).put("ok", true).put("id", id))

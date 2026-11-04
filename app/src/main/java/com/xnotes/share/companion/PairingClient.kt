@@ -30,6 +30,8 @@ class PairingClient(
     private val sender: Sender,
     var onPaired: (name: String) -> Unit = {},
 ) {
+    /** This connection's peer fingerprint, for the device registry. */
+    val peerFingerprint: String? get() = synchronized(lock) { peerFp }
     /** Minimal send surface so tests need no socket. */
     fun interface Sender {
         fun send(msg: JSONObject)

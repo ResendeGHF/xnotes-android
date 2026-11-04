@@ -35,7 +35,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     private val monitorObj = Object()
     private val pdfCacheDir = File(appContext.cacheDir, "share-pdf").apply { mkdirs() }
     private val tmpDir = File(appContext.cacheDir, "share-tmp").apply { mkdirs() }
-    private val policy = SharePolicy.of(File(appContext.filesDir, "share"))
+    private val grants: com.xnotes.share.db.GrantSource = com.xnotes.share.db.DeviceGrants.of(appContext)
 
     /** URIs recently served or watched; the commit poller only stats these. */
     private val observed = LinkedHashMap<String, String>()
@@ -48,17 +48,17 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     // --- ShareBackend ---
 
     override fun versionOf(uri: String): String? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         val stamp = stampOf(uri) ?: return null
         return ShareProtocol.etagFor(stamp.first, stamp.second)
     }
 
     override fun browseRootSet(): Boolean = browseRoot() != null
 
-    override fun isShared(uri: String): Boolean = policy.isShared(uri)
+    override fun isShared(uri: String): Boolean = grants.isShared(uri)
 
     override fun pdfBytes(uri: String): ShareServer.PdfSnapshot? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         val name = displayNameOf(uri) ?: return null
         val version = versionOf(uri) ?: return null
         touch(uri, version)
@@ -73,7 +73,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     }
 
     override fun rawBytes(uri: String): ShareServer.RawSnapshot? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         val name = displayNameOf(uri) ?: return null
         val version = versionOf(uri) ?: return null
         val bytes = readUri(uri, 64L * 1024 * 1024) ?: return null
@@ -92,7 +92,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         if (!bytes.startsWithPdf()) {
             return ShareServer.ReplaceResult.Rejected(415, "not a pdf")
         }
-        if (!policy.isShared(uri)) {
+        if (!grants.isShared(uri)) {
             return ShareServer.ReplaceResult.Rejected(404, "no such file")
         }
         synchronized(saveLock) {
@@ -327,7 +327,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     // --- companion canvas ---
 
     override fun canvasInfo(uri: String): ShareServer.ShareBackend.CanvasInfo? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         val version = versionOf(uri) ?: return null
         val name = displayNameOf(uri) ?: return null
         if (kindOf(name) != "note") return null
@@ -344,7 +344,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     }
 
     override fun pageStrokes(uri: String, page: Int): ShareServer.ShareBackend.StrokesPage? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         val version = versionOf(uri) ?: return null
         val name = displayNameOf(uri) ?: return null
         if (kindOf(name) != "note") return null
@@ -366,7 +366,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         if (strokes.isEmpty() || strokes.size > ShareStrokes.MAX_STROKES_PER_POST) {
             return ShareServer.ReplaceResult.Rejected(400, "stroke batch out of range")
         }
-        if (!policy.isShared(uri)) return ShareServer.ReplaceResult.Rejected(404, "no such file")
+        if (!grants.isShared(uri)) return ShareServer.ReplaceResult.Rejected(404, "no such file")
         synchronized(saveLock) {
             val current = versionOf(uri) ?: return ShareServer.ReplaceResult.Rejected(404, "no such file")
             if (current != baseVersion) {
@@ -397,7 +397,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
      * from the cached export (which also carries the device's ink).
      */
     override fun pagePng(uri: String, page: Int, dpi: Int): ShareServer.ShareBackend.PagePng? {
-        if (!policy.isShared(uri)) return null
+        if (!grants.isShared(uri)) return null
         if (page < 0 || dpi !in 36..300) return null
         val version = versionOf(uri) ?: return null
         val name = displayNameOf(uri) ?: return null
@@ -475,7 +475,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         }
         // When filtering, a directory shows only while a shared file lives under it.
         val sharedIds: Set<String>? = if (onlyShared) {
-            val ids = policy.sharedUris().mapNotNull { runCatching { DocumentsContract.getDocumentId(Uri.parse(it)) }.getOrNull() }.toSet()
+            val ids = grants.sharedUris().mapNotNull { runCatching { DocumentsContract.getDocumentId(Uri.parse(it)) }.getOrNull() }.toSet()
             if (!ids.any { it == dirDocId || it.startsWith("$dirDocId/") }) return emptyList()
             ids
         } else {
@@ -564,9 +564,20 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         if (!isUnderTree(uri, browseRoot() ?: return null)) return null
         val name = displayNameOf(uri) ?: return null
         if (name.startsWith(".")) return null
-        val (size, mtime) = stampOf(uri) ?: (-1L to 0L)
-        return ShareServer.ShareBackend.Entry(uri, name, size, mtime, kindOf(name))
+        val dir = isDirUri(uri)
+        val (size, mtime) = if (dir) (-1L to 0L) else stampOf(uri) ?: (-1L to 0L)
+        return ShareServer.ShareBackend.Entry(uri, name, size, mtime, if (dir) "folder" else kindOf(name), isDir = dir)
     }
+
+    private fun isDirUri(uri: String): Boolean = runCatching {
+        appContext.contentResolver.query(
+            Uri.parse(uri),
+            arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE),
+            null, null, null,
+        )?.use {
+            if (!it.moveToFirst()) false else it.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
+        } ?: false
+    }.getOrDefault(false)
 
     private fun displayNameOf(uri: String): String? = runCatching {
         appContext.contentResolver.query(
