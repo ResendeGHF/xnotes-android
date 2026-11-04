@@ -149,6 +149,22 @@ inline void wheelEvent(QWidget* w, QPointF at, QPoint angle) {
 class SmokeTest : public QObject {
     Q_OBJECT
 
+    /* Counts paint events and unions their regions on a widget. */
+    class PaintSpy : public QObject {
+    public:
+        int paints = 0;
+        QRegion region;
+        bool active = false;
+    protected:
+        bool eventFilter(QObject* o, QEvent* e) override {
+            if (active && e->type() == QEvent::Paint) {
+                paints++;
+                region += static_cast<QPaintEvent*>(e)->region();
+            }
+            return QObject::eventFilter(o, e);
+        }
+    };
+
     static QPointingDevice* pen() {
         static auto* device = new QPointingDevice(QStringLiteral("test pen"), 42, QInputDevice::DeviceType::Stylus,
                                                   QPointingDevice::PointerType::Pen,
@@ -855,6 +871,194 @@ private slots:
         QCOMPARE(QJsonDocument::fromJson(reply2.mid(4, n2)).object().value(QStringLiteral("t")).toString(), QStringLiteral("hello_ack"));
         second.disconnectFromHost();
         QVERIFY(second.waitForDisconnected(5000));
+    }
+
+    /* A remote page add through the sync engine grows the bound note. */
+    void companionRemotePageAddApplies() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        xn_note* note = xn_note_new(1);
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        canvas.setNote(note);
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        grab(canvas);
+        xn::CompanionServer server;
+        QTcpServer probe;
+        QVERIFY(probe.listen());
+        const int port = probe.serverPort();
+        probe.close();
+        QVERIFY(server.start(port));
+        server.bindEditor(canvas.editor(), QStringLiteral("u1"));
+        QCOMPARE(xn_note_page_count(note), 1);
+        auto feed = [&](const char* json) {
+            const QByteArray body = QByteArray(json);
+            QByteArray frame;
+            QDataStream ds(&frame, QIODevice::WriteOnly);
+            ds.setByteOrder(QDataStream::BigEndian);
+            ds << qint32(body.size());
+            frame += body;
+            xn_sync_feed(server.sync(), reinterpret_cast<const uint8_t*>(frame.constData()), frame.size());
+        };
+        feed("{\"t\":\"op\",\"seq\":1,\"file\":\"u1\",\"base_version\":0,\"version\":1,\"dedupe\":\"p-1\",\"ops\":["
+             "{\"op\":\"add_page\",\"index\":1,\"width\":595.0,\"height\":842.0}]}");
+        QTest::qWait(200);
+        QCOMPARE(xn_note_page_count(note), 2);
+        xn_note_close(note);
+    }
+
+    /* A live run through a real socket paints on the bound canvas. */
+    void companionLiveRunOverSocketPaints() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        xn_note* note = xn_note_new(1);
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        canvas.setNote(note);
+        canvas.setDark(false);
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        grab(canvas);
+        xn::CompanionServer server;
+        QTcpServer probe;
+        QVERIFY(probe.listen());
+        const int port = probe.serverPort();
+        probe.close();
+        QVERIFY(server.start(port));
+        QSignalSpy livePaint(&server, &xn::CompanionServer::paint);
+        server.bindEditor(canvas.editor(), QStringLiteral("u1"));
+        QSslSocket client;
+        client.setProtocol(QSsl::TlsV1_2OrLater);
+        client.setPeerVerifyMode(QSslSocket::VerifyNone);
+        client.ignoreSslErrors();
+        QSignalSpy clientEncrypted(&client, &QSslSocket::encrypted);
+        client.connectToHostEncrypted(QStringLiteral("127.0.0.1"), port);
+        QVERIFY2(clientEncrypted.wait(10000), "client handshake failed");
+        auto sendJson = [&](const QByteArray& body) {
+            QByteArray frame;
+            QDataStream ds(&frame, QIODevice::WriteOnly);
+            ds.setByteOrder(QDataStream::BigEndian);
+            ds << qint32(body.size());
+            frame += body;
+            QVERIFY(client.write(frame) == frame.size());
+            QVERIFY(client.waitForBytesWritten(5000));
+        };
+        sendJson("{\"t\":\"hello\",\"seq\":1,\"app\":\"test\",\"version\":1,"
+                 "\"device_name\":\"probe\",\"host_cert_fp\":\"aa\"}");
+        QTest::qWait(300);
+        // The engine must have run onLive for the frame (paint signal per frame).
+        sendJson("{\"file\":\"u1\",\"t\":\"live\",\"color\":\"#ff0000\",\"width\":6,\"page\":0,\"stroke_id\":\"s-9\","
+                 "\"done\":false,\"tool\":\"pen\",\"samples\":[[300.0,300.0,0.5],[400.0,300.0,0.5]]}");
+        QTest::qWait(200);
+        QVERIFY2(livePaint.count() >= 1, "live frame never reached the engine");
+        // The exact bytes the Android host emits (ints where it writes ints).
+        sendJson("{\"file\":\"u1\",\"t\":\"live\",\"color\":\"#ff0000\",\"width\":6,\"page\":0,\"stroke_id\":\"s-1\","
+                 "\"done\":false,\"tool\":\"pen\",\"samples\":[[100,100,0.5]]}");
+        QTest::qWait(200);
+        sendJson("{\"file\":\"u1\",\"t\":\"live\",\"color\":\"#ff0000\",\"width\":6,\"page\":0,\"stroke_id\":\"s-1\","
+                 "\"done\":false,\"tool\":\"pen\",\"samples\":[[200,100,0.5]]}");
+        for (int i = 1; i <= 60; i++) {
+            const QString xs = QString::number(200.0 + i, 'f', 1);
+            const QByteArray body = QString("{\"t\":\"live\",\"seq\":%1,\"file\":\"u1\",\"page\":0,\"stroke_id\":\"s-1\","
+                "\"tool\":\"pen\",\"width\":6.0,\"color\":\"#ff0000\",\"samples\":[[%2,100.0,0.5]],\"done\":false}")
+                .arg(3 + i).arg(xs).toUtf8();
+            QByteArray frame;
+            QDataStream fds(&frame, QIODevice::WriteOnly);
+            fds.setByteOrder(QDataStream::BigEndian);
+            fds << qint32(body.size());
+            frame += body;
+            QVERIFY(client.write(frame) == frame.size());
+        }
+        QVERIFY(client.waitForBytesWritten(5000));
+        PaintSpy spy;
+        canvas.installEventFilter(&spy);
+        spy.active = true;
+        QTest::qWait(300);
+        spy.active = false;
+        qInfo("socket live paints=%d region=%s", spy.paints,
+              qPrintable(QString("%1x%2+%3+%4").arg(spy.region.boundingRect().width()).arg(spy.region.boundingRect().height()).arg(spy.region.boundingRect().x()).arg(spy.region.boundingRect().y())));
+        QVERIFY2(spy.paints > 0, "no natural paint happened for live frames");
+        canvas.removeEventFilter(&spy);
+        QCoreApplication::processEvents();
+        QCoreApplication::processEvents();
+        const QImage shot = grab(canvas);
+        const int n = inkPixels(shot, canvas.rect());
+        qInfo("socket live red pixels=%d paint signals=%d", n, livePaint.count());
+        if (n > 0) {
+            int l = shot.width(), t = shot.height(), r = 0, b = 0;
+            for (int y = 0; y < shot.height(); y++)
+                for (int x = 0; x < shot.width(); x++) {
+                    const QColor c = shot.pixelColor(x, y);
+                    if (c.red() > 200 && c.green() < 60 && c.blue() < 60) {
+                        l = std::min(l, x);
+                        t = std::min(t, y);
+                        r = std::max(r, x);
+                        b = std::max(b, y);
+                    }
+                }
+            qInfo("socket live red bbox=(%d,%d)-(%d,%d)", l, t, r, b);
+        }
+        QVERIFY2(n > 20, "socket live run painted nothing");
+        client.disconnectFromHost();
+        xn_note_close(note);
+    }
+
+    /* A remote live run fed to the sync engine paints on the bound canvas. */
+    void companionLiveRunPaints() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        xn_note* note = xn_note_new(1);
+        CanvasWidget canvas;
+        canvas.resize(800, 1000);
+        canvas.show();
+        canvas.setNote(note);
+        canvas.setDark(false);
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        xn::CompanionServer server;
+        QTcpServer probe;
+        QVERIFY(probe.listen());
+        const int port = probe.serverPort();
+        probe.close();
+        QVERIFY(server.start(port));
+        QSignalSpy livePaint(&server, &xn::CompanionServer::paint);
+        server.bindEditor(canvas.editor(), QStringLiteral("u1"));
+        // Let the page lay out first: without page rects there is nothing to damage.
+        QVERIFY(QTest::qWaitForWindowExposed(&canvas));
+        grab(canvas);
+        // Two red samples across page 0, as the Android host would send them.
+        auto feed = [&](const char* json) {
+            const QByteArray body = QByteArray(json);
+            QByteArray frame;
+            QDataStream ds(&frame, QIODevice::WriteOnly);
+            ds.setByteOrder(QDataStream::BigEndian);
+            ds << qint32(body.size());
+            frame += body;
+            xn_sync_feed(server.sync(), reinterpret_cast<const uint8_t*>(frame.constData()), frame.size());
+        };
+        feed("{\"t\":\"live\",\"seq\":1,\"file\":\"u1\",\"page\":0,\"stroke_id\":\"s-1\",\"tool\":\"pen\","
+             "\"width\":6.0,\"color\":\"#ff0000\",\"samples\":[[100.0,100.0,0.5]],\"done\":false}");
+        feed("{\"t\":\"live\",\"seq\":2,\"file\":\"u1\",\"page\":0,\"stroke_id\":\"s-1\",\"tool\":\"pen\","
+             "\"width\":6.0,\"color\":\"#ff0000\",\"samples\":[[200.0,100.0,0.5]],\"done\":false}");
+        // The engine must have flagged that overlay damage for the next frame.
+        double d[4] = {};
+        const int hasDamage = xn_editor_frame_damage(canvas.editor(), d);
+        qInfo("live damage=%d rect=%f,%f,%f,%f", hasDamage, d[0], d[1], d[2], d[3]);
+        const QImage shot = grab(canvas);
+        const int n = inkPixels(shot, canvas.rect());
+        qInfo("live red pixels=%d", n);
+        qInfo("live paint signals=%d", livePaint.count());
+        QVERIFY2(n > 20, "live run painted nothing");
+        // A committed stroke through the same feed path must land in the model.
+        feed("{\"t\":\"op\",\"seq\":3,\"file\":\"u1\",\"base_version\":0,\"version\":1,\"dedupe\":\"c-1\",\"ops\":["
+             "{\"op\":\"add_stroke\",\"page\":0,\"stroke\":{\"tool\":\"pen\",\"width\":6.0,\"color\":\"#ff0000\","
+             "\"pressure\":true,\"samples\":[[300.0,300.0,0.5],[400.0,300.0,0.5]]}}]}");
+        QTest::qWait(200);
+        const QImage shot2 = grab(canvas);
+        const int n2 = inkPixels(shot2, canvas.rect());
+        qInfo("committed red pixels=%d", n2);
+        QVERIFY2(n2 > 20, "committed stroke painted nothing");
+        xn_note_close(note);
     }
 
     /* A PDF's outline lists its chapters; clicking one goes to its page. */

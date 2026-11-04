@@ -299,6 +299,24 @@ class SyncEngineTest {
         assertEquals(8L, e.fileVersion("u1"))
     }
 
+    @Test fun decoderEmitsCoalescedBurst() {
+        val frames = (1..60).map {
+            SyncFrames.encode(
+                SyncMsg.Live(it, "u1", 0, "s-1", "pen", 3.0, "#00e676", listOf(WireSample(it.toDouble(), 100.0, 0.5)), done = false),
+            )
+        }
+        val blob = frames.fold(ByteArray(0)) { acc, f -> acc + f }
+        val out = SyncFrames.Decoder().feed(blob)
+        assertEquals(60, out.size)
+        assertEquals((1..60).toList(), out.map { (it as SyncMsg.Live).seq })
+        // And split across an arbitrary byte boundary.
+        val half = blob.size / 2
+        val d2 = SyncFrames.Decoder()
+        val first = d2.feed(blob.sliceArray(0 until half))
+        val rest = d2.feed(blob.sliceArray(half until blob.size))
+        assertEquals((1..60).toList(), (first + rest).map { (it as SyncMsg.Live).seq })
+    }
+
     @Test fun imageOpCodecRoundTrip() {
         val img = WireImage("i-7", 640, 480, 1.0, 2.0, 3.0, 4.0, 90, 0.5, true, false, listOf(0.0, 0.0, 1.0, 0.5))
         val msg = SyncMsg.Op(1, "u1", 3L, 4L, "d", listOf(SyncOp.AddImage(2, img)))
@@ -307,6 +325,58 @@ class SyncEngineTest {
     }
 
     @Test fun liveFrameUpdatesOverlay() {
+        // Two Android-style live frames then draw: the run must paint.
+        val (e, h) = engine()
+        val state = com.xnotes.canvas.CanvasState(
+            com.xnotes.core.model.Document.blank(1),
+            com.xnotes.core.FakeSurfaceFactory(),
+            com.xnotes.canvas.TestPalette(),
+        )
+        state.viewportW = 800
+        state.viewportH = 600
+        state.relayout()
+        val overlay = com.xnotes.canvas.RemoteLiveStrokes(state)
+        overlay.showingFile = "u1"
+        e.liveOverlay = overlay
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Live(1, "u1", 0, "s-1", "pen", 3.0, "#00e676", listOf(WireSample(10.0, 20.0, 0.5)), done = false),
+            ),
+        )
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Live(2, "u1", 0, "s-1", "pen", 3.0, "#00e676", listOf(WireSample(11.5, 21.0, 0.6)), done = false),
+            ),
+        )
+        assertEquals(2, h.liveDirty)
+        val r = com.xnotes.core.FakeRenderer()
+        // Draw under the same content transform drawOverlay uses.
+        val o = state.origin()
+        r.withSave {
+            r.translate(o.x, o.y)
+            r.scale(state.zoom, state.zoom)
+            overlay.draw(r)
+        }
+        assertTrue("live run must paint, got ${r.ops}", r.ops.any { it == "strokePolyline" })
+        // The same run must flag partial damage (never a silent full frame).
+        val damage = overlay.dirtyViewportRect()
+        assertTrue("live run produced no damage", damage != null && damage.w > 0 && damage.h > 0)
+        // Commit drops the run: no double draw.
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Op(3, "u1", 7L, 8L, "s-1", listOf(SyncOp.AddStroke(0, WireStroke("pen", 3.0, "#00e676", true, emptyList())))),
+            ),
+        )
+        val r2 = com.xnotes.core.FakeRenderer()
+        r2.withSave {
+            r2.translate(o.x, o.y)
+            r2.scale(state.zoom, state.zoom)
+            overlay.draw(r2)
+        }
+        assertTrue("run must be gone after commit, got ${r2.ops}", r2.ops.none { it == "strokePolyline" })
+    }
+
+    @Test fun liveFrameUpdatesOverlayOld() {
         val (e, h) = engine()
         var overlays = 0
         e.liveOverlay = object : com.xnotes.canvas.RemoteLiveStrokes(

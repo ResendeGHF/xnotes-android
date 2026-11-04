@@ -312,8 +312,22 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     }
 
     override fun onLiveDirty() {
+        if (bindings.isEmpty()) {
+            // Live frames for a file that is not open here: notable (the far
+            // side is drawing into the void), but routine when idle, so whisper.
+            whisper("live for an unbound file")
+        }
         for (e in bindings.values) e.requestOverlayRender()
         host.sync_live_dirty?.invoke(host.ctx)
+    }
+
+    /** Rate-limited stdout note for silent-drop states (release builds keep qInfo). */
+    private var lastWhisperMs = 0L
+    private fun whisper(what: String) {
+        val now = com.xnotes.core.platform.monotonicNanos() / 1_000_000L
+        if (now - lastWhisperMs < 5000) return
+        lastWhisperMs = now
+        println("sync: ${what} (no file bound; open a shared file to see live strokes)")
     }
 
     override fun applyRemoteStroke(fileId: String, page: Int, stroke: WireStroke) {
