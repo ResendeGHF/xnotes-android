@@ -293,6 +293,33 @@ class HostEngineTest {
         assertEquals(1, doc.pages[0].items.filterIsInstance<com.xnotes.core.model.ImageItem>().size)
     }
 
+    @Test fun liveBytesFeedCompanionOverlay() {
+        // End-to-end shape check: the exact bytes liveSample emits must carry a
+        // drawable run (page, samples, style all present).
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        e.liveSample("f1", 0, "s-1", "pen", 3.0, "#00e676", 10.0, 20.0, 0.5)
+        e.liveSample("f1", 0, "s-1", "pen", 3.0, "#00e676", 11.5, 21.0, 0.6)
+        val lives = h.sent.filter { it.optString("t") == "live" }
+        assertEquals(2, lives.size)
+        for (m in lives) {
+            assertEquals("f1", m.getString("file"))
+            assertEquals(0, m.getInt("page"))
+            assertEquals("s-1", m.getString("stroke_id"))
+            assertEquals("pen", m.getString("tool"))
+            assertTrue(m.getDouble("width") > 0)
+            assertTrue(m.getString("color").isNotEmpty())
+            assertTrue(m.getJSONArray("samples").length() > 0)
+        }
+        // The second frame is a complete drawable run on its own.
+        val s = lives.last().getJSONArray("samples")
+        assertEquals(1, s.length())
+        assertEquals(3, s.getJSONArray(0).length())
+    }
+
     @Test fun staleBaseGetsResync() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)

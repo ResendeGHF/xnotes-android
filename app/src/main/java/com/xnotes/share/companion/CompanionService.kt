@@ -300,7 +300,7 @@ class CompanionService : Service() {
         editor.controller.onStrokeStarted = {
             // A previous gesture that never committed (dismiss tap): close its run first.
             pendingLive.remove(editor)?.let { stale ->
-                engine.finishStroke(uri, editor.state.currentPageIndex(), stale.id, stale.tool, stale.width, stale.color)
+                engine.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color)
             }
         }
         editor.controller.onStrokeSample = { page, x, y, p ->
@@ -360,7 +360,7 @@ class CompanionService : Service() {
         engine.presence(uri, editor.state.currentPageIndex())
     }
 
-    private data class LiveStroke(val id: String, val tool: String, val width: Double, val color: String)
+    private data class LiveStroke(val uri: String, val page: Int, val id: String, val tool: String, val width: Double, val color: String)
 
     private data class PendingRoom(val uri: String, val page: Int, val id: String)
 
@@ -374,10 +374,15 @@ class CompanionService : Service() {
     private fun liveSample(editor: Editor, uri: String, page: Int, x: Double, y: Double, p: Double) {
         val engine = engine ?: return
         var live = pendingLive[editor]
-        val tool = editor.controller.tool
+        if (live != null && (live.uri != uri || live.page != page)) {
+            // Crossed onto another page mid-stroke: close this run, open the next.
+            engine.finishStroke(live.uri, live.page, live.id, live.tool, live.width, live.color)
+            live = null
+        }
         if (live == null) {
+            val tool = editor.controller.tool
             val cfg = editor.controller.configFor(tool)
-            live = LiveStroke(newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba)).also { pendingLive[editor] = it }
+            live = LiveStroke(uri, page, newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba)).also { pendingLive[editor] = it }
         }
         engine.liveSample(uri, page, live.id, live.tool, live.width, live.color, x, y, p)
     }
