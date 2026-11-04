@@ -1660,7 +1660,7 @@ fun xnSyncTick(sync: COpaquePointer?) = guard(Unit) {
 
 @CName("xn_sync_hello")
 fun xnSyncHello(sync: COpaquePointer?) = guard(Unit) {
-    sync!!.sync().engine.startHandshake()
+    sync!!.sync().engine.onConnected()
 }
 
 @CName("xn_sync_reset")

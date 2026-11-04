@@ -89,12 +89,12 @@ class SyncFramesTest {
 
     @Test fun createDeleteRoundTrip() {
         assertEquals(
-            SyncMsg.DeleteRequest(15, "u9"),
-            SyncFrames.decode(SyncFrames.encode(SyncMsg.DeleteRequest(15, "u9")).drop(4).toByteArray()),
+            SyncMsg.DeleteRequest(15, "u9", "Pixel 8"),
+            SyncFrames.decode(SyncFrames.encode(SyncMsg.DeleteRequest(15, "u9", "Pixel 8")).drop(4).toByteArray()),
         )
         assertEquals(
-            SyncMsg.CreateRequest(16, "d1", "new note", 0),
-            SyncFrames.decode(SyncFrames.encode(SyncMsg.CreateRequest(16, "d1", "new note", 0)).drop(4).toByteArray()),
+            SyncMsg.CreateRequest(16, "Pixel 8", "d1", "new note", 0),
+            SyncFrames.decode(SyncFrames.encode(SyncMsg.CreateRequest(16, "Pixel 8", "d1", "new note", 0)).drop(4).toByteArray()),
         )
         assertEquals(
             SyncMsg.CreateResult(17, 16, true, "u10", null),

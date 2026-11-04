@@ -47,15 +47,17 @@ with live stroke feedback in both directions, over a network neither trusts.
 
 ## Handshake
 
+The dialer (host) speaks first on every connection:
+
 ```
-C -> S  hello {t, seq, app, version:1, device_name, host_cert_fp}
-S -> C  hello_ack {t, seq, in_reply_to, companion_cert_fp, paired:bool, code_required:bool}
-# unpaired:
-C -> S  pair_request {t, seq, device_name, host_cert_fp, code}
-S -> C  pair_result {t, seq, ok, reason?}      # after desktop approval; both sides pin now
-# paired (or after pair_result ok):
-C -> S  index_subscribe {}
-S -> C  index {files:[{id, kind:file|dir, version, size, mtime}], full:bool}
+HOST -> COMP hello {t, seq, app, version:1, device_name, host_cert_fp}
+COMP -> HOST hello_ack {t, seq, in_reply_to, companion_cert_fp, paired:bool, code_required:bool}
+# unpaired (code_required):
+HOST -> COMP pair_request {t, seq, device_name, host_cert_fp, code}
+COMP -> HOST pair_result {t, seq, ok, reason?}   # after desktop approval; both sides pin now
+# paired (hello_ack paired, or after pair_result ok):
+COMP -> HOST index_subscribe {}
+HOST -> COMP index {files:[{id, path, kind:file|dir, version, size}], full:true}
 ```
 
 `host_cert_fp` / `companion_cert_fp`: lowercase hex SHA-256 of cert DER.
@@ -169,6 +171,10 @@ C <-> S  live {file, page, stroke_id, tool, width, color, samples:[[x,y,p]...], 
 View-only grants, kick/revoke mid-session, multi-companion fan-out beyond one,
 binary frames, mDNS discovery, online relay, text/markup/page ops, conflict-free
 undo across sides.
+
+v1 syncs strokes and erases only: local undo of a synced stroke does not
+propagate (re-sync by refetching), area-erase splits and sticky-note ink stay
+local, and non-stroke item types are not mirrored.
 
 ## Conformance
 

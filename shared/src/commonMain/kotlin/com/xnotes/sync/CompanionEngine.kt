@@ -103,12 +103,11 @@ class CompanionEngine(
 
     // --- handshake + pairing ---
 
-    /** Connected: introduce ourselves. The host answers `hello_ack`. */
-    fun startHandshake() {
+    /** The socket connected: reset per-connection state and wait for the host's `hello`. */
+    fun onConnected() {
         helloSent = true
         lastRxMs = nowMs()
         lastHeartbeatMs = lastRxMs
-        send(SyncMsg.Hello(nextSeq(), "xnotes-linux", 1, deviceName, ownCertFp))
     }
 
     /**
@@ -184,11 +183,11 @@ class CompanionEngine(
     }
 
     fun requestDelete(id: String) {
-        send(SyncMsg.DeleteRequest(nextSeq(), id))
+        send(SyncMsg.DeleteRequest(nextSeq(), id, deviceName))
     }
 
     fun requestCreate(dirId: String?, name: String, kind: Int) {
-        send(SyncMsg.CreateRequest(nextSeq(), dirId, name, kind))
+        send(SyncMsg.CreateRequest(nextSeq(), deviceName, dirId, name, kind))
     }
 
     fun closeFile(id: String) {
@@ -241,7 +240,7 @@ class CompanionEngine(
 
     private fun onMessage(msg: SyncMsg) {
         when (msg) {
-            is SyncMsg.HelloAck -> onHelloAck(msg)
+            is SyncMsg.Hello -> onHello(msg)
             is SyncMsg.PairRequest -> onPairRequest(msg)
             is SyncMsg.PairResult -> onPairResult(msg)
             is SyncMsg.Index -> onIndex(msg)
@@ -252,6 +251,7 @@ class CompanionEngine(
             is SyncMsg.Live -> onLive(msg)
             is SyncMsg.Presence -> withLock(lock) { hostPresence[msg.file] = msg.page }
             is SyncMsg.IndexSubscribe -> Unit // we send it; the host answers an index
+            is SyncMsg.HelloAck -> Unit // the host never sends one; we answer hellos
             is SyncMsg.Heartbeat -> Unit
             is SyncMsg.DeleteResult -> host.onDeleteResult(msg.ok, msg.reason)
             is SyncMsg.CreateResult -> host.onCreateResult(msg.ok, msg.id, msg.reason)
@@ -262,20 +262,17 @@ class CompanionEngine(
         }
     }
 
-    private fun onHelloAck(m: SyncMsg.HelloAck) {
-        // The live peer must be the pinned companion (or be pairing now).
-        val pinned = pins.nameFor(m.companionCertFp)
-        if (pinned != null) {
-            pairedFp = m.companionCertFp
+    private fun onHello(m: SyncMsg.Hello) {
+        // The dialer introduces itself; answer with our pin state and ask for the file list.
+        val pinned = pins.nameFor(m.hostCertFp)
+        val paired = pinned != null
+        if (paired) {
+            pairedFp = m.hostCertFp
             pairedName = pinned
             host.onPaired(pinned)
-        } else if (m.paired) {
-            // The host thinks we are paired but we pinned nothing: re-pair.
-            host.onError("host claims pairing we do not have; pair again")
-            return
         }
-        if (pairedFp != null) {
-            // Ask for the file list.
+        send(SyncMsg.HelloAck(nextSeq(), m.seq, ownCertFp, paired, codeRequired = !paired))
+        if (paired) {
             send(SyncMsg.IndexSubscribe(nextSeq()))
         }
     }

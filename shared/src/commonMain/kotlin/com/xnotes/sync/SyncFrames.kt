@@ -193,7 +193,7 @@ sealed interface SyncMsg {
 
     data class IndexSubscribe(override val seq: Int) : SyncMsg
 
-    data class DeleteRequest(override val seq: Int, val id: String) : SyncMsg
+    data class DeleteRequest(override val seq: Int, val id: String, val device: String) : SyncMsg
 
     data class DeleteResult(
         override val seq: Int,
@@ -204,6 +204,7 @@ sealed interface SyncMsg {
 
     data class CreateRequest(
         override val seq: Int,
+        val device: String,
         val dirId: String?,
         val name: String,
         val kind: Int,

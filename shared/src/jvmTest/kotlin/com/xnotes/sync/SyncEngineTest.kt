@@ -82,10 +82,11 @@ class SyncEngineTest {
 
     @Test fun pairingFlowPinsAndSubscribes() {
         val (e, h) = engine()
-        e.startHandshake()
-        assertTrue(h.lastSent() is SyncMsg.Hello)
-        // Unknown host: ask for a code, not paired.
-        e.bytesReceived(SyncFrames.encode(SyncMsg.HelloAck(1, 0, "bb".repeat(32), paired = false, codeRequired = true)))
+        e.onConnected()
+        // Unknown host: hello answered unpaired, code required.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Hello(1, "xnotes-android", 1, "Pixel 8", "bb".repeat(32))))
+        val ack = h.lastSent()
+        assertTrue(ack is SyncMsg.HelloAck && !ack.paired && ack.codeRequired)
         val code = e.beginPairing()
         assertEquals(6, code.length)
         e.bytesReceived(SyncFrames.encode(SyncMsg.PairRequest(2, "Pixel 8", "bb".repeat(32), "000000")))
@@ -103,21 +104,25 @@ class SyncEngineTest {
         // Reconnect: pinned host is recognized, no code needed.
         val keepDir = File(System.getProperty("java.io.tmpdir"), "sync-eng-keep-${System.nanoTime()}").apply { mkdirs() }
         val (e0, h0) = engine(FakeHost(), keepDir)
-        e0.startHandshake()
+        e0.onConnected()
         h0.out.clear()
+        e0.bytesReceived(SyncFrames.encode(SyncMsg.Hello(8, "xnotes-android", 1, "Pixel 8", "bb".repeat(32))))
         e0.bytesReceived(SyncFrames.encode(SyncMsg.PairRequest(9, "Pixel 8", "bb".repeat(32), e0.beginPairing())))
         e0.decidePairing(true)
         val (e2, h2) = engine(FakeHost(), keepDir)
-        e2.startHandshake()
+        e2.onConnected()
         h2.out.clear()
-        e2.bytesReceived(SyncFrames.encode(SyncMsg.HelloAck(1, 0, "bb".repeat(32), paired = true, codeRequired = false)))
+        e2.bytesReceived(SyncFrames.encode(SyncMsg.Hello(1, "xnotes-android", 1, "Pixel 8", "bb".repeat(32))))
+        val ack2 = h2.out[h2.out.size - 2] as SyncMsg.HelloAck
+        assertEquals(true, ack2.paired)
+        assertEquals(false, ack2.codeRequired)
         assertEquals("Pixel 8", h2.paired)
         assertTrue(h2.lastSent() is SyncMsg.IndexSubscribe)
     }
 
     @Test fun indexFetchAndOpApply() {
         val (e, h) = engine()
-        e.startHandshake()
+        e.onConnected()
         h.out.clear()
         e.bytesReceived(
             SyncFrames.encode(

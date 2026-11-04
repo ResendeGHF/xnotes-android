@@ -108,6 +108,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "ok" -> ok = boolOr(p, false)
             "reason" -> reason = stringOrNull(p)
             "device_name" -> deviceName = stringOr(p, "")
+            "device" -> deviceName = stringOr(p, "")
             "code" -> code = stringOr(p, "")
             else -> p.skipValue()
         }
@@ -128,9 +129,9 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "presence" -> SyncMsg.Presence(seq, id, page)
         "heartbeat" -> SyncMsg.Heartbeat(seq)
         "index_subscribe" -> SyncMsg.IndexSubscribe(seq)
-        "delete_request" -> SyncMsg.DeleteRequest(seq, id)
+        "delete_request" -> SyncMsg.DeleteRequest(seq, id, deviceName)
         "delete_result" -> SyncMsg.DeleteResult(seq, replyTo, ok, reason)
-        "create_request" -> SyncMsg.CreateRequest(seq, dirId, name, kind)
+        "create_request" -> SyncMsg.CreateRequest(seq, deviceName, dirId, name, kind)
         "create_result" -> SyncMsg.CreateResult(seq, replyTo, ok, id.takeIf { it.isNotEmpty() }, reason)
         else -> SyncMsg.Unknown(t ?: "", seq)
     }
@@ -300,6 +301,7 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.name("t").value("delete_request")
             w.name("seq").value(msg.seq)
             w.name("id").value(msg.id)
+            w.name("device").value(msg.device)
             w.endObject()
         }
         is SyncMsg.DeleteResult -> {
@@ -315,6 +317,7 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.beginObject()
             w.name("t").value("create_request")
             w.name("seq").value(msg.seq)
+            w.name("device").value(msg.device)
             msg.dirId?.let { w.name("dir_id").value(it) }
             w.name("name").value(msg.name)
             w.name("kind").value(msg.kind)
