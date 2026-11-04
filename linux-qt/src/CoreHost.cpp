@@ -3,16 +3,19 @@
 #include "PdfPages.h"
 #include "PdfText.h"
 
+#include <QCoreApplication>
 #include <QFontMetricsF>
 #include <QPdfDocument>
 #include <QImageReader>
 #include <QMutex>
 #include <QPainterPath>
 #include <QTextLayout>
+#include <QThread>
 #include <QTimer>
 
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace xn {
 
@@ -573,21 +576,52 @@ int CoreHost::pdfPageCount(void* ctx, const char* path) {
     return doc ? doc->pageCount() : -1;
 }
 
+/* A document of the calling thread's own: a QPdfDocument is not shared between threads (as in
+   PdfPages), and the core reads text on its own workers. */
+QPdfDocument* CoreHost::textDocument(const char* path) {
+    const QString key = QString::fromUtf8(path);
+    thread_local QHash<QString, std::shared_ptr<QPdfDocument>> docs;
+    std::shared_ptr<QPdfDocument>& doc = docs[key];
+    if (!doc) {
+        doc = std::make_shared<QPdfDocument>();
+        if (doc->load(key) != QPdfDocument::Error::None) doc.reset();
+    }
+    return doc.get();
+}
+
 int CoreHost::pdfText(void* ctx, const char* path, int page, int capacity, uint32_t* codepoints, float* boxes) {
     CoreHost* self = H(ctx);
-    QPdfDocument* doc = self->pdf(path);
+    const QString spath = QString::fromUtf8(path);
+    // The cache, under the lock; the read itself runs without it so pages keep loading in parallel.
+    {
+        QMutexLocker lock(&self->textMutex_);
+        auto it = self->pageText_.find(spath + QLatin1Char('#') + QString::number(page));
+        if (it != self->pageText_.end()) {
+            const int count = int(it->codepoints.size());
+            if (count > 0 && capacity >= count && codepoints && boxes) {
+                memcpy(codepoints, it->codepoints.constData(), sizeof(uint32_t) * size_t(count));
+                memcpy(boxes, it->boxes.constData(), sizeof(float) * 4 * size_t(count));
+            }
+            return count;
+        }
+    }
+    // The UI thread reads through its cached document; workers use their own.
+    QPdfDocument* doc = (QThread::currentThread() == QCoreApplication::instance()->thread())
+        ? self->pdf(path)
+        : textDocument(path);
     if (!doc || page < 0 || page >= doc->pageCount()) return -1;
-    const QString key = QString::fromUtf8(path) + QLatin1Char('#') + QString::number(page);
-    auto it = self->pageText_.find(key);
-    if (it == self->pageText_.end()) {
+    pdftext::Page read = pdftext::read(doc, page);
+    const int count = int(read.codepoints.size());
+    {
+        QMutexLocker lock(&self->textMutex_);
+        const QString key = spath + QLatin1Char('#') + QString::number(page);
         // The pages read last are kept: a reader works on a few at a time.
         if (self->pageText_.size() >= kKeptPageTexts) self->pageText_.clear();
-        it = self->pageText_.insert(key, pdftext::read(doc, page));
-    }
-    const int count = int(it->codepoints.size());
-    if (count > 0 && capacity >= count && codepoints && boxes) {
-        memcpy(codepoints, it->codepoints.constData(), sizeof(uint32_t) * size_t(count));
-        memcpy(boxes, it->boxes.constData(), sizeof(float) * 4 * size_t(count));
+        auto it = self->pageText_.insert(key, std::move(read));
+        if (count > 0 && capacity >= count && codepoints && boxes) {
+            memcpy(codepoints, it->codepoints.constData(), sizeof(uint32_t) * size_t(count));
+            memcpy(boxes, it->boxes.constData(), sizeof(float) * 4 * size_t(count));
+        }
     }
     return count;
 }

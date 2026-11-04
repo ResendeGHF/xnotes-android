@@ -9,6 +9,7 @@
 #include <QFont>
 #include <QHash>
 #include <QImage>
+#include <QMutex>
 #include <QPainter>
 #include <QString>
 
@@ -120,10 +121,15 @@ private:
     /* Open PDFs by path, loaded on first use and kept while the host lives. */
     QHash<QString, QPdfDocument*> pdfs_;
     std::unique_ptr<PdfPages> pages_;
-    /* The text of the PDF pages read last, by path and page. */
+    /* The text of the PDF pages read last, by path and page. The core reads it on its own
+       threads too (a dense page takes ~0.4 s), so every access takes the lock and each thread
+       reads through its own document: a QPdfDocument is not shared between threads. */
+    QMutex textMutex_;
     QHash<QString, pdftext::Page> pageText_;
 
     QPdfDocument* pdf(const char* path);
+    /* This thread's document for reading text (the UI thread's is the cached one). */
+    static QPdfDocument* textDocument(const char* path);
 
     static void* surfaceCreate(void* ctx, int w, int h, double dpr);
     static void surfaceFill(void* ctx, void* s, xn_rgba c);

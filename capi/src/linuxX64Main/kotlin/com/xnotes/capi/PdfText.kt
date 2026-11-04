@@ -6,7 +6,9 @@ import com.xnotes.canvas.CanvasState
 import com.xnotes.canvas.PdfTextSource
 import com.xnotes.capi.c.xn_host
 import com.xnotes.core.pdf.PageText
+import com.xnotes.core.platform.Lock
 import com.xnotes.core.platform.pathString
+import com.xnotes.core.platform.withLock
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.FloatVar
 import kotlinx.cinterop.UIntVar
@@ -41,32 +43,104 @@ internal fun readPdfPageText(host: xn_host, path: String, page: Int): PageText? 
 }
 
 /**
- * A note's PDF text, read through the host when a page is first asked for and kept for the pages
- * read last. Reads happen on the UI thread, which the selection gestures already run on.
+ * A note's PDF text, read through the host off the UI thread and kept for the pages read last.
+ *
+ * A dense page costs ~0.4 s to read through QtPdf, far too long for the gestures that need it, so
+ * [peek] only answers from the cache while [prefetch] and [request] load in the background: a
+ * pointer down prefetches the page under it (the long-press delay covers the read), and a gesture
+ * that needs the text now waits on it, its [onReady] running on the UI thread. Reads run on the
+ * canvas's workers ([CanvasState.runAsync], delivered on [CanvasState.postToMain]); without them
+ * (tests, export) everything runs synchronously on the caller.
  */
 internal class CPdfTexts(private val host: xn_host, private val state: CanvasState) : PdfTextSource {
-    private val read = LinkedHashMap<Int, PageText?>()
+    private val lock = Lock()
+    private val read = LinkedHashMap<Int, PageText>()
     private var forDocument: Any? = null
 
-    private fun load(page: Int): PageText? {
+    /** PDF indices loading now. */
+    private val inFlight = HashSet<Int>()
+
+    /** Gesture continuations waiting on a load, by PDF index; run on the UI thread once it lands. */
+    private val waiters = HashMap<Int, MutableList<(PageText?) -> Unit>>()
+
+    private data class Target(val doc: Any, val path: String, val pdfIndex: Int)
+
+    private fun targetOf(page: Int): Target? {
         val doc = state.document
-        if (forDocument !== doc) {
-            read.clear()
-            forDocument = doc
-        }
         val index = doc.pages.getOrNull(page)?.pdfPage ?: return null
         val path = doc.pdfFile?.pathString ?: return null
-        if (read.containsKey(index)) return read[index]
-        val text = readPdfPageText(host, path, index)
-        read[index] = text
-        if (read.size > KEPT_PAGES) read.remove(read.keys.first())
-        return text
+        return Target(doc, path, index)
     }
 
-    override fun peek(page: Int): PageText? = load(page)
+    private fun dropStale(doc: Any) = withLock(lock) {
+        if (forDocument !== doc) {
+            read.clear()
+            // Loads for the outgoing note still land, but find no waiter and no cache home.
+            inFlight.clear()
+            waiters.clear()
+            forDocument = doc
+        }
+    }
 
-    /** Reads are made when asked for, so there is nothing to start early. */
-    override fun prefetch(page: Int) = Unit
+    override fun peek(page: Int): PageText? {
+        val t = targetOf(page) ?: return null
+        dropStale(t.doc)
+        return withLock(lock) { read[t.pdfIndex] }
+    }
 
-    override fun request(page: Int, onReady: (PageText?) -> Unit) = onReady(load(page))
+    override fun prefetch(page: Int) {
+        val t = targetOf(page) ?: return
+        dropStale(t.doc)
+        val start = withLock(lock) {
+            if (read.containsKey(t.pdfIndex) || !inFlight.add(t.pdfIndex)) false else true
+        }
+        if (!start) return
+        state.runAsync {
+            val text = readPdfPageText(host, t.path, t.pdfIndex)
+            val due = withLock(lock) {
+                inFlight.remove(t.pdfIndex)
+                if (text != null && forDocument === t.doc) {
+                    read[t.pdfIndex] = text
+                    if (read.size > KEPT_PAGES) read.remove(read.keys.first())
+                }
+                waiters.remove(t.pdfIndex)?.toList() ?: emptyList()
+            }
+            if (due.isNotEmpty()) state.postToMain { for (w in due) w(if (state.document === t.doc) text else null) }
+        }
+    }
+
+    override fun request(page: Int, onReady: (PageText?) -> Unit) {
+        val t = targetOf(page)
+        if (t == null) return onReady(null)
+        dropStale(t.doc)
+        // One locked decision: answer from the cache, join a running load, or start one. A load
+        // landing between an earlier peek and here is re-checked inside the lock, so no ready is
+        // lost and none is delivered twice.
+        var startLoad = false
+        val hit = withLock(lock) {
+            val now = read[t.pdfIndex]
+            if (now == null) {
+                if (t.pdfIndex !in inFlight) {
+                    inFlight.add(t.pdfIndex)
+                    startLoad = true
+                }
+                waiters.getOrPut(t.pdfIndex) { ArrayList() }.add(onReady)
+            }
+            now
+        }
+        if (hit != null) return onReady(hit)
+        if (!startLoad) return
+        state.runAsync {
+            val text = readPdfPageText(host, t.path, t.pdfIndex)
+            val due = withLock(lock) {
+                inFlight.remove(t.pdfIndex)
+                if (text != null && forDocument === t.doc) {
+                    read[t.pdfIndex] = text
+                    if (read.size > KEPT_PAGES) read.remove(read.keys.first())
+                }
+                waiters.remove(t.pdfIndex)?.toList() ?: emptyList()
+            }
+            state.postToMain { for (w in due) w(if (state.document === t.doc) text else null) }
+        }
+    }
 }

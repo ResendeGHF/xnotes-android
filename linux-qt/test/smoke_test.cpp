@@ -40,6 +40,10 @@
 
 #include <zlib.h>
 
+#include <future>
+#include <utility>
+#include <vector>
+
 /* A minimal .xnote: one stored manifest entry. */
 static bool writeNote(const QString& path, const QByteArray& manifest) {
     const QByteArray name("manifest.json");
@@ -563,6 +567,38 @@ private slots:
         // The space after Hello has no box, so it selects nothing.
         QCOMPARE(text.at(5), QLatin1Char(' '));
         QVERIFY(page.boxes[4 * 5 + 2] <= page.boxes[4 * 5]);
+    }
+
+    /* The text service reads the same page on several threads at once: the core reads text on its
+       workers while the UI reads it too. */
+    void pdfTextThreadSafe() {
+        const QString path = QFINDTESTDATA("data/text.pdf");
+        QVERIFY(!path.isEmpty());
+        xn::CoreHost host;
+        const xn_host* h = host.host();
+        QVERIFY(h->pdf_text != nullptr);
+        const QByteArray cpath = QFile::encodeName(path);
+        auto read = [&] {
+            const int n = h->pdf_text(h->ctx, cpath.constData(), 0, 0, nullptr, nullptr);
+            if (n <= 0) return std::make_pair(QVector<uint32_t>(), QVector<float>());
+            QVector<uint32_t> cps(n);
+            QVector<float> boxes(4 * n);
+            const int m = h->pdf_text(h->ctx, cpath.constData(), 0, n, cps.data(), boxes.data());
+            if (m != n) return std::make_pair(QVector<uint32_t>(), QVector<float>());
+            return std::make_pair(cps, boxes);
+        };
+        const auto first = read();
+        QVERIFY(first.first.size() > 10);
+        // Three workers read while this thread reads again.
+        std::vector<std::future<std::pair<QVector<uint32_t>, QVector<float>>>> done;
+        for (int i = 0; i < 3; ++i) done.push_back(std::async(std::launch::async, read));
+        const auto second = read();
+        QCOMPARE(second.first, first.first);
+        for (auto& f : done) {
+            const auto got = f.get();
+            QCOMPARE(got.first, first.first);
+            QCOMPARE(got.second, first.second);
+        }
     }
 
     /* The scroll bars follow the view and move it. */
