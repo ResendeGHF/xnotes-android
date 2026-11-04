@@ -73,6 +73,19 @@ class CompatNotesTest {
     }
 
     @Test
+    fun mathStudioWorkspaceSurvivesRoundTrip() {
+        val tmpPdf = File.createTempFile("compat-src", ".pdf").apply { deleteOnExit() }
+        val doc = fixture("example-note-created-by-note.xnote").inputStream()
+            .use { codec.read(it, tmpPdf.parentFile, Files_createTempDir("compat-math")) }
+        val studio = requireNotNull(doc.mathStudioJson) { "math studio workspace was dropped" }
+        val out = ByteArrayOutputStream()
+        codec.write(doc, out)
+        val doc2 = out.toByteArray().inputStream()
+            .use { codec.read(it, tmpPdf.parentFile, Files_createTempDir("compat-math2")) }
+        assertEquals(studio, doc2.mathStudioJson)
+    }
+
+    @Test
     fun pdfBackedNoteOpensWithSource() {
         val kinds = checkRoundTrip("pdf.xnote")
         assertTrue("expected strokes", (kinds["stroke"] ?: 0) > 0)

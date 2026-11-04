@@ -39,6 +39,19 @@ class Document(
      * draws the same on any device. Built-in rulings are never here. Replaced whole, never mutated.
      */
     var templates: Map<String, String> = emptyMap(),
+    /**
+     * The packaged templates (zips holding pictures) this note's styles name, by key, as files on
+     * disk so their pictures never sit in the heap. Like [templates], replaced whole.
+     */
+    var templatePackages: Map<String, File> = emptyMap(),
+    /** The size of each page added from now on, or null to give it the size of the page before it. */
+    var newPageSize: PageSizeChoice? = null,
+    /**
+     * The note's Math Studio workspace (calculator, solver, plots, fields, calculus, symbolic,
+     * units), serialized JSON. Kept per note so reopening the studio restores everything, and
+     * carried by export/import since it lives in the bundle manifest.
+     */
+    var mathStudioJson: String? = null,
 ) {
     /** Transient: set by the codec when legacy ink was compacted at load (debug overlay readout). */
     var compactedOnLoad = false

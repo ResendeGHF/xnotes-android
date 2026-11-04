@@ -15,6 +15,7 @@ import com.xnotes.core.model.PageMargins
 import com.xnotes.core.model.PagePattern
 import com.xnotes.core.model.PageTemplates
 import com.xnotes.core.model.PageSize
+import com.xnotes.core.model.PageSizeChoice
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Routing
@@ -133,6 +134,8 @@ class DocumentCodec(
             // The source PDF streams straight from disk for the same reason. [isCancelled] lets a
             // long copy abort (e.g. import cancel).
             doc.pdfFile?.let { zos.putStored("assets/source.pdf", it, isCancelled) }
+            // Packaged template zips ride along the same way, keyed by the template they belong to.
+            for ((key, file) in packagedTemplateAssets(doc)) zos.putStored(TEMPLATE_ASSET + key + TEMPLATE_EXT, file, isCancelled)
             val assetsDone = monotonicNanos()
             writeTail(zos, doc, assets, timing)
             timing?.assetsMs = (assetsDone - started) / 1_000_000L
@@ -188,6 +191,14 @@ class DocumentCodec(
         return keys.sorted().mapNotNull { k -> doc.templates[k]?.let { k to it } }
     }
 
+    /** The packaged template zips [doc]'s styles name, in key order, as files on disk. */
+    internal fun packagedTemplateAssets(doc: Document): List<Pair<String, File>> {
+        val keys = HashSet<String>()
+        doc.style.template?.let { keys.add(it) }
+        for (page in doc.pages) page.style.template?.let { keys.add(it) }
+        return keys.sorted().mapNotNull { k -> doc.templatePackages[k]?.let { k to it } }
+    }
+
     /**
      * The image entries a document needs, named in the order the manifest mentions them. The
      * manifest walks the same pages and items and takes the names from this list positionally, so
@@ -231,6 +242,18 @@ class DocumentCodec(
         j.endArray()
         writeStyle(j, doc.style)
         writeMargins(j, doc.margins)
+        doc.newPageSize?.let { writeNewPageSize(j, it) }
+        doc.mathStudioJson?.takeIf { it.isNotEmpty() }?.let { j.name("math_studio").value(it) }
+        j.endObject()
+    }
+
+    /** The size of pages added from now on, written only when it sets one. */
+    private fun writeNewPageSize(j: JsonWrite, c: PageSizeChoice) {
+        j.name("new_page_size").beginObject()
+        j.name("size").value(c.size.name.lowercase())
+        j.name("orientation").value(c.orientation.toName())
+        j.name("custom_width_mm").value(c.customWidthMm)
+        j.name("custom_height_mm").value(c.customHeightMm)
         j.endObject()
     }
 
@@ -564,6 +587,7 @@ class DocumentCodec(
         var flowBytes: ByteArray? = null
         var markupBytes: ByteArray? = null
         val templates = HashMap<String, String>()
+        val packages = HashMap<String, File>()
         val imageFiles = HashMap<String, File>()
         var pdfFile: File? = null
         ZipInputStream(input).use { zis ->
@@ -613,6 +637,13 @@ class DocumentCodec(
                         val key = name.substring(TEMPLATE_DIR.length, name.length - TEMPLATE_EXT.length)
                         val bytes = readAtMost(zis, TemplateReader.MAX_BYTES)
                         if (TEMPLATE_KEY.matches(key) && bytes != null) templates[key] = bytes.decodeToString()
+                    } else if (name.startsWith(TEMPLATE_ASSET) && name.endsWith(TEMPLATE_EXT)) {
+                        val key = name.substring(TEMPLATE_ASSET.length, name.length - TEMPLATE_EXT.length)
+                        if (TEMPLATE_KEY.matches(key) && imageDir != null) {
+                            val f = createTempFile("tpl", TEMPLATE_EXT, imageDir)
+                            copyToFile(zis, f)
+                            packages[key] = f
+                        }
                     }
                     // Anything else is an asset from a newer version: skipped, never buffered.
                 }
@@ -629,6 +660,9 @@ class DocumentCodec(
         doc.templates = templates
         doc.style = m.style
         doc.margins = m.margins
+        doc.newPageSize = m.newPageSize
+        doc.mathStudioJson = m.mathStudio
+        doc.templatePackages = packages
 
         if (m.hasPdf) {
             doc.pdfFile = pdfFile
@@ -697,6 +731,8 @@ class DocumentCodec(
         var hasPdf = false
         var style = PageStyle()
         var margins = PageMargins()
+        var newPageSize: PageSizeChoice? = null
+        var mathStudio: String? = null
         val bookmarks = ArrayList<Bookmark>()
         val pages = ArrayList<Page>()
         val pageImages = ArrayList<Triple<Page, List<PendingImage>, GlueRead>>()
@@ -770,6 +806,8 @@ class DocumentCodec(
                 "has_pdf" -> m.hasPdf = boolOr(p, false)
                 "style" -> m.style = parseStyle(p)
                 "margins" -> m.margins = parseMargins(p)
+                "new_page_size" -> m.newPageSize = parseNewPageSize(p)
+                "math_studio" -> m.mathStudio = stringOrNull(p)
                 "bookmarks" -> parseBookmarks(p, m.bookmarks)
                 "pages" -> parsePages(p, m)
                 else -> p.skipValue()
@@ -777,6 +815,30 @@ class DocumentCodec(
         }
         p.endObject()
         return m
+    }
+
+    private fun parseNewPageSize(p: JsonPull): PageSizeChoice? {
+        if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+            p.skipValue()
+            return null
+        }
+        var size: PageSize? = null
+        var orientation = Orientation.PORTRAIT
+        var customW = PageSize.A4.shortMm
+        var customH = PageSize.A4.longMm
+        p.beginObject()
+        while (p.hasNext()) {
+            when (p.nextName()) {
+                "size" -> size = PageSize.fromName(stringOrNull(p))
+                "orientation" -> orientation = Orientation.fromName(stringOrNull(p))
+                "custom_width_mm" -> customW = doubleOr(p, customW)
+                "custom_height_mm" -> customH = doubleOr(p, customH)
+                else -> p.skipValue()
+            }
+        }
+        p.endObject()
+        // Unknown size names fall back to A4 instead of failing the note.
+        return PageSizeChoice(size ?: PageSize.A4, orientation, customW, customH)
     }
 
     private fun parseBookmarks(p: JsonPull, out: MutableList<Bookmark>) {
@@ -1496,6 +1558,7 @@ class DocumentCodec(
 
         private const val TEMPLATE_DIR = "templates/"
         private const val TEMPLATE_EXT = ".xtemplate"
+        private const val TEMPLATE_ASSET = "assets/template-"
 
         /** What a template key may look like: it becomes part of a zip entry name. */
         val TEMPLATE_KEY = Regex("[A-Za-z0-9._-]{1,64}")

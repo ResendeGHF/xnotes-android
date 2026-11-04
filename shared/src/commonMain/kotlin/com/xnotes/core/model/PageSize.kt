@@ -28,7 +28,9 @@ enum class PageSize(val displayName: String, val shortMm: Double, val longMm: Do
     LETTER("Letter", 215.9, 279.4),
     LEGAL("Legal", 215.9, 355.6),
     SLIDE_16_9("Slide 16:9", 190.5, 338.7),
-    SLIDE_4_3("Slide 4:3", 190.5, 254.0);
+    SLIDE_4_3("Slide 4:3", 190.5, 254.0),
+    /** Samsung Notes page (1440 x 2036 px at 150 dpi): used when importing `.sdocx` notes. */
+    SAMSUNG_NOTES("Samsung Notes", 243.84, 344.76);
 
     /** Returns `(width, height)` in document pixels for [orientation] at [dpi]. */
     fun pixels(orientation: Orientation, dpi: Int): Pair<Double, Double> {
@@ -40,6 +42,10 @@ enum class PageSize(val displayName: String, val shortMm: Double, val longMm: Do
     companion object {
         const val DEFAULT_DPI = 150
 
+        /** Settable range of a custom page's sides, in millimetres. */
+        const val CUSTOM_MIN_MM = 10.0
+        const val CUSTOM_MAX_MM = 2000.0
+
         fun mmToPx(mm: Double, dpi: Int): Double = mm / 25.4 * dpi
         fun pxToMm(px: Double, dpi: Int): Double = px / dpi * 25.4
 
@@ -48,5 +54,39 @@ enum class PageSize(val displayName: String, val shortMm: Double, val longMm: Do
             entries.firstOrNull {
                 it.displayName.equals(name, ignoreCase = true) || it.name.equals(name, ignoreCase = true)
             } ?: A4
+    }
+}
+
+/** A page size as picked in a menu: a named [size] turned to [orientation], or Custom's sides as typed. */
+data class PageSizeChoice(
+    val size: PageSize,
+    val orientation: Orientation = Orientation.PORTRAIT,
+    val customWidthMm: Double = PageSize.A4.shortMm,
+    val customHeightMm: Double = PageSize.A4.longMm,
+) {
+    /** Returns `(width, height)` in document pixels at [dpi]. */
+    fun pixels(dpi: Int): Pair<Double, Double> =
+        if (size == PageSize.CUSTOM) {
+            PageSize.mmToPx(customWidthMm, dpi) to PageSize.mmToPx(customHeightMm, dpi)
+        } else {
+            size.pixels(orientation, dpi)
+        }
+
+    companion object {
+        /** How near, in millimetres, a page's sides must be to a named size's to count as that size. */
+        private const val MATCH_MM = 0.5
+
+        /** What a [w] by [h] page at [dpi] is: a named size either way round when its sides match one, else Custom with its sides. */
+        fun of(w: Double, h: Double, dpi: Int): PageSizeChoice {
+            val wMm = PageSize.pxToMm(w, dpi)
+            val hMm = PageSize.pxToMm(h, dpi)
+            val orientation = if (wMm > hMm) Orientation.LANDSCAPE else Orientation.PORTRAIT
+            val short = minOf(wMm, hMm)
+            val long = maxOf(wMm, hMm)
+            val named = PageSize.entries.firstOrNull {
+                it != PageSize.CUSTOM && kotlin.math.abs(it.shortMm - short) <= MATCH_MM && kotlin.math.abs(it.longMm - long) <= MATCH_MM
+            }
+            return named?.let { PageSizeChoice(it, orientation) } ?: PageSizeChoice(PageSize.CUSTOM, orientation, wMm, hMm)
+        }
     }
 }
