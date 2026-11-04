@@ -34,6 +34,7 @@
 #include <QPdfDocument>
 #include <QTreeView>
 #include <QSslSocket>
+#include <QTcpServer>
 #include <QSignalSpy>
 #include <QJsonDocument>
 #include <QDataStream>
@@ -766,8 +767,12 @@ private slots:
     /* A TLS client completes a handshake with the companion server and gets hello_ack. */
     void companionTlsHandshake() {
         xn::CompanionServer server;
-        QVERIFY(server.start());
-        qInfo("DBG test server running");
+        // A free port: the user's own app may hold 42317 on this machine.
+        QTcpServer probe;
+        QVERIFY(probe.listen());
+        const int port = probe.serverPort();
+        probe.close();
+        QVERIFY(server.start(port));
         QSslSocket client;
         client.setProtocol(QSsl::TlsV1_2OrLater);
         client.setPeerVerifyMode(QSslSocket::VerifyNone);
@@ -775,7 +780,7 @@ private slots:
         QSignalSpy clientEncrypted(&client, &QSslSocket::encrypted);
         QString clientError;
         QObject::connect(&client, &QSslSocket::errorOccurred, [&](QAbstractSocket::SocketError) { clientError = client.errorString(); });
-        client.connectToHostEncrypted(QStringLiteral("127.0.0.1"), xn::CompanionServer::kPort);
+        client.connectToHostEncrypted(QStringLiteral("127.0.0.1"), port);
         QVERIFY2(clientEncrypted.wait(10000), qPrintable(QStringLiteral("client handshake failed: %1 state=%2").arg(clientError).arg(client.state())));
         QVERIFY(client.isEncrypted());
         // Speak SYNC hello; the server must answer hello_ack.
@@ -789,6 +794,26 @@ private slots:
         frame += hello;
         QVERIFY(client.write(frame) == frame.size());
         QVERIFY(client.waitForBytesWritten(5000));
+        // A peer that resets mid-handshake must not take the server down: connect
+        // and drop before TLS completes, twice, then carry on.
+        for (int i = 0; i < 2; ++i) {
+            QTcpSocket plain;
+            plain.connectToHost(QStringLiteral("127.0.0.1"), port);
+            QVERIFY(plain.waitForConnected(3000));
+            plain.abort();
+            QTest::qWait(100);
+        }
+        // Android heartbeats every 20 s; send one now.
+        {
+            const QByteArray hb = QStringLiteral("{\"t\":\"heartbeat\",\"seq\":99}").toUtf8();
+            QByteArray hbFrame;
+            QDataStream hbds(&hbFrame, QIODevice::WriteOnly);
+            hbds.setByteOrder(QDataStream::BigEndian);
+            hbds << qint32(hb.size());
+            hbFrame += hb;
+            QVERIFY(client.write(hbFrame) == hbFrame.size());
+            QVERIFY(client.waitForBytesWritten(5000));
+        }
         QByteArray reply;
         QElapsedTimer replyTimer;
         replyTimer.start();
@@ -801,7 +826,35 @@ private slots:
         QVERIFY(reply.size() - 4 >= n);
         const QJsonDocument doc = QJsonDocument::fromJson(reply.mid(4, n));
         QCOMPARE(doc.object().value(QStringLiteral("t")).toString(), QStringLiteral("hello_ack"));
+        // Reconnect like an auto-reconnect would: drop and dial again, hello again.
         client.disconnectFromHost();
+        QVERIFY(client.waitForDisconnected(5000));
+        QTest::qWait(200);
+        QSslSocket second;
+        second.setProtocol(QSsl::TlsV1_2OrLater);
+        second.setPeerVerifyMode(QSslSocket::VerifyNone);
+        second.ignoreSslErrors();
+        QString secondError;
+        QObject::connect(&second, &QSslSocket::errorOccurred, [&](QAbstractSocket::SocketError) { secondError = second.errorString(); });
+        QObject::connect(&second, &QSslSocket::sslErrors, [&](const QList<QSslError> &e) { secondError = e.isEmpty() ? secondError : e.first().errorString(); });
+        QSignalSpy secondEncrypted(&second, &QSslSocket::encrypted);
+        second.connectToHostEncrypted(QStringLiteral("127.0.0.1"), port);
+        QVERIFY2(secondEncrypted.wait(10000), qPrintable(QStringLiteral("reconnect handshake failed: %1 state=%2").arg(secondError).arg(second.state())));
+        QVERIFY(second.write(frame) == frame.size());
+        QVERIFY(second.waitForBytesWritten(5000));
+        QByteArray reply2;
+        QElapsedTimer t2;
+        t2.start();
+        while (t2.elapsed() < 5000 && reply2.isEmpty()) {
+            QTest::qWait(50);
+            reply2 += second.readAll();
+        }
+        QVERIFY2(reply2.size() > 4, qPrintable(QStringLiteral("short reply2 %1").arg(reply2.size())));
+        const int n2 = (quint8(reply2[0]) << 24) | (quint8(reply2[1]) << 16) | (quint8(reply2[2]) << 8) | quint8(reply2[3]);
+        QVERIFY(reply2.size() - 4 >= n2);
+        QCOMPARE(QJsonDocument::fromJson(reply2.mid(4, n2)).object().value(QStringLiteral("t")).toString(), QStringLiteral("hello_ack"));
+        second.disconnectFromHost();
+        QVERIFY(second.waitForDisconnected(5000));
     }
 
     /* A PDF's outline lists its chapters; clicking one goes to its page. */

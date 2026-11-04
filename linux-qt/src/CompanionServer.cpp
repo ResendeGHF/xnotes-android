@@ -79,7 +79,7 @@ bool CompanionServer::ensureIdentity() {
     return true;
 }
 
-bool CompanionServer::start() {
+bool CompanionServer::start(int port) {
     if (server_) return true;
     if (!ensureIdentity()) return false;
     auto* server = new QSslServer(this);
@@ -95,17 +95,20 @@ bool CompanionServer::start() {
     conf.setPrivateKey(QSslKey(keyFile.readAll(), QSsl::Rsa));
     conf.setProtocol(QSsl::TlsV1_2OrLater);
     server->setSslConfiguration(conf);
-    if (!server->listen(QHostAddress::Any, kPort)) {
-        status_ = QStringLiteral("Could not listen on %1: %2").arg(kPort).arg(server->errorString());
+    if (!server->listen(QHostAddress::Any, port)) {
+        status_ = QStringLiteral("Could not listen on %1: %2").arg(port).arg(server->errorString());
         emit statusChanged(status_);
         delete server;
         return false;
     }
     server_ = server;
+    // Sockets come only from startedEncryptionHandshake, which hands over a live
+    // socket. The base-class pending queue is never touched: entries there can be
+    // reaped by QSslServer's own handshake cleanup, leaving dangling pointers
+    // behind (qobject_cast on one segfaulted here).
     connect(server_, &QSslServer::startedEncryptionHandshake, this, &CompanionServer::onHandshakeStarted);
-    connect(server_, &QTcpServer::newConnection, this, &CompanionServer::onNewConnection);
-    connect(server_, &QSslServer::handshakeInterruptedOnError, this, [this](QSslSocket* socket, const QSslError&) {
-        if (socket != nullptr && socket == socket_) onDisconnected();
+    connect(server_, &QSslServer::handshakeInterruptedOnError, this, [this](QSslSocket* socket) {
+        if (socket != nullptr && socket == socket_.data()) onDisconnected();
     });
     const QByteArray pins = QFile::encodeName(configDir());
     const QByteArray name = deviceName_.toUtf8();
@@ -127,9 +130,12 @@ void CompanionServer::stop() {
         tick_ = nullptr;
     }
     if (socket_) {
-        socket_->disconnectFromHost();
-        socket_->deleteLater();
+        // Same clear-first discipline as dropSocket(): disconnectFromHost() may
+        // emit disconnected synchronously, which must see an empty socket_.
+        QPointer<QSslSocket> s = socket_;
         socket_ = nullptr;
+        s->disconnectFromHost();
+        s->deleteLater();
     }
     if (server_) {
         server_->close();
@@ -200,20 +206,40 @@ void CompanionServer::unbindEditor(xn_editor* editor) const {
 }
 
 void CompanionServer::takeSocket(QSslSocket* socket) {
+    if (socket != nullptr && socket == socket_.data()) return;  // already adopted
     // One host at a time: a new dial replaces the old one.
-    if (socket_) {
-        socket_->disconnectFromHost();
-        socket_->deleteLater();
-        socket_ = nullptr;
-    }
+    dropSocket();
     socket_ = socket;
     if (!socket_) return;
     socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
-    connect(socket_, &QSslSocket::encrypted, this, &CompanionServer::onEncrypted);
-    connect(socket_, &QSslSocket::readyRead, this, &CompanionServer::onReadyRead);
-    connect(socket_, &QSslSocket::disconnected, this, &CompanionServer::onDisconnected);
-    connect(socket_, &QSslSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) { onDisconnected(); });
+    // Each signal is bound to its own socket: a late signal from a dropped
+    // connection must never tear down the current one.
+    connect(socket_, &QSslSocket::encrypted, this, [this, socket = socket_.data()] {
+        if (socket != nullptr && socket == this->socket_.data()) onEncrypted();
+    });
+    connect(socket_, &QSslSocket::readyRead, this, [this, socket = socket_.data()] {
+        if (socket != nullptr && socket == this->socket_.data()) onReadyRead();
+    });
+    connect(socket_, &QSslSocket::disconnected, this, [this, socket = socket_.data()] {
+        if (socket != nullptr && socket == this->socket_.data()) onDisconnected();
+    });
+    connect(socket_, &QSslSocket::errorOccurred, this, [this, socket = socket_.data()](QAbstractSocket::SocketError) {
+        if (socket != nullptr && socket == this->socket_.data()) onDisconnected();
+    });
     if (socket_->isEncrypted()) onEncrypted();
+}
+
+void CompanionServer::dropSocket() {
+    // Clear first: disconnectFromHost() can emit disconnected/error synchronously,
+    // and the per-socket guard then sees we already let go instead of recursing
+    // into a second deleteLater on a null QPointer (that was the segfault).
+    QPointer<QSslSocket> s = socket_;
+    socket_ = nullptr;
+    if (s) {
+        // deleteLater, not delete: signals already in flight for it stay valid.
+        s->disconnectFromHost();
+        s->deleteLater();
+    }
 }
 
 void CompanionServer::onHandshakeStarted(QSslSocket* socket) {
@@ -221,23 +247,21 @@ void CompanionServer::onHandshakeStarted(QSslSocket* socket) {
     takeSocket(socket);
 }
 
-void CompanionServer::onNewConnection() {
-    if (!server_) return;
-    // QSslServer hands accepted sockets out through startedEncryptionHandshake with the
-    // handshake already running; the base-class queue is only a fallback for builds
-    // without auto-start.
-    if (!server_->hasPendingConnections()) return;
-    if (auto* socket = qobject_cast<QSslSocket*>(server_->nextPendingConnection())) {
-        if (socket->mode() == QSslSocket::UnencryptedMode) {
-            takeSocket(socket);
-            socket->startServerEncryption();
+void CompanionServer::onEncrypted() {
+    // QSslServer queues the socket in the base pending list once encrypted; take our
+    // adopted one back out so close() never deletes a live socket out from under us.
+    while (server_ != nullptr && server_->hasPendingConnections()) {
+        if (auto* queued = qobject_cast<QSslSocket*>(server_->nextPendingConnection())) {
+            if (queued != socket_.data()) {
+                // Not ours (should not happen with one host at a time): put it back
+                // by leaving it alone is impossible, so drop it rather than leak it.
+                queued->disconnectFromHost();
+                queued->deleteLater();
+            }
         } else {
-            socket->deleteLater();
+            break;
         }
     }
-}
-
-void CompanionServer::onEncrypted() {
     if (socket_ && sync_) xn_sync_hello(sync_);
 }
 
@@ -248,10 +272,7 @@ void CompanionServer::onReadyRead() {
 }
 
 void CompanionServer::onDisconnected() {
-    if (socket_) {
-        socket_->deleteLater();
-        socket_ = nullptr;
-    }
+    dropSocket();
     if (sync_) xn_sync_reset(sync_);
     status_ = server_ ? QStringLiteral("Listening") : status_;
     emit statusChanged(status_);

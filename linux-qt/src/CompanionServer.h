@@ -8,6 +8,7 @@
 
 #include <QHostAddress>
 #include <QObject>
+#include <QPointer>
 #include <QSslError>
 #include <QString>
 
@@ -29,7 +30,7 @@ public:
     xn_sync* sync() const { return sync_; }
 
     /* Start listening (cert bootstrap included). False with status() saying why. */
-    bool start();
+    bool start(int port = kPort);
     void stop();
     bool running() const { return server_ != nullptr; }
 
@@ -70,12 +71,13 @@ signals:
     void error(const QString& reason);
 
 private slots:
-    void onNewConnection();
     void onHandshakeStarted(QSslSocket* socket);
+    void dropSocket();
     void onEncrypted();
+    void onDisconnected();
+    /* Adopt a live handshaking socket, dropping any previous one. */
     void takeSocket(QSslSocket* socket);
     void onReadyRead();
-    void onDisconnected();
     void onTick();
 
 private:
@@ -99,7 +101,9 @@ private:
     xn_host host_{};
     xn_sync* sync_ = nullptr;
     QSslServer* server_ = nullptr;
-    QSslSocket* socket_ = nullptr;
+    /* Guarded: QSslServer may drop a socket (failed handshake, reset peer)
+       without notice; a raw pointer would dangle. */
+    QPointer<QSslSocket> socket_;
     QTimer* tick_ = nullptr;
     QString deviceName_;
     QString certFp_;
