@@ -19,7 +19,10 @@ enum class Tool(val id: String) {
     IMAGE("image"),
 
     /** Marks a PDF's text: highlights and lines along it, or selects it ([MarkupMode]). */
-    MARKUP("markup");
+    MARKUP("markup"),
+
+    /** Opens room down the page (or closes a strip of it) where the pen drags. */
+    INSERT_SPACE("insert_space");
 
     /** Tools that produce ink via the stroke engine. */
     val isStroke: Boolean get() = this == PEN || this == DASHED || this == CALLIGRAPHY ||
@@ -32,7 +35,8 @@ enum class Tool(val id: String) {
      * usable by finger either way.
      */
     val fingerPansWhenOff: Boolean get() = isStroke ||
-        this == SELECT || this == LASSO || this == SCREENSHOT || this == SHAPE || this == ERASER || this == MARKUP
+        this == SELECT || this == LASSO || this == SCREENSHOT || this == SHAPE || this == ERASER || this == MARKUP ||
+        this == INSERT_SPACE
 
     /** Render-time ink alpha scale: the highlighter is translucent (spec 03 §3). */
     val alphaScale: Double get() = if (this == HIGHLIGHTER) 0.35 else 1.0
@@ -44,6 +48,6 @@ enum class Tool(val id: String) {
         val DEFAULT = PAN
 
         /** Quick-tool-wheel order (spec 06 §11 / 10 §7). */
-        val wheelOrder = listOf(PEN, DASHED, CALLIGRAPHY, SPEED, TAPER, HIGHLIGHTER, ERASER, SELECT, LASSO, SCREENSHOT, SHAPE, TEXT, MARKUP, PAN)
+        val wheelOrder = listOf(PEN, DASHED, CALLIGRAPHY, SPEED, TAPER, HIGHLIGHTER, ERASER, SELECT, LASSO, INSERT_SPACE, SCREENSHOT, SHAPE, TEXT, MARKUP, PAN)
     }
 }

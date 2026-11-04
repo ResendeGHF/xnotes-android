@@ -687,6 +687,16 @@ internal class CEditor(note: CNote, private val host: xn_host) {
 
     init {
         controller.frontInk = damageTracker
+        // Insert-space preview: paper where room opens (the commit bakes the real layers).
+        state.paintRoomPaper = { view, r ->
+            val cover = view.cover
+            val lo = minOf(view.split, view.resume, view.split + view.shift)
+            val hi = maxOf(view.split, view.resume, view.split + view.shift)
+            if (hi > lo) {
+                if (view.sideways) r.fillRect(Rect(cover.left + lo, cover.top, hi - lo, cover.h), state.paperColor(view.page))
+                else r.fillRect(Rect(cover.left, cover.top + lo, cover.w, hi - lo), state.paperColor(view.page))
+            }
+        }
     }
 
     /**
@@ -889,7 +899,7 @@ internal class CCanvasEditor(note: CCanvasNote, private val host: xn_host) {
 /** Tools the infinite canvas has (no text boxes, flow text or screenshots there). */
 private val CANVAS_TOOLS = setOf(
     Tool.PEN, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER, Tool.ERASER,
-    Tool.PAN, Tool.SELECT, Tool.LASSO, Tool.SHAPE,
+    Tool.PAN, Tool.SELECT, Tool.LASSO, Tool.SHAPE, Tool.INSERT_SPACE,
 )
 
 /** The canvas's keyboard and toolbar zoom step. */

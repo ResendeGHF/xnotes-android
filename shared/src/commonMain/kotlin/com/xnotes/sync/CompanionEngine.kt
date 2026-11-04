@@ -239,6 +239,24 @@ class CompanionEngine(
         send(SyncMsg.Live(nextSeq(), fileId, page, strokeId, tool, width, color, emptyList(), done = true))
     }
 
+    // --- room drags (live preview + committed edit, mirroring strokes) ---
+
+    fun previewRoom(
+        fileId: String,
+        page: Int,
+        liveId: String,
+        sideways: Boolean,
+        split: Double,
+        resume: Double,
+        shift: Double,
+    ) {
+        send(SyncMsg.RoomLive(nextSeq(), fileId, page, sideways, split, resume, shift, liveId, done = false))
+    }
+
+    fun finishRoom(fileId: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        send(SyncMsg.RoomLive(nextSeq(), fileId, page, sideways, split, resume, shift, liveId, done = true))
+    }
+
     // --- inbound ---
 
     private fun onMessage(msg: SyncMsg) {
@@ -252,6 +270,7 @@ class CompanionEngine(
             is SyncMsg.OpAck -> onOpAck(msg)
             is SyncMsg.Resync -> onResync(msg)
             is SyncMsg.Live -> onLive(msg)
+            is SyncMsg.RoomLive -> onRoomLive(msg)
             is SyncMsg.Presence -> withLock(lock) { hostPresence[msg.file] = msg.page }
             is SyncMsg.IndexSubscribe -> Unit // we send it; the host answers an index
             is SyncMsg.HelloAck -> Unit // the host never sends one; we answer hellos
@@ -316,19 +335,32 @@ class CompanionEngine(
     }
 
     private fun onIndex(m: SyncMsg.Index) {
+        // Deltas (full:false) carry the files that changed: merge them. Only a
+        // full listing may retire ids. Heads only move forward: the host is the
+        // authority, so an index head is always at least what ops gave us, and
+        // advancing it makes a later open refetch instead of serving stale bytes.
         val gone = withLock(lock) {
             val seen = HashSet<String>()
             for (f in m.files) {
                 seen += f.id
                 index[f.id] = f
-                if (f.kind == 0) { if (f.id !in versions) versions[f.id] = f.version } else versions.remove(f.id)
+                if (f.kind == 0) {
+                    val cur = versions[f.id]
+                    if (cur == null || f.version > cur) versions[f.id] = f.version
+                } else {
+                    versions.remove(f.id)
+                }
             }
-            index.keys.filter { it !in seen }.also { dropped ->
-                for (id in dropped) {
-                    index.remove(id)
-                    versions.remove(id)
-                    fileCache.remove(id)
-                    hostPresence.remove(id)
+            if (!m.full) {
+                emptyList<String>()
+            } else {
+                index.keys.filter { it !in seen }.also { dropped ->
+                    for (id in dropped) {
+                        index.remove(id)
+                        versions.remove(id)
+                        fileCache.remove(id)
+                        hostPresence.remove(id)
+                    }
                 }
             }
         }
@@ -385,12 +417,16 @@ class CompanionEngine(
         withLock(lock) { versions[m.file] = m.version }
         liveOverlay?.finish(key)
         if (!fresh) return
+        // A room commit supersedes its live preview even when the done frame was lost.
+        if (m.ops.any { it is SyncOp.OpenRoom || it is SyncOp.CloseRoom }) host.clearRemoteRoomPreview(m.file)
         for (op in m.ops) {
             when (op) {
                 is SyncOp.AddStroke -> host.applyRemoteStroke(m.file, op.page, op.stroke)
                 is SyncOp.EraseStrokes -> host.applyRemoteErase(m.file, op.page, op.ids)
                 is SyncOp.AddPage -> host.applyRemotePageAdd(m.file, op.index, op.width, op.height)
                 is SyncOp.RemovePage -> host.applyRemotePageRemove(m.file, op.index)
+                is SyncOp.OpenRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, true, op.at, op.at + op.size)
+                is SyncOp.CloseRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, false, op.a, op.b)
                 is SyncOp.Unknown -> Unit
             }
         }
@@ -414,6 +450,15 @@ class CompanionEngine(
     private fun onLive(m: SyncMsg.Live) {
         if (m.samples.isEmpty() && !m.done) return
         liveOverlay?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done)
+        host.onLiveDirty()
+    }
+
+    private fun onRoomLive(m: SyncMsg.RoomLive) {
+        if (m.done) {
+            host.clearRemoteRoomPreview(m.file)
+        } else {
+            host.previewRemoteRoom(m.file, m.page, m.sideways, m.split, m.resume, m.shift)
+        }
         host.onLiveDirty()
     }
 

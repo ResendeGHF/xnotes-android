@@ -1,7 +1,9 @@
 package com.xnotes.desktop
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.model.ImageCrop
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.pal.BlendMode
@@ -30,6 +32,7 @@ import java.awt.image.WritableRaster
 import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 internal fun Rgba.awt(): Color = Color(r, g, b, a)
 
@@ -275,7 +278,7 @@ internal class DesktopRenderer(root: Graphics2D) : Renderer, AutoCloseable {
         return true
     }
 
-    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double) {
+    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double, flip: Flip, part: Rect?) {
         if (dest.w <= 0.0 || dest.h <= 0.0) return
         val transform = g.transform
         val scale = max(1.0, max(hypot(transform.scaleX, transform.shearY),
@@ -283,11 +286,22 @@ internal class DesktopRenderer(root: Graphics2D) : Renderer, AutoCloseable {
         val turned = ((orientation % 180) + 180) % 180 == 90
         val width = (if (turned) dest.h else dest.w) * scale
         val height = (if (turned) dest.w else dest.h) * scale
-        val bitmap = DesktopImageCodec.decode(image.file, ceil(width).toInt(), ceil(height).toInt()) ?: return
+        var bitmap = DesktopImageCodec.decode(image.file, ceil(width).toInt(), ceil(height).toInt()) ?: return
+        // Crop first (fractions of the stored image), then orientation, mirror, free angle.
+        if (part != null && !ImageCrop.isWhole(part)) {
+            val px = (part.x * bitmap.width).roundToInt().coerceIn(0, bitmap.width - 1)
+            val py = (part.y * bitmap.height).roundToInt().coerceIn(0, bitmap.height - 1)
+            val pw = (part.w * bitmap.width).roundToInt().coerceIn(1, bitmap.width - px)
+            val ph = (part.h * bitmap.height).roundToInt().coerceIn(1, bitmap.height - py)
+            bitmap = bitmap.getSubimage(px, py, pw, ph)
+        }
         val original = g.transform
         try {
             g.translate(dest.centerX, dest.centerY)
-            g.rotate(Math.toRadians(orientation.toDouble()) + angle)
+            g.rotate(Math.toRadians(orientation.toDouble()))
+            if (flip.x) g.scale(-1.0, 1.0)
+            if (flip.y) g.scale(1.0, -1.0)
+            g.rotate(angle)
             val w = if (turned) dest.h else dest.w
             val h = if (turned) dest.w else dest.h
             g.drawImage(bitmap, AffineTransform.getTranslateInstance(-w / 2, -h / 2).apply {

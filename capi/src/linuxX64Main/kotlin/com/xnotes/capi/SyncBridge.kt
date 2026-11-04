@@ -4,6 +4,7 @@ package com.xnotes.capi
 
 import com.xnotes.capi.c.xn_host
 import com.xnotes.canvas.RemoteLiveStrokes
+import com.xnotes.canvas.RoomEdit
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
@@ -55,6 +56,10 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     )
     private val active = HashMap<CEditor, ActiveStroke>()
 
+    /** The live room drag each editor has going, if its file is shared. */
+    private class ActiveRoom(val fileId: String, val page: Int, val id: String)
+    private var activeRoom: ActiveRoom? = null
+
     // --- binding ---
 
     fun bind(editor: CEditor, fileId: String) {
@@ -86,6 +91,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         c.onStrokeSample = { page, x, y, p -> onSample(editor, page, x, y, p) }
         c.onStrokeCommitted = { page, stroke -> onCommitted(editor, page, stroke) }
         c.onStrokesErased = { page, strokes -> onErased(editor, page, strokes) }
+        c.onRoomPreview = { page, sideways, split, resume, shift -> onRoomPreview(editor, page, sideways, split, resume, shift) }
+        c.onRoomCommitted = { edit -> onRoomCommitted(editor, edit) }
+        c.onRoomPreviewDone = { onRoomPreviewDone(editor) }
         // Explicit local page edits submit matching ops; remote ones never fire these.
         editor.editor.onPageInserted = { index, w, h -> onPageInserted(editor, index, w, h) }
         editor.editor.onPageRemoved = { index -> onPageRemoved(editor, index) }
@@ -149,6 +157,36 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
         engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemovePage(index)))
+    }
+
+    private fun onRoomPreview(editor: CEditor, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val fileId = reverse[editor] ?: return
+        var r = activeRoom
+        if (r == null || r.fileId != fileId || r.page != page) {
+            r = ActiveRoom(fileId, page, "r${dedupeCounter++}-${Random.nextInt().toString(16)}")
+            activeRoom = r
+        }
+        engine.previewRoom(fileId, page, r.id, sideways, split, resume, shift)
+    }
+
+    private fun onRoomCommitted(editor: CEditor, edit: RoomEdit) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val r = activeRoom?.takeIf { it.fileId == fileId && it.page == edit.page }
+        activeRoom = null
+        val id = r?.id ?: "r${dedupeCounter++}-${Random.nextInt().toString(16)}"
+        val (split, resume, shift) = if (edit.open) Triple(edit.a, edit.a, edit.b - edit.a) else Triple(edit.a, edit.b, edit.a - edit.b)
+        engine.finishRoom(fileId, edit.page, id, edit.sideways, split, resume, shift)
+        val op = if (edit.open) SyncOp.OpenRoom(edit.page, edit.sideways, edit.a, edit.b - edit.a)
+        else SyncOp.CloseRoom(edit.page, edit.sideways, edit.a, edit.b)
+        engine.submitOp(fileId, base, id, listOf(op))
+    }
+
+    private fun onRoomPreviewDone(editor: CEditor) {
+        val r = activeRoom ?: return
+        if (reverse[editor] != r.fileId) return
+        activeRoom = null
+        engine.finishRoom(r.fileId, r.page, r.id, false, 0.0, 0.0, 0.0)
     }
 
     // --- SyncEngineHost (remote in) ---
@@ -274,6 +312,24 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         ce.state.relayout()
         ce.state.clampScroll()
         ce.requestRender()
+    }
+
+    override fun applyRemoteRoomEdit(fileId: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double) {
+        val ce = bindings[fileId] ?: return
+        if (!ce.controller.applyRemoteRoomEdit(page, sideways, open, a, b)) {
+            // Page or room gone (concurrent edit): refetch the whole file.
+            engine.requestOpen(fileId)
+        }
+    }
+
+    override fun previewRemoteRoom(fileId: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val ce = bindings[fileId] ?: return
+        if (ce.controller.roomGestureActive) return // a local drag owns the preview
+        ce.controller.previewRemoteRoom(page, sideways, split, resume, shift)
+    }
+
+    override fun clearRemoteRoomPreview(fileId: String) {
+        bindings[fileId]?.controller?.clearRemoteRoom()
     }
 
     override fun applyResync(fileId: String, version: Long) {

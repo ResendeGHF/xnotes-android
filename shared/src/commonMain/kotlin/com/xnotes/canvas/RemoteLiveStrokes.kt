@@ -80,6 +80,7 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
     /**
      * Union of all runs' bounds in viewport px (for partial damage repaints):
      * page-space point bounds → content → viewport, padded for width/AA.
+     * A live room drag adds its band, so room previews never force full frames.
      */
     fun dirtyViewportRect(): com.xnotes.core.geometry.Rect? {
         val showing = showingFile ?: return null
@@ -98,28 +99,53 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
                 if (p.y > b) b = p.y
             }
             val pad = run.width / 2.0 + 2.0
-            val content = state.fromPageSpaceRect(run.page, com.xnotes.core.geometry.Rect(l - pad, t - pad, rr - l + pad * 2, b - t + pad * 2))
-            val corners = listOf(
-                com.xnotes.core.geometry.Pt(content.left, content.top),
-                com.xnotes.core.geometry.Pt(content.right, content.top),
-                com.xnotes.core.geometry.Pt(content.left, content.bottom),
-                com.xnotes.core.geometry.Pt(content.right, content.bottom),
-            ).map { state.contentToViewport(it) }
-            var vl = Double.MAX_VALUE
-            var vt = Double.MAX_VALUE
-            var vr = -Double.MAX_VALUE
-            var vb = -Double.MAX_VALUE
-            for (c in corners) {
-                if (c.x < vl) vl = c.x
-                if (c.y < vt) vt = c.y
-                if (c.x > vr) vr = c.x
-                if (c.y > vb) vb = c.y
+            out = unionPageRect(run.page, l - pad, t - pad, rr - l + pad * 2, b - t + pad * 2, out)
+        }
+        state.roomView?.takeIf { it.live }?.let { v ->
+            val pi = state.document.pages.indexOf(v.page)
+            if (pi >= 0 && state.pageRects.getOrNull(pi) != null) {
+                val f = state.footprint(v.page)
+                val lo = minOf(v.split, v.resume) + minOf(0.0, v.shift) - 2.0
+                val hi = maxOf(v.split, v.resume) + maxOf(0.0, v.shift) + 2.0
+                out = if (v.sideways) {
+                    unionPageRect(pi, lo, 0.0, hi - lo, f.h, out)
+                } else {
+                    unionPageRect(pi, 0.0, lo, f.w, hi - lo, out)
+                }
             }
-            val padV = 3.0
-            val r = com.xnotes.core.geometry.Rect(vl - padV, vt - padV, vr - vl + padV * 2, vb - vt + padV * 2)
-            out = if (out == null) r else out.union(r)
         }
         return out
+    }
+
+    /** [out] ∪ page-space rect ([x],[y],[w],[h]) on [page] mapped to viewport px. */
+    private fun unionPageRect(
+        page: Int,
+        x: Double,
+        y: Double,
+        w: Double,
+        h: Double,
+        out: com.xnotes.core.geometry.Rect?,
+    ): com.xnotes.core.geometry.Rect? {
+        val content = state.fromPageSpaceRect(page, com.xnotes.core.geometry.Rect(x, y, w, h))
+        val corners = listOf(
+            com.xnotes.core.geometry.Pt(content.left, content.top),
+            com.xnotes.core.geometry.Pt(content.right, content.top),
+            com.xnotes.core.geometry.Pt(content.left, content.bottom),
+            com.xnotes.core.geometry.Pt(content.right, content.bottom),
+        ).map { state.contentToViewport(it) }
+        var vl = Double.MAX_VALUE
+        var vt = Double.MAX_VALUE
+        var vr = -Double.MAX_VALUE
+        var vb = -Double.MAX_VALUE
+        for (c in corners) {
+            if (c.x < vl) vl = c.x
+            if (c.y < vt) vt = c.y
+            if (c.x > vr) vr = c.x
+            if (c.y > vb) vb = c.y
+        }
+        val padV = 3.0
+        val r = com.xnotes.core.geometry.Rect(vl - padV, vt - padV, vr - vl + padV * 2, vb - vt + padV * 2)
+        return if (out == null) r else out.union(r)
     }
 
     /** Parse `#rrggbb` (or `#rrggbbaa`); null when malformed. */

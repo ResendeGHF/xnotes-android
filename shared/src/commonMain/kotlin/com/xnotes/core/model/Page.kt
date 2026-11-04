@@ -19,6 +19,13 @@ class Page(
     var margins: PageMargins = PageMargins(),
     /** The marks on its PDF text, bottom first. Replaced whole, never mutated, so any thread can read it. */
     @Volatile var markups: List<TextMarkup> = emptyList(),
+    /**
+     * Bands Insert space opened on the page (page space, display positions).
+     * The page's height/width already include them and its items already sit
+     * around them; they persist so the band can be closed later and so PDF
+     * backgrounds and text marks map back to source space.
+     */
+    var rooms: List<Room> = emptyList(),
 ) {
     /**
      * A process-unique, stable id (not persisted). Pages compare by identity, but Compose list keys

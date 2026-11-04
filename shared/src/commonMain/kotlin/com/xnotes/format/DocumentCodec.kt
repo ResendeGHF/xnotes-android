@@ -1,12 +1,15 @@
 package com.xnotes.format
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.Bookmark
 import com.xnotes.core.model.CanvasItem
+import com.xnotes.core.model.CutEdge
 import com.xnotes.core.model.ConnectorEnd
 import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.Document
+import com.xnotes.core.model.ImageCrop
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Orientation
@@ -18,6 +21,7 @@ import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageSizeChoice
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.Room
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.StickyNoteItem
@@ -291,7 +295,22 @@ class DocumentCodec(
         j.endArray()
         writeStyle(j, page.style)
         writeMargins(j, page.margins)
+        writeRooms(j, page.rooms)
         j.endObject()
+    }
+
+    /** The room Insert space opened on a page, written only when there is some (same keys as Android). */
+    private fun writeRooms(j: JsonWrite, rooms: List<Room>) {
+        if (rooms.isEmpty()) return
+        j.name("rooms").beginArray()
+        for (r in rooms) {
+            j.beginObject()
+            j.name("at").value(r.at)
+            j.name("size").value(r.size)
+            if (r.sideways) j.name("sideways").value(true)
+            j.endObject()
+        }
+        j.endArray()
     }
 
     private fun writeStroke(j: JsonWrite, s: Stroke) {
@@ -345,8 +364,92 @@ class DocumentCodec(
         if (s.smoothScale != 1.0) j.name("smooth_scale").value(s.smoothScale)
         // Straight-line strokes must reload un-smoothed, else the EMA pulls their far end inward.
         if (s.straight) j.name("straight").value(true)
+        writeCuts(j, s.cuts)
         if (s.locked) j.name("locked").value(true)
         j.endObject()
+    }
+
+    /** Room-cut edges: omitted when empty, matching the Android writer key for key. */
+    private fun writeCuts(j: JsonWrite, cuts: List<CutEdge>) {
+        if (cuts.isEmpty()) return
+        j.name("cuts").beginArray()
+        for (c in cuts) j.beginArray().value(c.x).value(c.y).value(c.nx).value(c.ny).endArray()
+        j.endArray()
+    }
+
+    /** A page's room as written, the broken rooms left out and the rest within the page and apart. */
+    private fun parseRooms(p: JsonPull): List<Room> {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return emptyList()
+        }
+        val out = ArrayList<Room>()
+        p.beginArray()
+        while (p.hasNext()) {
+            if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+                p.skipValue()
+                continue
+            }
+            var at: Double? = null
+            var size: Double? = null
+            var sideways = false
+            p.beginObject()
+            while (p.hasNext()) {
+                when (p.nextName()) {
+                    "at" -> at = doubleOrNull(p)
+                    "size" -> size = doubleOrNull(p)
+                    "sideways" -> sideways = boolOr(p, false)
+                    else -> p.skipValue()
+                }
+            }
+            p.endObject()
+            if (at != null && size != null && at.isFinite() && size.isFinite() && size > 0.0) out += Room(at, size, sideways)
+        }
+        p.endArray()
+        return out
+    }
+
+    /** [rooms] a [width] by [height] page can hold: in order, apart, and leaving the page some size of its own. */
+    private fun roomsWithin(rooms: List<Room>, width: Double, height: Double): List<Room> {
+        if (rooms.isEmpty()) return rooms
+        val out = ArrayList<Room>()
+        for (sideways in listOf(false, true)) {
+            var total = 0.0
+            var end = Double.NEGATIVE_INFINITY
+            val room = if (sideways) width else height
+            for (r in rooms.filter { it.sideways == sideways }.sortedBy { it.at }) {
+                if (r.at <= end || total + r.size >= room) continue
+                out += r
+                total += r.size
+                end = r.end
+            }
+        }
+        return out.sortedWith(compareBy<Room>({ it.sideways }, { it.at }))
+    }
+
+    private fun partWithin(r: Rect): Rect? {
+        val l = r.left.coerceIn(0.0, 1.0)
+        val t = r.top.coerceIn(0.0, 1.0)
+        val rr = r.right.coerceIn(0.0, 1.0)
+        val b = r.bottom.coerceIn(0.0, 1.0)
+        if (rr - l <= 1e-9 || b - t <= 1e-9) return null
+        val part = Rect.ltrb(l, t, rr, b)
+        return if (ImageCrop.isWhole(part)) null else part
+    }
+
+    private fun parseCuts(p: JsonPull): List<CutEdge>? {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            return null
+        }
+        val out = ArrayList<CutEdge>()
+        p.beginArray()
+        while (p.hasNext()) {
+            val a = doublesOrNull(p)
+            if (a != null && a.size == 4) out += CutEdge(a[0], a[1], a[2], a[3])
+        }
+        p.endArray()
+        return out
     }
 
     /** A sticky note: paper box, paper color, collapsed flag, text and note-local ink. */
@@ -419,6 +522,8 @@ class DocumentCodec(
         // Additive fields: written only when turned, so older readers stay compatible.
         if (item.orientation != 0) j.name("orientation").value(item.orientation)
         if (item.angle != 0.0) j.name("angle").value(item.angle)
+        if (item.flip != Flip.NONE) j.name("flip").value(item.flip.id)
+        item.part?.let { j.name("part").beginArray().value(it.x).value(it.y).value(it.w).value(it.h).endArray() }
         if (item.locked) j.name("locked").value(true)
         j.endObject()
     }
@@ -810,6 +915,8 @@ class DocumentCodec(
         val angle: Double,
         val locked: Boolean,
         val id: Int?,
+        val flip: Flip,
+        val part: Rect?,
     )
 
     /** [peek] for a note that only comes as a stream: reads through to the manifest, skipping what comes before it. */
@@ -939,6 +1046,7 @@ class DocumentCodec(
             var pdfPage: Int? = null
             var style = PageStyle()
             var margins = PageMargins()
+            var rooms = emptyList<Room>()
             val items = mutableListOf<CanvasItem>()
             val pending = ArrayList<PendingImage>()
             val glue = GlueRead()
@@ -950,6 +1058,7 @@ class DocumentCodec(
                     "pdf_page" -> pdfPage = intOrNull(p)
                     "style" -> style = parseStyle(p)
                     "margins" -> margins = parseMargins(p)
+                    "rooms" -> rooms = parseRooms(p)
                     "items" -> parseItems(p, items, pending, glue)
                     else -> p.skipValue()
                 }
@@ -962,7 +1071,7 @@ class DocumentCodec(
                 height = prev?.height ?: fallbackH
                 pdfPage = null
             }
-            val page = Page(width = width, height = height, items = items, pdfPage = pdfPage, style = style, margins = margins)
+            val page = Page(width = width, height = height, items = items, pdfPage = pdfPage, style = style, margins = margins, rooms = roomsWithin(rooms, width, height))
             m.pages.add(page)
             m.pageGlue.add(glue)
             if (pending.isNotEmpty()) m.pageImages.add(Triple(page, pending, glue))
@@ -1024,6 +1133,9 @@ class DocumentCodec(
         var linkColor: Rgba? = null
         var collapsed = false
         var stickyInk: MutableList<Stroke>? = null
+        var cuts: List<CutEdge> = emptyList()
+        var flip: Flip = Flip.NONE
+        var part: Rect? = null
     }
 
     /** Stroke config fields as written; null = absent, so defaults resolve exactly as before. */
@@ -1060,12 +1172,15 @@ class DocumentCodec(
                 "speed_scale" -> s.speedScale = doubleOr(p, 1.0)
                 "smooth_scale" -> s.smoothScale = doubleOr(p, 1.0)
                 "straight" -> s.straight = boolOr(p, false)
+                "cuts" -> s.cuts = parseCuts(p) ?: emptyList()
                 "asset" -> s.asset = stringOr(p, "")
                 "rect" -> s.rect = rectOrNull(p)
                 "src_w" -> s.srcW = intOr(p, 0)
                 "src_h" -> s.srcH = intOr(p, 0)
                 "orientation" -> s.orientation = intOr(p, 0)
                 "angle" -> s.angle = doubleOr(p, 0.0)
+                "flip" -> s.flip = Flip.fromId(stringOrNull(p))
+                "part" -> s.part = rectOrNull(p)?.let { partWithin(it) }
                 "pos" -> s.pos = ptOrNull(p)
                 "width" -> s.width = doubleOr(p, TextItem.DEFAULT_WIDTH)
                 "height" -> s.height = doubleOr(p, 0.0)
@@ -1109,7 +1224,7 @@ class DocumentCodec(
                     pending.add(
                         PendingImage(
                             items.size + pending.size, asset, s.rect, s.srcW, s.srcH,
-                            s.orientation, s.angle, s.locked, s.id,
+                            s.orientation, s.angle, s.locked, s.id, s.flip, s.part,
                         ),
                     )
                 }
@@ -1237,6 +1352,7 @@ class DocumentCodec(
         )
         val stroke = Stroke(tool, config, emptyList(), s.speedScale, s.straight, s.smoothScale)
         s.samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
+        stroke.cuts = s.cuts
         return stroke
     }
 
@@ -1555,7 +1671,7 @@ class DocumentCodec(
             h = probed.height
         }
         val rect = spec.rect ?: Rect(0.0, 0.0, w.toDouble(), h.toDouble())
-        return ImageItem(ImageData(file, w, h), rect, spec.orientation, spec.angle)
+        return ImageItem(ImageData(file, w, h), rect, spec.orientation, spec.angle, spec.flip, spec.part)
             .also { it.locked = spec.locked }
     }
 

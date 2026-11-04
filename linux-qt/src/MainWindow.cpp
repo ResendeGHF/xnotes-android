@@ -62,6 +62,7 @@ const ToolEntry kTools[] = {
     {"eraser", "Eraser", "4", "eraser"},
     {"lasso", "Lasso", "5", "lasso"},
     {"select", "Selection", "6", "select"},
+    {"insert_space", "Insert space", "", "insertSpace"},
     {"shape", "Shape", "7", "shape"},
     {"text_box", "Text", "8", "textBox"},
     {"markup", "Markup", "9", "ic_stroke_highlighter"},

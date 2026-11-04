@@ -1,6 +1,7 @@
 package com.xnotes.core.model
 
 import com.xnotes.core.geometry.Affine
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.pal.Renderer
@@ -22,13 +23,17 @@ class ImageItem(
     var orientation: Int = 0,
     /** Free rotation about [rect]'s centre, radians clockwise. */
     var angle: Double = 0.0,
+    /** How the picture is mirrored in [rect], after [orientation] turns it and before [angle] does. */
+    var flip: Flip = Flip.NONE,
+    /** The share of [image] that fills [rect], as fractions of the image as stored (left, top, right, bottom); null for all of it. */
+    var part: Rect? = null,
 ) : CanvasItem, Resizable {
 
     override val kind = KIND
     override val resizable = true
     override var locked = false
 
-    override fun paint(r: Renderer) = r.drawImage(image, rect, orientation, angle)
+    override fun paint(r: Renderer) = r.drawImage(image, rect, orientation, angle, flip, part)
 
     override fun bounds(): Rect = if (angle == 0.0) rect else Rect.bounding(corners())
 
@@ -75,12 +80,14 @@ class ImageItem(
         if (handle is RectHandle) rect = handle.rect
     }
 
-    override fun snapshotGeometry(): GeometrySnapshot = ImageSnapshot(rect, angle)
+    override fun snapshotGeometry(): GeometrySnapshot = ImageSnapshot(rect, angle, flip, part)
 
     override fun restoreGeometry(snap: GeometrySnapshot) {
         if (snap is ImageSnapshot) {
             rect = snap.rect
             angle = snap.angle
+            flip = snap.flip
+            part = snap.part
         }
     }
 
@@ -103,4 +110,4 @@ class ImageItem(
 }
 
 /** Snapshot of an image's transformable geometry. */
-private data class ImageSnapshot(val rect: Rect, val angle: Double) : GeometrySnapshot
+private data class ImageSnapshot(val rect: Rect, val angle: Double, val flip: Flip, val part: Rect?) : GeometrySnapshot

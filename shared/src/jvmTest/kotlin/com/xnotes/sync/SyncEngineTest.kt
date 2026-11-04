@@ -21,6 +21,11 @@ class SyncEngineTest {
         val erases = ArrayList<Triple<String, Int, List<String>>>()
         val pageAdds = ArrayList<Triple<String, Int, Pair<Double, Double>>>()
         val pageRemoves = ArrayList<Pair<String, Int>>()
+        data class RoomEditRec(val file: String, val page: Int, val sideways: Boolean, val open: Boolean, val a: Double, val b: Double)
+        data class RoomPreviewRec(val file: String, val page: Int, val sideways: Boolean, val split: Double, val resume: Double, val shift: Double)
+        val roomEdits = ArrayList<RoomEditRec>()
+        val roomPreviews = ArrayList<RoomPreviewRec>()
+        val roomPreviewClears = ArrayList<String>()
         var resynced: Pair<String, Long>? = null
 
         override fun onBytes(data: ByteArray) {
@@ -65,13 +70,24 @@ class SyncEngineTest {
         override fun applyRemoteErase(fileId: String, page: Int, ids: List<String>) {
             erases += Triple(fileId, page, ids)
         }
-
         override fun applyRemotePageAdd(fileId: String, index: Int, width: Double, height: Double) {
             pageAdds += Triple(fileId, index, width to height)
         }
 
         override fun applyRemotePageRemove(fileId: String, index: Int) {
             pageRemoves += fileId to index
+        }
+
+        override fun applyRemoteRoomEdit(fileId: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double) {
+            roomEdits += RoomEditRec(fileId, page, sideways, open, a, b)
+        }
+
+        override fun previewRemoteRoom(fileId: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+            roomPreviews += RoomPreviewRec(fileId, page, sideways, split, resume, shift)
+        }
+
+        override fun clearRemoteRoomPreview(fileId: String) {
+            roomPreviewClears += fileId
         }
 
         override fun applyResync(fileId: String, version: Long) {
@@ -192,11 +208,67 @@ class SyncEngineTest {
         assertEquals(11L, e.fileVersion("u1"))
     }
 
+    @Test fun indexDeltaAdvancesHeadWithoutPruning() {
+        val (e, h) = engine()
+        e.onConnected()
+        h.out.clear()
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "a.xnote", 0, 7L, 10L), SyncFileEntry("u2", "b.xnote", 0, 3L, 5L))),
+            ),
+        )
+        assertEquals(7L, e.fileVersion("u1"))
+        // A delta for u1 moves its head but must not retire u2.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(2, -1, false, listOf(SyncFileEntry("u1", "a.xnote", 0, 9L, 12L)))))
+        assertEquals(9L, e.fileVersion("u1"))
+        assertEquals(3L, e.fileVersion("u2"))
+        assertEquals(listOf("u1", "u2"), e.files().map { it.id }.sorted())
+        // A full listing still retires what it omits.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(3, -1, true, listOf(SyncFileEntry("u1", "a.xnote", 0, 9L, 12L)))))
+        assertEquals(listOf("u1"), e.files().map { it.id })
+    }
+
     @Test fun pageOpsRoundTripCodec() {
         val ops = listOf(SyncOp.AddPage(2, 595.0, 842.0), SyncOp.RemovePage(0))
         val msg = SyncMsg.Op(1, "u1", 3L, 4L, "d", ops)
         val back = SyncFrames.Decoder().feed(SyncFrames.encode(msg)).single() as SyncMsg.Op
         assertEquals(ops, back.ops)
+    }
+
+    @Test fun roomOpsRoundTripCodec() {
+        val ops = listOf(SyncOp.OpenRoom(1, false, 200.0, 100.0), SyncOp.CloseRoom(0, true, 10.0, 60.0))
+        val msg = SyncMsg.Op(1, "u1", 3L, 4L, "d", ops)
+        val back = SyncFrames.Decoder().feed(SyncFrames.encode(msg)).single() as SyncMsg.Op
+        assertEquals(ops, back.ops)
+        val live = SyncMsg.RoomLive(2, "u1", 1, false, 200.0, 200.0, 100.0, "r-1", done = false)
+        val liveBack = SyncFrames.Decoder().feed(SyncFrames.encode(live)).single()
+        assertEquals(live, liveBack)
+        val done = SyncMsg.RoomLive(3, "u1", 1, false, 0.0, 0.0, 0.0, "r-1", done = true)
+        assertEquals(done, SyncFrames.Decoder().feed(SyncFrames.encode(done)).single())
+    }
+
+    @Test fun roomOpAppliesAndPreviewClears() {
+        val (e, h) = engine()
+        e.onConnected()
+        h.out.clear()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        // Live preview frames reach the host and repaint.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.RoomLive(2, "u1", 0, false, 200.0, 200.0, 50.0, "r-9", done = false)))
+        assertEquals(1, h.roomPreviews.size)
+        assertEquals(SyncEngineTest.FakeHost.RoomPreviewRec("u1", 0, false, 200.0, 200.0, 50.0), h.roomPreviews.single())
+        assertEquals(1, h.liveDirty)
+        // Done drops the preview.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.RoomLive(3, "u1", 0, false, 0.0, 0.0, 0.0, "r-9", done = true)))
+        assertEquals(listOf("u1"), h.roomPreviewClears)
+        // The commit clears any preview and applies.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(4, "u1", 7L, 8L, "r-10", listOf(SyncOp.OpenRoom(0, false, 200.0, 50.0)))))
+        assertEquals(listOf("u1", "u1"), h.roomPreviewClears)
+        assertEquals(listOf(SyncEngineTest.FakeHost.RoomEditRec("u1", 0, false, true, 200.0, 250.0)), h.roomEdits)
+        assertEquals(8L, e.fileVersion("u1"))
+        // Unknown op names still skip cleanly alongside room ops.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 8L, 9L, "r-11", listOf(SyncOp.CloseRoom(0, true, 10.0, 60.0)))))
+        assertEquals(2, h.roomEdits.size)
+        assertEquals(SyncEngineTest.FakeHost.RoomEditRec("u1", 0, true, false, 10.0, 60.0), h.roomEdits.last())
     }
 
     @Test fun liveFrameUpdatesOverlay() {

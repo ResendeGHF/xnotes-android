@@ -51,6 +51,19 @@ interface SyncEngineHost {
     fun applyRemotePageRemove(fileId: String, index: Int)
 
     /**
+     * Apply a committed remote room edit on [page]: [open] opens room at [a]
+     * (to [b]), else closes the strip [a] to [b]. No-op when the page or room
+     * is gone; bypasses undo like all remote ops.
+     */
+    fun applyRemoteRoomEdit(fileId: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double)
+
+    /** Show the far side's room drag on [fileId]'s page without touching the model. */
+    fun previewRemoteRoom(fileId: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double)
+
+    /** Drop the far side's room preview for [fileId]. */
+    fun clearRemoteRoomPreview(fileId: String)
+
+    /**
      * [fileId]'s head moved under us: drop the open document's state and
      * refetch. The engine already queued the fetch.
      */

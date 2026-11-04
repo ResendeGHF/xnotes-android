@@ -34,6 +34,10 @@ sealed interface SyncOp {
     data class AddPage(val index: Int, val width: Double, val height: Double) : SyncOp
     /** Remove the page at [index]; no-op when it would empty the note or is out of range. */
     data class RemovePage(val index: Int) : SyncOp
+    /** Open [size] of room at [at] on [page] ([sideways] across the page). */
+    data class OpenRoom(val page: Int, val sideways: Boolean, val at: Double, val size: Double) : SyncOp
+    /** Close the strip [a] to [b] of a room on [page]. */
+    data class CloseRoom(val page: Int, val sideways: Boolean, val a: Double, val b: Double) : SyncOp
     data class Unknown(val name: String) : SyncOp
 }
 
@@ -67,6 +71,11 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
     var color = ""
     var samples: List<WireSample>? = null
     var done = false
+    var sideways = false
+    var split = 0.0
+    var resume = 0.0
+    var shift = 0.0
+    var liveId = ""
     var dirId: String? = null
     var name = ""
     var kind = 0
@@ -106,6 +115,11 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "pressure" -> Unit // parsed inside stroke objects; ignored at top level
             "samples" -> samples = sampleListOr(p)
             "done" -> done = boolOr(p, false)
+            "sideways" -> sideways = boolOr(p, false)
+            "split" -> split = doubleOr(p, 0.0)
+            "resume" -> resume = doubleOr(p, 0.0)
+            "shift" -> shift = doubleOr(p, 0.0)
+            "live_id" -> liveId = stringOr(p, "")
             "dir_id" -> dirId = stringOrNull(p)
             "name" -> name = stringOr(p, "")
             "kind" -> kind = intOr(p, 0)
@@ -130,6 +144,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "op_ack" -> SyncMsg.OpAck(seq, replyTo, id, version)
         "resync" -> SyncMsg.Resync(seq, id, version)
         "live" -> SyncMsg.Live(seq, id, page, strokeId, tool, width, color, samples ?: emptyList(), done)
+        "room_live" -> SyncMsg.RoomLive(seq, id, page, sideways, split, resume, shift, liveId, done)
         "presence" -> SyncMsg.Presence(seq, id, page)
         "heartbeat" -> SyncMsg.Heartbeat(seq)
         "index_subscribe" -> SyncMsg.IndexSubscribe(seq)
@@ -280,6 +295,20 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.name("done").value(msg.done)
             w.endObject()
         }
+        is SyncMsg.RoomLive -> {
+            w.beginObject()
+            w.name("t").value("room_live")
+            w.name("seq").value(msg.seq)
+            w.name("file").value(msg.file)
+            w.name("page").value(msg.page)
+            if (msg.sideways) w.name("sideways").value(true)
+            w.name("split").value(msg.split)
+            w.name("resume").value(msg.resume)
+            w.name("shift").value(msg.shift)
+            w.name("live_id").value(msg.liveId)
+            w.name("done").value(msg.done)
+            w.endObject()
+        }
         is SyncMsg.Presence -> {
             w.beginObject()
             w.name("t").value("presence")
@@ -387,6 +416,24 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.name("index").value(op.index)
             w.endObject()
         }
+        is SyncOp.OpenRoom -> {
+            w.beginObject()
+            w.name("op").value("open_room")
+            w.name("page").value(op.page)
+            if (op.sideways) w.name("sideways").value(true)
+            w.name("at").value(op.at)
+            w.name("size").value(op.size)
+            w.endObject()
+        }
+        is SyncOp.CloseRoom -> {
+            w.beginObject()
+            w.name("op").value("close_room")
+            w.name("page").value(op.page)
+            if (op.sideways) w.name("sideways").value(true)
+            w.name("a").value(op.a)
+            w.name("b").value(op.b)
+            w.endObject()
+        }
         is SyncOp.Unknown -> {
             w.beginObject()
             w.name("op").value(op.name)
@@ -487,6 +534,11 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var samples: List<WireSample>? = null
         var ids: List<String>? = null
         var index = 0
+        var sideways = false
+        var at = 0.0
+        var size = 0.0
+        var a = 0.0
+        var b = 0.0
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
@@ -495,6 +547,11 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                 "index" -> index = intOr(p, 0)
                 "width" -> width = doubleOr(p, 0.0)
                 "height" -> height = doubleOr(p, 0.0)
+                "sideways" -> sideways = boolOr(p, false)
+                "at" -> at = doubleOr(p, 0.0)
+                "size" -> size = doubleOr(p, 0.0)
+                "a" -> a = doubleOr(p, 0.0)
+                "b" -> b = doubleOr(p, 0.0)
                 "stroke" -> if (p.peek() == JsonPull.Token.BEGIN_OBJECT) {
                     p.beginObject()
                     while (p.hasNext()) {
@@ -528,6 +585,8 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
             "erase_strokes" -> SyncOp.EraseStrokes(page, ids ?: emptyList())
             "add_page" -> SyncOp.AddPage(index, width, height)
             "remove_page" -> SyncOp.RemovePage(index)
+            "open_room" -> SyncOp.OpenRoom(page, sideways, at, size)
+            "close_room" -> SyncOp.CloseRoom(page, sideways, a, b)
             else -> SyncOp.Unknown(name ?: "")
         }
     }

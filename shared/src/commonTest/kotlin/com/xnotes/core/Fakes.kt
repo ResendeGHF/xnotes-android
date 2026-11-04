@@ -1,5 +1,6 @@
 package com.xnotes.core
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
@@ -60,6 +61,7 @@ class FakeRenderer : Renderer {
     override fun translate(dx: Double, dy: Double) { ops += "translate" }
     override fun scale(sx: Double, sy: Double) { ops += "scale" }
     override fun clipRect(rect: Rect) { ops += "clipRect" }
+    override fun clipPolygon(points: List<Pt>) { ops += "clipPolygon" }
     override fun clear() { ops += "clear" }
     override fun fillBackground(rect: Rect, color: Rgba) { ops += "fillBackground" }
     override fun fillRect(rect: Rect, color: Rgba) { ops += "fillRect" }
@@ -88,7 +90,7 @@ class FakeRenderer : Renderer {
         ops += "drawRaster"
         rasterDests += dest
     }
-    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double) { ops += "drawImage" }
+    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double, flip: Flip, part: Rect?) { ops += "drawImage" }
     override fun drawText(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags) { ops += "drawText" }
     override fun drawTextTurned(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags, angle: Double) {
         ops += "drawTextTurned:$text@$angle"

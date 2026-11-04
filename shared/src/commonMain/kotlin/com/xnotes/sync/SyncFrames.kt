@@ -183,6 +183,23 @@ sealed interface SyncMsg {
         val done: Boolean,
     ) : SyncMsg
 
+    /**
+     * A room drag's live preview: the cut ([split], [resume]) and [shift] the far
+     * side shows without touching its model, keyed by [liveId]; [done] drops it.
+     * The matching committed room op (same id as dedupe) also drops it.
+     */
+    data class RoomLive(
+        override val seq: Int,
+        val file: String,
+        val page: Int,
+        val sideways: Boolean,
+        val split: Double,
+        val resume: Double,
+        val shift: Double,
+        val liveId: String,
+        val done: Boolean,
+    ) : SyncMsg
+
     data class Presence(
         override val seq: Int,
         val file: String,

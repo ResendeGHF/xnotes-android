@@ -8,6 +8,7 @@ import com.xnotes.capi.c.xn_host
 import com.xnotes.capi.c.xn_palette
 import com.xnotes.capi.c.xn_pen
 import com.xnotes.capi.c.xn_renderer_vt
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
@@ -119,6 +120,15 @@ internal class CRenderer(private val vt: xn_renderer_vt, internal val r: COpaque
     override fun translate(dx: Double, dy: Double) = vt.translate!!.invoke(r, dx, dy)
     override fun scale(sx: Double, sy: Double) = vt.scale!!.invoke(r, sx, sy)
     override fun clipRect(rect: Rect) = vt.clip_rect!!.invoke(r, rect.x, rect.y, rect.w, rect.h)
+    override fun clipPolygon(points: List<Pt>) {
+        if (points.isEmpty()) return
+        val xy = DoubleArray(points.size * 2)
+        for ((i, p) in points.withIndex()) {
+            xy[2 * i] = p.x
+            xy[2 * i + 1] = p.y
+        }
+        xy.usePinned { vt.clip_polygon!!.invoke(r, it.addressOf(0), points.size) }
+    }
     override fun clear() = vt.clear!!.invoke(r)
 
     override fun fillBackground(rect: Rect, color: Rgba) = fillRect(rect, color)
@@ -184,8 +194,12 @@ internal class CRenderer(private val vt: xn_renderer_vt, internal val r: COpaque
         }
     }
 
-    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double) = memScoped {
-        vt.draw_image!!.invoke(r, image.file.pathString.cstr.ptr, dest.x, dest.y, dest.w, dest.h, orientation, angle)
+    override fun drawImage(image: ImageData, dest: Rect, orientation: Int, angle: Double, flip: Flip, part: Rect?) = memScoped {
+        vt.draw_image!!.invoke(
+            r, image.file.pathString.cstr.ptr, dest.x, dest.y, dest.w, dest.h, orientation, angle,
+            if (flip.x) 1 else 0, if (flip.y) 1 else 0,
+            if (part != null) 1 else 0, part?.x ?: 0.0, part?.y ?: 0.0, part?.right ?: 1.0, part?.bottom ?: 1.0,
+        )
     }
 
     override fun drawText(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags) = memScoped {

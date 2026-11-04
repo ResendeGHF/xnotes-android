@@ -13,6 +13,7 @@ import com.xnotes.core.model.Page
 import com.xnotes.core.model.PageInsets
 import com.xnotes.core.model.PageTemplates
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.pdf.MarkupPainter
@@ -48,6 +49,27 @@ fun CanvasItem.isHighlighterInk(): Boolean = this is Stroke && this.tool == Tool
  * mismatch — and blitted stretched into the new one meanwhile, like a stale-resolution entry is
  * during a pinch.
  */
+/**
+ * The room Insert space is previewing on a page: the old layers cut at it while the drag is live
+ * ([live]), kept showing it until rebuilds that hold it land once the edit is made.
+ */
+class RoomView(
+    val page: Page,
+    val sideways: Boolean,
+    val split: Double,
+    val resume: Double,
+    val shift: Double,
+    val anchored: List<CanvasItem>,
+    val cover: Rect,
+    val live: Boolean = true,
+) {
+    /** Anchored items drawn under the ink: filled shapes, which lie under the lines they fill. */
+    val fills: List<CanvasItem> get() = anchored.filter { it is ShapeItem && it.fillRgba != null }
+
+    /** Anchored items drawn over the ink. */
+    val over: List<CanvasItem> get() = anchored.filter { !(it is ShapeItem && it.fillRgba != null) }
+}
+
 class CacheEntry(val surface: RasterSurface, val res: Double, val cover: Rect = Rect(0.0, 0.0, 0.0, 0.0)) {
     /** A background layer's last markup edit held (see [CanvasState.rebakeBackground]). Main thread only. */
     var seq: Int = 0
@@ -190,11 +212,11 @@ class CanvasState(
      */
     fun insets(page: Page): PageInsets = page.insets(document)
 
-    /** Page width including its margins (unrotated). */
-    fun outerW(page: Page): Double = insets(page).let { it.left + page.width + it.right }
+    /** Page width including its margins (unrotated), plus a live room being opened on it. */
+    fun outerW(page: Page): Double = insets(page).let { it.left + page.width + it.right } + roomGrowth(page, true)
 
-    /** Page height including its margins (unrotated). */
-    fun outerH(page: Page): Double = insets(page).let { it.top + page.height + it.bottom }
+    /** Page height including its margins (unrotated), plus a live room being opened on it. */
+    fun outerH(page: Page): Double = insets(page).let { it.top + page.height + it.bottom } + roomGrowth(page, false)
 
     /** The whole paper in page space, margins included: the rect every page-space painter fills. */
     fun footprint(page: Page): Rect {
@@ -1356,8 +1378,51 @@ class CanvasState(
     fun invalidatePage(page: Page) {
         caches.remove(page)
         staleInk.remove(page)
+        if (roomView?.page === page && roomView?.live == false) roomView = null
         cacheGen++
         sharpGen++
+    }
+
+    /** The room Insert space is showing on [page]: its old layers cut at the room while it is live. */
+    var roomView: RoomView? = null
+
+    /**
+     * Paints, in page space, the paper the old layers of [RoomView.page] leave bare: on a PDF page
+     * the room, ruled like its margins, and on a plain one the page it grew by. Installed by the host.
+     */
+    var paintRoomPaper: ((view: RoomView, r: Renderer) -> Unit)? = null
+
+    /** How much the room still under the pen adds to [page] along one axis: none once the page itself has it. */
+    private fun roomGrowth(page: Page, sideways: Boolean): Double {
+        val v = roomView ?: return 0.0
+        return if (v.live && v.page === page && v.sideways == sideways) v.shift else 0.0
+    }
+
+    /** [page]'s ink layer as cached, whatever footprint it was built for, for drawing room through an old one. */
+    fun rawInkCache(page: Page): CacheEntry? = caches[page]
+
+    /** [page]'s background layer as cached, whatever footprint it was built for. */
+    fun rawBackgroundCache(page: Page): CacheEntry? = bgCaches[page]
+
+    /**
+     * The room [view] drew has been made: keep its old caches showing it until rebuilds that hold it
+     * land, which the changed footprint schedules, and lay the note out round the page as it now is.
+     */
+    fun settleRoom(view: RoomView) {
+        roomView = RoomView(view.page, view.sideways, view.split, view.resume, view.shift, view.anchored, view.cover, live = false)
+        staleInk.remove(view.page)
+        cacheGen++
+        sharpGen++
+        relayout()
+    }
+
+    /** True once [page]'s caches hold what a settled [roomView] drew, so it can go. */
+    fun roomSettled(page: Page): Boolean {
+        val f = footprint(page)
+        val ink = caches[page]
+        if (ink != null && ink.cover != f) return false
+        val bg = rawBackgroundCache(page)
+        return bg == null || bg.cover == f
     }
 
     /**
@@ -1409,6 +1474,7 @@ class CanvasState(
     }
 
     fun invalidateAllCaches() {
+        roomView = null
         caches.clear()
         staleInk.clear()
         bgCaches.clear()

@@ -1,6 +1,7 @@
 package com.xnotes.core.pal
 
 import com.xnotes.core.geometry.Geometry
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
@@ -110,6 +111,9 @@ interface Renderer {
 
     /** Intersect the clip region with an axis-aligned rectangle (content space). */
     fun clipRect(rect: Rect)
+
+    /** Intersect the clip region with a polygon (content space), for cut ink. */
+    fun clipPolygon(points: List<Pt>)
 
     /**
      * Clear the current clip region to fully transparent (replace, not composite).
@@ -224,7 +228,7 @@ interface Renderer {
      * single primitive that takes a free angle. Default is a no-op for backends that don't place
      * images.
      */
-    fun drawImage(image: ImageData, dest: Rect, orientation: Int = 0, angle: Double = 0.0) {}
+    fun drawImage(image: ImageData, dest: Rect, orientation: Int = 0, angle: Double = 0.0, flip: Flip = Flip.NONE, part: Rect? = null) {}
 
     fun drawText(text: String, rect: Rect, font: FontSpec, color: Rgba, flags: TextFlags = TextFlags())
 

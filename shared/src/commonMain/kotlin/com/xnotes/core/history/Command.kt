@@ -7,6 +7,7 @@ import com.xnotes.core.model.GeoHandle
 import com.xnotes.core.model.GeometrySnapshot
 import com.xnotes.core.model.Labelled
 import com.xnotes.core.model.Page
+import com.xnotes.core.model.PageShape
 import com.xnotes.core.model.Resizable
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
@@ -367,6 +368,21 @@ class DeletePage(
             document.pages.add(index.coerceIn(0, document.pages.size), page)
         }
     }
+}
+
+/** Pages resized (or reshaped): each one's [PageShape] before and after. The view repaints them whole. */
+class ReshapePages(
+    private val pages: List<Page>,
+    private val before: List<PageShape>,
+    private val after: List<PageShape>,
+) : Command {
+    override fun redo() = pages.forEachIndexed { i, page -> after[i].restore(page) }
+    override fun undo() = pages.forEachIndexed { i, page -> before[i].restore(page) }
+
+    override fun touched(locate: (CanvasItem) -> Page?): List<Pair<Page, CanvasItem>> = emptyList()
+
+    /** The pages this step reshapes, for callers that repaint them whole. */
+    fun reshaped(): List<Page> = pages
 }
 
 // --- touched-region helpers ---

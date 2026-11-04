@@ -97,7 +97,14 @@ import kotlin.math.sin
 enum class PointerMode {
     IDLE, DRAW, ERASE, BAND, LASSO_DRAW, SHOT, SHAPE, MOVE, RESIZE, TRANSFORM, PAN, PINCH, FLOW_TEXT,
     TEXT_DRAG, RULER_MOVE, RULER_TRANSFORM, RULER_ROTATE, PDF_TEXT, VERTEX, POLYGON, CONNECT, JOINT, SLIDE,
+    ROOM, ROOM_BUTTON,
 }
+
+/**
+ * A committed local Insert space edit, for the sync bridge to submit as an op.
+ * [open] opens room at [a] (to [b]), else closes the strip [a] to [b].
+ */
+data class RoomEdit(val page: Int, val sideways: Boolean, val open: Boolean, val a: Double, val b: Double)
 
 /**
  * Geometry of the live text editor field: [x]/[y] place its top-left in viewport pixels, while
@@ -214,6 +221,32 @@ class InteractionController(
 
     /** The far side's live runs, painted in the overlay (installed by the sync bridge). */
     var remoteLive: RemoteLiveStrokes? = null
+
+    /** A committed local room edit: [RoomEdit.open] opens room at [RoomEdit.a] (to [RoomEdit.b]), else closes the strip. */
+    var onRoomCommitted: ((RoomEdit) -> Unit)? = null
+    /** Fired per local room-drag frame: the preview geometry, without touching the model. */
+    var onRoomPreview: ((page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) -> Unit)? = null
+
+    /** Fired when the local preview ends without a commit (abort, undersized drag). */
+    var onRoomPreviewDone: (() -> Unit)? = null
+
+    /** True while the local Insert space gesture is mid-drag. */
+    val roomGestureActive: Boolean get() = insertSpace.active
+
+    /** Show the far side's room drag on [page] without touching the model. */
+    fun previewRemoteRoom(page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val pg = state.document.pages.getOrNull(page) ?: return
+        insertSpace.showRemotePreview(pg, sideways, split, resume, shift)
+    }
+
+    /** Drop the far side's room preview. */
+    fun clearRemoteRoom() {
+        insertSpace.hideRemotePreview()
+    }
+
+    /** Apply the far side's committed room edit without touching undo; true when it changed. */
+    fun applyRemoteRoomEdit(page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean =
+        insertSpace.applyRemote(page, sideways, open, a, b)
 
     /** A pan tap or a markup tool tap at viewport point [at], told before anything acts on it. */
     var onTap: ((at: Pt) -> Unit)? = null
@@ -542,11 +575,24 @@ class InteractionController(
     /** Front-buffered wet ink, installed by the host when the device can do it. */
     var frontInk: FrontInkSink? = null
 
+    /** The Insert space gesture: room preview, commit, close buttons and hover cut line. */
+    internal val insertSpace = InsertSpaceGesture(
+        state, history, scheduler, chromePalette,
+        requestRender = { requestRender() },
+        repair = { page, rect -> if (!state.repairRegion(page, rect)) state.invalidatePage(page) },
+    )
+
     init {
         state.isLiftedItem = { item ->
             item === editingText || item === editingLabel || item in carried || item in followed || frontInk?.holding(item) == true ||
-                selection.any { it.item === item }
+                item in insertSpace.lifted || selection.any { it.item === item }
         }
+        // Local room drags stream previews and submit commits; the bridge installs the other ends.
+        insertSpace.onLocalPreview = { pi, sideways, split, resume, shift ->
+            onRoomPreview?.invoke(pi, sideways, split, resume, shift)
+        }
+        insertSpace.onLocalCommit = { onRoomCommitted?.invoke(it) }
+        insertSpace.onLocalPreviewDone = { onRoomPreviewDone?.invoke() }
     }
 
     val hasSelection: Boolean get() = selection.isNotEmpty()
@@ -566,6 +612,7 @@ class InteractionController(
         if (t == Tool.SELECT) toolBeforeSelect = tool
         if (t == Tool.SCREENSHOT) toolBeforeScreenshot = tool
         if (t == Tool.TEXT_BOX) toolBeforeText = tool
+        if (tool == Tool.INSERT_SPACE) insertSpace.hoverAt(null)
         commitTextEdit()
         if (t != Tool.TEXT) flowText?.endSession()
         abortGesture()
@@ -632,6 +679,12 @@ class InteractionController(
     fun onHover(e: PointerEvent): Boolean {
         if (handleHoverAction(e)) return true
         if (hoverConnect(e)) return true
+        if (tool == Tool.INSERT_SPACE && mode == PointerMode.IDLE) {
+            val gone = e.actionMasked == PointerEvent.ACTION_HOVER_EXIT
+            val v = Pt(e.x.toDouble(), e.y.toDouble())
+            insertSpace.hoverAt(if (gone) null else state.viewportToContent(v), v)
+            return true
+        }
         val isEraserPointer = e.getToolType(0) == PointerEvent.TOOL_TYPE_ERASER
         if (tool != Tool.ERASER && !isEraserPointer) return false
         eraserCursor = if (e.actionMasked == PointerEvent.ACTION_HOVER_EXIT) {
@@ -775,6 +828,16 @@ class InteractionController(
             }
         }
 
+        // A room's close button takes a press from a pen or a finger alike, and acts once it lifts there.
+        if (tool == Tool.INSERT_SPACE && toolType != PointerEvent.TOOL_TYPE_ERASER) {
+            insertSpace.buttonAt(Pt(vx, vy))?.let { button ->
+                roomButton = button
+                roomButtonAt = Pt(vx, vy)
+                mode = PointerMode.ROOM_BUTTON
+                return
+            }
+        }
+
         // Touching the ruler grabs it before the normal tool dispatch — for the stylus too, so a
         // pen-down ON the body moves it. A pen-down OFF the body falls through to drawing, where the
         // magnet snaps the in-progress stroke to the edge. Its buttons toggle; its body moves it.
@@ -866,15 +929,42 @@ class InteractionController(
             effectiveTool == Tool.TEXT -> beginTextGesture(content, Pt(vx, vy))
             effectiveTool == Tool.TEXT_BOX -> beginTextBoxGesture(content)
             effectiveTool == Tool.MARKUP -> beginMarkup(content)
+            effectiveTool == Tool.INSERT_SPACE -> beginInsertSpace(content)
             else -> Unit
         }
         // The flow caret owns its own long press (word selection), mid text-drag it is suppressed so
         // a hold-then-drag still sizes a box, and a markup drag held still is just a slow drag.
         if (mode != PointerMode.FLOW_TEXT && mode != PointerMode.TEXT_DRAG && mode != PointerMode.PDF_TEXT &&
-            mode != PointerMode.POLYGON
+            mode != PointerMode.POLYGON && mode != PointerMode.ROOM
         ) {
             armLongPress(Pt(vx, vy), content, isFinger, free)
         }
+    }
+
+    /** Insert space's press: room opens or closes from here as the pen drags. */
+    private fun beginInsertSpace(content: Pt) {
+        clearSelection()
+        if (insertSpace.press(content)) mode = PointerMode.ROOM
+        requestRender()
+    }
+
+    /** The pen lifted off Insert space's drag: room it opened or closed is made, and the tool stays armed for the next. */
+    private fun endInsertSpace() {
+        mode = PointerMode.IDLE
+        if (insertSpace.release()) onContentChanged()
+    }
+
+    /** The room button pressed, until the press lifts on it (closing its room) or wanders off. */
+    private var roomButton: InsertSpaceGesture.RoomButton? = null
+    private var roomButtonAt = Pt.ZERO
+
+    /** A press on a room's button lifted at viewport [up]: on the button still, it closes that room. */
+    private fun endRoomButton(up: Pt) {
+        mode = PointerMode.IDLE
+        val button = roomButton ?: return
+        roomButton = null
+        if (up.distanceTo(roomButtonAt) > TAP_SLOP) return
+        if (insertSpace.closeRoom(button)) onContentChanged()
     }
 
     /** The markup tool's press: selects, or marks, the PDF text it then drags over; anywhere else nothing. */
@@ -901,6 +991,17 @@ class InteractionController(
         }
         if (mode == PointerMode.RULER_ROTATE) return // handle-drag rotation ignores extra fingers
         if (mode == PointerMode.DRAW && drawingIsStylus) return
+        // Room opened with the pen ignores a resting hand; with a finger it gives way to the pinch, nothing changed.
+        if (mode == PointerMode.ROOM) {
+            if (drawingIsStylus) return
+            insertSpace.abort()
+            mode = PointerMode.IDLE
+        }
+        // A pinch begun on a room's button is a pinch, and the room stays.
+        if (mode == PointerMode.ROOM_BUTTON) {
+            roomButton = null
+            mode = PointerMode.IDLE
+        }
         // A finger erase (finger-draw on) yields to a two-finger pinch: commit what was erased so
         // far as one undo step, then start the zoom. A stylus-eraser erase keeps ignoring incidental
         // finger/palm contact, so a resting hand never starts a zoom mid-erase.
@@ -934,6 +1035,8 @@ class InteractionController(
             PointerMode.VERTEX -> extendVertex(content)
             PointerMode.POLYGON -> showPolygonDraft(content)
             PointerMode.SHAPE -> extendShape(content)
+            PointerMode.ROOM -> insertSpace.drag(content, Pt(vx, vy))
+            PointerMode.ROOM_BUTTON -> if (Pt(vx, vy).distanceTo(roomButtonAt) > TAP_SLOP) { roomButton = null; mode = PointerMode.IDLE }
             PointerMode.CONNECT -> extendConnector(content)
             PointerMode.JOINT -> extendJoint(content)
             PointerMode.SLIDE -> extendSlide(content)
@@ -1013,6 +1116,8 @@ class InteractionController(
             PointerMode.VERTEX -> endVertex(e.eventTime)
             PointerMode.POLYGON -> endPolygonTap(content, e.eventTime)
             PointerMode.SHAPE -> endShape()
+            PointerMode.ROOM -> endInsertSpace()
+            PointerMode.ROOM_BUTTON -> endRoomButton(Pt(e.getX(idx).toDouble(), e.getY(idx).toDouble()))
             PointerMode.CONNECT -> endConnector()
             PointerMode.JOINT -> endJoint(e.eventTime)
             PointerMode.SLIDE -> endSlide()
@@ -4126,6 +4231,8 @@ class InteractionController(
         slideSel = null
         slideBefore = null
         if (mode == PointerMode.POLYGON) showPolygonDraft(null)
+        if (mode == PointerMode.ROOM) insertSpace.abort()
+        roomButton = null
         if (mode == PointerMode.MOVE) moveOffset = Pt.ZERO
         if (mode == PointerMode.MOVE || mode == PointerMode.TRANSFORM || mode == PointerMode.VERTEX || mode == PointerMode.JOINT) {
             for ((_, f) in follows) f.restore()
@@ -4276,6 +4383,9 @@ class InteractionController(
             // Where a connector can glue, while one is armed or an end is being dragged.
             if (marking) drawConnectionMarks(r)
 
+            // Room on the pages, the cut a hovering pen would make, while Insert space is armed.
+            if (tool == Tool.INSERT_SPACE || insertSpace.active) insertSpace.drawOverlay(r, state.visibleContentRect())
+
             // The far side's live runs, over content and chrome but in content space
             // (the page offset + transform only make sense under origin + zoom).
             remoteLive?.draw(r)
@@ -4283,6 +4393,9 @@ class InteractionController(
 
         // Note icons: chrome of one size at any zoom, so in viewport space.
         noteIcons?.draw(r)
+
+        // Each room's close button while Insert space is armed, and the room's height beside the pen while it drags.
+        if (tool == Tool.INSERT_SPACE || insertSpace.active) insertSpace.drawViewport(r)
 
         // Eraser cursor (viewport space, after the transform is restored).
         eraserCursor?.let {

@@ -41,6 +41,7 @@ class MarkupPainterTest {
             scale *= sx
         }
         override fun clipRect(rect: Rect) {}
+        override fun clipPolygon(points: List<Pt>) {}
         override fun clear() {}
         override fun fillBackground(rect: Rect, color: Rgba) {}
         override fun fillRect(rect: Rect, color: Rgba) {

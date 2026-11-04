@@ -66,6 +66,7 @@ typedef struct xn_renderer_vt {
     void (*scale)(void* r, double sx, double sy);
     void (*rotate)(void* r, double degrees); /* multiples of 90 */
     void (*clip_rect)(void* r, double x, double y, double w, double h);
+    void (*clip_polygon)(void* r, const double* xy, int n);
     void (*clear)(void* r); /* clear the current clip to transparent */
 
     void (*fill_rect)(void* r, double x, double y, double w, double h, xn_rgba c);
@@ -85,9 +86,12 @@ typedef struct xn_renderer_vt {
     /* A surface (see xn_host.surface_create) scaled into dest; src may be NULL for the whole. */
     void (*draw_surface)(void* r, void* surface, const double* dest_xywh, const double* src_xywh,
                          double alpha, int blend);
-    /* An image file (UTF-8 path) into dest, turned `orientation` degrees then `angle` radians about dest's centre. */
+    /* An image file (UTF-8 path) into dest, turned `orientation` degrees then `angle` radians about dest's centre.
+     * `flip_x`/`flip_y` mirror after the orientation turn; (`pl`,`pt`,`pr`,`pb`) is the share of the
+     * stored image to draw when `has_part`, null (whole image) otherwise. */
     void (*draw_image)(void* r, const char* path, double x, double y, double w, double h,
-                       int orientation, double angle);
+                       int orientation, double angle, int flip_x, int flip_y,
+                       int has_part, double pl, double pt, double pr, double pb);
     void (*draw_text)(void* r, const uint16_t* text, int len, double x, double y, double w, double h,
                       const xn_font* font, xn_rgba c, int word_wrap, int align_left, int align_top);
     void (*draw_text_run)(void* r, const uint16_t* text, int len, double x, double baseline,

@@ -137,6 +137,15 @@ void rTranslate(void* r, double dx, double dy) { P(r)->translate(dx, dy); }
 void rScale(void* r, double sx, double sy) { P(r)->scale(sx, sy); }
 void rRotate(void* r, double degrees) { P(r)->rotate(degrees); }
 void rClipRect(void* r, double x, double y, double w, double h) { P(r)->setClipRect(QRectF(x, y, w, h), Qt::IntersectClip); }
+void rClipPolygon(void* r, const double* xy, int n) {
+    QPolygonF poly;
+    poly.reserve(n);
+    for (int i = 0; i < n; i++) poly << QPointF(xy[2 * i], xy[2 * i + 1]);
+    QPainterPath path;
+    path.addPolygon(poly);
+    path.closeSubpath();
+    P(r)->setClipPath(path, Qt::IntersectClip);
+}
 void rClear(void* r) {
     QPainter* p = P(r);
     p->save();
@@ -327,13 +336,15 @@ QMutex& imageCacheLock() {
     return lock;
 }
 
-void rDrawImage(void* r, const char* path, double x, double y, double w, double h, int orientation, double angle) {
+void rDrawImage(void* r, const char* path, double x, double y, double w, double h, int orientation, double angle,
+                int flipX, int flipY, int hasPart, double pl, double pt, double pr, double pb) {
     QPainter* p = P(r);
     const QRectF dest(x, y, w, h);
     const bool turned = ((orientation % 180) + 180) % 180 == 90;
     const double scale = std::max(1.0, std::hypot(p->transform().m11(), p->transform().m12()));
     const QSize want(std::ceil((turned ? h : w) * scale), std::ceil((turned ? w : h) * scale));
-    const QString key = QString::fromUtf8(path) + QStringLiteral("@%1x%2").arg(want.width()).arg(want.height());
+    QString key = QString::fromUtf8(path) + QStringLiteral("@%1x%2").arg(want.width()).arg(want.height());
+    if (hasPart) key += QStringLiteral("@%1,%2,%3,%4").arg(pl).arg(pt).arg(pr).arg(pb);
     QImage image;  // a shared copy: the cache may drop its own while another thread draws
     {
         QMutexLocker lock(&imageCacheLock());
@@ -351,9 +362,21 @@ void rDrawImage(void* r, const char* path, double x, double y, double w, double 
     p->save();
     p->setRenderHint(QPainter::SmoothPixmapTransform, true);
     p->translate(dest.center());
-    p->rotate(orientation + angle * 180.0 / M_PI);
+    p->rotate(orientation);
+    if (flipX) p->scale(-1.0, 1.0);
+    if (flipY) p->scale(1.0, -1.0);
+    p->rotate(angle * 180.0 / M_PI);
     const double iw = turned ? h : w, ih = turned ? w : h;
-    p->drawImage(QRectF(-iw / 2, -ih / 2, iw, ih), image);
+    if (hasPart) {
+        // Crop first (fractions of the stored image), mirroring the desktop renderer.
+        const int px = std::clamp<int>(int(pl * image.width()), 0, image.width() - 1);
+        const int py = std::clamp<int>(int(pt * image.height()), 0, image.height() - 1);
+        const int pw = std::clamp<int>(int((pr - pl) * image.width()), 1, image.width() - px);
+        const int ph = std::clamp<int>(int((pb - pt) * image.height()), 1, image.height() - py);
+        p->drawImage(QRectF(-iw / 2, -ih / 2, iw, ih), image, QRectF(px, py, pw, ph));
+    } else {
+        p->drawImage(QRectF(-iw / 2, -ih / 2, iw, ih), image);
+    }
     p->restore();
 }
 
@@ -379,7 +402,7 @@ void rDrawTextRun(void* r, const uint16_t* text, int len, double x, double basel
 }
 
 const xn_renderer_vt kVtable = {
-    rSave, rRestore, rSaveLayer, rTranslate, rScale, rRotate, rClipRect, rClear,
+    rSave, rRestore, rSaveLayer, rTranslate, rScale, rRotate, rClipRect, rClipPolygon, rClear,
     rFillRect, rFillPolygon, rFillEllipse, rFillDiskRibbon,
     rStrokePolyline, rStrokeRect, rStrokeEllipse,
     rDrawSurface, rDrawImage, rDrawText, rDrawTextRun,

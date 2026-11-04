@@ -137,31 +137,37 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   remove the page at `index`; no-op when it would empty the note or is out of
   range. Both bypass undo and relayout; page content beyond the blank shell
   (pasted items, PDF joins, reorder) is not carried in v1.
-- Unknown op names are skipped with a log.
+- `open_room {page, sideways, at, size}`: open room at `at` on `page` (across
+  the page when `sideways`); `close_room {page, sideways, a, b}`: close the
+  strip `a` to `b`. Both sides re-execute the same deterministic cut
+  (same base version ⇒ same result); no-op when the page or room is gone.
+  Unknown op names are skipped with a log.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
 companion undo sends a compensating op, e.g. `erase_strokes` for your stroke).
 
-## Live strokes (true streaming, both directions)
+## Live strokes and room drags (true streaming, both directions)
 
 ```
 C <-> S  live {file, page, stroke_id, tool, width, color, samples:[[x,y,p]...], done}
+C <-> S  room_live {file, page, sideways, split, resume, shift, live_id, done}
 ```
 
-- Streaming is **per sample, no batching timer**: every pointer sample goes
-  out on the socket as it happens (TCP_NODELAY both ends), and receivers paint
-  it immediately — a partial damage rect covering just the runs, never a full
-  frame. `tool`/`width`/`color` ride along so the far side renders the run
-  exactly as drawn.
+- Streaming is **per sample, no batching timer**: every pointer sample (and
+  every room-drag frame) goes out on the socket as it happens (TCP_NODELAY
+  both ends), and receivers paint it immediately — a partial damage rect
+  covering just the runs (or the room band), never a full frame. `tool`/
+  `width`/`color` ride along so the far side renders the run exactly as drawn.
 - Receivers show the run as an overlay keyed by `(sender, stroke_id)`,
-  *appending* each frame's samples. `done:true` ends the run; the matching
-  committed `add_stroke` (same id as dedupe) also drops it, so a lost `done`
-  frame can never leave a stale duplicate beside the committed stroke.
-- Live frames never touch the model or versions; the committed `add_stroke`
-  op follows through the normal path (dedupe keys this to the live `stroke_id`
-  so pen-up never double-draws).
-- Only for the file(s) both sides have open. Frames for a closed file, or a
-  `stroke_id` never started, are dropped.
+  *appending* each frame's samples, and a room drag as a live `RoomView`
+  (same settle machinery, model untouched). `done:true` ends the run; the
+  matching committed `add_stroke` (same id as dedupe) also drops it, and a
+  room commit clears its preview — so a lost `done` frame can never leave a
+  stale duplicate beside the committed result.
+
+- Only for the file(s) both sides have open. Frames for a closed file,
+  a `stroke_id` never started, or a room drag while the local Insert space
+  gesture is active, are dropped.
 
 ## Presence and keepalive
 
@@ -185,10 +191,11 @@ C <-> S  live {file, page, stroke_id, tool, width, color, samples:[[x,y,p]...], 
 ## What is deliberately v2
 
 View-only grants, kick/revoke mid-session, multi-companion fan-out beyond one,
-binary frames, mDNS discovery, online relay, text/markup/page ops, conflict-free
+binary frames, mDNS discovery, online relay, text/markup ops, conflict-free
 undo across sides.
 
-v1 syncs strokes, erases and blank page add/remove: local undo of a synced op
+v1 syncs strokes, erases, blank page add/remove and room open/close: local
+undo of a synced op
 does not propagate (re-sync by refetching), area-erase splits and sticky-note
 ink stay local, undo/redo of page commands is local, and non-stroke item types
 (text, markup, shapes, pasted page content) are not mirrored.

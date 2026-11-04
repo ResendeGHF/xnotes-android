@@ -17,6 +17,9 @@ import com.xnotes.core.pal.Renderer
  */
 object CanvasFramePainter {
 
+    /** Clip bound for room cuts: beyond any page, inside any transform. */
+    private const val FAR = 1e9
+
     /** What the host must do after a frame. */
     class Frame internal constructor(
         internal val cachedPages: Set<Page>,
@@ -30,10 +33,14 @@ object CanvasFramePainter {
 
     /** Paint the document (everything below the interaction overlay) into [r], in viewport pixels. */
     fun paint(r: Renderer, st: CanvasState): Frame {
+        // A room made whose page rebuilt to hold it draws as any other again.
+        st.roomView?.let { v -> if (!v.live && st.roomSettled(v.page)) st.roomView = null }
+        val room = st.roomView
         // Past the resolution cap a sharp render of the view may cover all of it: it is opaque
         // (background, paper, page backgrounds), so nothing under it needs drawing. Scaling the
         // soft page caches up only to hide them was most of a frame's cost on a large screen.
-        val pastCap = st.isPastResolutionCap()
+        // A live room drag draws its own shifted layers, so the sharp cover stands down for it.
+        val pastCap = st.isPastResolutionCap() && room?.live != true
         val sharp = if (pastCap) st.sharpViewportBlit() else null
         val covered = sharp != null && sharp.dx <= 0.0 && sharp.dy <= 0.0 &&
             sharp.dx + sharp.base.width * sharp.scale >= st.viewportW &&
@@ -59,6 +66,10 @@ object CanvasFramePainter {
             val page = st.document.pages[i]
             cachedPages.add(page)
 
+            if (room != null && room.page === page) {
+                drawRoomPage(r, st, page, pr, room, visible)
+                continue
+            }
             if (covered) {
                 // Hidden under the sharp render; still keep the caches coming for when it moves.
                 st.backgroundForOrSchedule(page)
@@ -160,6 +171,7 @@ object CanvasFramePainter {
                 val page = st.document.pages[i]
                 // Page-space visible rect, so off-band highlighters on a tall page skip the composite.
                 val visLocal = st.displayRectToPage(page, visible.translate(-pr.left, -pr.top))
+                if (room?.page === page) continue // cut at its room in drawRoomPage instead
                 r.withSave {
                     r.clipRect(pr)
                     r.translate(pr.left, pr.top)
@@ -182,6 +194,94 @@ object CanvasFramePainter {
 
     /** End the frame once the host's own layers are drawn: release caches of pages now out of view. */
     fun finish(st: CanvasState, frame: Frame) = st.dropCachesExcept(frame.cachedPages)
+
+    /**
+     * The page room is being drawn through (roomView): its old layers cut at the room, the near
+     * part where it was and the far part moved on, with paper where room opens. What the cut
+     * cannot split is drawn live where it stays. A layer rebuilt since is drawn as it is.
+     */
+    private fun drawRoomPage(r: Renderer, st: CanvasState, page: Page, pr: Rect, v: RoomView, visible: Rect) {
+        r.fillRect(pr, st.paperColor(page))
+        // Asked for so a settled room's changed footprint schedules the rebuilds that end it.
+        st.backgroundForOrSchedule(page)
+        st.cacheForOrSchedule(page)
+        val bg = st.rawBackgroundCache(page)
+        val ink = st.rawInkCache(page)
+        r.withSave {
+            r.clipRect(pr)
+            r.translate(pr.left, pr.top)
+            st.applyPageTransform(r, page)
+            if (bg != null) {
+                if (bg.cover != v.cover) {
+                    r.drawRaster(bg.surface, bg.cover)
+                } else if (page.pdfPage == null) {
+                    // A plain page's ruling is laid for the page, not carried by what is on it.
+                    r.drawRaster(bg.surface, bg.cover)
+                } else {
+                    drawCut(r, bg.surface, bg.cover, v)
+                }
+            }
+            if (bg == null || bg.cover == v.cover) st.paintRoomPaper?.invoke(v, r)
+        }
+        val old = ink == null || ink.cover == v.cover
+        // What stays put is out of the old ink layer, so it is drawn here until a layer that holds it lands.
+        if (old) {
+            r.withSave {
+                r.clipRect(pr)
+                r.translate(pr.left, pr.top)
+                st.applyPageTransform(r, page)
+                for (item in v.fills) item.paint(r)
+            }
+        }
+        if (ink != null) {
+            r.withSave {
+                r.clipRect(pr)
+                r.translate(pr.left, pr.top)
+                st.applyPageTransform(r, page)
+                if (ink.cover == v.cover) drawCut(r, ink.surface, ink.cover, v) else r.drawRaster(ink.surface, ink.cover)
+            }
+        }
+        if (old) {
+            r.withSave {
+                r.clipRect(pr)
+                r.translate(pr.left, pr.top)
+                st.applyPageTransform(r, page)
+                for (item in v.over) item.paint(r)
+            }
+        }
+        // The room page's highlights, cut at the room like the layers under them.
+        r.withSave {
+            r.clipRect(pr)
+            r.translate(pr.left, pr.top)
+            st.applyPageTransform(r, page)
+            for (item in page.items) {
+                if (item !is Stroke || !item.isHighlighterInk() || st.isLiftedItem(item)) continue
+                val hc = st.highlighterCacheFor(item, page)
+                val alpha = item.renderColor.a / 255.0
+                r.withSave {
+                    r.clipRect(if (v.sideways) Rect.ltrb(-FAR, -FAR, v.split, FAR) else Rect.ltrb(-FAR, -FAR, FAR, v.split))
+                    r.drawRasterBlended(hc.surface, hc.cover, alpha, item.blendMode)
+                }
+                r.withSave {
+                    if (v.sideways) r.translate(v.shift, 0.0) else r.translate(0.0, v.shift)
+                    r.clipRect(if (v.sideways) Rect.ltrb(v.resume, -FAR, FAR, FAR) else Rect.ltrb(-FAR, v.resume, FAR, FAR))
+                    r.drawRasterBlended(hc.surface, hc.cover, alpha, item.blendMode)
+                }
+            }
+        }
+    }
+
+    /** [surface], a page layer built for [cover], drawn cut at [v]'s room: what lay before it in place, what lay past it moved on. */
+    private fun drawCut(r: Renderer, surface: RasterSurface, cover: Rect, v: RoomView) {        r.withSave {
+            r.clipRect(if (v.sideways) Rect.ltrb(-FAR, -FAR, v.split, FAR) else Rect.ltrb(-FAR, -FAR, FAR, v.split))
+            r.drawRaster(surface, cover)
+        }
+        r.withSave {
+            if (v.sideways) r.translate(v.shift, 0.0) else r.translate(0.0, v.shift)
+            r.clipRect(if (v.sideways) Rect.ltrb(v.resume, -FAR, FAR, FAR) else Rect.ltrb(-FAR, v.resume, FAR, FAR))
+            r.drawRaster(surface, cover)
+        }
+    }
 
     /** Blit a page-space cache surface into the page's display rect, rotated per the view. The
      *  surface covers the page's whole footprint (margins included), so it blits at [CanvasState.footprint]. */

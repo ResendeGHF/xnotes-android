@@ -24,7 +24,7 @@ class ToolbarLayoutTest {
             d.sections[2].entries.map { it.item },
         )
         assertEquals(
-            listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT),
+            listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.INSERT_SPACE, ToolbarItem.SCREENSHOT),
             d.sections[3].entries.map { it.item },
         )
         assertEquals(
