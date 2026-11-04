@@ -81,6 +81,10 @@ class HostEngineTest {
             liveRepaints += uri
         }
         override fun editorState(uri: String): com.xnotes.canvas.CanvasState? = states[uri]
+        override fun structureChanged(uri: String) {
+            structured += uri
+        }
+        val structured = ArrayList<String>()
         override fun liveOverlay(uri: String): RemoteLiveStrokes? = overlays[uri]
         override fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
             roomPreviews += RoomPreview(uri, page, sideways, split, resume, shift)
@@ -240,6 +244,53 @@ class HostEngineTest {
         e.onMessage(JSONObject().put("t", "op").put("seq", 4).put("file", "f1").put("base_version", 2).put("dedupe", "r-3")
             .put("ops", org.json.JSONArray().put(JSONObject().put("op", "close_room").put("page", 0).put("sideways", true).put("a", 10.0).put("b", 60.0))))
         assertEquals(FakeHost.RoomEdit("f1", 0, true, false, 10.0, 60.0), h.roomEdits.last())
+    }
+
+    @Test fun imageBytesThenOpAppliesToOpenDoc() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["f1"] = doc
+        val bytes = ByteArray(300 * 1024) { (it % 251).toByte() } // spans two chunks
+        e.sendImageBytes("f1", "i-1", bytes)
+        val chunks = h.sent.filter { it.optString("t") == "image_data" }
+        assertEquals(2, chunks.size)
+        h.sent.clear()
+        for (c in chunks) e.onMessage(c)
+        e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "f1").put("base_version", 1).put("dedupe", "i-1")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_image").put("page", 0).put("image_id", "i-1")
+                .put("width", 100).put("height", 80)
+                .put("rect", org.json.JSONArray().put(10.0).put(20.0).put(50.0).put(40.0))
+                .put("orientation", 0).put("angle", 0.0))))
+        val items = doc.pages[0].items.filterIsInstance<com.xnotes.core.model.ImageItem>()
+        assertEquals(1, items.size)
+        assertEquals(com.xnotes.core.geometry.Rect(10.0, 20.0, 50.0, 40.0), items.single().rect)
+        assertTrue(items.single().image.file.readBytes().contentEquals(bytes))
+    }
+
+    @Test fun imageOpBeforeBytesWaitsForThem() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["f1"] = doc
+        val op = JSONObject().put("t", "op").put("seq", 1).put("file", "f1").put("base_version", 1).put("dedupe", "i-9")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_image").put("page", 0).put("image_id", "i-9")
+                .put("width", 10).put("height", 10)
+                .put("rect", org.json.JSONArray().put(0.0).put(0.0).put(5.0).put(5.0))
+                .put("orientation", 0).put("angle", 0.0)))
+        e.onMessage(op)
+        assertTrue(doc.pages[0].items.isEmpty())
+        e.sendImageBytes("f1", "i-9", ByteArray(10) { 7 })
+        val chunks = h.sent.filter { it.optString("t") == "image_data" }
+        h.sent.clear()
+        for (c in chunks) e.onMessage(c)
+        assertEquals(1, doc.pages[0].items.filterIsInstance<com.xnotes.core.model.ImageItem>().size)
     }
 
     @Test fun staleBaseGetsResync() {

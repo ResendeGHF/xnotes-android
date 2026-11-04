@@ -57,7 +57,7 @@ class CompanionService : Service() {
         runningService = this
         CompanionEditors.onTracked = { editor, uri ->
             if (engine == null) {
-                CompanionEditors.onTracked = null
+                // Session not up yet; the startSession sweep wires everything tracked.
             } else if (uri == null) {
                 detachEditor(editor)
             } else {
@@ -142,6 +142,10 @@ class CompanionService : Service() {
                     override fun editorState(uri: String): com.xnotes.canvas.CanvasState? =
                         CompanionEditors.editorFor(uri)?.state
 
+                    override fun structureChanged(uri: String) {
+                        main.post { CompanionEditors.editorFor(uri)?.syncStructureChanged() }
+                    }
+
                     override fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
                         main.post {
                             val editor = CompanionEditors.editorFor(uri) ?: return@post
@@ -156,7 +160,9 @@ class CompanionService : Service() {
 
                     override fun applyRoomEdit(uri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
                         val editor = CompanionEditors.editorFor(uri) ?: return false
-                        return editor.controller.applyRemoteRoomEdit(page, sideways, open, a, b)
+                        if (!editor.controller.applyRemoteRoomEdit(page, sideways, open, a, b)) return false
+                        editor.syncStructureChanged()
+                        return true
                     }
 
                     override fun liveOverlay(uri: String): RemoteLiveStrokes? =
@@ -170,7 +176,10 @@ class CompanionService : Service() {
                         _status.value = Status(reason, _status.value.paired, connected = false)
                     }
                 }
-                val engine = HostEngine(backend, BackendFiles(backend), policy, versions, host, deviceName)
+                val engine = HostEngine(
+                    backend, BackendFiles(backend), policy, versions, host, deviceName,
+                    imageDir = File(cacheDir, "sync-images").apply { mkdirs() },
+                )
                 val ui = object : PairingUi {
                     override fun showCodeEntry() {
                         _codeNeeded.value = true
@@ -192,7 +201,15 @@ class CompanionService : Service() {
                 this.engine = engine
                 this.ui = ui
                 _active.value = true
-                main.post { dialLocked() }
+                main.post {
+                    // Files opened before the session started never fired onTracked
+                    // while the engine existed: wire them now.
+                    for (e in CompanionEditors.editors()) {
+                        val uri = CompanionEditors.uriFor(e) ?: continue
+                        attachEditor(e, uri)
+                    }
+                    dialLocked()
+                }
             } catch (e: Exception) {
                 postStatus("Start failed: ${e.message}")
                 starting.set(false)
@@ -319,6 +336,18 @@ class CompanionService : Service() {
             if (edit.open) engine.submitLocalRoomOpen(uri, edit.page, edit.sideways, edit.a, edit.b - edit.a, id)
             else engine.submitLocalRoomClose(uri, edit.page, edit.sideways, edit.a, edit.b, id)
         }
+        editor.onFileContentReplaced = { engine?.pushFile(uri) }
+        editor.onImageInserted = { page, item ->
+            val eng = engine
+            if (eng != null) {
+                val id = newDedupe()
+                runCatching { item.image.file.readBytes() }.getOrNull()?.let { bytes ->
+                    val part = item.part?.let { com.xnotes.core.geometry.Rect(it.x, it.y, it.right, it.bottom) }
+                    eng.submitLocalImage(uri, page, id, bytes, item.image.width, item.image.height,
+                        item.rect, item.orientation, item.angle, item.flip.x, item.flip.y, part, id)
+                }
+            }
+        }
         editor.controller.onRoomPreviewDone = {
             pendingRoom?.takeIf { it.uri == uri }?.let {
                 pendingRoom = null
@@ -361,6 +390,8 @@ class CompanionService : Service() {
         editor.state.onPageChanged = null
         editor.onPageInserted = null
         editor.onPageRemoved = null
+        editor.onImageInserted = null
+        editor.onFileContentReplaced = null
         editor.controller.onRoomPreview = null
         editor.controller.onRoomCommitted = null
         editor.controller.onRoomPreviewDone = null

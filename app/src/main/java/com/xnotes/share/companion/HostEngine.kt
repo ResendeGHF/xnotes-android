@@ -47,6 +47,8 @@ class HostEngine(
     private val versionsFile: File,
     private val host: HostEngineHost,
     val deviceName: String,
+    /** Where received image bytes land; defaults to the process temp dir. */
+    private val imageDir: File = File(System.getProperty("java.io.tmpdir"), "xnotes-sync-images").apply { mkdirs() },
 ) {
     interface HostEngineHost {
         fun send(msg: JSONObject)
@@ -60,6 +62,8 @@ class HostEngine(
         fun repaintLive(uri: String)
         /** The open document's canvas state for [uri], or null. */
         fun editorState(uri: String): com.xnotes.canvas.CanvasState?
+        /** A remote structural apply changed [uri]'s pages: refresh chrome, not just pixels. */
+        fun structureChanged(uri: String)
         /** Show the far side's room drag on [uri]'s page without touching the model. */
         fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double)
         /** Drop the far side's room preview for [uri]. */
@@ -99,6 +103,7 @@ class HostEngine(
             "op" -> onOp(msg)
             "live" -> onLive(msg)
             "room_live" -> onRoomLive(msg)
+            "image_data" -> onImageChunk(msg)
             "presence" -> synchronized(lock) {
                 val file = msg.optString("file")
                 if (file.isNotEmpty()) companionPresence[file] = msg.optInt("page", -1)
@@ -279,6 +284,9 @@ class HostEngine(
                 "close_room" -> {
                     if (applyRoomEdit(file, op.optInt("page", 0), op.optBoolean("sideways", false), false, op.optDouble("a", 0.0), op.optDouble("b", 0.0))) changed = true
                 }
+                "add_image" -> {
+                    if (applyRemoteImage(file, op)) changed = true
+                }
                 else -> Unit
             }
         }
@@ -316,6 +324,71 @@ class HostEngine(
     fun submitLocalPageRemove(uri: String, index: Int, dedupe: String) {
         val ops = JSONArray().put(JSONObject().put("op", "remove_page").put("index", index))
         submitLocalOps(uri, ops, dedupe)
+    }
+
+    /** A local image insert to broadcast: chunked bytes first, then the placing op. */
+    fun submitLocalImage(
+        uri: String, page: Int, imageId: String, bytes: ByteArray,
+        width: Int, height: Int, rect: com.xnotes.core.geometry.Rect,
+        orientation: Int, angle: Double, flipX: Boolean, flipY: Boolean, part: com.xnotes.core.geometry.Rect?,
+        dedupe: String,
+    ) {
+        sendImageBytes(uri, imageId, bytes)
+        val op = JSONObject().put("op", "add_image").put("page", page).put("image_id", imageId)
+            .put("width", width).put("height", height)
+            .put("rect", JSONArray().put(rect.x).put(rect.y).put(rect.w).put(rect.h))
+            .put("orientation", orientation).put("angle", angle)
+        if (flipX) op.put("flip_x", true)
+        if (flipY) op.put("flip_y", true)
+        part?.let { op.put("part", JSONArray().put(it.x).put(it.y).put(it.right).put(it.bottom)) }
+        submitLocalOps(uri, JSONArray().put(op), dedupe)
+    }
+
+    /** Chunked image bytes ahead of their op (256 KiB frames, base64 like file chunks). */
+    fun sendImageBytes(uri: String, imageId: String, bytes: ByteArray) {
+        if (bytes.isEmpty()) {
+            send(JSONObject().put("t", "image_data").put("file", uri).put("image_id", imageId)
+                .put("total", 0).put("offset", 0).put("data", "").put("last", true))
+            return
+        }
+        var off = 0
+        while (off < bytes.size) {
+            val n = minOf(IMAGE_CHUNK, bytes.size - off)
+            val slice = bytes.copyOfRange(off, off + n)
+            send(JSONObject().put("t", "image_data").put("file", uri).put("image_id", imageId)
+                .put("total", bytes.size).put("offset", off)
+                .put("data", java.util.Base64.getEncoder().encodeToString(slice))
+                .put("last", off + n >= bytes.size))
+            off += n
+        }
+    }
+
+    /**
+     * Push the whole file after a change ops cannot carry (PDF joined, cover
+     * set): the far side replaces its bytes and reloads. Bumps the head so the
+     * bytes and the version stay one story.
+     */
+    fun pushFile(uri: String) {
+        if (!policyAllows(uri)) return
+        val doc = host.openDocument(uri)
+        val bytes = if (doc != null) host.snapshotBytes(doc) else files.read(uri)
+        bytes ?: return
+        val version = bumpVersion(uri)
+        pushIndexDelta()
+        if (bytes.isEmpty()) {
+            send(JSONObject().put("t", "file").put("id", uri).put("version", version)
+                .put("total", 0).put("offset", 0).put("data", "").put("last", true))
+            return
+        }
+        var off = 0
+        while (off < bytes.size) {
+            val end = minOf(off + CHUNK.toInt(), bytes.size)
+            send(JSONObject().put("t", "file").put("id", uri).put("version", version)
+                .put("total", bytes.size).put("offset", off)
+                .put("data", java.util.Base64.getEncoder().encodeToString(bytes.sliceArray(off until end)))
+                .put("last", end >= bytes.size))
+            off = end
+        }
     }
 
     /** A local room open to broadcast ([at] cut, [size] tall). */
@@ -413,7 +486,7 @@ class HostEngine(
         doc.dirty = true
         st?.relayout()
         st?.clampScroll()
-        host.repaintDocument(file)
+        host.structureChanged(file)
         return true
     }
 
@@ -432,7 +505,7 @@ class HostEngine(
             st.relayout()
             st.clampScroll()
         }
-        host.repaintDocument(file)
+        host.structureChanged(file)
         return true
     }
 
@@ -454,6 +527,156 @@ class HostEngine(
             doc.dirty = true
             true
         }
+    }
+
+    // --- images (chunked bytes first, then the placing op) ---
+
+    private class ImageAsm(val file: String, val total: Long, val buf: ByteArrayOutputStream, var filled: Long = 0)
+    private val imageAsm = HashMap<String, ImageAsm>()
+    private val pendingImageOps = HashMap<String, ArrayList<Pair<String, JSONObject>>>()
+    private val imageBytes = HashMap<String, Pair<String, ByteArray>>()
+    private val imageOrder = ArrayDeque<String>()
+
+    private fun onImageChunk(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty() || !policyAllows(file)) return
+        val id = msg.optString("image_id")
+        if (id.isEmpty()) return
+        val total = msg.optLong("total", -1)
+        val offset = msg.optLong("offset", -1)
+        if (total < 0 || total > IMAGE_MAX_BYTES || offset < 0 || offset > total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        if (total == 0L) {
+            if (!msg.optBoolean("last", false)) {
+                imageAsm.remove(id)
+                pendingImageOps.remove(id)
+                return
+            }
+            rememberImage(id, file, ByteArray(0))
+            flushImage(id)
+            return
+        }
+        val asm = imageAsm.getOrPut(id) { ImageAsm(file, total, ByteArrayOutputStream(total.coerceAtMost(IMAGE_MAX_BYTES).toInt())) }
+        if (asm.total != total || asm.file != file) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(msg.optString("data"))
+        } catch (_: Exception) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        if (offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        asm.buf.write(bytes)
+        asm.filled += bytes.size
+        if (!msg.optBoolean("last", false) && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            imageAsm.remove(id)
+            pendingImageOps.remove(id)
+            return
+        }
+        imageAsm.remove(id)
+        rememberImage(id, file, asm.buf.toByteArray())
+        flushImage(id)
+    }
+
+    private fun rememberImage(id: String, file: String, bytes: ByteArray) {
+        imageBytes[id] = file to bytes
+        imageOrder.remove(id)
+        imageOrder.addLast(id)
+        while (imageOrder.size > IMAGE_KEPT) {
+            if (imageBytes.size <= 1 || imageOrder.isEmpty()) break
+            imageBytes.remove(imageOrder.removeFirst())
+        }
+    }
+
+    private fun flushImage(id: String) {
+        val pend = pendingImageOps.remove(id) ?: return
+        val (file, bytes) = imageBytes[id] ?: return
+        for ((f, op) in pend) if (f == file && applyImageBytes(f, op, bytes)) Unit
+    }
+
+    /** An `add_image` op: apply at once when the bytes are in, else hold for them. */
+    private fun applyRemoteImage(file: String, op: JSONObject): Boolean {
+        val id = op.optString("image_id")
+        if (id.isEmpty()) return false
+        val ready = imageBytes[id]?.takeIf { it.first == file }?.second
+        if (ready != null) return applyImageBytes(file, op, ready)
+        val pend = pendingImageOps.getOrPut(id) { ArrayList() }
+        pend += file to op
+        while (pendingImageOps.values.sumOf { it.size } > 16) {
+            val first = pendingImageOps.keys.firstOrNull() ?: break
+            val list = pendingImageOps[first]!!
+            list.removeAt(0)
+            if (list.isEmpty()) pendingImageOps.remove(first)
+        }
+        return false
+    }
+
+    /** Materialize [bytes] as an image file and place the item; closed files go through the codec. */
+    private fun applyImageBytes(file: String, op: JSONObject, bytes: ByteArray): Boolean {
+        val page = op.optInt("page", 0)
+        val rect = op.optJSONArray("rect") ?: return false
+        if (rect.length() < 4) return false
+        val safeId = op.optString("image_id").filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(64).ifEmpty { "img" }
+        val dest = try {
+            imageDir.mkdirs()
+            File.createTempFile("img-$safeId-", ".bin", imageDir)
+        } catch (_: Exception) {
+            return false
+        }
+        try {
+            dest.writeBytes(bytes)
+        } catch (_: Exception) {
+            dest.delete()
+            return false
+        }
+        val partArr = op.optJSONArray("part")
+        val part = if (partArr != null && partArr.length() == 4) {
+            com.xnotes.core.geometry.Rect(partArr.optDouble(0), partArr.optDouble(1),
+                partArr.optDouble(2) - partArr.optDouble(0), partArr.optDouble(3) - partArr.optDouble(1))
+        } else null
+        val item = com.xnotes.core.model.ImageItem(
+            com.xnotes.core.model.ImageData(dest, op.optInt("width", 0), op.optInt("height", 0)),
+            com.xnotes.core.geometry.Rect(rect.optDouble(0), rect.optDouble(1), rect.optDouble(2), rect.optDouble(3)),
+            orientation = op.optInt("orientation", 0),
+            angle = op.optDouble("angle", 0.0),
+            flip = com.xnotes.core.geometry.Flip.of(op.optBoolean("flip_x", false), op.optBoolean("flip_y", false)),
+            part = part,
+        )
+        host.openDocument(file)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: run {
+                dest.delete()
+                return false
+            }
+            if (item.rect.w <= 0 || item.rect.h <= 0) {
+                dest.delete()
+                return false
+            }
+            pg.items.add(item)
+            doc.dirty = true
+            host.editorState(file)?.appendToCache(pg, item)
+            host.repaintDocument(file)
+            return true
+        }
+        val ok = modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            if (item.rect.w <= 0 || item.rect.h <= 0) return@modifyFile false
+            pg.items.add(item)
+            true
+        }
+        if (!ok) dest.delete()
+        return ok
     }
 
     private val codec by lazy {
@@ -682,6 +905,9 @@ class HostEngine(
 
     companion object {
         const val CHUNK = 256 * 1024L
+        const val IMAGE_CHUNK = 256 * 1024
+        const val IMAGE_MAX_BYTES = 64L * 1024 * 1024
+        const val IMAGE_KEPT = 8
         const val DEDUPE_KEPT = 64
         const val VERSIONS = "sync_versions.json"
     }

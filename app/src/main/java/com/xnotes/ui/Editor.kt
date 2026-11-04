@@ -3500,6 +3500,7 @@ class Editor(
         state.document.dirty = true
         refreshContent()
         view.requestRender()
+        onImageInserted?.invoke(index, item)
     }
 
     // --- table tool ---
@@ -5127,6 +5128,25 @@ class Editor(
 
     /** Repaint after a remote sync apply. */
     fun syncRepaint() {
+        view.requestRender()
+    }
+
+    /**
+     * Sync hook: fired for every explicit local image insert so the bridge can
+     * send the bytes and submit a matching `add_image` op. Remote image ops
+     * apply directly and never fire this.
+     */
+    var onImageInserted: ((pageIndex: Int, item: com.xnotes.core.model.ImageItem) -> Unit)? = null
+
+    /**
+     * Sync hook: the whole file changed shape beyond ops (PDF joined, cover
+     * set). The bridge pushes the full bytes; the far side reloads.
+     */
+    var onFileContentReplaced: (() -> Unit)? = null
+
+    /** Refresh page chrome after a remote structural apply (page add/remove, room size). */
+    fun syncStructureChanged() {
+        refreshContent()
         view.requestRender()
     }
 
@@ -10020,6 +10040,7 @@ class Editor(
         history.push(AddPage(state.document, page, 0).also { it.redo() })
         afterPageEdit()
         goToPage(0)
+        onFileContentReplaced?.invoke()
     }
 
     /** Take the cover away, as deleting its page would. */
@@ -10119,6 +10140,7 @@ class Editor(
         history.push(CompositeCommand(cmds))
         afterPageEdit()
         goToPage(at)
+        onFileContentReplaced?.invoke()
     }
 
     /** Stage the PDF at [uri] and join it onto [base], the note's source, read by [baseSource]. IO. */
