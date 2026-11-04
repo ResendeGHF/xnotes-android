@@ -29,12 +29,28 @@ expandable to online later.
    PGP import/export (encrypted *folders* may stay Android-only for now;
    single encrypted notes must round-trip), math studio, images and
    canvas animations, audio items + stroke replay.
+   **File manager / home screen** like the Android app: browse locally
+   imported files, per-file/folder share entry points, and incoming
+   "shared notes" / "shared folders" views.
+   **Full shape + diagram support** on the Linux canvas: every shape the
+   Android version draws (basic shapes, flowchart, block arrows,
+   callouts, 3D and maths, labels, connectors, point editing) must
+   render and be creatable.
+   **PDF text selection à la pdf.js** (top priority): select text on PDF
+   pages; highlight, underline, strikeout, squiggly, copy, in-document
+   search, and pdf.js-compatible annotations (standard quadpoint markups
+   + comments), both directions.
    **Preserve-only** (Linux must open without corrupting, no editor):
    image scan, stroke tracing, sdocx import/export, handwriting
    recognition.
-3. **Format compat is the gate**: a set of reference notes exercising the
-   custom features must open identically on Android and Linux before any
-   merge lands. (Owner to produce the set.)
+3. **Format compat is the gate**: reference notes exercising the custom
+   features must open identically on Android and Linux before any merge
+   lands. First results (2026-11-05, `CompatNotesTest`): stock Android
+   notes and a PDF-backed note parse cleanly in the fork's shared codec
+   with byte-identical round trips (strokes, images, shapes, text boxes
+   all present). Still to verify with dedicated fixtures: sticky notes,
+   tables, tape, math-studio workspace, audio items, PGP-encrypted notes
+   (needs password handoff), Samsung-format imports.
 4. **Protocol is a fresh implementation** (the old live-stroke streaming
    never worked reliably). Same threat model and semantics, new code —
    see "Sync protocol" below.
