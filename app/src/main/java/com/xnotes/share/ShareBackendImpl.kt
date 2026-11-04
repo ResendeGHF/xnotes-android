@@ -587,6 +587,46 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         null
     }
 
+    /** Replace a shared file's bytes (sealed temp+copy, never a truncation of a good file). */
+    fun writeRawBytes(uri: String, bytes: ByteArray): Boolean {
+        if (bytes.isEmpty()) return false
+        return try {
+            val tmp = File.createTempFile("share-replace", null, appContext.cacheDir)
+            try {
+                tmp.writeBytes(bytes)
+                copyFileToUri(tmp, uri)
+            } finally {
+                tmp.delete()
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Delete a shared document. */
+    fun deleteDoc(uri: String): Boolean = try {
+        DocumentsContract.deleteDocument(appContext.contentResolver, android.net.Uri.parse(uri))
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Create a file or folder under [dirUri] (or the browse root): returns the
+     * new document URI. A creation the user approved is shared from birth.
+     */
+    fun createDoc(dirUri: String?, name: String, isDir: Boolean): String? = try {
+        val tree = browseRoot() ?: return null
+        val parent = dirUri?.let { android.net.Uri.parse(it) }
+            ?: DocumentsContract.buildDocumentUriUsingTree(
+                android.net.Uri.parse(tree),
+                DocumentsContract.getTreeDocumentId(android.net.Uri.parse(tree)),
+            )
+        val mime = if (isDir) DocumentsContract.Document.MIME_TYPE_DIR else "application/octet-stream"
+        DocumentsContract.createDocument(appContext.contentResolver, parent, mime, name)?.toString()
+    } catch (_: Exception) {
+        null
+    }
+
     /** Same sealed-write shape the editor uses: temp first, copy over, never truncate a good file. */
     private fun copyFileToUri(tmp: File, uri: String): Boolean = try {
         appContext.contentResolver.openOutputStream(Uri.parse(uri), "wt")?.use { out ->

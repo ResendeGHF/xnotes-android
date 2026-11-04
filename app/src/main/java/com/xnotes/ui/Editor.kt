@@ -141,6 +141,7 @@ import com.xnotes.settings.SettingsRepository
 import com.xnotes.ui.theme.MaterialColors
 import com.xnotes.ui.theme.Palette
 import com.xnotes.ui.theme.dynamicMaterialColors
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import kotlin.math.roundToInt
@@ -5115,6 +5116,20 @@ class Editor(
         pendingOpenUri = null
     }
 
+    /** Serialize the live document for a companion fetch (null when it fails). */
+    fun syncSnapshotBytes(): ByteArray? = try {
+        synchronized(saveLock) {
+            ByteArrayOutputStream().also { codec.write(state.document, it) }.toByteArray()
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** Repaint after a remote sync apply. */
+    fun syncRepaint() {
+        view.requestRender()
+    }
+
     fun save(output: OutputStream, uri: String, name: String? = null) {
         try {
             synchronized(saveLock) { codec.write(state.document, output) }
@@ -9533,6 +9548,7 @@ class Editor(
         controller.resetGestureState() // drop the outgoing note's fling/elastic so it can't bleed in
         clearPageSelection()
         state.document = doc
+        com.xnotes.share.companion.CompanionEditors.track(this, doc.path)
         rebuildPdfSource()
         adoptOpenPdf(doc) // outgoing note's PDF source is now closed; delete its temp file
         history.clear()
@@ -12535,6 +12551,7 @@ class Editor(
         pendingVaultOpen = null
         if (wasSealed) clearSessionsSecure()
         state.document = blankDocument().also { stampNewNoteDefaults(it) }
+        com.xnotes.share.companion.CompanionEditors.track(this, null)
         rebuildPdfSource() // close the outgoing note's PDF source (a blank note has none)
         adoptOpenPdf(state.document) // and reclaim its temp PDF file now it's released
         history.clear()

@@ -955,6 +955,9 @@ class CanvasState(
     /** The first page of the row before the one containing [from] (page-nav stepping). */
     fun prevPageIndex(from: Int): Int = rowOf(max(rowOf(from).first - 1, 0)).first
 
+    /** Fires with the landed page (paginated jumps and programmatic goes). */
+    var onPageChanged: ((Int) -> Unit)? = null
+
     fun goToPage(index: Int) {
         if (pageRects.isEmpty()) return
         val i = index.coerceIn(0, pageRects.size - 1)
@@ -966,6 +969,7 @@ class CanvasState(
             scrollX = t.x
             scrollY = t.y
             clampScroll()
+            onPageChanged?.invoke(i)
             return
         }
         // Navigate to the page's whole layout row, so a Double/Cover spread centres as one.
@@ -977,6 +981,7 @@ class CanvasState(
         scrollY = (top * zoom - TOP_GAP - insetTop).coerceAtLeast(-insetTop)
         scrollX = centerX * zoom - clearCenter().x
         clampScroll()
+        onPageChanged?.invoke(i)
     }
 
     /** After a relayout, scroll by as much as [page] moved from [was], so it stays where it showed. */

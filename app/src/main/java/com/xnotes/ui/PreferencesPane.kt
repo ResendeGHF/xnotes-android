@@ -1157,53 +1157,29 @@ private fun PortSection(editor: Editor) {
 private fun ShareSection(enabled: Boolean, onToggle: (Boolean) -> Unit) {
     val palette = LocalPalette.current
     val context = LocalContext.current
-    var pairing by remember { mutableStateOf<Triple<String, String, String>?>(null) }
-    var showToken by remember { mutableStateOf(false) }
-    // Reload on every enable: first enable generates the identity, which takes a moment.
-    LaunchedEffect(enabled) {
-        if (!enabled) {
-            pairing = null
-            showToken = false
-            return@LaunchedEffect
-        }
-        pairing = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching {
-                val id = com.xnotes.share.ShareCrypto.loadOrCreate(context.filesDir)
-                val addr = com.xnotes.share.ShareService.hostAddresses().firstOrNull() ?: "127.0.0.1"
-                Triple(
-                    "https://$addr:${com.xnotes.share.ShareProtocol.DEFAULT_PORT}",
-                    com.xnotes.share.ShareCrypto.displayFingerprint(id.fingerprintHex),
-                    id.token,
-                )
-            }.getOrNull()
-        }
-    }
+    val status by com.xnotes.share.companion.CompanionService.status.collectAsState()
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SectionTitle(stringResource(R.string.pref_sharing))
         Text(stringResource(R.string.pref_share_help), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
         CheckRow(stringResource(R.string.pref_share_files), enabled) {
             onToggle(it)
-            if (it) com.xnotes.share.ShareService.start(context) else com.xnotes.share.ShareService.stop(context)
+            if (it) com.xnotes.share.companion.CompanionService.start(context)
+            else com.xnotes.share.companion.CompanionService.stop(context)
         }
         if (enabled) {
-            val current = pairing
-            if (current == null) {
-                Text(stringResource(R.string.share_starting), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
-            } else {
-                val (url, fingerprint, token) = current
-                Text(url, color = palette.text.toComposeColor(), fontSize = 13.sp)
-                Text(stringResource(R.string.share_fingerprint, fingerprint), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        stringResource(R.string.share_token, if (showToken) token else "••••••••"),
-                        color = palette.textDim.toComposeColor(),
-                        fontSize = 12.sp,
-                    )
-                    TextButton(onClick = { showToken = !showToken }) {
-                        Text(stringResource(if (showToken) R.string.share_hide_token else R.string.share_show_token), fontSize = 13.sp)
-                    }
-                }
+            Text(
+                status.text.ifEmpty { stringResource(R.string.share_starting) },
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+            )
+            status.paired?.let { paired ->
+                Text(paired, color = palette.text.toComposeColor(), fontSize = 13.sp)
             }
+            Text(
+                "Pair from the Connect screen; approve the desktop's popup, then pick files in the policy screen.",
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+            )
         }
     }
 }

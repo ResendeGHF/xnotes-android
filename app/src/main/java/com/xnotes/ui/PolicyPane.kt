@@ -138,6 +138,7 @@ fun PolicyPane(editor: Editor) {
                     Row(
                         Modifier.fillMaxWidth().clickable {
                             policy.setShared(e.uri, !shared)
+                            com.xnotes.share.companion.CompanionService.refreshPolicy(context)
                             ticks++
                         }.padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -146,6 +147,7 @@ fun PolicyPane(editor: Editor) {
                             checked = shared,
                             onCheckedChange = {
                                 policy.setShared(e.uri, it)
+                                com.xnotes.share.companion.CompanionService.refreshPolicy(context)
                                 ticks++
                             },
                         )
