@@ -34,6 +34,18 @@ internal class InsertSpaceGesture(
     /** What stays put across the cut, or is placed afresh while it moves: out of the page's cache, drawn live. */
     val lifted: MutableSet<CanvasItem> = Collections.newSetFromMap(IdentityHashMap())
 
+    /** Fired per local drag frame with the preview geometry (never for remote previews). */
+    var onLocalPreview: ((pageIndex: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) -> Unit)? = null
+
+    /** Fired when a local drag or button press commits a room edit. */
+    var onLocalCommit: ((com.xnotes.canvas.RoomEdit) -> Unit)? = null
+
+    /** Fired when the local preview ends without a commit (abort, failed release). */
+    var onLocalPreviewDone: (() -> Unit)? = null
+
+    /** A remote preview is showing: cleared by the next local press, commit or explicit hide. */
+    private var remotePreview = false
+
     private enum class Kind { WAITING, OPEN, CLOSE, NOTHING }
 
     private var kind: Kind? = null
@@ -103,6 +115,7 @@ internal class InsertSpaceGesture(
      * edges are cut there, what cannot be cut stays, and the far band comes back. True when it closed.
      */
     fun closeRoom(b: RoomButton): Boolean {
+        hideRemotePreview()
         val page = state.document.pages.getOrNull(b.page) ?: return false
         val room = page.rooms.firstOrNull { it == b.room } ?: return false
         val a = room.at
@@ -126,11 +139,13 @@ internal class InsertSpaceGesture(
         state.settleRoom(view)
         state.clampScroll()
         requestRender()
+        onLocalCommit?.invoke(com.xnotes.canvas.RoomEdit(b.page, room.sideways, open = false, a, end))
         return true
     }
 
     /** A press at [content]; false when it is on no page. */
     fun press(content: Pt): Boolean {
+        hideRemotePreview()
         val pi = state.pageIndexAtContent(content) ?: return false
         hover = null
         pageIndex = pi
@@ -185,6 +200,13 @@ internal class InsertSpaceGesture(
         state.settleRoom(RoomView(page, view.sideways, view.split, view.resume, view.shift, keep, view.cover))
         state.clampScroll()
         requestRender()
+        val edit = when (k) {
+            Kind.OPEN -> com.xnotes.canvas.RoomEdit(pageIndex, false, open = true, press.y, press.y + openSize())
+            else -> room?.let { r ->
+                closeStrip(r)?.let { (a, b) -> com.xnotes.canvas.RoomEdit(pageIndex, r.sideways, open = false, a, b) }
+            }
+        }
+        edit?.let { onLocalCommit?.invoke(it) }
         return true
     }
 
@@ -198,6 +220,7 @@ internal class InsertSpaceGesture(
     }
 
     private fun drop(page: Page?) {
+        remotePreview = false
         if (state.roomView?.live == true) {
             state.roomView = null
             state.relayout()
@@ -207,6 +230,7 @@ internal class InsertSpaceGesture(
         follow = GlueFollow.NONE
         if (page != null) for (item in back) repair(page, item.paintBounds())
         requestRender()
+        onLocalPreviewDone?.invoke()
     }
 
     /** Which way the drag goes, once it has gone far enough to tell: down opens, back across room closes it. */
@@ -261,6 +285,15 @@ internal class InsertSpaceGesture(
                 Quad(r.sideways, a, b, a - b)
             }
         }
+        showPreview(page, sideways, split, resume, shift)
+    }
+
+    /**
+     * Show the room ([split] cut, [resume] side, [shift] on) on [page] without changing the model:
+     * the preview for a local drag and, with network-supplied geometry, for the far side's drag.
+     * Local previews fire [onLocalPreview]; remote ones never echo.
+     */
+    fun showPreview(page: Page, sideways: Boolean, split: Double, resume: Double, shift: Double, remote: Boolean = false) {
         val dx = if (sideways) shift else 0.0
         val dy = if (sideways) 0.0 else shift
         follow.follow(Affine.translateBy(dx, dy)) { if (it in moving) Affine.translateBy(dx, dy) else null }
@@ -277,6 +310,64 @@ internal class InsertSpaceGesture(
         state.roomView = RoomView(page, sideways, split, resume, shift, now.toList(), state.footprint(page))
         state.relayout()
         requestRender()
+        if (!remote) onLocalPreview?.invoke(state.document.pages.indexOf(page), sideways, split, resume, shift)
+    }
+
+    /**
+     * Show the far side's drag on [page] without touching the model. Cleared by
+     * [hideRemotePreview], the next local press/commit, or the matching commit op.
+     */
+    fun showRemotePreview(page: Page, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        if (kind != null) return // a local drag owns the preview
+        remotePreview = true
+        showPreview(page, sideways, split, resume, shift, remote = true)
+    }
+
+    /** Drop the far side's preview, returning lifted items to the caches. */
+    fun hideRemotePreview() {
+        if (!remotePreview) return
+        remotePreview = false
+        val page = state.roomView?.page
+        if (state.roomView?.live == true) {
+            state.roomView = null
+            state.relayout()
+        }
+        val back = lifted.toList()
+        lifted.clear()
+        if (page != null) for (item in back) repair(page, item.paintBounds())
+        requestRender()
+    }
+
+    /**
+     * Apply the far side's committed room edit without touching undo: the same
+     * settle transition a local commit uses, so no blank frame. True when it changed.
+     */
+    fun applyRemote(pageIndex: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
+        hideRemotePreview()
+        val page = state.document.pages.getOrNull(pageIndex) ?: return false
+        val size = b - a
+        if (open && size <= Rooms.EPS) return false
+        val room = if (!open) Rooms.at(page.rooms, (a + b) / 2, sideways, 1.0) else null
+        if (!open && room == null) return false
+        // Computed before RoomCut mutates, like a local commit: what stays put
+        // and the connectors the edit places afresh leave the old layers first.
+        val fates = RoomCut.fates(page, sideways, a, b)
+        val movers = page.items.filter { fates[it] == RoomCut.Fate.MOVES }
+        val glue = GlueFollow.of(movers, page.items, { it in page.items }, rigid = false)
+        val keep = RoomCut.anchored(page, sideways, a, b) + glue.items
+        for (item in keep) if (lifted.add(item)) repair(page, item.paintBounds())
+        val view = RoomView(page, sideways, a, b, if (open) size else a - b, keep, state.footprint(page))
+        val command = if (open) RoomCut.open(page, a, size) else RoomCut.close(page, room!!, a, b)
+        if (command == null) {
+            drop(page)
+            return false
+        }
+        state.document.dirty = true
+        lifted.clear()
+        state.settleRoom(view)
+        state.clampScroll()
+        requestRender()
+        return true
     }
 
     private data class Quad(val sideways: Boolean, val split: Double, val resume: Double, val shift: Double)

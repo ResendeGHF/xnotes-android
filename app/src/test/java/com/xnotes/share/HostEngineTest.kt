@@ -82,6 +82,22 @@ class HostEngineTest {
         }
         override fun editorState(uri: String): com.xnotes.canvas.CanvasState? = states[uri]
         override fun liveOverlay(uri: String): RemoteLiveStrokes? = overlays[uri]
+        override fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+            roomPreviews += RoomPreview(uri, page, sideways, split, resume, shift)
+        }
+        override fun clearRoomPreview(uri: String) {
+            roomClears += uri
+        }
+        override fun applyRoomEdit(uri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
+            roomEdits += RoomEdit(uri, page, sideways, open, a, b)
+            return true
+        }
+
+        data class RoomPreview(val uri: String, val page: Int, val sideways: Boolean, val split: Double, val resume: Double, val shift: Double)
+        data class RoomEdit(val uri: String, val page: Int, val sideways: Boolean, val open: Boolean, val a: Double, val b: Double)
+        val roomPreviews = ArrayList<RoomPreview>()
+        val roomClears = ArrayList<String>()
+        val roomEdits = ArrayList<RoomEdit>()
 
         val liveRepaints = ArrayList<String>()
         val states = HashMap<String, com.xnotes.canvas.CanvasState>()
@@ -199,6 +215,31 @@ class HostEngineTest {
         e.onMessage(JSONObject().put("t", "op").put("seq", 2).put("file", "f1").put("base_version", 1).put("dedupe", "run-1")
             .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_stroke").put("page", 0).put("stroke", wire))))
         assertEquals(1, doc.pages[0].items.size)
+    }
+
+    @Test fun roomOpsApplyAndPreviewStreams() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.docs["f1"] = Document(mutableListOf(Page(300.0, 200.0)))
+        e.onMessage(JSONObject().put("t", "room_live").put("seq", 1).put("file", "f1").put("page", 0)
+            .put("split", 100.0).put("resume", 100.0).put("shift", 40.0).put("live_id", "r-1").put("done", false))
+        assertEquals(listOf(FakeHost.RoomPreview("f1", 0, false, 100.0, 100.0, 40.0)), h.roomPreviews)
+        assertEquals(listOf("f1"), h.liveRepaints)
+        e.onMessage(JSONObject().put("t", "room_live").put("seq", 2).put("file", "f1").put("page", 0)
+            .put("split", 0.0).put("resume", 0.0).put("shift", 0.0).put("live_id", "r-1").put("done", true))
+        assertEquals(listOf("f1"), h.roomClears)
+        e.onMessage(JSONObject().put("t", "op").put("seq", 3).put("file", "f1").put("base_version", 1).put("dedupe", "r-2")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "open_room").put("page", 0).put("at", 100.0).put("size", 40.0))))
+        assertEquals(listOf(FakeHost.RoomEdit("f1", 0, false, true, 100.0, 140.0)), h.roomEdits)
+        assertEquals(listOf("f1", "f1"), h.roomClears)
+        val fwd = h.lastOfType("op")
+        assertEquals("r-2", fwd.getString("dedupe"))
+        e.onMessage(JSONObject().put("t", "op").put("seq", 4).put("file", "f1").put("base_version", 2).put("dedupe", "r-3")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "close_room").put("page", 0).put("sideways", true).put("a", 10.0).put("b", 60.0))))
+        assertEquals(FakeHost.RoomEdit("f1", 0, true, false, 10.0, 60.0), h.roomEdits.last())
     }
 
     @Test fun staleBaseGetsResync() {

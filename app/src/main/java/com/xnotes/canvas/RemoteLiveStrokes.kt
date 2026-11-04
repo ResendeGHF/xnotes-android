@@ -93,6 +93,25 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
             ).map { state.contentToViewport(it) }
             out = Rect.bounding(corners).outset(3.0).let { if (out == null) it else out.union(it) }
         }
+        // A live room drag (either side's): the band it cuts, so previews stay partial.
+        state.roomView?.takeIf { it.live }?.let { v ->
+            val pi = state.document.pages.indexOf(v.page)
+            if (pi >= 0 && state.pageRects.getOrNull(pi) != null) {
+                val f = state.footprint(v.page)
+                val lo = minOf(v.split, v.resume) + minOf(0.0, v.shift) - 2.0
+                val hi = maxOf(v.split, v.resume) + maxOf(0.0, v.shift) + 2.0
+                val band = if (v.sideways) Rect(lo, 0.0, hi - lo, f.h) else Rect(0.0, lo, f.w, hi - lo)
+                val content = state.fromPageSpaceRect(pi, band)
+                val corners = listOf(
+                    Pt(content.left, content.top),
+                    Pt(content.right, content.top),
+                    Pt(content.left, content.bottom),
+                    Pt(content.right, content.bottom),
+                ).map { state.contentToViewport(it) }
+                val added = Rect.bounding(corners).outset(3.0)
+                out = if (out == null) added else out.union(added)
+            }
+        }
         return out
     }
 

@@ -114,6 +114,12 @@ import kotlin.math.sin
 import com.xnotes.core.model.sourcePoint
 
 /** The pointer state machine modes (spec 06 §1). */
+/**
+ * A committed local Insert space edit, for the sync bridge to submit as an op.
+ * [open] opens room at [a] (to [b]), else closes the strip [a] to [b].
+ */
+data class RoomEdit(val page: Int, val sideways: Boolean, val open: Boolean, val a: Double, val b: Double)
+
 enum class PointerMode {
     IDLE, DRAW, ERASE, BAND, LASSO_DRAW, SHOT, SHAPE, MOVE, RESIZE, TRANSFORM, PAN, PINCH, FLOW_TEXT,
     TEXT_DRAG, RULER_MOVE, RULER_TRANSFORM, RULER_ROTATE, PDF_TEXT, VERTEX, POLYGON, CONNECT, JOINT, SLIDE,
@@ -272,6 +278,26 @@ class InteractionController(
     var onStrokesErased: ((page: Int, strokes: List<Stroke>) -> Unit)? = null
     /** A pointer sample in page space, as drawn (for live streaming). */
     var onStrokeSample: ((page: Int, x: Double, y: Double, p: Double) -> Unit)? = null
+    /** A committed local room edit: [RoomEdit.open] opens room at [RoomEdit.a] (to [RoomEdit.b]), else closes the strip. */
+    var onRoomCommitted: ((RoomEdit) -> Unit)? = null
+    /** Fired per local room-drag frame: the preview geometry, without touching the model. */
+    var onRoomPreview: ((page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) -> Unit)? = null
+    /** Fired when the local preview ends without a commit (abort, undersized drag). */
+    var onRoomPreviewDone: (() -> Unit)? = null
+    /** True while the local Insert space gesture is mid-drag. */
+    val roomGestureActive: Boolean get() = insertSpace.active
+    /** Show the far side's room drag on [page] without touching the model. */
+    fun previewRemoteRoom(page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val pg = state.document.pages.getOrNull(page) ?: return
+        insertSpace.showRemotePreview(pg, sideways, split, resume, shift)
+    }
+    /** Drop the far side's room preview. */
+    fun clearRemoteRoom() {
+        insertSpace.hideRemotePreview()
+    }
+    /** Apply the far side's committed room edit without touching undo; true when it changed. */
+    fun applyRemoteRoomEdit(page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean =
+        insertSpace.applyRemote(page, sideways, open, a, b)
     val document: Document get() = state.document
 
     var tool: Tool = Tool.DEFAULT
@@ -481,6 +507,11 @@ class InteractionController(
     private var toolBeforeText: Tool? = null
     /** Insert space's gesture, its live room and what it lifts out of the page's cache. */
     private val insertSpace = InsertSpaceGesture(state, history, { requestRender() }) { page, rect -> repairRegion(page, rect) }
+        .also { g ->
+            g.onLocalPreview = { pi, sideways, split, resume, shift -> onRoomPreview?.invoke(pi, sideways, split, resume, shift) }
+            g.onLocalCommit = { onRoomCommitted?.invoke(it) }
+            g.onLocalPreviewDone = { onRoomPreviewDone?.invoke() }
+        }
     /** Whether the live erase is finger-driven (vs the stylus eraser tip / side button): a finger
      *  erase yields to a two-finger pinch, a stylus erase ignores incidental finger/palm contact. */
     private var erasingWithFinger = false

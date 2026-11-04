@@ -142,6 +142,23 @@ class CompanionService : Service() {
                     override fun editorState(uri: String): com.xnotes.canvas.CanvasState? =
                         CompanionEditors.editorFor(uri)?.state
 
+                    override fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+                        main.post {
+                            val editor = CompanionEditors.editorFor(uri) ?: return@post
+                            if (editor.controller.roomGestureActive) return@post
+                            editor.controller.previewRemoteRoom(page, sideways, split, resume, shift)
+                        }
+                    }
+
+                    override fun clearRoomPreview(uri: String) {
+                        main.post { CompanionEditors.editorFor(uri)?.controller?.clearRemoteRoom() }
+                    }
+
+                    override fun applyRoomEdit(uri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
+                        val editor = CompanionEditors.editorFor(uri) ?: return false
+                        return editor.controller.applyRemoteRoomEdit(page, sideways, open, a, b)
+                    }
+
                     override fun liveOverlay(uri: String): RemoteLiveStrokes? =
                         CompanionEditors.editorFor(uri)?.controller?.remoteLive
 
@@ -285,6 +302,29 @@ class CompanionService : Service() {
             val ids = strokes.map { SyncWire.fingerprintOf(it) }
             if (ids.isNotEmpty()) engine.submitLocalErase(uri, page, ids, newDedupe())
         }
+        editor.controller.onRoomPreview = { page, sideways, split, resume, shift ->
+            var live = pendingRoom
+            if (live == null || live.uri != uri || live.page != page) {
+                live = PendingRoom(uri, page, newDedupe())
+                pendingRoom = live
+            }
+            engine.roomPreview(uri, page, live.id, sideways, split, resume, shift)
+        }
+        editor.controller.onRoomCommitted = { edit ->
+            val live = pendingRoom?.takeIf { it.uri == uri && it.page == edit.page }
+            pendingRoom = null
+            val id = live?.id ?: newDedupe()
+            val (split, resume, shift) = if (edit.open) Triple(edit.a, edit.a, edit.b - edit.a) else Triple(edit.a, edit.b, edit.a - edit.b)
+            engine.finishRoom(uri, edit.page, id, edit.sideways, split, resume, shift)
+            if (edit.open) engine.submitLocalRoomOpen(uri, edit.page, edit.sideways, edit.a, edit.b - edit.a, id)
+            else engine.submitLocalRoomClose(uri, edit.page, edit.sideways, edit.a, edit.b, id)
+        }
+        editor.controller.onRoomPreviewDone = {
+            pendingRoom?.takeIf { it.uri == uri }?.let {
+                pendingRoom = null
+                engine.finishRoom(uri, it.page, it.id, false, 0.0, 0.0, 0.0)
+            }
+        }
         editor.state.onPageChanged = { page -> engine.presence(uri, page) }
         editor.onPageInserted = { index, w, h -> engine.submitLocalPageAdd(uri, index, w, h, newDedupe()) }
         editor.onPageRemoved = { index -> engine.submitLocalPageRemove(uri, index, newDedupe()) }
@@ -292,6 +332,10 @@ class CompanionService : Service() {
     }
 
     private data class LiveStroke(val id: String, val tool: String, val width: Double, val color: String)
+
+    private data class PendingRoom(val uri: String, val page: Int, val id: String)
+
+    private var pendingRoom: PendingRoom? = null
 
     private val pendingLive = HashMap<Editor, LiveStroke>()
     private var dedupeCounter = 0
@@ -317,6 +361,10 @@ class CompanionService : Service() {
         editor.state.onPageChanged = null
         editor.onPageInserted = null
         editor.onPageRemoved = null
+        editor.controller.onRoomPreview = null
+        editor.controller.onRoomCommitted = null
+        editor.controller.onRoomPreviewDone = null
+        if (pendingRoom?.uri == CompanionEditors.uriFor(editor)) pendingRoom = null
         editor.controller.remoteLive = null
         pendingLive.remove(editor)
     }

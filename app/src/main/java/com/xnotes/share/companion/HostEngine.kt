@@ -60,6 +60,12 @@ class HostEngine(
         fun repaintLive(uri: String)
         /** The open document's canvas state for [uri], or null. */
         fun editorState(uri: String): com.xnotes.canvas.CanvasState?
+        /** Show the far side's room drag on [uri]'s page without touching the model. */
+        fun previewRoom(uri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double)
+        /** Drop the far side's room preview for [uri]. */
+        fun clearRoomPreview(uri: String)
+        /** Apply the far side's committed room edit without touching undo; true when it changed. */
+        fun applyRoomEdit(uri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean
         /** The open document's live overlay for [uri], or null. */
         fun liveOverlay(uri: String): com.xnotes.canvas.RemoteLiveStrokes?
         fun onApproval(kind: String, device: String, name: String, respond: (Boolean) -> Unit)
@@ -92,6 +98,7 @@ class HostEngine(
             "fetch" -> onFetch(msg)
             "op" -> onOp(msg)
             "live" -> onLive(msg)
+            "room_live" -> onRoomLive(msg)
             "presence" -> synchronized(lock) {
                 val file = msg.optString("file")
                 if (file.isNotEmpty()) companionPresence[file] = msg.optInt("page", -1)
@@ -266,11 +273,20 @@ class HostEngine(
                 "remove_page" -> {
                     if (applyPageRemove(file, op.optInt("index", -1))) changed = true
                 }
+                "open_room" -> {
+                    if (applyRoomEdit(file, op.optInt("page", 0), op.optBoolean("sideways", false), true, op.optDouble("at", 0.0), op.optDouble("at", 0.0) + op.optDouble("size", 0.0))) changed = true
+                }
+                "close_room" -> {
+                    if (applyRoomEdit(file, op.optInt("page", 0), op.optBoolean("sideways", false), false, op.optDouble("a", 0.0), op.optDouble("b", 0.0))) changed = true
+                }
                 else -> Unit
             }
         }
         // The commit supersedes its live run even when the done frame was lost.
         if (dedupe.isNotEmpty()) host.liveOverlay(file)?.finish(dedupe)
+        if ((0 until ops.length()).any { ops.optJSONObject(it)?.optString("op") == "open_room" || ops.optJSONObject(it)?.optString("op") == "close_room" }) {
+            host.clearRoomPreview(file)
+        }
         val version = if (!changed) head else bumpVersion(file)
         if (changed) {
             // Same dedupe end to end: the sender recognizes its own echo and
@@ -300,6 +316,20 @@ class HostEngine(
     fun submitLocalPageRemove(uri: String, index: Int, dedupe: String) {
         val ops = JSONArray().put(JSONObject().put("op", "remove_page").put("index", index))
         submitLocalOps(uri, ops, dedupe)
+    }
+
+    /** A local room open to broadcast ([at] cut, [size] tall). */
+    fun submitLocalRoomOpen(uri: String, page: Int, sideways: Boolean, at: Double, size: Double, dedupe: String) {
+        val op = JSONObject().put("op", "open_room").put("page", page).put("at", at).put("size", size)
+        if (sideways) op.put("sideways", true)
+        submitLocalOps(uri, JSONArray().put(op), dedupe)
+    }
+
+    /** A local room close to broadcast (strip [a] to [b]). */
+    fun submitLocalRoomClose(uri: String, page: Int, sideways: Boolean, a: Double, b: Double, dedupe: String) {
+        val op = JSONObject().put("op", "close_room").put("page", page).put("a", a).put("b", b)
+        if (sideways) op.put("sideways", true)
+        submitLocalOps(uri, JSONArray().put(op), dedupe)
     }
 
     /** A local erase to broadcast. */
@@ -406,6 +436,26 @@ class HostEngine(
         return true
     }
 
+    /** Apply a committed remote room edit; straight to the file when not open. */
+    private fun applyRoomEdit(file: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
+        host.openDocument(file)?.let {
+            return host.applyRoomEdit(file, page, sideways, open, a, b)
+        }
+        return modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            val cmd = if (open) {
+                com.xnotes.core.room.RoomCut.open(pg, a, b - a)
+            } else {
+                val room = com.xnotes.core.model.Rooms.at(pg.rooms, (a + b) / 2, sideways, 1.0)
+                    ?: return@modifyFile false
+                com.xnotes.core.room.RoomCut.close(pg, room, a, b)
+            }
+            if (cmd == null) return@modifyFile false
+            doc.dirty = true
+            true
+        }
+    }
+
     private val codec by lazy {
         DocumentCodec(com.xnotes.platform.AndroidImageCodec(), com.xnotes.platform.AndroidTextMeasurer())
     }
@@ -452,6 +502,41 @@ class HostEngine(
                 .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
                 .put("samples", JSONArray()).put("done", true),
         )
+    }
+
+    /** A local room-drag frame, straight to the socket (no batching, like strokes). */
+    fun roomPreview(file: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val msg = JSONObject().put("t", "room_live").put("file", file).put("page", page)
+            .put("split", split).put("resume", resume).put("shift", shift)
+            .put("live_id", liveId).put("done", false)
+        if (sideways) msg.put("sideways", true)
+        send(msg)
+    }
+
+    /** The local room drag ended: drop the far side's preview. */
+    fun finishRoom(file: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
+        val msg = JSONObject().put("t", "room_live").put("file", file).put("page", page)
+            .put("split", split).put("resume", resume).put("shift", shift)
+            .put("live_id", liveId).put("done", true)
+        if (sideways) msg.put("sideways", true)
+        send(msg)
+    }
+
+    private fun onRoomLive(msg: JSONObject) {
+        val file = msg.optString("file")
+        if (file.isEmpty() || !policyAllows(file)) return
+        if (msg.optBoolean("done", false)) {
+            host.clearRoomPreview(file)
+        } else {
+            val page = msg.optInt("page", 0)
+            val doc = host.openDocument(file) ?: return
+            if (page !in doc.pages.indices) return
+            host.previewRoom(
+                file, page, msg.optBoolean("sideways", false),
+                msg.optDouble("split", 0.0), msg.optDouble("resume", 0.0), msg.optDouble("shift", 0.0),
+            )
+        }
+        host.repaintLive(file)
     }
 
     private fun onLive(msg: JSONObject) {
