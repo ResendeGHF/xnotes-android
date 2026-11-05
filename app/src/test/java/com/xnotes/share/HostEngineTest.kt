@@ -779,4 +779,27 @@ class HostEngineTest {
         assertTrue(f.policy.sharedUris().none { it == "d1" || it == "f1" })
         assertTrue(f.policy.sharedUris().contains("f2"))
     }
+
+    @Test fun refreshPolicyPushesGrantChangesWithoutResubscribe() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        assertEquals(0, h.lastOfType("index").optJSONArray("files")!!.length())
+        // Granting later pushes a fresh index on its own.
+        f.policy.setShared("f1", true)
+        e.refreshPolicy()
+        val end = System.currentTimeMillis() + 5000
+        while (System.currentTimeMillis() < end && h.countOfType("index") < 2) Thread.sleep(20)
+        val listed = h.lastOfType("index").optJSONArray("files")!!
+        assertEquals(1, listed.length())
+        assertEquals("f1", listed.getJSONObject(0).getString("id"))
+        // Revoking pushes the removal the same way.
+        f.policy.setShared("f1", false)
+        e.refreshPolicy()
+        val end2 = System.currentTimeMillis() + 5000
+        while (System.currentTimeMillis() < end2 && h.countOfType("index") < 3) Thread.sleep(20)
+        assertEquals(0, h.lastOfType("index").optJSONArray("files")!!.length())
+    }
 }
