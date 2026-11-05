@@ -43,13 +43,13 @@ class ShareStore private constructor(
      * Linux dial path passes [makeActive] so the first companion ever becomes
      * the active dial target; Android peers never take that slot.
      */
-    suspend fun remember(fp: String, name: String, host: String, port: Int, makeActive: Boolean = false) {
+    suspend fun remember(fp: String, name: String, host: String, port: Int, makeActive: Boolean = false, kind: String? = null) {
         val now = System.currentTimeMillis()
         val cur = dao.device(fp)
         val keepNick = cur?.nickname
         val wasActive = cur?.active ?: false
         dao.upsertDevice(
-            DeviceEntity(fp, name.ifBlank { cur?.name ?: "" }, host, port, keepNick, now, wasActive),
+            DeviceEntity(fp, name.ifBlank { cur?.name ?: "" }, host, port, keepNick, now, wasActive, kind ?: cur?.kind ?: DeviceKind.LINUX),
         )
         if (!wasActive && makeActive) {
             // First companion ever: make it active so existing setups keep working untouched.
@@ -114,6 +114,7 @@ class ShareStore private constructor(
             instance ?: run {
                 val dir = File(context.filesDir, "share").apply { mkdirs() }
                 val db = Room.databaseBuilder(context.applicationContext, ShareDatabase::class.java, File(dir, "share.db").absolutePath)
+                    .addMigrations(ShareMigration1To2)
                     .fallbackToDestructiveMigration()
                     .build()
                 ShareStore(db, dir).also { instance = it }

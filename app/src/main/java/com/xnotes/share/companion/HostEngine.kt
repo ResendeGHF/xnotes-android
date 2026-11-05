@@ -97,7 +97,10 @@ class HostEngine(
 
     fun onMessage(msg: JSONObject) {
         when (msg.optString("t")) {
-            "index_subscribe" -> sendIndex(full = true)
+            "index_subscribe" -> {
+                sendIndex(full = true)
+                pushStyleSnapshots()
+            }
             "fetch" -> onFetch(msg)
             "op" -> onOp(msg)
             "live" -> onLive(msg)
@@ -110,6 +113,7 @@ class HostEngine(
             "heartbeat" -> Unit
             "delete_request" -> onDeleteRequest(msg)
             "create_request" -> onCreateRequest(msg)
+            "link_request" -> onLinkRequest(msg)
             else -> Unit // hello_ack/pair_result belong to PairingClient; unknowns ignored
         }
     }
@@ -203,6 +207,52 @@ class HostEngine(
         pushIndexDelta()
     }
 
+    /**
+     * Push full style snapshots for covered files with non-default styles, so a
+     * fresh subscriber converges without waiting for the next style edit.
+     * Invert flags ride along (companions honor them; guests ignore them).
+     * Counts as a version bump like any commit, keeping both heads in step.
+     */
+    private fun pushStyleSnapshots() {
+        io.execute {
+            val ids: Set<String> = synchronized(lock) { coveredIds.toSet() }
+            for (id in ids) {
+                val snap = styleSnapshot(id) ?: continue
+                val (docStyle, docMargins, pages) = snap
+                val arr = JSONArray()
+                for ((index, style, margins) in pages) {
+                    if (style == com.xnotes.core.model.PageStyle() &&
+                        margins == com.xnotes.core.model.PageMargins()
+                    ) continue
+                    val e = JSONObject().put("index", index)
+                    mergeStyleInto(e, style)
+                    if (margins != com.xnotes.core.model.PageMargins()) e.put("margins", SyncWire.toWireMargins(margins))
+                    arr.put(e)
+                }
+                if (docStyle == com.xnotes.core.model.PageStyle() &&
+                    docMargins == com.xnotes.core.model.PageMargins() && arr.length() == 0
+                ) continue
+                val op = JSONObject().put("op", "page_style").put("entries", arr)
+                if (docStyle != com.xnotes.core.model.PageStyle()) op.put("doc_style", SyncWire.toWirePageStyle(docStyle))
+                if (docMargins != com.xnotes.core.model.PageMargins()) op.put("doc_margins", SyncWire.toWireMargins(docMargins))
+                submitLocalOps(id, JSONArray().put(op), "snap-${System.nanoTime().toString(16)}")
+            }
+        }
+    }
+
+    private fun styleSnapshot(id: String): Triple<com.xnotes.core.model.PageStyle, com.xnotes.core.model.PageMargins, List<Triple<Int, com.xnotes.core.model.PageStyle, com.xnotes.core.model.PageMargins>>>? {
+        host.openDocument(id)?.let { doc ->
+            return Triple(doc.style, doc.margins, doc.pages.mapIndexed { i, p -> Triple(i, p.style, p.margins) })
+        }
+        return try {
+            val bytes = files.read(id) ?: return null
+            val doc = codec.read(bytes.inputStream(), null, null)
+            Triple(doc.style, doc.margins, doc.pages.mapIndexed { i, p -> Triple(i, p.style, p.margins) })
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun requestOpen(id: String) {
         if (!policyAllows(id)) return
         send(JSONObject().put("t", "fetch").put("id", id).put("offset", 0).put("length", 0))
@@ -236,7 +286,7 @@ class HostEngine(
         if (id.isEmpty()) return
         if (!policyAllows(id)) return
         io.execute {
-            val bytes = readFileBytes(id) ?: return@execute
+            val bytes = serveBytes(id) ?: return@execute
             val version = headVersion(id)
             val total = bytes.size.toLong()
             var offset = msg.optLong("offset", 0L).coerceIn(0L, total)
@@ -262,6 +312,37 @@ class HostEngine(
             }
         }
         return files.read(id)
+    }
+
+    /**
+     * Served file bytes never carry invert flags: invert mirrors over
+     * page_style (host↔companion), and guests keep their own view. When no
+     * flag is set anywhere the original bytes go out untouched.
+     */
+    private fun serveBytes(id: String): ByteArray? = stripInvertForSync(readFileBytes(id))
+
+    private fun stripInvertForSync(bytes: ByteArray?): ByteArray? {
+        if (bytes == null) return null
+        return try {
+            val doc = codec.read(bytes.inputStream(), null, null)
+            var touched = false
+            if (doc.style.invertColors != null || doc.style.invertImages != null) {
+                doc.style = doc.style.copy(invertColors = null, invertImages = null)
+                touched = true
+            }
+            for (pg in doc.pages) {
+                if (pg.style.invertColors != null || pg.style.invertImages != null) {
+                    pg.style = pg.style.copy(invertColors = null, invertImages = null)
+                    touched = true
+                }
+            }
+            if (!touched) return bytes
+            val out = ByteArrayOutputStream()
+            codec.write(doc, out)
+            out.toByteArray()
+        } catch (_: Exception) {
+            bytes
+        }
     }
 
     // --- committed ops ---
@@ -304,6 +385,17 @@ class HostEngine(
                 }
                 "add_image" -> {
                     if (applyRemoteImage(file, op)) changed = true
+                }
+                "add_markup" -> {
+                    val m = op.optJSONObject("markup")?.let { SyncWire.markupFrom(it) }
+                    if (m != null && applyMarkupAdd(file, op.optInt("page", 0), m)) changed = true
+                }
+                "remove_markup" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } }
+                    if (ids != null && applyMarkupRemove(file, op.optInt("page", 0), ids)) changed = true
+                }
+                "page_style" -> {
+                    if (applyPageStyle(file, op)) changed = true
                 }
                 else -> Unit
             }
@@ -389,7 +481,8 @@ class HostEngine(
     fun pushFile(uri: String) {
         if (!policyAllows(uri)) return
         val doc = host.openDocument(uri)
-        val bytes = if (doc != null) host.snapshotBytes(doc) else files.read(uri)
+        val live = if (doc != null) host.snapshotBytes(doc) else files.read(uri)
+        val bytes = stripInvertForSync(live)
         bytes ?: return
         val version = bumpVersion(uri)
         pushIndexDelta()
@@ -428,6 +521,81 @@ class HostEngine(
         val idArr = JSONArray()
         for (id in ids) idArr.put(id)
         val ops = JSONArray().put(JSONObject().put("op", "erase_strokes").put("page", page).put("ids", idArr))
+        submitLocalOps(uri, ops, dedupe)
+    }
+
+    /**
+     * Committed local text markups: replayed as add_markup / remove_markup ops
+     * ([added] as page→markups, [removedIds] as page→ids).
+     */
+    fun submitLocalMarkups(
+        uri: String,
+        added: List<Pair<Int, com.xnotes.core.model.TextMarkup>>,
+        removedIds: List<Pair<Int, String>>,
+        dedupe: String,
+    ) {
+        val ops = JSONArray()
+        for ((page, m) in added) {
+            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
+        }
+        for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
+            ops.put(JSONObject().put("op", "remove_markup").put("page", page).put("ids", JSONArray(ids)))
+        }
+        if (ops.length() == 0) return
+        submitLocalOps(uri, ops, dedupe)
+    }
+
+    /**
+     * Committed local page-style/margin changes: one page_style op carrying
+     * per-page snapshots plus the document-wide defaults.
+     */
+    fun submitLocalPageStyle(
+        uri: String,
+        entries: List<Triple<Int, com.xnotes.core.model.PageStyle?, com.xnotes.core.model.PageMargins?>>,
+        docStyle: com.xnotes.core.model.PageStyle?,
+        docMargins: com.xnotes.core.model.PageMargins?,
+        dedupe: String,
+    ) {
+        val arr = JSONArray()
+        for ((index, style, margins) in entries) {
+            val e = JSONObject().put("index", index)
+            if (style != null) mergeStyleInto(e, style)
+            if (margins != null) e.put("margins", SyncWire.toWireMargins(margins))
+            arr.put(e)
+        }
+        val op = JSONObject().put("op", "page_style").put("entries", arr)
+        if (docStyle != null) op.put("doc_style", SyncWire.toWirePageStyle(docStyle))
+        if (docMargins != null) op.put("doc_margins", SyncWire.toWireMargins(docMargins))
+        submitLocalOps(uri, JSONArray().put(op), dedupe)
+    }
+
+    private fun mergeStyleInto(e: JSONObject, style: com.xnotes.core.model.PageStyle) {
+        val s = SyncWire.toWirePageStyle(style)
+        val names = s.names() ?: return
+        for (i in 0 until names.length()) {
+            val k = names.getString(i)
+            e.put(k, s.get(k))
+        }
+    }
+
+    /**
+     * Committed stroke replacements (move/rotate/resize/restyle/delete-area):
+     * replayed as one message of erase_strokes + add_stroke ops, so every
+     * peer converges with no new wire type.
+     */
+    fun submitLocalReplacements(uri: String, changes: List<com.xnotes.canvas.StrokeReplacement>, dedupe: String) {
+        val ops = JSONArray()
+        for (c in changes) {
+            if (c.removed.isNotEmpty()) {
+                val idArr = JSONArray()
+                for (s in c.removed) idArr.put(SyncWire.fingerprintOf(s))
+                ops.put(JSONObject().put("op", "erase_strokes").put("page", c.erasePage).put("ids", idArr))
+            }
+            for (s in c.added) {
+                ops.put(JSONObject().put("op", "add_stroke").put("page", c.addPage).put("stroke", SyncWire.toWire(s)))
+            }
+        }
+        if (ops.length() == 0) return
         submitLocalOps(uri, ops, dedupe)
     }
 
@@ -486,6 +654,148 @@ class HostEngine(
             if (targets.isEmpty()) return@modifyFile false
             pg.items.removeAll(targets.toSet())
             true
+        }
+    }
+
+    /** Apply a committed remote markup; straight to the file when not open. */
+    private fun applyMarkupAdd(file: String, page: Int, m: com.xnotes.core.model.TextMarkup): Boolean {
+        host.openDocument(file)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (pg.markups.any { it.id == m.id }) return false
+            pg.markups = pg.markups + m
+            doc.dirty = true
+            host.editorState(file)?.rebakeBackground(pg, listOf(m))
+            host.repaintDocument(file)
+            return true
+        }
+        return modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            if (pg.markups.any { it.id == m.id }) return@modifyFile false
+            pg.markups = pg.markups + m
+            true
+        }
+    }
+
+    /** Apply a committed remote markup removal; straight to the file when not open. */
+    private fun applyMarkupRemove(file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        host.openDocument(file)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (pg.markups.none { it.id in ids }) return false
+            pg.markups = pg.markups.filter { it.id !in ids }
+            doc.dirty = true
+            host.editorState(file)?.rebakeBackground(pg, emptyList())
+            host.repaintDocument(file)
+            return true
+        }
+        return modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            if (pg.markups.none { it.id in ids }) return@modifyFile false
+            pg.markups = pg.markups.filter { it.id !in ids }
+            true
+        }
+    }
+
+    /** Apply a committed remote page-style change; straight to the file when not open. */
+    private fun applyPageStyle(file: String, op: JSONObject): Boolean {
+        // Invert flags ride page_style too, but only when explicitly set: a null
+        // keeps the local setting, so guests (who always submit nulls) never
+        // clobber the host's view, while a companion's explicit toggle lands.
+        val honorInvert = { s: com.xnotes.core.model.PageStyle, local: com.xnotes.core.model.PageStyle ->
+            s.copy(
+                invertColors = s.invertColors ?: local.invertColors,
+                invertImages = s.invertImages ?: local.invertImages,
+            )
+        }
+        val entries = op.optJSONArray("entries")?.let { arr ->
+            List(arr.length()) { i ->
+                val e = arr.optJSONObject(i) ?: return@let null
+                Triple(
+                    e.optInt("index", -1),
+                    if (e.isNull("page_color") && e.isNull("template") && e.isNull("pattern_color") &&
+                        e.isNull("spacing") && e.isNull("accent_color") && e.isNull("params") &&
+                        e.isNull("colors") && e.isNull("invert_colors") && e.isNull("invert_images")
+                    ) null else SyncWire.pageStyleFrom(e),
+                    e.optJSONObject("margins")?.let { SyncWire.pageMarginsFrom(it) },
+                )
+            }
+        } ?: emptyList()
+        val docStyle = op.optJSONObject("doc_style")?.let { SyncWire.pageStyleFrom(it) }
+        val docMargins = op.optJSONObject("doc_margins")?.let { SyncWire.pageMarginsFrom(it) }
+        if (entries.isEmpty() && docStyle == null && docMargins == null) return false
+        host.openDocument(file)?.let { doc ->
+            var touched = false
+            var relayout = false
+            if (docStyle != null) {
+                val merged = honorInvert(docStyle, doc.style)
+                if (doc.style != merged) {
+                    doc.style = merged
+                    touched = true
+                }
+            }
+            if (docMargins != null && doc.margins != docMargins) {
+                doc.margins = docMargins
+                touched = true
+                relayout = true
+            }
+            for ((index, style, margins) in entries) {
+                val pg = doc.pages.getOrNull(index) ?: continue
+                if (style != null) {
+                    val merged = honorInvert(style, pg.style)
+                    if (pg.style != merged) {
+                        pg.style = merged
+                        touched = true
+                    }
+                }
+                if (margins != null && pg.margins != margins) {
+                    pg.margins = margins
+                    touched = true
+                    relayout = true
+                }
+            }
+            if (!touched) return false
+            doc.dirty = true
+            val st = host.editorState(file)
+            if (st != null) {
+                if (relayout) {
+                    st.invalidatePageGeometry()
+                    st.relayout()
+                }
+                st.invalidateAllBackgrounds()
+                st.invalidatePaper()
+            }
+            host.repaintDocument(file)
+            host.structureChanged(file)
+            return true
+        }
+        return modifyFile(file) { doc ->
+            var touched = false
+            if (docStyle != null) {
+                val merged = honorInvert(docStyle, doc.style)
+                if (doc.style != merged) {
+                    doc.style = merged
+                    touched = true
+                }
+            }
+            if (docMargins != null && doc.margins != docMargins) {
+                doc.margins = docMargins
+                touched = true
+            }
+            for ((index, style, margins) in entries) {
+                val pg = doc.pages.getOrNull(index) ?: continue
+                if (style != null) {
+                    val merged = honorInvert(style, pg.style)
+                    if (pg.style != merged) {
+                        pg.style = merged
+                        touched = true
+                    }
+                }
+                if (margins != null && pg.margins != margins) {
+                    pg.margins = margins
+                    touched = true
+                }
+            }
+            touched
         }
     }
 
@@ -851,6 +1161,45 @@ class HostEngine(
             pushIndexDelta()
             send(JSONObject().put("t", "create_result").put("in_reply_to", msg.optInt("seq", -1)).put("ok", true).put("id", id))
         }
+    }
+
+    /**
+     * A guest tapped a link to a file it cannot see: ask the user, grant on
+     * allow (the next index covers it), and answer either way. Already-shared
+     * targets answer ok at once, without a popup.
+     */
+    private fun onLinkRequest(msg: JSONObject) {
+        val id = msg.optString("id")
+        val replyTo = msg.optInt("seq", -1)
+        if (id.isEmpty()) {
+            send(JSONObject().put("t", "link_result").put("in_reply_to", replyTo).put("id", id).put("ok", false).put("reason", "no target"))
+            return
+        }
+        if (policyAllows(id)) {
+            send(JSONObject().put("t", "link_result").put("in_reply_to", replyTo).put("id", id).put("ok", true))
+            return
+        }
+        // Unknown ids (deleted, typo, probing) are denied without a popup.
+        if (!backendKnows(id)) {
+            send(JSONObject().put("t", "link_result").put("in_reply_to", replyTo).put("id", id).put("ok", false).put("reason", "not shared"))
+            return
+        }
+        host.onApproval("link", msg.optString("device", "?"), displayName(id)) { allow ->
+            if (!allow) {
+                send(JSONObject().put("t", "link_result").put("in_reply_to", replyTo).put("id", id).put("ok", false).put("reason", "declined"))
+                return@onApproval
+            }
+            grants.setGranted(id, true)
+            pushIndexDelta()
+            send(JSONObject().put("t", "link_result").put("in_reply_to", replyTo).put("id", id).put("ok", true))
+        }
+    }
+
+    /** Whether [id] names a real file/folder on this host (vs a typo or probe). */
+    private fun backendKnows(id: String): Boolean = try {
+        files.read(id) != null
+    } catch (_: Exception) {
+        false
     }
 
     // --- versions / dedupe / policy ---

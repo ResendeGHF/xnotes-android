@@ -89,6 +89,7 @@ import com.xnotes.core.stroke.RecognizedShape
 import com.xnotes.core.stroke.Scribble
 import com.xnotes.core.stroke.Sample
 import com.xnotes.core.stroke.ShapeRecognizer
+import com.xnotes.core.stroke.StrokeFingerprint
 import com.xnotes.core.stroke.StrokeSimplify
 import com.xnotes.core.tools.EraseMode
 import com.xnotes.core.tools.InkPalette
@@ -276,6 +277,79 @@ class InteractionController(
     var onStrokeCommitted: ((page: Int, stroke: Stroke) -> Unit)? = null
     /** Strokes the local eraser took off [page]. Area-erase splits are not reported. */
     var onStrokesErased: ((page: Int, strokes: List<Stroke>) -> Unit)? = null
+    /**
+     * Committed stroke replacements: move/resize/rotate/restyle/delete and
+     * area-erase splits, as (erase from [StrokeReplacement.erasePage] the
+     * pre-change [StrokeReplacement.removed], add post-change
+     * [StrokeReplacement.added] on [StrokeReplacement.addPage]). The sync
+     * layer replays them as erase_strokes + add_stroke ops, so every peer
+     * converges without a new wire type. Non-stroke items are not carried.
+     */
+    var onStrokesReplaced: ((changes: List<StrokeReplacement>) -> Unit)? = null
+
+    /** Pre-gesture stroke snapshots for the sync replacement hook. */
+    private var moveSyncBefore: List<Triple<Int, Stroke, Stroke>> = emptyList()
+    private var txSyncBefore: List<Triple<Int, Stroke, Stroke>> = emptyList()
+    private var restyleSyncBefore: List<Triple<Int, Stroke, Stroke>>? = null
+
+    /**
+     * Snapshot [strokes] (with pages) before a mutating gesture: each live
+     * ref paired with a frozen pre-change copy. After the mutation,
+     * [emitStrokeReplacements] fingerprints both and reports what changed, so
+     * preview settles that changed nothing stay quiet.
+     */
+    private fun snapshotStrokes(strokes: List<Pair<Int, Stroke>>): List<Triple<Int, Stroke, Stroke>> =
+        strokes.map { (page, s) -> Triple(page, s, Stroke(s)) }
+
+    /** Strokes of the current selection, with pages. */
+    private fun selectionStrokes(): List<Pair<Int, Stroke>> {
+        val out = ArrayList<Pair<Int, Stroke>>()
+        for (sel in selection) (sel.item as? Stroke)?.let { out += sel.pageIndex to it }
+        return out
+    }
+
+    private fun emitStrokeReplacements(before: List<Triple<Int, Stroke, Stroke>>) {
+        if (before.isEmpty() || onStrokesReplaced == null) return
+        val removed = LinkedHashMap<Pair<Int, Int>, ArrayList<Stroke>>()
+        val added = LinkedHashMap<Pair<Int, Int>, ArrayList<Stroke>>()
+        for ((page, live, frozen) in before) {
+            val newPage = state.document.pages.indexOfFirst { p -> p.items.any { it === live } }
+            if (newPage < 0) {
+                // Gone from the document: a delete reports the removal even
+                // though the content never changed.
+                removed.getOrPut(page to page) { ArrayList() } += frozen
+                continue
+            }
+            // Untouched in place (a preview that settled back): stay quiet.
+            if (newPage == page && StrokeFingerprint.of(live) == StrokeFingerprint.of(frozen)) continue
+            removed.getOrPut(page to newPage) { ArrayList() } += frozen
+            added.getOrPut(page to newPage) { ArrayList() } += live
+        }
+        val changes = (removed.keys + added.keys).distinct().mapNotNull { key ->
+            val (erasePage, addPage) = key
+            val r = removed[key].orEmpty()
+            val a = added[key].orEmpty()
+            if (r.isEmpty() && a.isEmpty()) null else StrokeReplacement(erasePage, r, addPage, a)
+        }
+        if (changes.isNotEmpty()) onStrokesReplaced?.invoke(changes)
+    }
+
+    /** Area-erase diff for [page]: identity-based (fragments are new objects). */
+    private fun emitAreaReplacements(page: Page, before: List<CanvasItem>) {
+        if (onStrokesReplaced == null) return
+        val pageIndex = state.document.pages.indexOf(page)
+        if (pageIndex < 0) return
+        val beforeStrokes = before.filterIsInstance<Stroke>()
+        val afterStrokes = page.items.filterIsInstance<Stroke>()
+        val afterSet = afterStrokes.toSet()
+        val beforeSet = beforeStrokes.toSet()
+        val removedStrokes = beforeStrokes.filter { it !in afterSet }
+        val addedStrokes = afterStrokes.filter { it !in beforeSet }
+        if (removedStrokes.isEmpty() && addedStrokes.isEmpty()) return
+        onStrokesReplaced?.invoke(listOf(StrokeReplacement(pageIndex, removedStrokes, pageIndex, addedStrokes)))
+    }
+    /** Text markups the local eraser took off [page], by id. */
+    var onMarkupsErased: ((page: Int, ids: List<String>) -> Unit)? = null
     /** A pointer sample in page space, as drawn (for live streaming). */
     var onStrokeSample: ((page: Int, x: Double, y: Double, p: Double) -> Unit)? = null
     /** A committed local room edit: [RoomEdit.open] opens room at [RoomEdit.a] (to [RoomEdit.b]), else closes the strip. */
@@ -737,6 +811,30 @@ class InteractionController(
     fun selectedItems(): List<CanvasItem> = selection.map { it.item }
 
     fun configFor(t: Tool): ToolConfig = toolConfigs[t] ?: ToolDefaults.configFor(t)
+
+    /**
+     * The style a stroke of [t] commits with right now: the toolbar's ink
+     * color (unless the tool overrides its own) and the zoom-normalized
+     * width. The sync live path must send exactly this — the stored tool
+     * config alone goes stale whenever the toolbar color changes, which
+     * showed the far side's live run in the wrong color.
+     */
+    fun resolvedStrokeConfig(t: Tool): ToolConfig {
+        val cfg0 = configFor(t)
+        val drawColor = cfg0.colorOverride ?: inkColor
+        return if (cfg0.scale) {
+            cfg0.copy(rgba = drawColor)
+        } else {
+            val z = state.zoom
+            cfg0.copy(
+                rgba = drawColor,
+                baseWidth = cfg0.baseWidth / z,
+                dashLength = cfg0.dashLength / z,
+                dashGap = cfg0.dashGap / z,
+                scale = true,
+            )
+        }
+    }
 
     fun setToolConfig(t: Tool, config: ToolConfig) {
         toolConfigs[t] = config
@@ -1440,25 +1538,7 @@ class InteractionController(
         // Capture content-px → dp scale now, so the speed pen judges gesture speed in
         // zoom- and density-independent dp regardless of how the stroke is later viewed.
         val speedScale = state.zoom / state.devicePxPerDp
-        val cfg0 = configFor(drawTool)
-        // SCALE off: normalise the stroke to its 100%-zoom size by dividing the spatial
-        // dimensions by the draw-time zoom, so it draws at a constant on-screen thickness
-        // whatever zoom you are at. Baked into the snapshot, so it is ordinary ink afterwards.
-        // A pen with a colour override always draws in its own colour; otherwise it follows the
-        // toolbar's active ink colour.
-        val drawColor = cfg0.colorOverride ?: inkColor
-        val cfg = if (cfg0.scale) {
-            cfg0.copy(rgba = drawColor)
-        } else {
-            val z = state.zoom
-            cfg0.copy(
-                rgba = drawColor,
-                baseWidth = cfg0.baseWidth / z,
-                dashLength = cfg0.dashLength / z,
-                dashGap = cfg0.dashGap / z,
-                scale = true,
-            )
-        }
+        val cfg = resolvedStrokeConfig(drawTool)
         val straight = drawTool == Tool.HIGHLIGHTER && cfg.straightLine
         val stroke = Stroke(
             drawTool, cfg, speedScale = speedScale, straight = straight,
@@ -1900,7 +1980,10 @@ class InteractionController(
         cmds += EraseItems(items.map { page to it } + (page to stroke))
         val marks = taken.filterIsInstance<TextMarkup>()
         for (m in marks) cmds += RemoveMarkup(page, m).also { it.redo() }
-        if (marks.isNotEmpty()) state.rebakeBackground(page, emptyList())
+        if (marks.isNotEmpty()) {
+            state.rebakeBackground(page, emptyList())
+            onMarkupsErased?.invoke(state.document.pages.indexOf(page), marks.map { it.id })
+        }
         history.push(AddItem(page, stroke))
         history.push(cmds.singleOrNull() ?: CompositeCommand(cmds))
         state.document.dirty = true
@@ -1977,6 +2060,7 @@ class InteractionController(
         val hit = page.markups.filter { MarkupPainter.touches(it, at.x * ptPerPx, at.y * ptPerPx, radius * ptPerPx) }
         if (hit.isEmpty()) return false
         for (m in hit) eraseMarkups += RemoveMarkup(page, m).also { it.redo() }
+        onMarkupsErased?.invoke(state.document.pages.indexOf(page), hit.map { it.id })
         state.rebakeBackground(page, emptyList())
         return true
     }
@@ -2060,10 +2144,14 @@ class InteractionController(
         if (areaErase()) {
             // One drag may split/trim many strokes across pages; commit each touched page's
             // net before/after as one undo step.
-            eraseSnapshots.mapNotNullTo(cmds) { (page, before) ->
+            val areaChanged = eraseSnapshots.mapNotNull { (page, before) ->
                 val after = page.items.toList()
-                if (after != before) ReplacePageItems(page, before, after) else null
+                if (after != before) {
+                    emitAreaReplacements(page, before)
+                    ReplacePageItems(page, before, after)
+                } else null
             }
+            areaChanged.mapNotNullTo(cmds) { it }
         } else if (eraseRemovals.isNotEmpty()) {
             cmds += EraseItems(eraseRemovals.toList())
             val erased = eraseRemovals.mapNotNull { (page, item) -> (item as? Stroke)?.let { page to it } }
@@ -2452,6 +2540,7 @@ class InteractionController(
         val lone = loneConnector()
         looseBefore = lone?.item?.snapshotGeometry()
         beginFollow(rigid = true, pin = lone == null)
+        moveSyncBefore = snapshotStrokes(selectionStrokes())
         onSelectionMenu(null) // hide while dragging
     }
 
@@ -2495,6 +2584,7 @@ class InteractionController(
             // already excludes them — needs no repair; it is repainted at their final spot
             // when the selection is later cleared.
             onContentChanged()
+            emitStrokeReplacements(moveSyncBefore)
         }
         // A press that never really moved leaves the connectors as it found them.
         if (!moved) for ((_, f) in follows) f.restore()
@@ -3138,6 +3228,7 @@ class InteractionController(
         txItems = selection.toList()
         txSnaps = txItems.map { it.item.snapshotGeometry() }
         beginFollow(rigid = true, pin = true)
+        txSyncBefore = snapshotStrokes(selectionStrokes())
         txStartObb = selObb
         txMargin = selectionChromeMargin()
         txHandle = handle
@@ -3214,6 +3305,7 @@ class InteractionController(
                 // Members stay lifted (overlay-drawn); the ink cache they were lifted out of needs
                 // no repair — it is repainted at their new geometry on deselect.
                 onContentChanged()
+                emitStrokeReplacements(txSyncBefore)
             }
         }
         txItems = emptyList()
@@ -5229,6 +5321,7 @@ class InteractionController(
 
     fun deleteSelection() {
         if (selection.isEmpty()) return
+        val syncBefore = snapshotStrokes(selectionStrokes())
         val removals = selection.map { state.document.pages[it.pageIndex] to it.item }
         for ((page, item) in removals) page.items.remove(item)
         history.push(EraseItems(removals))
@@ -5238,6 +5331,7 @@ class InteractionController(
         // cache is left untouched — no full flush, no flicker.
         clearSelection()
         onContentChanged()
+        emitStrokeReplacements(syncBefore)
         maybeSwitchBackAfterSelect()
     }
 
@@ -5384,6 +5478,7 @@ class InteractionController(
             for (s in selection) DrawStyle.of(s.item)?.let { map[s.item] = it }
         }
         restyleBaseline = if (preview) baseline else null
+        if (restyleSyncBefore == null) restyleSyncBefore = snapshotStrokes(selectionStrokes())
         if (color != null || width != null) {
             for (s in selection) {
                 val current = DrawStyle.of(s.item) ?: continue
@@ -5399,6 +5494,10 @@ class InteractionController(
         }
         state.document.dirty = true
         onContentChanged()
+        if (!preview) {
+            emitStrokeReplacements(restyleSyncBefore.orEmpty())
+            restyleSyncBefore = null
+        }
         requestRender()
     }
 

@@ -117,6 +117,16 @@ class HostEngineTest {
         fun lastOfType(t: String): JSONObject = synchronized(sent) { sent.last { it.optString("t") == t } }
 
         fun countOfType(t: String): Int = synchronized(sent) { sent.count { it.optString("t") == t } }
+
+        /** The index is built off-thread; wait for it before asserting on names/paths. */
+        fun waitForIndex(timeoutMs: Long = 5000) {
+            val end = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < end) {
+                if (synchronized(sent) { sent.any { it.optString("t") == "index" } }) return
+                Thread.sleep(20)
+            }
+            throw AssertionError("timed out waiting for the shared index")
+        }
     }
 
     private class FakeGrants(val policy: SharePolicy) : com.xnotes.share.db.GrantSource {
@@ -143,6 +153,116 @@ class HostEngineTest {
             "11812f53989ff4dc",
             SyncWire.fingerprintOf("pen", 3.0, "#00e676", listOf(Triple(10.0, 20.0, 0.5), Triple(11.5, 21.0, 0.6))),
         )
+    }
+
+    @Test fun markupsReplayAsAddAndRemove() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+            f.policy.setShared("f1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val pageB = Page(300.0, 200.0)
+        val docB = Document(mutableListOf(pageB))
+        fb.host.docs["f1"] = docB
+        val markup = com.xnotes.core.model.TextMarkup(
+            "m1", com.xnotes.core.model.MarkupType.HIGHLIGHT,
+            com.xnotes.core.model.Rgba(255, 235, 59, 255), 0.5,
+            listOf(com.xnotes.core.pdf.TextQuad(1f, 2f, 30f, 12f, 0)),
+            "hello", null, 1000L, 2000L,
+        )
+        fa.engine.submitLocalMarkups("f1", listOf(0 to markup), emptyList(), "mk1")
+        val add = fa.host.lastOfType("op")
+        fb.engine.onMessage(add)
+        assertEquals(1, docB.pages[0].markups.size)
+        assertEquals("m1", docB.pages[0].markups.single().id)
+        // Re-adding the same id is a no-op (idempotent redelivery).
+        fb.engine.onMessage(add)
+        assertEquals(1, docB.pages[0].markups.size)
+        fa.engine.submitLocalMarkups("f1", emptyList(), listOf(0 to "m1"), "mk2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertTrue(docB.pages[0].markups.isEmpty())
+    }
+
+    @Test fun pageStyleRoundTripAndInvertHonor() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+            f.policy.setShared("f1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val pageB = Page(300.0, 200.0)
+        val docB = Document(mutableListOf(pageB))
+        fb.host.docs["f1"] = docB
+        val style = com.xnotes.core.model.PageStyle(
+            pageColor = com.xnotes.core.model.Rgba(255, 255, 255, 255),
+            template = "lines",
+            patternColor = com.xnotes.core.model.Rgba(0, 0, 255, 128),
+            spacing = 64.0,
+        )
+        fa.engine.submitLocalPageStyle(
+            "f1",
+            listOf(Triple(0, style, com.xnotes.core.model.PageMargins(0.1, 0.1, 0.1, 0.1))),
+            style, null, "ps1",
+        )
+        val msg = fa.host.lastOfType("op")
+        assertEquals("page_style", msg.getJSONArray("ops").getJSONObject(0).getString("op"))
+        fb.engine.onMessage(msg)
+        assertEquals(style, docB.pages[0].style)
+        assertEquals(com.xnotes.core.model.PageMargins(0.1, 0.1, 0.1, 0.1), docB.pages[0].margins)
+        assertEquals(style, docB.style)
+        // An explicit invert toggle from a companion lands; nulls keep local.
+        val toggled = JSONObject()
+            .put("t", "op").put("seq", 9).put("file", "f1")
+            .put("base_version", fb.engine.headVersion("f1")).put("dedupe", "inv1")
+            .put("ops", org.json.JSONArray().put(
+                JSONObject().put("op", "page_style")
+                    .put("entries", org.json.JSONArray())
+                    .put("doc_style", JSONObject().put("invert_colors", true)),
+            ))
+        fb.engine.onMessage(toggled)
+        assertEquals(true, docB.style.invertColors)
+        val keep = JSONObject()
+            .put("t", "op").put("seq", 10).put("file", "f1")
+            .put("base_version", fb.engine.headVersion("f1")).put("dedupe", "inv2")
+            .put("ops", org.json.JSONArray().put(
+                JSONObject().put("op", "page_style")
+                    .put("entries", org.json.JSONArray().put(
+                        JSONObject().put("index", 0).put("page_color", "#ffffff"),
+                    )),
+            ))
+        fb.engine.onMessage(keep)
+        // The entry applied; the local invert survived the null.
+        assertEquals(com.xnotes.core.model.Rgba(255, 255, 255, 255), docB.pages[0].style.pageColor)
+        assertEquals(true, docB.style.invertColors)
+    }
+
+    @Test fun linkRequestGrantsAndAnswers() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+        f.policy.setShared("f1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        // Already shared: ok at once, no popup.
+        e.onMessage(JSONObject().put("t", "link_request").put("seq", 1).put("id", "f1").put("device", "Phone"))
+        assertEquals(true, h.lastOfType("link_result").optBoolean("ok"))
+        // Unknown id: denied without a popup.
+        var asked = false
+        h.approval = { _, _, _, respond ->
+            asked = true
+            respond(true)
+        }
+        e.onMessage(JSONObject().put("t", "link_request").put("seq", 2).put("id", "nope").put("device", "Phone"))
+        assertEquals(false, h.lastOfType("link_result").optBoolean("ok"))
+        assertEquals(false, asked)
+        // Unshared but real: approval grants, pushes the index, answers ok.
+        b.addFile("f2", "secret.xnote", bytes = ByteArray(100))
+        e.onMessage(JSONObject().put("t", "link_request").put("seq", 3).put("id", "f2").put("device", "Phone"))
+        assertEquals(true, asked)
+        assertEquals(true, h.lastOfType("link_result").optBoolean("ok"))
+        assertTrue(f.policy.isShared("f2"))
     }
 
     @Test fun indexListsSharedSubtreeByPath() {
@@ -418,8 +538,39 @@ class HostEngineTest {
             asked = Triple(kind, device, name)
             respond(true)
         }
+        h.waitForIndex()
         e.onMessage(JSONObject().put("t", "delete_request").put("seq", 1).put("id", "f1").put("device", "Desktop"))
         assertEquals(Triple("delete", "Desktop", "todo.xnote"), asked)
         assertEquals(true, h.lastOfType("delete_result").optBoolean("ok"))
+    }
+
+    @Test fun replacementsReplayAsErasePlusAdds() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("f1", "todo.xnote", bytes = ByteArray(100))
+            f.policy.setShared("f1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val s = stroke()
+        val pageB = Page(300.0, 200.0)
+        pageB.items.add(s)
+        val docB = Document(mutableListOf(pageB))
+        fb.host.docs["f1"] = docB
+        val moved = Stroke(s).also { it.translate(50.0, 0.0) }
+        fa.engine.submitLocalReplacements(
+            "f1",
+            listOf(com.xnotes.canvas.StrokeReplacement(0, listOf(s), 0, listOf(moved))),
+            "mv1",
+        )
+        val msg = fa.host.lastOfType("op")
+        val ops = msg.getJSONArray("ops")
+        assertEquals(2, ops.length())
+        assertEquals("erase_strokes", ops.getJSONObject(0).getString("op"))
+        assertEquals("add_stroke", ops.getJSONObject(1).getString("op"))
+        fb.engine.onMessage(msg)
+        assertEquals(1, docB.pages[0].items.size)
+        val landed = docB.pages[0].items.single() as Stroke
+        assertEquals(SyncWire.fingerprintOf(moved), SyncWire.fingerprintOf(landed))
     }
 }

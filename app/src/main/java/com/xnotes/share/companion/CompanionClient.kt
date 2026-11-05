@@ -50,6 +50,9 @@ class CompanionClient(
     @Volatile private var socket: SSLSocket? = null
     @Volatile private var out: OutputStream? = null
     @Volatile private var lastPeerFp: String? = null
+    /** True between a completed handshake and the socket closing. */
+    @Volatile var connected: Boolean = false
+        private set
     private val writeQueue: BlockingQueue<ByteArray> = LinkedBlockingQueue()
     /** Poison marker that unblocks the writer on shutdown. */
     private val POISON = ByteArray(0)
@@ -147,6 +150,7 @@ class CompanionClient(
         socket = sock
         out = runCatching { sock.getOutputStream() }.getOrNull()
         seq.set(0)
+        connected = true
         onConnected(fp)
 
         val decoder = Frames.Decoder()
@@ -196,6 +200,7 @@ class CompanionClient(
             val msg = e.message ?: e.javaClass.simpleName
             if (running.get()) onError(msg)
         } finally {
+            connected = false
             runCatching { writeQueue.put(POISON) }
             runCatching { sock.close() }
             socket = null

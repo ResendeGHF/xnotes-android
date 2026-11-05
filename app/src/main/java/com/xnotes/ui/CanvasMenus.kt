@@ -1286,7 +1286,7 @@ fun PdfSelectionMenu(editor: Editor) {
     var overflowOpen by remember { mutableStateOf(false) }
 
     val barHeightPx = with(density) { 48.dp.toPx() }
-    val barWidthPx = with(density) { ((1 + PDF_MARKS.size + if (actions.isEmpty()) 0 else 1) * 46).dp.toPx() }
+    val barWidthPx = with(density) { ((1 + PDF_MARKS.size + (if (editor.onPickLinkTarget != null) 1 else 0) + if (actions.isEmpty()) 0 else 1) * 46).dp.toPx() }
     val gap = with(density) { 10.dp.toPx() }
     val margin = with(density) { 8.dp.toPx() }
     // When pushed below the selection, also clear the teardrop handles hanging there.
@@ -1311,6 +1311,9 @@ fun PdfSelectionMenu(editor: Editor) {
             ActionIcon(XnotesIcons.copy, stringResource(R.string.copy), shortcut = Keys.COPY) { editor.copyPdfText() }
             for ((type, icon, label) in PDF_MARKS) {
                 ActionIcon(icon, stringResource(label)) { editor.markPdfSelection(type) }
+            }
+            if (editor.onPickLinkTarget != null) {
+                ActionIcon(XnotesIcons.link, stringResource(R.string.note_link)) { editor.onPickLinkTarget?.invoke() }
             }
             if (actions.isNotEmpty()) {
                 Box {
@@ -1488,7 +1491,8 @@ private fun MarkupDot(color: Color, active: Boolean, onClick: () -> Unit) {
     )
 }
 
-private fun markIcon(type: com.xnotes.core.model.MarkupType): ImageVector = PDF_MARKS.first { it.first == type }.second
+private fun markIcon(type: com.xnotes.core.model.MarkupType): ImageVector =
+    PDF_MARKS.firstOrNull { it.first == type }?.second ?: XnotesIcons.link
 
 /** The selection bar's marks, in the order the markup tool's popup lists them. */
 private val PDF_MARKS = listOf(

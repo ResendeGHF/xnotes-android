@@ -43,6 +43,9 @@ class GuestEngineTest {
         override fun onResult(hostFp: String, ok: Boolean, reason: String) {
             result = ok to reason
         }
+        override fun onLinkResult(hostFp: String, remoteId: String, ok: Boolean, reason: String) {
+            result = ok to reason
+        }
         override fun onError(reason: String) {
             error = reason
         }
@@ -74,6 +77,21 @@ class GuestEngineTest {
         val (e, _, sent) = engine()
         e.start()
         assertEquals("index_subscribe", sent[0].getString("t"))
+    }
+
+    @Test fun linkRequestAndOpenOnGrant() {
+        val (e, h, sent) = engine()
+        // Unknown target: ask the host.
+        e.requestLinkAccess("r9")
+        assertEquals("link_request", sent.last().getString("t"))
+        assertEquals("r9", sent.last().getString("id"))
+        // Denied: surfaces, no open.
+        e.onMessage(JSONObject().put("t", "link_result").put("id", "r9").put("ok", false).put("reason", "declined"))
+        assertEquals(false to "declined", h.result)
+        assertNull(h.fileReady)
+        // Granted: the refreshed index covers the target, then it opens.
+        e.onMessage(JSONObject().put("t", "link_result").put("id", "r1").put("ok", true))
+        assertEquals(true to "", h.result)
     }
 
     @Test fun fetchSkipsSocketOnCacheHit() {

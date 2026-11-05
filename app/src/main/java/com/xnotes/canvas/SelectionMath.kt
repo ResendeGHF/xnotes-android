@@ -21,6 +21,19 @@ import kotlin.math.sqrt
 data class Selected(val pageIndex: Int, val item: CanvasItem)
 
 /**
+ * A committed stroke change for sync: erase the pre-change [removed] from
+ * [erasePage] (fingerprinted by the sync layer), add the post-change [added]
+ * on [addPage]. Covers move/resize/rotate/restyle/delete and area-erase
+ * splits; replayed as erase_strokes + add_stroke ops.
+ */
+data class StrokeReplacement(
+    val erasePage: Int,
+    val removed: List<com.xnotes.core.model.Stroke>,
+    val addPage: Int,
+    val added: List<com.xnotes.core.model.Stroke>,
+)
+
+/**
  * Pure selection-membership tests (spec 06 §6–7).
  *
  * The band and the lasso share one rule: an item is in when the ring they draw touches what the

@@ -8,7 +8,9 @@ enum class MarkupType(val id: String) {
     HIGHLIGHT("highlight"),
     UNDERLINE("underline"),
     STRIKEOUT("strikeout"),
-    SQUIGGLY("squiggly");
+    SQUIGGLY("squiggly"),
+    /** A tap target jumping to another note; [TextMarkup.link] names it. */
+    NOTE_LINK("note_link");
 
     companion object {
         fun fromId(id: String?): MarkupType? = entries.firstOrNull { it.id == id }
@@ -37,6 +39,11 @@ class TextMarkup(
     /** Epoch ms. */
     val created: Long,
     val modified: Long,
+    /**
+     * Note-link target (a stable file id on the hosting device) when
+     * [type] is [MarkupType.NOTE_LINK]; null otherwise.
+     */
+    val link: String? = null,
 ) {
     /** The same markup restyled or noted at [modified]. */
     fun copy(

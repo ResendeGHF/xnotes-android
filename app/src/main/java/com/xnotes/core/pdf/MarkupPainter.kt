@@ -80,6 +80,8 @@ object MarkupPainter {
         val w = thickness(q)
         return when (type) {
             MarkupType.UNDERLINE -> listOf(frame(q, 0.0, h - w), frame(q, len, h - w))
+            // A note link reads like an underline, in the markup's own (link) colour.
+            MarkupType.NOTE_LINK -> listOf(frame(q, 0.0, h - w), frame(q, len, h - w))
             MarkupType.STRIKEOUT -> listOf(frame(q, 0.0, h / 2), frame(q, len, h / 2))
             MarkupType.SQUIGGLY -> {
                 val period = h / WAVE_PERIODS

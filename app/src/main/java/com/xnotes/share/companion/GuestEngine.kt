@@ -39,6 +39,8 @@ class GuestEngine(
     /** Already-scoped cache root (per dial target); meta + blobs live here. */
     cacheRoot: File,
     var peerName: String,
+    /** Transport liveness, for guarded sends (fetch when offline reports instead). */
+    var isConnected: () -> Boolean = { true },
 ) {
     fun interface Sender {
         fun send(msg: JSONObject)
@@ -61,6 +63,8 @@ class GuestEngine(
         fun onFileReady(hostFp: String, remoteId: String, cacheUri: String, version: Long, openNow: Boolean)
         /** A create/delete request was answered (toast/status wiring). */
         fun onResult(hostFp: String, ok: Boolean, reason: String)
+        /** A link access request was answered: open [remoteId] on ok. */
+        fun onLinkResult(hostFp: String, remoteId: String, ok: Boolean, reason: String)
         fun onError(reason: String)
     }
 
@@ -111,9 +115,18 @@ class GuestEngine(
             "delete_result", "create_result" -> host.onResult(
                 hostFp, msg.optBoolean("ok", false), msg.optString("reason"),
             )
+            "link_result" -> host.onLinkResult(
+                hostFp, msg.optString("id"), msg.optBoolean("ok", false), msg.optString("reason"),
+            )
             "heartbeat" -> Unit
             else -> Unit
         }
+    }
+
+    /** Ask the host for access to a link target; the answer lands in `onLinkResult`. */
+    fun requestLinkAccess(remoteId: String) {
+        if (remoteId.isEmpty()) return
+        send(JSONObject().put("t", "link_request").put("id", remoteId).put("device", peerName))
     }
 
     fun remoteIndex(): List<RemoteEntry> = synchronized(lock) { index.values.toList() }
@@ -165,6 +178,10 @@ class GuestEngine(
             host.onFileReady(hostFp, remoteId, cacheUri(cache), known, openNow)
             return
         }
+        if (!isConnected()) {
+            host.onError("Not connected.")
+            return
+        }
         fileAsm.remove(remoteId)
         send(JSONObject().put("t", "fetch").put("id", remoteId).put("offset", 0).put("length", 0))
         pendingOpen.add(remoteId to openNow)
@@ -204,7 +221,7 @@ class GuestEngine(
         }
         fileAsm.remove(id)
         val version = msg.optLong("version", 1L)
-        val data = asm.buf.toByteArray()
+        val data = stripInvert(asm.buf.toByteArray())
         val openNow = synchronized(lock) {
             val want = pendingOpen.filter { it.first == id }.lastOrNull()?.second ?: (host.openDocument(bound[id] ?: "") != null)
             pendingOpen.removeAll { it.first == id }
@@ -233,6 +250,18 @@ class GuestEngine(
         if (file.isEmpty()) return
         synchronized(lock) { versions[file] = msg.optLong("version", versions[file] ?: 1L) }
         fetch(file, openNow = false)
+    }
+
+    /** The transport dropped: failOutstanding fetches instead of hanging silently. */
+    fun onDisconnected(report: Boolean) {
+        val pending = synchronized(lock) {
+            val p = pendingOpen.toList()
+            pendingOpen.clear()
+            p
+        }
+        if (report && pending.isNotEmpty()) {
+            host.onError("Not connected.")
+        }
     }
 
     private fun onOpAck(msg: JSONObject) {
@@ -287,6 +316,17 @@ class GuestEngine(
                 "add_image" -> {
                     if (applyRemoteImage(cacheUri, file, op)) changed = true
                 }
+                "add_markup" -> {
+                    val m = op.optJSONObject("markup")?.let { SyncWire.markupFrom(it) }
+                    if (m != null && applyMarkupAdd(cacheUri, file, op.optInt("page", 0), m)) changed = true
+                }
+                "remove_markup" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } }
+                    if (ids != null && applyMarkupRemove(cacheUri, file, op.optInt("page", 0), ids)) changed = true
+                }
+                "page_style" -> {
+                    if (applyPageStyle(cacheUri, file, op)) changed = true
+                }
                 else -> Unit
             }
         }
@@ -336,6 +376,149 @@ class GuestEngine(
             if (targets.isEmpty()) return@modifyCache false
             pg.items.removeAll(targets.toSet())
             true
+        }
+    }
+
+    private fun applyMarkupAdd(cacheUri: String?, file: String, page: Int, m: com.xnotes.core.model.TextMarkup): Boolean {
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (pg.markups.any { it.id == m.id }) return false
+            pg.markups = pg.markups + m
+            doc.dirty = true
+            host.editorState(uri)?.rebakeBackground(pg, listOf(m))
+            host.repaintDocument(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            if (pg.markups.any { it.id == m.id }) return@modifyCache false
+            pg.markups = pg.markups + m
+            true
+        }
+    }
+
+    private fun applyMarkupRemove(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (pg.markups.none { it.id in ids }) return false
+            pg.markups = pg.markups.filter { it.id !in ids }
+            doc.dirty = true
+            host.editorState(uri)?.rebakeBackground(pg, emptyList())
+            host.repaintDocument(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            if (pg.markups.none { it.id in ids }) return@modifyCache false
+            pg.markups = pg.markups.filter { it.id !in ids }
+            true
+        }
+    }
+
+    /**
+     * Apply a committed remote page-style change. Invert flags ride page_style
+     * too, but only when explicitly set: nulls keep the local view, so the
+     * host's flags never leak onto this device.
+     */
+    private fun applyPageStyle(cacheUri: String?, file: String, op: JSONObject): Boolean {
+        val keepLocalInvert = { s: com.xnotes.core.model.PageStyle, local: com.xnotes.core.model.PageStyle ->
+            s.copy(
+                invertColors = s.invertColors ?: local.invertColors,
+                invertImages = s.invertImages ?: local.invertImages,
+            )
+        }
+        val entries = op.optJSONArray("entries")?.let { arr ->
+            List(arr.length()) { i ->
+                val e = arr.optJSONObject(i) ?: return@let null
+                Triple(
+                    e.optInt("index", -1),
+                    if (e.isNull("page_color") && e.isNull("template") && e.isNull("pattern_color") &&
+                        e.isNull("spacing") && e.isNull("accent_color") && e.isNull("params") &&
+                        e.isNull("colors") && e.isNull("invert_colors") && e.isNull("invert_images")
+                    ) null else SyncWire.pageStyleFrom(e),
+                    e.optJSONObject("margins")?.let { SyncWire.pageMarginsFrom(it) },
+                )
+            }
+        } ?: emptyList()
+        val docStyle = op.optJSONObject("doc_style")?.let { SyncWire.pageStyleFrom(it) }
+        val docMargins = op.optJSONObject("doc_margins")?.let { SyncWire.pageMarginsFrom(it) }
+        if (entries.isEmpty() && docStyle == null && docMargins == null) return false
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            var touched = false
+            var relayout = false
+            if (docStyle != null) {
+                val merged = keepLocalInvert(docStyle, doc.style)
+                if (doc.style != merged) {
+                    doc.style = merged
+                    touched = true
+                }
+            }
+            if (docMargins != null && doc.margins != docMargins) {
+                doc.margins = docMargins
+                touched = true
+                relayout = true
+            }
+            for ((index, style, margins) in entries) {
+                val pg = doc.pages.getOrNull(index) ?: continue
+                if (style != null) {
+                    val merged = keepLocalInvert(style, pg.style)
+                    if (pg.style != merged) {
+                        pg.style = merged
+                        touched = true
+                    }
+                }
+                if (margins != null && pg.margins != margins) {
+                    pg.margins = margins
+                    touched = true
+                    relayout = true
+                }
+            }
+            if (!touched) return false
+            doc.dirty = true
+            host.editorState(uri)?.let { st ->
+                if (relayout) {
+                    st.invalidatePageGeometry()
+                    st.relayout()
+                }
+                st.invalidateAllBackgrounds()
+                st.invalidatePaper()
+            }
+            host.repaintDocument(uri)
+            host.structureChanged(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            var touched = false
+            if (docStyle != null) {
+                val merged = keepLocalInvert(docStyle, doc.style)
+                if (doc.style != merged) {
+                    doc.style = merged
+                    touched = true
+                }
+            }
+            if (docMargins != null && doc.margins != docMargins) {
+                doc.margins = docMargins
+                touched = true
+            }
+            for ((index, style, margins) in entries) {
+                val pg = doc.pages.getOrNull(index) ?: continue
+                if (style != null) {
+                    val merged = keepLocalInvert(style, pg.style)
+                    if (pg.style != merged) {
+                        pg.style = merged
+                        touched = true
+                    }
+                }
+                if (margins != null && pg.margins != margins) {
+                    pg.margins = margins
+                    touched = true
+                }
+            }
+            touched
         }
     }
 
@@ -588,6 +771,62 @@ class GuestEngine(
 
     fun isGuestUri(cacheUri: String): Boolean = synchronized(lock) { bound.containsValue(cacheUri) }
 
+    /**
+     * Committed local text markups: replayed as add_markup / remove_markup ops.
+     */
+    fun submitLocalMarkups(
+        cacheUri: String,
+        added: List<Pair<Int, com.xnotes.core.model.TextMarkup>>,
+        removedIds: List<Pair<Int, String>>,
+        dedupe: String,
+    ) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val ops = JSONArray()
+        for ((page, m) in added) {
+            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
+        }
+        for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
+            ops.put(JSONObject().put("op", "remove_markup").put("page", page).put("ids", JSONArray(ids)))
+        }
+        if (ops.length() == 0) return
+        submitLocalOps(file, ops, dedupe)
+    }
+
+    /**
+     * Committed local page-style/margin changes: forwarded to the host as one
+     * page_style op (a guest never owns the style; the host applies it). The
+     * guest's own invert flags never travel: each device keeps its own view.
+     */
+    fun submitLocalPageStyle(
+        cacheUri: String,
+        entries: List<Triple<Int, com.xnotes.core.model.PageStyle?, com.xnotes.core.model.PageMargins?>>,
+        docStyle: com.xnotes.core.model.PageStyle?,
+        docMargins: com.xnotes.core.model.PageMargins?,
+        dedupe: String,
+    ) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val arr = JSONArray()
+        for ((index, style, margins) in entries) {
+            val e = JSONObject().put("index", index)
+            if (style != null) {
+                val s = SyncWire.toWirePageStyle(style.copy(invertColors = null, invertImages = null))
+                val names = s.names() ?: JSONObject().names()
+                if (names != null) for (i in 0 until names.length()) {
+                    val k = names.getString(i)
+                    e.put(k, s.get(k))
+                }
+            }
+            if (margins != null) e.put("margins", SyncWire.toWireMargins(margins))
+            arr.put(e)
+        }
+        val op = JSONObject().put("op", "page_style").put("entries", arr)
+        if (docStyle != null) {
+            op.put("doc_style", SyncWire.toWirePageStyle(docStyle.copy(invertColors = null, invertImages = null)))
+        }
+        if (docMargins != null) op.put("doc_margins", SyncWire.toWireMargins(docMargins))
+        submitLocalOps(file, JSONArray().put(op), dedupe)
+    }
+
     fun submitLocalStroke(cacheUri: String, page: Int, stroke: Stroke, dedupe: String) {
         val file = remoteIdOf(cacheUri) ?: return
         val ops = JSONArray().put(
@@ -614,6 +853,29 @@ class GuestEngine(
         submitLocalOps(file, JSONArray().put(
             JSONObject().put("op", "erase_strokes").put("page", page).put("ids", JSONArray(ids)),
         ), dedupe)
+    }
+
+    /**
+     * Committed stroke replacements (move/rotate/resize/restyle/delete-area):
+     * replayed as one message of erase_strokes + add_stroke ops, so the host
+     * converges with no new wire type.
+     */
+    fun submitLocalReplacements(cacheUri: String, changes: List<com.xnotes.canvas.StrokeReplacement>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val ops = JSONArray()
+        for (c in changes) {
+            if (c.removed.isNotEmpty()) {
+                ops.put(
+                    JSONObject().put("op", "erase_strokes").put("page", c.erasePage)
+                        .put("ids", JSONArray(c.removed.map { SyncWire.fingerprintOf(it) })),
+                )
+            }
+            for (s in c.added) {
+                ops.put(JSONObject().put("op", "add_stroke").put("page", c.addPage).put("stroke", SyncWire.toWire(s)))
+            }
+        }
+        if (ops.length() == 0) return
+        submitLocalOps(file, ops, dedupe)
     }
 
     fun submitLocalRoomOpen(cacheUri: String, page: Int, sideways: Boolean, at: Double, size: Double, dedupe: String) {
@@ -792,6 +1054,30 @@ class GuestEngine(
     private fun indexPath(remoteId: String): String = synchronized(lock) { index[remoteId]?.path ?: remoteId }
 
     /** Read-modify-write a cached file through the codec. */
+    /** Fetched bytes never keep the host's invert flags: each device keeps its own view. */
+    private fun stripInvert(bytes: ByteArray): ByteArray {
+        return try {
+            val doc = codec.read(bytes.inputStream(), null, null)
+            var touched = false
+            if (doc.style.invertColors != null || doc.style.invertImages != null) {
+                doc.style = doc.style.copy(invertColors = null, invertImages = null)
+                touched = true
+            }
+            for (pg in doc.pages) {
+                if (pg.style.invertColors != null || pg.style.invertImages != null) {
+                    pg.style = pg.style.copy(invertColors = null, invertImages = null)
+                    touched = true
+                }
+            }
+            if (!touched) return bytes
+            val out = ByteArrayOutputStream()
+            codec.write(doc, out)
+            out.toByteArray()
+        } catch (_: Exception) {
+            bytes
+        }
+    }
+
     private fun modifyCache(file: String, edit: (Document) -> Boolean): Boolean {
         val cache = cacheFile(file)
         if (!cache.isFile) return false

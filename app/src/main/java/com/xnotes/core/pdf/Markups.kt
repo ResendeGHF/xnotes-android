@@ -19,6 +19,7 @@ object Markups {
         color: Rgba,
         intensity: Double,
         now: Long,
+        link: String? = null,
     ): List<Pair<Int, TextMarkup>> {
         val out = ArrayList<Pair<Int, TextMarkup>>()
         for (page in sel.start.page..sel.end.page) {
@@ -28,7 +29,7 @@ object Markups {
             val quads = TextQuads.of(text, range.first, range.last + 1)
             if (quads.isEmpty()) continue
             val marked = text.text(range.first, range.last + 1)
-            out += page to TextMarkup(TextMarkup.newId(), type, color.withAlpha(255), intensity, quads, marked, null, now, now)
+            out += page to TextMarkup(TextMarkup.newId(), type, color.withAlpha(255), intensity, quads, marked, null, now, now, link)
         }
         return out
     }

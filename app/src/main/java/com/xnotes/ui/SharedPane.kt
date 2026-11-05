@@ -23,7 +23,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,13 +38,13 @@ import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 
 /**
- * Phones pane: Android-to-Android sharing. This phone both hosts its own
+ * Shared pane: Android-to-Android sharing. This phone both hosts its own
  * files (other phones dial its listener) and reads files hosted by friends
  * (guest sessions, all connected at once). Pairing is mutual-confirm: both
  * phones show the same 6-digit code and each user confirms the match.
  */
 @Composable
-fun PhonesPane(openFile: (String) -> Unit) {
+fun SharedPane() {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val sharing by CompanionService.active.collectAsState()
@@ -55,15 +54,6 @@ fun PhonesPane(openFile: (String) -> Unit) {
     val guestIndex by CompanionService.guestIndex.collectAsState()
     val sasIn by CompanionService.sasInbound.collectAsState()
     val sasOut by CompanionService.sasOutbound.collectAsState()
-    val guestOpen by CompanionService.guestOpen.collectAsState()
-
-    // Fetched peer files open in the editor as soon as the bytes land.
-    LaunchedEffect(guestOpen) {
-        guestOpen?.let {
-            openFile(it.cacheUri)
-            CompanionService.consumeGuestOpen()
-        }
-    }
 
     var host by remember { mutableStateOf("") }
     var portText by remember { mutableStateOf("") }
@@ -82,8 +72,11 @@ fun PhonesPane(openFile: (String) -> Unit) {
         }
     }
 
+    // Inbound peers only: the desktop companion lives on the Companion screen.
+    val phones = remember(peers) { peers.filter { it.kind == com.xnotes.share.db.DeviceKind.PHONE } }
+
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text("Phones", color = palette.text.toComposeColor(), fontSize = 20.sp)
+        Text("Shared", color = palette.text.toComposeColor(), fontSize = 20.sp)
         Text(
             "Pair with a friend's phone to read each other's shared notes. " +
                 "Each side hosts its own files; everyone connected to you can edit what you shared with them.",
@@ -266,11 +259,11 @@ fun PhonesPane(openFile: (String) -> Unit) {
             item {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Reading my files (${peers.count { it.connected }} connected)",
+                    "Reading my files (${phones.count { it.connected }} connected)",
                     color = palette.text.toComposeColor(),
                     fontSize = 13.sp,
                 )
-                if (peers.isEmpty()) {
+                if (phones.isEmpty()) {
                     Text(
                         "Nobody yet. Use Share policy to choose what each paired phone may see.",
                         color = palette.textDim.toComposeColor(),
@@ -278,7 +271,7 @@ fun PhonesPane(openFile: (String) -> Unit) {
                     )
                 }
             }
-            items(peers, key = { "p:${it.fp}" }) { p ->
+            items(phones, key = { "p:${it.fp}" }) { p ->
                 Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(p.name, color = palette.text.toComposeColor(), fontSize = 14.sp, maxLines = 1)

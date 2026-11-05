@@ -1892,18 +1892,22 @@ class Editor(
     }
 
     /** Marks [sel] as [type] in the active ink colour, a markup on each page it covers, as one undo step. */
-    fun markSelection(sel: com.xnotes.core.pdf.TextSelection, type: MarkupType) {
+    fun markSelection(sel: com.xnotes.core.pdf.TextSelection, type: MarkupType, link: String? = null) {
         val intensity = controller.configFor(Tool.MARKUP).markupIntensity
-        val color = controller.inkColor
+        // Note links always draw link-blue; other marks use the active ink colour.
+        val color = if (type == MarkupType.NOTE_LINK) Rgba(64, 156, 255, 255) else controller.inkColor
         readPdfTexts(sel.start.page..sel.end.page) { texts ->
             pdfText.clear()
-            val made = com.xnotes.core.pdf.Markups.of(sel, { texts[it] }, type, color, intensity, System.currentTimeMillis())
+            val made = com.xnotes.core.pdf.Markups.of(sel, { texts[it] }, type, color, intensity, System.currentTimeMillis(), link)
             val pages = state.document.pages
             val steps = made.groupBy({ it.first }, { it.second })
                 .mapNotNull { (i, marks) -> pages.getOrNull(i)?.let { AddMarkups(it, marks) } }
             if (steps.isNotEmpty()) applyMarkupEdit(steps.singleOrNull() ?: CompositeCommand(steps))
         }
     }
+
+    /** Set when the host screen can pick a note-link target (shared files + recents). */
+    var onPickLinkTarget: (() -> Unit)? = null
 
     /** A markup's tap menu: the markup on note page [page], where it shows in the viewport, and the link under the tap. */
     class MarkupMenu(val page: Int, val markup: TextMarkup, val anchor: Rect, val openLink: (() -> Unit)?)
@@ -2009,6 +2013,11 @@ class Editor(
      */
     private fun tapMarkup(at: Pt, withLink: Boolean): Boolean {
         val hit = markupHit(at) ?: return false
+        // A note link jumps instead of opening the markup menu.
+        if (hit.markup.type == com.xnotes.core.model.MarkupType.NOTE_LINK && hit.markup.link != null) {
+            openNoteLink(hit.markup.link!!)
+            return true
+        }
         val anchor = markupAnchor(hit.page, hit.markup) ?: return false
         // Reading toggles a markup's note and never opens its menu; a markup without one lets the tap reach the PDF.
         if (readerMode) {
@@ -4543,6 +4552,11 @@ class Editor(
             state.invalidateBackground(page)
         }
         applyStyleChange(prev, style, state.document.pages.toList())
+        onPageStyleChanged?.invoke(
+            state.document.pages.mapIndexed { i, p -> Triple<Int, PageStyle?, PageMargins?>(i, p.style, p.margins) },
+            state.document.style,
+            null,
+        )
     }
 
     /** Set the All Pages template to [key]; [memory] keeps what the note and the pages following it had for the one left. */
@@ -4571,6 +4585,11 @@ class Editor(
         TemplateLibrary.embed(state.document, style.template, imageDir)
         page.style = style
         applyStyleChange(prev, style, listOf(page))
+        onPageStyleChanged?.invoke(
+            listOf(Triple<Int, PageStyle?, PageMargins?>(state.document.pages.indexOf(page), page.style, null)),
+            null,
+            null,
+        )
     }
 
     // --- page margins (extra paper on any edge): document-wide ("All Pages") and per-page ---
@@ -4587,6 +4606,11 @@ class Editor(
         if (state.document.margins == margins) return
         state.document.margins = margins
         applyMarginChange()
+        onPageStyleChanged?.invoke(
+            state.document.pages.mapIndexed { i, p -> Triple<Int, PageStyle?, PageMargins?>(i, null, p.margins) },
+            null,
+            state.document.margins,
+        )
     }
 
     /** Replace the current page's margin override. */
@@ -4595,6 +4619,11 @@ class Editor(
         if (page.margins == margins) return
         page.margins = margins
         applyMarginChange()
+        onPageStyleChanged?.invoke(
+            listOf(Triple<Int, PageStyle?, PageMargins?>(state.currentPageIndex(), null, page.margins)),
+            null,
+            null,
+        )
     }
 
     /**
@@ -5143,6 +5172,39 @@ class Editor(
      * set). The bridge pushes the full bytes; the far side reloads.
      */
     var onFileContentReplaced: (() -> Unit)? = null
+
+    /**
+     * Sync hook: a fresh local markup commit (add/remove/retype/note), as
+     * (added page→markups, removed page→ids). Remote markup ops apply
+     * directly and never fire this.
+     */
+    var onMarkupsChanged: ((
+        added: List<Pair<Int, com.xnotes.core.model.TextMarkup>>,
+        removedIds: List<Pair<Int, String>>,
+    ) -> Unit)? = null
+
+    /**
+     * Sync hook: a fresh local page-style/margin commit (all-pages or
+     * current page), as per-page (index, style, margins) plus the
+     * document-wide defaults. Styles ride no undo stack, so unlike ops this
+     * fires on every set, not on undo. Remote applies never fire this.
+     */
+    var onPageStyleChanged: ((
+        entries: List<Triple<Int, com.xnotes.core.model.PageStyle?, com.xnotes.core.model.PageMargins?>>,
+        docStyle: com.xnotes.core.model.PageStyle?,
+        docMargins: com.xnotes.core.model.PageMargins?,
+    ) -> Unit)? = null
+
+    /** Resolve a note link tap (markup or card) to open/fetch/request. */
+    var onOpenSharedNoteLink: ((targetId: String) -> Unit)? = null
+
+    /** Open a note-link target: a local URI, a shared file, or a permission request. */
+    fun openNoteLink(targetId: String, page: Int = 0) {
+        // NoteLinkItem cards carry their page; markup links open the target's first page.
+        onOpenNoteLink?.invoke(targetId, page)
+            ?: onOpenSharedNoteLink?.invoke(targetId)
+            ?: say(appContext.getString(R.string.note_link_cannot_open))
+    }
 
     /** Refresh page chrome after a remote structural apply (page add/remove, room size). */
     fun syncStructureChanged() {
@@ -9852,6 +9914,41 @@ class Editor(
         state.document.dirty = true
         refreshContent()
         view.requestRender()
+        // Sync fresh local commits (undo/redo never pass through here).
+        val added = ArrayList<Pair<Int, com.xnotes.core.model.TextMarkup>>()
+        val removed = ArrayList<Pair<Int, String>>()
+        collectMarkupDelta(command, added, removed)
+        if (added.isNotEmpty() || removed.isNotEmpty()) {
+            onMarkupsChanged?.invoke(added, removed)
+        }
+    }
+
+    private fun collectMarkupDelta(
+        command: Command,
+        added: MutableList<Pair<Int, com.xnotes.core.model.TextMarkup>>,
+        removed: MutableList<Pair<Int, String>>,
+    ) {
+        when (command) {
+            is com.xnotes.core.history.AddMarkups -> {
+                val page = state.document.pages.indexOf(command.page)
+                if (page >= 0) for (m in command.markups) added += page to m
+            }
+            is com.xnotes.core.history.RemoveMarkup -> {
+                val page = state.document.pages.indexOf(command.page)
+                if (page >= 0) removed += page to command.markup.id
+            }
+            is com.xnotes.core.history.ReplaceMarkup -> {
+                val page = state.document.pages.indexOf(command.page)
+                if (page >= 0) {
+                    removed += page to command.before.id
+                    added += page to command.after
+                }
+            }
+            is com.xnotes.core.history.CompositeCommand -> {
+                for (c in command.commands) collectMarkupDelta(c, added, removed)
+            }
+            else -> Unit
+        }
     }
 
     /** Paints afresh the backgrounds of the pages [command]'s markups lie on; the overlay shows new ones meanwhile. */

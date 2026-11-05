@@ -30,6 +30,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.ime
@@ -59,6 +61,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -453,6 +456,11 @@ private fun EditorScreen(
         var noteLinkTargetName by remember { mutableStateOf("") }
         var noteLinkPicking by remember { mutableStateOf(false) }
         val noteLinkForm = remember { com.xnotes.ui.NoteLinkFormState() }
+        // Creating a text-anchored note link (NOTE_LINK markup): the pending
+        // selection plus the picked target file id.
+        var markupLinkSel by remember { mutableStateOf<com.xnotes.core.pdf.TextSelection?>(null) }
+        var markupLinkEditor by remember { mutableStateOf<com.xnotes.ui.Editor?>(null) }
+        var markupLinkPicking by remember { mutableStateOf(false) }
         // A finished PDF render awaiting a SAF "Save as" destination (open-note / file / pages export).
         var pendingExportTemp by remember { mutableStateOf<java.io.File?>(null) }
         // A finished SDOCX render awaiting a SAF "Save as" destination.
@@ -1121,6 +1129,12 @@ private fun EditorScreen(
             scope.launch { openTab(editor, uriStr); Unit }
         }
 
+        // Guest files land here straight from the sync service (tap a shared
+        // file, or follow a note link), without needing the Shared screen.
+        androidx.compose.runtime.SideEffect {
+            com.xnotes.share.companion.CompanionService.onOpenGuestFile = { uri -> openTreeFile(uri) }
+        }
+
         /** Switch the pane that owns [uri] to it, or load it there when it is not open yet. */
         fun activateTab(uri: String, secondary: Boolean = false) {
             val target = if (secondary) editor.secondaryPane() else editor
@@ -1156,6 +1170,9 @@ private fun EditorScreen(
                 from.goToPage(page.coerceIn(0, from.state.document.pages.lastIndex.coerceAtLeast(0)))
                 return
             }
+            // A host's shared file opens from its guest cache (permission flow
+            // included); everything else takes the local path below.
+            if (com.xnotes.share.companion.CompanionService.openSharedTarget(uri)) return
             val other = if (from.pane == com.xnotes.ui.Pane.PRIMARY) editor.secondary else editor
             val target = if (other?.noteOpen == true) other else from
             if (target === from) {
@@ -1676,7 +1693,11 @@ private fun EditorScreen(
                         onTraceScan = { traceScanLauncher.launch(arrayOf("image/*", "application/pdf")) },
                         onTraceCamera = { launchTraceCamera() },
                         onOpenFile = { uri ->
-                            val name = displayNameOf(resolver, Uri.parse(uri)).orEmpty()
+                            val parsed = Uri.parse(uri)
+                            // Guest-cache files are plain file:// URIs with no
+                            // provider to name them; fall back to the path stem.
+                            val name = displayNameOf(resolver, parsed).orEmpty()
+                                .ifEmpty { parsed.lastPathSegment?.substringAfterLast('/').orEmpty() }
                             if (com.xnotes.core.util.ReaderKind.isSdocx(name)) {
                                 // A Samsung Notes file picked from elsewhere:
                                 // queue its conversion like an external share.
@@ -1859,6 +1880,18 @@ private fun EditorScreen(
                     editor.onOpenNoteLink = { uri, page -> followNoteLink(editor.active, uri, page) }
                     editor.secondary?.onOpenNoteLink = { uri, page ->
                         followNoteLink(editor.secondary ?: editor.active, uri, page)
+                    }
+                    // Text-anchored link creation: the selection bar's Link button
+                    // stashes the selection, then the picker below names the target.
+                    editor.onPickLinkTarget = {
+                        markupLinkEditor = editor
+                        markupLinkSel = editor.pdfText.selection
+                        if (markupLinkSel != null) markupLinkPicking = true
+                    }
+                    editor.secondary?.onPickLinkTarget = {
+                        markupLinkEditor = editor.secondary ?: editor
+                        markupLinkSel = (editor.secondary ?: editor).pdfText.selection
+                        if (markupLinkSel != null) markupLinkPicking = true
                     }
                     SplitHost(editor, actions)
 
@@ -2054,6 +2087,77 @@ private fun EditorScreen(
                 },
             )
             }
+        }
+        // Text-anchored note links (NOTE_LINK markups): pick a shared file or a
+        // recent note as the target, then mark the stashed selection with it.
+        if (markupLinkPicking) {
+            val guestIndex by com.xnotes.share.companion.CompanionService.guestIndex.collectAsState()
+            val recents = editor.recentDocs
+            com.xnotes.ui.AlertDialog(
+                onDismissRequest = { markupLinkPicking = false; markupLinkSel = null; markupLinkEditor = null },
+                title = { androidx.compose.material3.Text(stringResource(R.string.note_link)) },
+                text = {
+                    androidx.compose.foundation.lazy.LazyColumn(modifier = androidx.compose.ui.Modifier.heightIn(max = 320.dp)) {
+                        val shared = guestIndex.flatMap { (fp, entries) ->
+                            entries.filter { it.kind == 0 }.map { Triple(fp, it.id, it.path) }
+                        }.sortedBy { it.third.lowercase() }
+                        if (shared.isNotEmpty()) {
+                            item {
+                                androidx.compose.material3.Text(
+                                    "Shared with me",
+                                    style = androidx.compose.material3.MaterialTheme.typography.labelLarge,
+                                )
+                            }
+                            items(shared, key = { (fp, id, _) -> "s:$fp:$id" }) { (_, id, path) ->
+                                androidx.compose.material3.TextButton(onClick = {
+                                    val ed = markupLinkEditor ?: editor
+                                    markupLinkSel?.let { sel ->
+                                        ed.markSelection(sel, com.xnotes.core.model.MarkupType.NOTE_LINK, link = id)
+                                    }
+                                    markupLinkPicking = false
+                                    markupLinkSel = null
+                                    markupLinkEditor = null
+                                }) {
+                                    androidx.compose.material3.Text(path.substringAfterLast('/').ifEmpty { "note" }, maxLines = 1)
+                                }
+                            }
+                        }
+                        val mine = recents.filter { it.uri != editor.openDocumentUri }.take(20)
+                        if (mine.isNotEmpty()) {
+                            item {
+                                androidx.compose.material3.Text(
+                                    "My notes",
+                                    style = androidx.compose.material3.MaterialTheme.typography.labelLarge,
+                                )
+                            }
+                            items(mine, key = { "m:${it.uri}" }) { r ->
+                                androidx.compose.material3.TextButton(onClick = {
+                                    val ed = markupLinkEditor ?: editor
+                                    markupLinkSel?.let { sel ->
+                                        ed.markSelection(sel, com.xnotes.core.model.MarkupType.NOTE_LINK, link = r.uri)
+                                    }
+                                    markupLinkPicking = false
+                                    markupLinkSel = null
+                                    markupLinkEditor = null
+                                }) {
+                                    androidx.compose.material3.Text(r.name, maxLines = 1)
+                                }
+                            }
+                        }
+                        if (shared.isEmpty() && mine.isEmpty()) {
+                            item {
+                                androidx.compose.material3.Text("No linkable notes yet — share a file or open a note first.")
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { markupLinkPicking = false; markupLinkSel = null; markupLinkEditor = null }) {
+                        androidx.compose.material3.Text(stringResource(android.R.string.cancel))
+                    }
+                },
+            )
         }
         pendingBackup?.let { backup ->
             com.xnotes.ui.AlertDialog(
@@ -2982,7 +3086,9 @@ private suspend fun openInto(
     onOpenReader: (String, String) -> Unit
 ): String? {
     val resolver = context.contentResolver
-    val name = displayNameOf(resolver, Uri.parse(uriStr)) ?: ""
+    val uri = Uri.parse(uriStr)
+    val name = displayNameOf(resolver, uri)
+        ?: uri.lastPathSegment?.substringAfterLast('/').orEmpty()
 
     val expected = if (name.endsWith(".pdf", ignoreCase = true)) {
         val newUri = target.importPdfDirectly(uriStr, name)

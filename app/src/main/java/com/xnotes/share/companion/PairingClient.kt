@@ -5,7 +5,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 
-/** UI surface the pairing handshake drives. Implemented by ConnectPane. */
+/** UI surface the pairing handshake drives. Implemented by CompanionPane. */
 interface PairingUi {
     fun showCodeEntry()
     fun showStatus(s: String)

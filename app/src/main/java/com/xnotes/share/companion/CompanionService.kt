@@ -321,17 +321,20 @@ class CompanionService : Service() {
         val sender = PairingClient.Sender { msg -> client?.send(msg) }
         val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, ui ?: return, sender)
         pairing.listenPort = listener?.boundPort ?: 0
+        var sasPeer = false
         // An Android peer answers hello_ack in SAS mode; surface it the same way.
         pairing.onSasPeer = { sas, name ->
+            sasPeer = true
             _sasOutbound.value = SasRequest(dev?.fp ?: "$host:$port", name, sas, inbound = false)
         }
         pairing.onPaired = { name ->
             val peerFp = pairing.peerFingerprint
             if (peerFp != null) {
+                val wasSas = sasPeer
                 Thread({
                     runCatching {
                         kotlinx.coroutines.runBlocking {
-                            store.remember(peerFp, name, host, port)
+                            store.remember(peerFp, name, host, port, kind = if (wasSas) com.xnotes.share.db.DeviceKind.PHONE else null)
                             // First companion ever becomes active; otherwise the
                             // active one keeps its slot.
                             if (store.activeDeviceOnce() == null) {
@@ -465,7 +468,7 @@ class CompanionService : Service() {
                         synchronized(peerLock) { peerNames[key] = name }
                         runCatching {
                             kotlinx.coroutines.runBlocking {
-                                store.remember(key, name, conn.remoteHost, port)
+                                store.remember(key, name, conn.remoteHost, port, kind = com.xnotes.share.db.DeviceKind.PHONE)
                                 grants.refresh()
                             }
                         }
@@ -529,7 +532,8 @@ class CompanionService : Service() {
             val fps = (byFp.keys + connected).sorted()
             main.post {
                 _peers.value = fps.map { fp ->
-                    PeerInfo(fp, byFp[fp]?.displayName ?: "phone", fp in connected)
+                    val dev = byFp[fp]
+                    PeerInfo(fp, dev?.displayName ?: "phone", fp in connected, dev?.kind ?: com.xnotes.share.db.DeviceKind.PHONE)
                 }
             }
         }, "peers-publish").apply { isDaemon = true; start() }
@@ -581,16 +585,25 @@ class CompanionService : Service() {
         }
         override fun onFileReady(hostFp: String, remoteId: String, cacheUri: String, version: Long, openNow: Boolean) {
             if (openNow) {
-                val eng = synchronized(peerLock) {
-                    guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
+                main.post {
+                    CompanionService.onOpenGuestFile?.invoke(cacheUri)
+                        ?: postStatus("Shared file is ready.")
                 }
-                val name = eng?.remoteIndex()?.firstOrNull { it.id == remoteId }?.path
-                    ?.substringAfterLast('/')?.ifEmpty { null } ?: "shared note"
-                _guestOpen.value = GuestOpen(hostFp, remoteId, cacheUri, name)
             }
         }
         override fun onResult(hostFp: String, ok: Boolean, reason: String) {
             postStatus(if (ok) "Done." else "Declined${if (reason.isNotEmpty()) ": $reason" else "."}")
+        }
+        override fun onLinkResult(hostFp: String, remoteId: String, ok: Boolean, reason: String) {
+            if (!ok) {
+                postStatus("No access${if (reason.isNotEmpty()) ": $reason" else "."}")
+                return
+            }
+            // Granted: the pushed index now covers the target; fetch and open it.
+            val eng = synchronized(peerLock) {
+                guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
+            } ?: return
+            eng.fetch(remoteId, openNow = true)
         }
         override fun onError(reason: String) = postStatus(reason)
     }
@@ -612,6 +625,7 @@ class CompanionService : Service() {
         val scoped = File(cacheRoot, key.replace(Regex("[^A-Za-z0-9.-]"), "_")).apply { mkdirs() }
         val client = CompanionClient(host, port, identity, pinnedFp = null, autoReconnect = true)
         val engine = GuestEngine("", GuestEngine.Sender { client.send(it) }, guestBridge(), scoped, key)
+        engine.isConnected = { client.connected }
         val sender = PairingClient.Sender { msg -> client.send(msg) }
         val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, guestPairingUi(key), sender)
         pairing.listenPort = listener?.boundPort ?: 0
@@ -634,6 +648,7 @@ class CompanionService : Service() {
                     _guestIndex.value = _guestIndex.value - (session.fp ?: key)
                     publishGuests()
                 }
+                session.engine.onDisconnected(!willRetry)
             }
         }
         client.onError = { err -> postStatus(err) }
@@ -672,7 +687,7 @@ class CompanionService : Service() {
         s.engine.start()
         Thread({
             runCatching {
-                kotlinx.coroutines.runBlocking { store?.remember(fp.lowercase(), name, s.host, s.port) }
+                kotlinx.coroutines.runBlocking { store?.remember(fp.lowercase(), name, s.host, s.port, kind = com.xnotes.share.db.DeviceKind.PHONE) }
             }
             main.post { publishGuests() }
         }, "guest-remember").apply { isDaemon = true; start() }
@@ -783,6 +798,13 @@ class CompanionService : Service() {
         val engine = engine ?: return
         if (CompanionEditors.uriFor(editor) != uri) return
         val guest = guestForCacheUri(uri)
+        if (guest != null) {
+            // Shared docs resolve note-link taps through the sync host:
+            // open when shared, ask the owner for permission when not.
+            editor.onOpenSharedNoteLink = { targetId -> openGuestLink(guest, targetId) }
+        } else {
+            editor.onOpenSharedNoteLink = null
+        }
         val overlay = RemoteLiveStrokes(editor.state).also { it.showingFile = uri }
         editor.controller.remoteLive = overlay
         editor.controller.onStrokeStarted = {
@@ -824,6 +846,13 @@ class CompanionService : Service() {
                 }
             }
         }
+        editor.controller.onStrokesReplaced = { changes ->
+            if (guest != null) guest.submitLocalReplacements(uri, changes, newDedupe())
+            else {
+                val id = newDedupe()
+                eachHost { it.submitLocalReplacements(uri, changes, id) }
+            }
+        }
         editor.controller.onRoomPreview = { page, sideways, split, resume, shift ->
             var live = pendingRoom
             if (live == null || live.uri != uri || live.page != page) {
@@ -851,6 +880,32 @@ class CompanionService : Service() {
         editor.onFileContentReplaced = {
             // Host docs fan out a full-file push; guest docs already sync op-by-op.
             if (guest == null) eachHost { it.pushFile(uri) }
+        }
+        editor.onMarkupsChanged = { added, removed ->
+            if (added.isNotEmpty() || removed.isNotEmpty()) {
+                if (guest != null) guest.submitLocalMarkups(uri, added, removed, newDedupe())
+                else {
+                    val id = newDedupe()
+                    eachHost { it.submitLocalMarkups(uri, added, removed, id) }
+                }
+            }
+        }
+        editor.onPageStyleChanged = { entries, docStyle, docMargins ->
+            // Style/margin commits carry no undo step; the callback fires once per set.
+            if (guest != null) guest.submitLocalPageStyle(uri, entries, docStyle, docMargins, newDedupe())
+            else {
+                val id = newDedupe()
+                eachHost { it.submitLocalPageStyle(uri, entries, docStyle, docMargins, id) }
+            }
+        }
+        editor.controller.onMarkupsErased = { page, ids ->
+            if (ids.isNotEmpty()) {
+                if (guest != null) guest.submitLocalMarkups(uri, emptyList(), ids.map { page to it }, newDedupe())
+                else {
+                    val id = newDedupe()
+                    eachHost { it.submitLocalMarkups(uri, emptyList(), ids.map { page to it }, id) }
+                }
+            }
         }
         editor.onImageInserted = { page, item ->
             val id = newDedupe()
@@ -914,7 +969,7 @@ class CompanionService : Service() {
         }
         if (live == null) {
             val tool = editor.controller.tool
-            val cfg = editor.controller.configFor(tool)
+            val cfg = editor.controller.resolvedStrokeConfig(tool)
             live = LiveStroke(uri, page, newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba)).also { pendingLive[editor] = it }
         }
         val cur = live ?: return
@@ -937,6 +992,20 @@ class CompanionService : Service() {
         }
     }
 
+    /** Follow a note-link tap from a guest document (open or permission request). */
+    private fun openGuestLink(engine: GuestEngine, targetId: String) {
+        main.post {
+            if (engine.remoteIndex().any { it.id == targetId }) {
+                engine.fetch(targetId, openNow = true)
+            } else if (engine.isConnected()) {
+                postStatus("Asking the owner for access…")
+                engine.requestLinkAccess(targetId)
+            } else {
+                postStatus("Not connected.")
+            }
+        }
+    }
+
     @Volatile private var guestCachePrefix: String? = null
 
     private fun detachEditor(editor: Editor) {
@@ -944,11 +1013,16 @@ class CompanionService : Service() {
         editor.controller.onStrokeSample = null
         editor.controller.onStrokeCommitted = null
         editor.controller.onStrokesErased = null
+        editor.controller.onStrokesReplaced = null
         editor.state.onPageChanged = null
         editor.onPageInserted = null
         editor.onPageRemoved = null
         editor.onImageInserted = null
         editor.onFileContentReplaced = null
+        editor.onMarkupsChanged = null
+        editor.onPageStyleChanged = null
+        editor.controller.onMarkupsErased = null
+        editor.onOpenSharedNoteLink = null
         editor.controller.onRoomPreview = null
         editor.controller.onRoomCommitted = null
         editor.controller.onRoomPreviewDone = null
@@ -1039,7 +1113,7 @@ class CompanionService : Service() {
     data class Status(val text: String, val paired: String?, val connected: Boolean)
 
     /** An inbound Android peer (this phone hosts files for it). */
-    data class PeerInfo(val fp: String, val name: String, val connected: Boolean)
+    data class PeerInfo(val fp: String, val name: String, val connected: Boolean, val kind: String = com.xnotes.share.db.DeviceKind.PHONE)
 
     /** An outbound Android peer (this phone reads that phone's files). */
     data class GuestInfo(
@@ -1052,9 +1126,6 @@ class CompanionService : Service() {
 
     /** A mutual-confirm SAS code shown on both phones. */
     data class SasRequest(val key: String, val name: String, val sas: String, val inbound: Boolean)
-
-    /** A fetched peer file ready to open in the editor. */
-    data class GuestOpen(val hostFp: String, val remoteId: String, val cacheUri: String, val name: String)
 
     companion object {
         private const val CHANNEL = "companion"
@@ -1092,9 +1163,9 @@ class CompanionService : Service() {
         private val _sasOutbound = MutableStateFlow<SasRequest?>(null)
         /** Outbound SAS code to confirm against the other phone. */
         val sasOutbound: StateFlow<SasRequest?> = _sasOutbound.asStateFlow()
-        private val _guestOpen = MutableStateFlow<GuestOpen?>(null)
-        /** A fetched peer file the UI should open; cleared after consuming. */
-        val guestOpen: StateFlow<GuestOpen?> = _guestOpen.asStateFlow()
+
+        /** Opens a fetched guest file in the editor; wired by MainActivity. */
+        var onOpenGuestFile: ((String) -> Unit)? = null
 
         const val PREFS = "companion"
         const val KEY_IP = "companion_last_ip"
@@ -1215,6 +1286,28 @@ class CompanionService : Service() {
             }
         }
 
+        /**
+         * Follow a note link from a shared document: open when the target is
+         * shared, otherwise ask its host for permission (the answer opens it).
+         */
+        fun followSharedLink(context: Context, engine: GuestEngine, targetId: String) {
+            val svc = runningService ?: return
+            svc.main.post {
+                if (engine.remoteIndex().any { it.id == targetId }) {
+                    engine.fetch(targetId, openNow = true)
+                } else if (engine.isConnected()) {
+                    postStatusStatic("Asking the owner for access…")
+                    engine.requestLinkAccess(targetId)
+                } else {
+                    postStatusStatic("Not connected.")
+                }
+            }
+        }
+
+        private fun postStatusStatic(s: String) {
+            runningService?.postStatus(s)
+        }
+
         /** Cached bytes of a peer file, for the save-a-copy flow. */
         fun readGuestBytes(hostFp: String, remoteId: String): ByteArray? {
             val svc = runningService ?: return null
@@ -1224,9 +1317,18 @@ class CompanionService : Service() {
             return eng.cachedBytes(remoteId)
         }
 
-        /** The UI opened the fetched file: clear the one-shot request. */
-        fun consumeGuestOpen() {
-            _guestOpen.value = null
+        /**
+         * Open a note-link target shared by a connected host: fetches and
+         * opens it. Returns true when a guest session covers [uri].
+         */
+        fun openSharedTarget(uri: String): Boolean {
+            val svc = runningService ?: return false
+            val eng = synchronized(svc.peerLock) {
+                svc.guestSessions.values.mapNotNull { it.engine }
+                    .firstOrNull { e -> e.remoteIndex().any { it.id == uri } }
+            } ?: return false
+            svc.main.post { eng.fetch(uri, openNow = true) }
+            return true
         }
 
         /** Allow an inbound peer whose SAS matches ([key] from [sasInbound]). */

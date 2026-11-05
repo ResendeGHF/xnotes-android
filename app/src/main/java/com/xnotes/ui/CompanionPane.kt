@@ -43,19 +43,21 @@ import java.text.DateFormat
 import java.util.Date
 
 /**
- * Connect pane: which companions this phone knows, which one is active, and
- * pairing new ones. At most one companion is connected; the rest stay
- * remembered but disconnected until picked.
+ * Companion pane: the desktop Linux companion this phone knows, which one is
+ * active, and pairing new ones. At most one companion is connected; the rest
+ * stay remembered but disconnected until picked. Android phones live on the
+ * Shared screen instead.
  */
 @Composable
-fun ConnectPane() {
+fun CompanionPane() {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val status by CompanionService.status.collectAsState()
     val sharing by CompanionService.active.collectAsState()
     val codeNeeded by CompanionService.codeNeeded.collectAsState()
     val store = remember { ShareStore.of(context.applicationContext) }
-    val devices by store.devices.collectAsState(initial = emptyList())
+    val allDevices by store.devices.collectAsState(initial = emptyList())
+    val devices = remember(allDevices) { allDevices.filter { it.kind == com.xnotes.share.db.DeviceKind.LINUX } }
     val activeDevice by store.activeDevice.collectAsState(initial = null)
 
     var host by remember {
@@ -93,7 +95,7 @@ fun ConnectPane() {
     }
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text("Connect", color = palette.text.toComposeColor(), fontSize = 20.sp)
+        Text("Companion", color = palette.text.toComposeColor(), fontSize = 20.sp)
         Text(
             "Dial a Linux companion over TLS, then type the 6-digit code it shows. " +
                 "For USB, run `adb reverse tcp:42317 tcp:42317` and use 127.0.0.1.",

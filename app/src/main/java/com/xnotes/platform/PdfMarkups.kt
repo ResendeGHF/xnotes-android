@@ -108,6 +108,8 @@ internal object PdfMarkups {
         MarkupType.UNDERLINE -> PDAnnotationTextMarkup.SUB_TYPE_UNDERLINE
         MarkupType.STRIKEOUT -> PDAnnotationTextMarkup.SUB_TYPE_STRIKEOUT
         MarkupType.SQUIGGLY -> PDAnnotationTextMarkup.SUB_TYPE_SQUIGGLY
+        // Note links export as a plain underline: PDF has no note-link annotation.
+        MarkupType.NOTE_LINK -> PDAnnotationTextMarkup.SUB_TYPE_UNDERLINE
     }
 
     private fun utc(ms: Long): Calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { timeInMillis = ms }

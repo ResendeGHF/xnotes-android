@@ -31,6 +31,9 @@ class PeerGrants(
     override fun sharedUris(): Set<String> = snap
 
     override fun setGranted(uri: String, granted: Boolean) {
+        // Optimistic snapshot so a follow-up index push in the same turn
+        // already covers the grant; the store write + refresh reconcile after.
+        snap = if (granted) snap + uri else snap - uri
         io.launch {
             runCatching { store.setGranted(fp, uri, granted) }
             refresh()

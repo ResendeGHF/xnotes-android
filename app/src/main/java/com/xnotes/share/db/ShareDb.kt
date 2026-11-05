@@ -25,17 +25,24 @@ import kotlinx.coroutines.flow.Flow
  * default (file-based encryption). SQLCipher would add native blobs and
  * reproducible-build risk for no practical gain here.
  */
-@Database(entities = [DeviceEntity::class, GrantEntity::class], version = 1, exportSchema = false)
+@Database(entities = [DeviceEntity::class, GrantEntity::class], version = 2, exportSchema = false)
 abstract class ShareDatabase : RoomDatabase() {
     abstract fun shareDao(): ShareDao
 }
 
-/** One paired companion (this phone dials it; at most one is active). */
+/** v1 → v2: device kind (old rows are all Linux companions). */
+val ShareMigration1To2 = object : androidx.room.migration.Migration(1, 2) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT '${DeviceKind.LINUX}'")
+    }
+}
+
+/** One paired device: the Linux companion (this phone dials it) or an Android phone. */
 @androidx.room.Entity(tableName = "devices")
 data class DeviceEntity(
-    /** Lowercase hex SHA-256 of the companion's cert: the stable identity. */
+    /** Lowercase hex SHA-256 of the peer's cert: the stable identity. */
     @androidx.room.PrimaryKey val fp: String,
-    /** The name the companion introduced itself with. */
+    /** The name the peer introduced itself with. */
     val name: String,
     /** Last known address, for redial. */
     val host: String,
@@ -46,8 +53,18 @@ data class DeviceEntity(
     val lastSeen: Long = 0L,
     /** The companion to dial; the others stay remembered but disconnected. */
     val active: Boolean = false,
+    /** [DeviceKind.LINUX] (desktop companion) or [DeviceKind.PHONE] (Android peer). */
+    val kind: String = DeviceKind.LINUX,
 ) {
     val displayName: String get() = nickname?.takeIf { it.isNotBlank() } ?: name.ifEmpty { "$host:$port" }
+}
+
+/** What kind of peer a device row is. */
+object DeviceKind {
+    /** The desktop Linux companion (dialed when active). */
+    const val LINUX = "linux"
+    /** An Android phone (guest sessions + inbound hosting). */
+    const val PHONE = "phone"
 }
 
 /** One shared file-or-folder grant, scoped to a single companion. */
