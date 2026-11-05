@@ -124,6 +124,17 @@ never the name.
   an `index` delta; a created file arrives with its fresh id (shared from
   birth when made under a shared folder, else unshared — the host decides).
 
+## Note-link permission (guest asks, host approves in UI)
+
+- A tapped note link whose target the guest cannot see asks first:
+  `C -> S link_request {id, device}`.
+- An already-shared target answers `S -> C link_result {id, ok:true}` at
+  once, with no popup. An unknown id answers `{ok:false}` the same way.
+- Otherwise the host shows a popup (Allow / Deny, works from the status-bar
+  notification with the screen off). Allow grants the target to that peer,
+  pushes an `index` delta covering it, and answers `{ok:true}`; the guest
+  then fetches and opens it. Deny (or timeout) answers `{ok:false, reason}`.
+
 ## Committed ops (both directions, host-authoritative)
 
 ```
@@ -175,6 +186,26 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   first as `image_data` chunks (below); the op applies once they are in, and
   waits for them when they are still in flight. Eraser-protected images are
   never erased; select-delete of any non-stroke item is not synced in v1.
+- `add_markup {page, markup:{id, type, color, intensity, quads:[[l,t,r,b,q]...],
+  text, note?, link?, created, modified}}`: mark PDF text (`type` is
+  `highlight|underline|strikeout|squiggly|note_link`; `color` is `#rrggbb`,
+  alpha rides `intensity`). `remove_markup {page, ids:[markup-id...]}` takes
+  them off. Redelivery is idempotent (adds skip known ids); both bypass undo.
+  A `note_link` markup whose `link` names a file id is a note-to-note link —
+  tapping it opens the target when shared, else asks the host (below).
+- `page_style {entries:[{index, page_color?, template?, pattern_color?,
+  spacing?, accent_color?, params?, colors?, invert_colors?, invert_images?,
+  margins?}], doc_style?, doc_margins?}`: set page styles (colors as
+  `#rrggbb`, pattern color `#rrggbbaa` with line opacity, margins as
+  fractions). Absent fields inherit (leave alone). Invert flags ride along
+  but only when explicitly set: null keeps the local view, so guests (who
+  always strip them on send) never clobber the host, while a companion's
+  explicit toggle lands. Fetched file bytes never carry invert flags; invert
+  mirrors over this op only.
+- Selection move/resize/rotate/restyle/delete and area-erase splits replay as
+  plain `erase_strokes` + `add_stroke` in one batch (pre-change fingerprints,
+  post-change strokes), so every peer converges with no new wire type.
+  Strokes only; non-stroke items are untouched by selection sync.
   Unknown op names are skipped with a log.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
