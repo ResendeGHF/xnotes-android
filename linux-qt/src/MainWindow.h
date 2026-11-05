@@ -27,6 +27,7 @@ class QSlider;
 class QSpinBox;
 class QLabel;
 class QScrollBar;
+class QToolBar;
 class PageStylePopup;
 class PagesPanel;
 class QDockWidget;
@@ -71,6 +72,7 @@ private:
     QAction* navHome_ = nullptr;
     QAction* navBrowse_ = nullptr;
     QAction* navShared_ = nullptr;
+    QToolBar* navBar_ = nullptr;
     QList<QToolBar*> editorBars_;
     xn::CompanionServer* companion_ = nullptr;
     QString pendingOpenId_;

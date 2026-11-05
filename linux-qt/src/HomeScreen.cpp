@@ -1,32 +1,12 @@
 #include "HomeScreen.h"
 
-#include "Icons.h"
-#include "NoteThumb.h"
-#include "Recents.h"
-#include "TileButton.h"
-
 #include <QBoxLayout>
-#include <QFileInfo>
-#include <QGridLayout>
+#include <QGroupBox>
 #include <QLabel>
-#include <QLayoutItem>
 #include <QListWidget>
-#include <QMouseEvent>
 #include <QPushButton>
-#include <QScrollArea>
 
 namespace xn {
-
-namespace {
-
-void clearLayout(QGridLayout* grid) {
-    while (QLayoutItem* child = grid->takeAt(0)) {
-        if (child->widget()) child->widget()->deleteLater();
-        delete child;
-    }
-}
-
-}  // namespace
 
 HomeScreen::HomeScreen(QWidget* parent) : QWidget(parent) {
     auto* outer = new QVBoxLayout(this);
@@ -41,60 +21,58 @@ HomeScreen::HomeScreen(QWidget* parent) : QWidget(parent) {
     outer->addWidget(title);
 
     // --- connection card ---
-    auto* link = new QLabel(QStringLiteral("Companion link"), this);
-    QFont section = link->font();
-    section.setBold(true);
-    link->setFont(section);
-    outer->addWidget(link);
+    auto* link = new QGroupBox(QStringLiteral("Connection"), this);
+    auto* linkLayout = new QVBoxLayout(link);
+    linkLayout->setSpacing(8);
 
-    status_ = new QLabel(this);
+    status_ = new QLabel(link);
     status_->setWordWrap(true);
-    outer->addWidget(status_);
+    linkLayout->addWidget(status_);
 
-    connected_ = new QLabel(this);
-    outer->addWidget(connected_);
+    connected_ = new QLabel(link);
+    linkLayout->addWidget(connected_);
 
     auto* linkRow = new QHBoxLayout;
-    serverButton_ = new QPushButton(this);
+    linkRow->setContentsMargins(0, 0, 0, 0);
+    serverButton_ = new QPushButton(link);
     serverButton_->setCheckable(true);
     linkRow->addWidget(serverButton_);
-    pairButton_ = new QPushButton(QStringLiteral("Pair a new device…"), this);
+    pairButton_ = new QPushButton(QStringLiteral("Pair a new device…"), link);
     linkRow->addWidget(pairButton_);
     linkRow->addStretch(1);
-    outer->addLayout(linkRow);
+    linkLayout->addLayout(linkRow);
     connect(serverButton_, &QPushButton::toggled, this, &HomeScreen::serverToggled);
     connect(pairButton_, &QPushButton::clicked, this, &HomeScreen::pairBegin);
 
-    code_ = new QLabel(this);
+    code_ = new QLabel(link);
     QFont codeFont = code_->font();
     codeFont.setPointSize(32);
     codeFont.setBold(true);
     code_->setFont(codeFont);
     code_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     code_->setVisible(false);
-    outer->addWidget(code_);
+    linkLayout->addWidget(code_);
+    outer->addWidget(link);
 
-    auto* selfRow = new QHBoxLayout;
-    selfName_ = new QLabel(this);
-    selfRow->addWidget(selfName_, 1);
-    auto* selfRename = new QPushButton(QStringLiteral("Rename this device…"), this);
-    selfRow->addWidget(selfRename);
-    outer->addLayout(selfRow);
-    connect(selfRename, &QPushButton::clicked, this, &HomeScreen::renameSelf);
-
-    devices_ = new QListWidget(this);
-    devices_->setMaximumHeight(96);
+    // --- paired devices card ---
+    auto* devicesBox = new QGroupBox(QStringLiteral("Paired devices"), this);
+    auto* devicesLayout = new QVBoxLayout(devicesBox);
+    devicesLayout->setSpacing(8);
+    devices_ = new QListWidget(devicesBox);
     devices_->setVisible(false);
-    outer->addWidget(devices_);
+    devices_->setMaximumHeight(120);
+    devicesLayout->addWidget(devices_);
     auto* devRow = new QHBoxLayout;
-    forgetButton_ = new QPushButton(QStringLiteral("Forget…"), this);
-    renameButton_ = new QPushButton(QStringLiteral("Rename…"), this);
+    devRow->setContentsMargins(0, 0, 0, 0);
+    forgetButton_ = new QPushButton(QStringLiteral("Forget…"), devicesBox);
+    renameButton_ = new QPushButton(QStringLiteral("Rename…"), devicesBox);
     forgetButton_->setEnabled(false);
     renameButton_->setEnabled(false);
     devRow->addWidget(forgetButton_);
     devRow->addWidget(renameButton_);
     devRow->addStretch(1);
-    outer->addLayout(devRow);
+    devicesLayout->addLayout(devRow);
+    outer->addWidget(devicesBox);
     auto selectedDevice = [this]() -> QString {
         auto* item = devices_->currentItem();
         return item ? item->text() : QString();
@@ -116,53 +94,24 @@ HomeScreen::HomeScreen(QWidget* parent) : QWidget(parent) {
         if (!name.isEmpty()) emit renameDevice(name);
     });
 
-    // --- recents ---
-    auto* recent = new QLabel(QStringLiteral("Recent on this device"), this);
-    recent->setFont(section);
-    outer->addWidget(recent);
+    // --- this device card ---
+    auto* selfBox = new QGroupBox(QStringLiteral("This device"), this);
+    auto* selfLayout = new QHBoxLayout(selfBox);
+    selfName_ = new QLabel(selfBox);
+    selfLayout->addWidget(selfName_, 1);
+    auto* selfRename = new QPushButton(QStringLiteral("Rename…"), selfBox);
+    selfLayout->addWidget(selfRename);
+    outer->addWidget(selfBox);
+    connect(selfRename, &QPushButton::clicked, this, &HomeScreen::renameSelf);
 
-    auto* recentScroll = new QScrollArea(this);
-    recentScroll->setWidgetResizable(true);
-    recentScroll->setFrameShape(QFrame::NoFrame);
-    recentScroll->setMaximumHeight(230);
-    auto* recentInner = new QWidget(recentScroll);
-    recentGrid_ = new QGridLayout(recentInner);
-    recentGrid_->setSpacing(8);
-    recentScroll->setWidget(recentInner);
-    outer->addWidget(recentScroll);
-
-    sharedRecentLabel_ = new QLabel(QStringLiteral("Recent from the server"), this);
-    sharedRecentLabel_->setFont(section);
-    outer->addWidget(sharedRecentLabel_);
-
-    sharedRecentScroll_ = new QScrollArea(this);
-    sharedRecentScroll_->setWidgetResizable(true);
-    sharedRecentScroll_->setFrameShape(QFrame::NoFrame);
-    sharedRecentScroll_->setMaximumHeight(230);
-    auto* sharedInner = new QWidget(sharedRecentScroll_);
-    sharedRecentGrid_ = new QGridLayout(sharedInner);
-    sharedRecentGrid_->setSpacing(8);
-    sharedRecentScroll_->setWidget(sharedInner);
-    outer->addWidget(sharedRecentScroll_);
     outer->addStretch(1);
-
-    auto* localRow = new QHBoxLayout;
-    auto* newNote = new QPushButton(QStringLiteral("New note"), this);
-    auto* openFile = new QPushButton(QStringLiteral("Open…"), this);
-    localRow->addWidget(newNote);
-    localRow->addWidget(openFile);
-    localRow->addStretch(1);
-    outer->addLayout(localRow);
-    connect(newNote, &QPushButton::clicked, this, &HomeScreen::newNote);
-    connect(openFile, &QPushButton::clicked, this, &HomeScreen::openFile);
 }
 
 void HomeScreen::setStatus(const QString& s) { status_->setText(s); }
 
 void HomeScreen::setConnected(const QString& device) {
     connected_->setText(device.isEmpty() ? QString() : QStringLiteral("Connected: %1").arg(device));
-    sharedRecentLabel_->setVisible(!device.isEmpty());
-    sharedRecentScroll_->setVisible(!device.isEmpty());
+    connected_->setVisible(!device.isEmpty());
 }
 
 void HomeScreen::setPairCode(const QString& code) {
@@ -184,25 +133,6 @@ void HomeScreen::setSharing(bool sharing) {
     serverButton_->setChecked(sharing);
     serverButton_->setText(sharing ? QStringLiteral("Stop sharing") : QStringLiteral("Start sharing"));
     pairButton_->setEnabled(sharing);
-}
-
-void HomeScreen::refreshRecents() {
-    clearLayout(recentGrid_);
-    int col = 0;
-    for (const RecentEntry& e : Recents::local()) {
-        QPixmap thumb;
-        if (e.id.endsWith(QStringLiteral(".xnote"), Qt::CaseInsensitive)) thumb = NoteThumb::render(e.id, 140);
-        auto* tile = new TileButton(thumb, QStringLiteral("file"), e.name, Recents::ago(e.opened), e.id, this);
-        connect(tile, &TileButton::opened, this, [this](const QString& id) { emit openLocal(id); });
-        recentGrid_->addWidget(tile, 0, col++);
-    }
-    clearLayout(sharedRecentGrid_);
-    col = 0;
-    for (const RecentEntry& e : Recents::shared()) {
-        auto* tile = new TileButton(QPixmap(), QStringLiteral("share"), e.name, Recents::ago(e.opened), e.id, this);
-        connect(tile, &TileButton::opened, this, [this](const QString& id) { emit openShared(id); });
-        sharedRecentGrid_->addWidget(tile, 0, col++);
-    }
 }
 
 }  // namespace xn

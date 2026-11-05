@@ -142,14 +142,17 @@ MainWindow::MainWindow() {
     grid->addWidget(canvas_, 0, 0);
     grid->addWidget(vbar_, 0, 1);
     grid->addWidget(hbar_, 1, 0);
-    // Sidebar navigation: Home, Browse, Shared files. The canvas is page 0.
-    auto* nav = new QToolBar(tr("Navigate"), this);
+    // Sidebar navigation: Home, Browse, Shared. The canvas is page 0.
+    // The sidebar only lives on the browser pages; the editor is chromeless
+    // apart from its own toolbar (Back returns home).
+    navBar_ = new QToolBar(tr("Navigate"), this);
+    auto* nav = navBar_;
     nav->setOrientation(Qt::Vertical);
     nav->setMovable(false);
     nav->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
     navHome_ = nav->addAction(xnIcon(QStringLiteral("home")), QStringLiteral("Home"));
     navBrowse_ = nav->addAction(xnIcon(QStringLiteral("folder")), QStringLiteral("Browse"));
-    navShared_ = nav->addAction(xnIcon(QStringLiteral("share")), QStringLiteral("Shared files"));
+    navShared_ = nav->addAction(xnIcon(QStringLiteral("share")), QStringLiteral("Shared"));
     for (QAction* a : {navHome_, navBrowse_, navShared_}) a->setCheckable(true);
     connect(navHome_, &QAction::triggered, this, [this] { showHome(); });
     connect(navBrowse_, &QAction::triggered, this, [this] { showPage(2); });
@@ -882,13 +885,13 @@ void MainWindow::install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, 
 void MainWindow::showPage(int index) {
     stack_->setCurrentWidget(stack_->widget(index));
     const bool onCanvas = index == 0;
+    if (navBar_) navBar_->setVisible(!onCanvas);
     for (QToolBar* bar : std::as_const(editorBars_)) bar->setVisible(onCanvas);
     pagesDock_->setVisible(onCanvas && pagesAction_->isChecked() && !(note_ && xn_note_is_canvas(note_)));
     navHome_->setChecked(index == 1);
     navBrowse_->setChecked(index == 2);
     navShared_->setChecked(index == 3);
     if (index == 1) {
-        home_->refreshRecents();
         refreshHome();
     } else if (index == 2) {
         browse_->refresh();
@@ -901,10 +904,6 @@ void MainWindow::showPage(int index) {
 
 void MainWindow::setupCompanion() {
     companion_ = new xn::CompanionServer(this);
-    connect(home_, &xn::HomeScreen::newNote, this, [this] { if (confirmDiscard()) newNote(); });
-    connect(home_, &xn::HomeScreen::openFile, this, [this] { chooseOpen(); });
-    connect(home_, &xn::HomeScreen::openLocal, this, [this](const QString& path) { open(path); });
-    connect(home_, &xn::HomeScreen::openShared, this, [this](const QString& id) { openSharedFile(id); });
     connect(browse_, &xn::BrowsePage::newNote, this, [this] { if (confirmDiscard()) newNote(); });
     connect(browse_, &xn::BrowsePage::openLocal, this, [this](const QString& path) { open(path); });
     connect(shared_, &xn::SharedPage::openShared, this, [this](const QString& id) { openSharedFile(id); });

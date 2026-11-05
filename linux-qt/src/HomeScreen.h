@@ -1,4 +1,4 @@
-// The companion home: the server connection on top, recently opened notes below.
+// The companion home: the server connection, paired devices, this device.
 #pragma once
 
 #include <QLabel>
@@ -6,13 +6,9 @@
 #include <QPushButton>
 #include <QWidget>
 
-class QGridLayout;
 class QListWidget;
-class QScrollArea;
 
 namespace xn {
-
-struct RecentTile;
 
 class HomeScreen : public QWidget {
     Q_OBJECT
@@ -20,10 +16,6 @@ public:
     explicit HomeScreen(QWidget* parent = nullptr);
 
 signals:
-    void newNote();
-    void openFile();
-    void openLocal(const QString& path);
-    void openShared(const QString& id);
     void serverToggled(bool on);
     void pairBegin();
     void unpair(const QString& name);
@@ -41,8 +33,6 @@ public slots:
     void setSharing(bool sharing);
     /* This companion's own nickname, shown to the host in requests. */
     void setSelfName(const QString& name);
-    /* Rebuild the recents grid from stored recents. */
-    void refreshRecents();
 
 private:
     QLabel* status_ = nullptr;
@@ -54,10 +44,6 @@ private:
     QPushButton* forgetButton_ = nullptr;
     QPushButton* renameButton_ = nullptr;
     QLabel* selfName_ = nullptr;
-    QGridLayout* recentGrid_ = nullptr;
-    QLabel* sharedRecentLabel_ = nullptr;
-    QScrollArea* sharedRecentScroll_ = nullptr;
-    QGridLayout* sharedRecentGrid_ = nullptr;
 };
 
 }  // namespace xn

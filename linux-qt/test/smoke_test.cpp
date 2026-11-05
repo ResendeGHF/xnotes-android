@@ -761,18 +761,18 @@ private slots:
         QVERIFY(!server->certFingerprint().isEmpty());
         const QString code = server->pairBegin();
         QCOMPARE(code.size(), 6);
-        // Sidebar navigation: Home, Browse, Shared files.
+        // Sidebar navigation: Home, Browse, Shared.
         auto navAction = [&](const QString& text) {
             for (QAction* a : window.findChildren<QAction*>())
                 if (a->text() == text) return a;
             return static_cast<QAction*>(nullptr);
         };
         QVERIFY(navAction(QStringLiteral("Browse")) != nullptr);
-        QVERIFY(navAction(QStringLiteral("Shared files")) != nullptr);
+        QVERIFY(navAction(QStringLiteral("Shared")) != nullptr);
         navAction(QStringLiteral("Browse"))->trigger();
         QTest::qWait(100);
         QCOMPARE(home->currentIndex(), 2);
-        navAction(QStringLiteral("Shared files"))->trigger();
+        navAction(QStringLiteral("Shared"))->trigger();
         QTest::qWait(100);
         QCOMPARE(home->currentIndex(), 3);
         navAction(QStringLiteral("Home"))->trigger();
