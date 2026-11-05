@@ -800,8 +800,6 @@ fun PreferencesPane(
             BackupSection(editor)
             HorizontalDivider(color = palette.border.toComposeColor())
             Box(Modifier.searchAnchor(stringResource(R.string.search_keywords_port))) { PortSection(editor) }
-            HorizontalDivider(color = palette.border.toComposeColor())
-            ShareSection()
             Spacer(Modifier.size(8.dp))
         }
         }
@@ -1144,38 +1142,6 @@ private fun PortSection(editor: Editor) {
             }
         }
         status?.let { Text(it, color = palette.textDim.toComposeColor(), fontSize = 12.sp) }
-    }
-}
-
-/**
- * LAN sharing switch plus the pairing material the desktop needs. The
- * certificate and token live in the app's private dir and are generated on
- * first enable (RSA keygen, off the main thread); the fingerprint shown here
- * is what the desktop checks on first connect (trust-on-first-use).
- */
-@Composable
-private fun ShareSection() {
-    val palette = LocalPalette.current
-    val status by com.xnotes.share.companion.CompanionService.status.collectAsState()
-    val companionOn by com.xnotes.share.companion.CompanionService.companionOn.collectAsState()
-    val sharing = companionOn
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SectionTitle(stringResource(R.string.pref_sharing))
-        Text(stringResource(R.string.pref_share_help), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
-        Text(
-            if (!sharing) stringResource(R.string.share_off_hint)
-            else status.text.ifEmpty { stringResource(R.string.share_starting) },
-            color = palette.textDim.toComposeColor(),
-            fontSize = 12.sp,
-        )
-        status.paired?.let { paired ->
-            Text(paired, color = palette.text.toComposeColor(), fontSize = 13.sp)
-        }
-        Text(
-            "Turn Companion on and pair from the Companion screen.",
-            color = palette.textDim.toComposeColor(),
-            fontSize = 12.sp,
-        )
     }
 }
 

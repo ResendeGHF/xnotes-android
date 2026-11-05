@@ -858,12 +858,9 @@ class CompanionService : Service() {
 
     private fun startingNotification(): Notification {
         ensureChannel(this)
-        val compOn = try { isCompanionOn(this) } catch (_: Exception) { true }
-        val title = if (compOn) getString(R.string.share_notif_title)
-        else getString(R.string.share_channel)
         return NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification_share)
-            .setContentTitle(title)
+            .setContentTitle(getString(R.string.share_notif_title))
             .setContentText(getString(R.string.share_starting))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
