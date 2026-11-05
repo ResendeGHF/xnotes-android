@@ -195,6 +195,7 @@ sealed interface SyncMsg {
         val color: String,
         val samples: List<WireSample>,
         val done: Boolean,
+        val style: WireStrokeStyle? = null,
     ) : SyncMsg
 
     /**

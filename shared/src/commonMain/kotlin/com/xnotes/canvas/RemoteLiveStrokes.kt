@@ -21,6 +21,8 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
         val width: Double,
         val color: Rgba,
         val points: ArrayList<Pt> = ArrayList(),
+        val pressures: ArrayList<Double> = ArrayList(),
+        val style: com.xnotes.sync.WireStrokeStyle? = null,
     )
 
     /** The open file's sync id; runs for other files never draw. */
@@ -38,16 +40,20 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
         color: String,
         samples: List<WireSample>,
         done: Boolean,
+        style: com.xnotes.sync.WireStrokeStyle? = null,
     ) {
         if (done) {
             runs.remove(strokeId)
             return
         }
         val run = runs.getOrPut(strokeId) {
-            Run(file, page, tool, width, parseColor(color) ?: Rgba(20, 20, 20, 255))
+            Run(file, page, tool, width, parseColor(color) ?: Rgba(20, 20, 20, 255), style = style)
         }
         if (run.file != file || run.page != page) return
-        for (s in samples) run.points += Pt(s.x, s.y)
+        for (s in samples) {
+            run.points += Pt(s.x, s.y)
+            run.pressures += s.p
+        }
     }
 
     /** Drop the run (its model landed). */
@@ -67,13 +73,46 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
         for ((_, run) in runs) {
             if (run.file != showing || run.points.size < 2) continue
             val pr = state.pageRects.getOrNull(run.page) ?: continue
-            // NOTE: the caller (drawOverlay) already translated to content space
-            // (origin + zoom); page coords only need the page offset + transform.
+            // Render through the real Stroke painter so pencil grain, taper,
+            // highlighter and dashed rhythm match the commit exactly.
+            val stroke = runToStroke(run) ?: continue
             r.withSave {
                 r.translate(pr.left, pr.top)
                 state.applyPageTransform(r, state.document.pages[run.page])
-                r.strokePolyline(run.points, Pen(run.color, run.width, cosmetic = false))
+                stroke.paint(r)
             }
+        }
+    }
+
+    private fun runToStroke(run: Run): com.xnotes.core.model.Stroke? {
+        return try {
+            val tool = com.xnotes.core.tools.Tool.fromId(run.tool) ?: com.xnotes.core.tools.Tool.PEN
+            val base = com.xnotes.core.tools.ToolDefaults.configFor(tool)
+                .copy(baseWidth = run.width, rgba = run.color)
+            val st = run.style
+            val cfg = if (st == null) base else base.copy(
+                pressureMinFactor = st.pmin ?: base.pressureMinFactor,
+                directionStrength = st.dir ?: base.directionStrength,
+                speedStrength = st.speed ?: base.speedStrength,
+                taperEnabled = st.taper ?: base.taperEnabled,
+                taperMinFactor = st.taperMin ?: base.taperMinFactor,
+                neon = st.neon ?: base.neon,
+                neonStrength = st.neonS ?: base.neonStrength,
+                dashLength = st.dashL ?: base.dashLength,
+                dashGap = st.dashG ?: base.dashGap,
+                highlighterAlpha = st.hlAlpha ?: base.highlighterAlpha,
+                highlighterInverse = st.hlInv ?: base.highlighterInverse,
+            )
+            val n = run.points.size
+            val xs = DoubleArray(n) { run.points[it].x }
+            val ys = DoubleArray(n) { run.points[it].y }
+            val ps = DoubleArray(n) { run.pressures.getOrElse(it) { 1.0 } }
+            val ts = DoubleArray(n) { 0.0 }
+            val s = com.xnotes.core.model.Stroke(tool, cfg, emptyList(), 1.0, false, 1.0)
+            s.setSamples(xs, ys, ps, ts, n)
+            s
+        } catch (_: Exception) {
+            null
         }
     }
 

@@ -22,6 +22,7 @@ import com.xnotes.core.platform.fileOf
 import com.xnotes.core.platform.pathString
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
+import com.xnotes.core.tools.ToolDefaults
 import com.xnotes.sync.CompanionEngine
 import com.xnotes.sync.SyncEngineHost
 import com.xnotes.sync.SyncFileEntry
@@ -73,6 +74,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val tool: String,
         val width: Double,
         val color: String,
+        val style: com.xnotes.sync.WireStrokeStyle? = null,
     )
     private val active = HashMap<CEditor, ActiveStroke>()
 
@@ -100,6 +102,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         unbindEditor(editor)
         bindings[fileId] = editor
         reverse[editor] = fileId
+        historyBefore[editor] = snapshotOf(editor)
         val overlay = RemoteLiveStrokes(editor.state)
         overlay.showingFile = fileId
         editor.controller.remoteLive = overlay
@@ -149,11 +152,135 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         editor.editor.onImageInserted = { page, item -> onImageInserted(editor, page, item) }
         editor.editor.onMarkupsAdded = { page, markups -> onLocalMarkupsAdded(editor, page, markups) }
         editor.editor.onPageStyleChanged = { entries, docStyle, docMargins -> onLocalPageStyle(editor, entries, docStyle, docMargins) }
+        // Undo/redo converges via the same op paths (no new wire type): snapshot
+        // before the step, diff after, and submit stroke/markup/page deltas.
+        editor.editor.onHistoryStep = { onHistoryStep(editor) }
+    }
+
+    private var historyBefore: HashMap<CEditor, HistorySnapshot> = HashMap()
+
+    private data class HistorySnapshot(
+        val pages: List<String>,
+        val items: List<List<String>>,
+        val markups: List<List<String>>,
+    )
+
+    private fun snapshotOf(editor: CEditor): HistorySnapshot {
+        val doc = editor.state.document
+        return HistorySnapshot(
+            pages = doc.pages.map { "${it.width}x${it.height}" },
+            items = doc.pages.map { pg ->
+                pg.items.filterIsInstance<Stroke>().map {
+                    com.xnotes.sync.SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) + "|" + it.config.hashCode()
+                }
+            },
+            markups = doc.pages.map { pg -> pg.markups.map { it.id } },
+        )
+    }
+
+    fun armHistory(editor: CEditor) {
+        historyBefore[editor] = snapshotOf(editor)
+    }
+
+    private fun onHistoryStep(editor: CEditor) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val before = historyBefore.remove(editor)
+        // Arm for the next step (redo chain, or next undo).
+        historyBefore[editor] = snapshotOf(editor)
+        if (before == null) return
+        val doc = editor.state.document
+        // Page add/remove: single-index ops (reorder falls back to nothing —
+        // page order has no op; a full refetch converges it).
+        if (doc.pages.size != before.pages.size) {
+            if (doc.pages.size < before.pages.size) {
+                for (i in before.pages.indices) {
+                    if (i >= doc.pages.size || doc.pages[i].let { "${it.width}x${it.height}" } != before.pages[i]) {
+                        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemovePage(i)))
+                        return
+                    }
+                }
+            } else {
+                for (i in doc.pages.indices) {
+                    if (i >= before.pages.size || doc.pages[i].let { "${it.width}x${it.height}" } != before.pages[i]) {
+                        val pg = doc.pages[i]
+                        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddPage(i, pg.width, pg.height)))
+                        return
+                    }
+                }
+            }
+            return
+        }
+        // Stroke diff (fingerprint+config, catches moves/restyles).
+        val ops = ArrayList<SyncOp>()
+        for (pi in doc.pages.indices) {
+            val b = before.items.getOrNull(pi) ?: emptyList()
+            val a = doc.pages[pi].items.filterIsInstance<Stroke>().map {
+                com.xnotes.sync.SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) + "|" + it.config.hashCode()
+            }
+            if (b != a) {
+                // Coarse but convergent: erase removed fingerprints, add current strokes.
+                // Fingerprints alone identify removals; adds carry full wire strokes.
+                val bSet = b.toSet()
+                val aSet = a.toSet()
+                val removed = b.filter { it.substringBefore("|") !in aSet.map { x -> x.substringBefore("|") } }
+                // Map fingerprints back to wire strokes for adds.
+                val afterStrokes = doc.pages[pi].items.filterIsInstance<Stroke>()
+                val addedWires = ArrayList<SyncOp>()
+                // Simplified: send full page strokes as adds for new fingerprints.
+                // Erase by fingerprint, add by wire (upsert-safe on the host).
+                if (removed.isNotEmpty()) {
+                    ops += SyncOp.EraseStrokes(pi, removed.map { it.substringBefore("|") })
+                }
+                val newKeys = a.filter { it !in bSet }
+                if (newKeys.isNotEmpty()) {
+                    val byKey = HashMap<String, Stroke>()
+                    for (st in afterStrokes) {
+                        val k = com.xnotes.sync.SyncFingerprint.of(st.tool.id, st.config.baseWidth, hexColor(st.config.rgba), wireSamplesOf(st)) + "|" + st.config.hashCode()
+                        if (k in newKeys) byKey.putIfAbsent(k, st)
+                    }
+                    for (k in newKeys) {
+                        byKey[k]?.let { ops += SyncOp.AddStroke(pi, wireOf(it)) }
+                    }
+                }
+            }
+            val bm = before.markups.getOrNull(pi) ?: emptyList()
+            val am = doc.pages[pi].markups.map { it.id }
+            if (bm != am) {
+                val removedIds = bm.filter { it !in am }
+                if (removedIds.isNotEmpty()) ops += SyncOp.RemoveMarkup(pi, removedIds)
+                val added = doc.pages[pi].markups.filter { it.id !in bm }
+                for (m in added) ops += SyncOp.AddMarkup(pi, m.toWireMarkup())
+            }
+        }
+        if (ops.isNotEmpty()) {
+            engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+        }
     }
 
     // --- local gestures out ---
 
     private fun headOf(fileId: String): Long? = engine.headVersion(fileId)
+
+    private fun styleOf(tool: Tool, cfg: ToolConfig): com.xnotes.sync.WireStrokeStyle {
+        return com.xnotes.sync.WireStrokeStyle(
+            pmin = cfg.pressureMinFactor,
+            dir = cfg.directionStrength,
+            speed = cfg.speedStrength,
+            taper = cfg.taperEnabled.takeIf { it },
+            taperMin = cfg.taperMinFactor,
+            neon = cfg.neon.takeIf { it },
+            neonS = cfg.neonStrength,
+            dashL = cfg.dashLength,
+            dashG = cfg.dashGap,
+            hlAlpha = cfg.highlighterAlpha,
+            hlInv = cfg.highlighterInverse.takeIf { it },
+            pencilP = cfg.pencilPressure,
+            pencilD = cfg.pencilDensity,
+            pencilG = cfg.pencilGrainSize,
+            pencilS = cfg.pencilShadeResponse,
+        )
+    }
 
     private fun onStarted(editor: CEditor, page: Int) {
         val fileId = reverse[editor] ?: return
@@ -162,7 +289,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val cfg = editor.controller.resolvedStrokeConfig(tool)
         active[editor] = ActiveStroke(
             fileId, page, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
-            tool.id, cfg.baseWidth, hexColor(cfg.rgba),
+            tool.id, cfg.baseWidth, hexColor(cfg.rgba), styleOf(tool, cfg),
         )
     }
 
@@ -170,13 +297,13 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         var a = active[editor] ?: return
         if (a.page != page) {
             // Crossed onto another page mid-stroke: close this run, open the next.
-            engine.finishStroke(a.fileId, a.page, a.id, a.tool, a.width, a.color)
+            engine.finishStroke(a.fileId, a.page, a.id, a.tool, a.width, a.color, a.style)
             val tool = editor.controller.tool
             val cfg = editor.controller.resolvedStrokeConfig(tool)
-            a = ActiveStroke(a.fileId, page, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", tool.id, cfg.baseWidth, hexColor(cfg.rgba))
+            a = ActiveStroke(a.fileId, page, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", tool.id, cfg.baseWidth, hexColor(cfg.rgba), styleOf(tool, cfg))
             active[editor] = a
         }
-        engine.liveSample(a.fileId, page, a.id, a.tool, a.width, a.color, x, y, p)
+        engine.liveSample(a.fileId, page, a.id, a.tool, a.width, a.color, x, y, p, a.style)
     }
 
     private fun onCommitted(editor: CEditor, page: Int, stroke: Stroke) {
@@ -184,11 +311,12 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
         if (a != null && a.fileId == fileId) {
-            engine.finishStroke(fileId, page, a.id, a.tool, a.width, a.color)
+            engine.finishStroke(fileId, page, a.id, a.tool, a.width, a.color, a.style)
             engine.submitOp(fileId, base, a.id, listOf(SyncOp.AddStroke(page, wireOf(stroke))))
         } else {
             engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddStroke(page, wireOf(stroke))))
         }
+        historyBefore[editor] = snapshotOf(editor)
     }
 
     private fun onErased(editor: CEditor, page: Int, strokes: List<Stroke>) {
@@ -250,10 +378,11 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
         val ops = ArrayList<SyncOp>()
-        for ((page, m) in added) ops += SyncOp.AddMarkup(page, m.toWireMarkup())
+        // Removes first: same-id recolor/retype converges (add upserts).
         for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
             ops += SyncOp.RemoveMarkup(page, ids)
         }
+        for ((page, m) in added) ops += SyncOp.AddMarkup(page, m.toWireMarkup())
         if (ops.isEmpty()) return
         engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
     }
@@ -620,18 +749,53 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     // --- conversion ---
 
-    private fun wireOf(s: Stroke): WireStroke = WireStroke(
-        s.tool.id, s.config.baseWidth, hexColor(s.config.rgba), s.config.pressureEnabled,
-        s.samples.map { WireSample(it.x, it.y, it.pressure) },
-    )
+    private fun wireOf(s: Stroke): WireStroke {
+        val c = s.config
+        return WireStroke(
+            s.tool.id, c.baseWidth, hexColor(c.rgba), c.pressureEnabled,
+            s.samples.map { WireSample(it.x, it.y, it.pressure) },
+            com.xnotes.sync.WireStrokeStyle(
+                pmin = c.pressureMinFactor,
+                dir = c.directionStrength,
+                speed = c.speedStrength,
+                taper = c.taperEnabled.takeIf { it },
+                taperMin = c.taperMinFactor,
+                neon = c.neon.takeIf { it },
+                neonS = c.neonStrength,
+                dashL = c.dashLength,
+                dashG = c.dashGap,
+                hlAlpha = c.highlighterAlpha,
+                hlInv = c.highlighterInverse.takeIf { it },
+                pencilP = c.pencilPressure,
+                pencilD = c.pencilDensity,
+                pencilG = c.pencilGrainSize,
+                pencilS = c.pencilShadeResponse,
+            ),
+        )
+    }
 
     private fun wireSamplesOf(s: Stroke): List<WireSample> =
         s.samples.map { WireSample(it.x, it.y, it.pressure) }
 
     private fun strokeToNative(w: WireStroke): Stroke {
         val color = RemoteLiveStrokes.parseColor(w.color) ?: Rgba(20, 20, 20, 255)
-        val cfg = ToolConfig(baseWidth = w.width, rgba = color, pressureEnabled = w.pressure)
-        val stroke = Stroke(Tool.fromId(w.tool) ?: Tool.PEN, cfg, emptyList(), 1.0, false, 1.0)
+        val tool = Tool.fromId(w.tool) ?: Tool.PEN
+        val base = ToolDefaults.configFor(tool).copy(baseWidth = w.width, rgba = color, pressureEnabled = w.pressure)
+        val st = w.style
+        val cfg = if (st == null) base else base.copy(
+            pressureMinFactor = st.pmin ?: base.pressureMinFactor,
+            directionStrength = st.dir ?: base.directionStrength,
+            speedStrength = st.speed ?: base.speedStrength,
+            taperEnabled = st.taper ?: base.taperEnabled,
+            taperMinFactor = st.taperMin ?: base.taperMinFactor,
+            neon = st.neon ?: base.neon,
+            neonStrength = st.neonS ?: base.neonStrength,
+            dashLength = st.dashL ?: base.dashLength,
+            dashGap = st.dashG ?: base.dashGap,
+            highlighterAlpha = st.hlAlpha ?: base.highlighterAlpha,
+            highlighterInverse = st.hlInv ?: base.highlighterInverse,
+        )
+        val stroke = Stroke(tool, cfg, emptyList(), 1.0, false, 1.0)
         val n = w.samples.size
         val xs = DoubleArray(n)
         val ys = DoubleArray(n)

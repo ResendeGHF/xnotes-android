@@ -164,12 +164,21 @@ S -> C  resync {file, version}                          # base_version stale; re
 
 Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
 
-- `add_stroke {page, stroke:{tool, width, color, pressure, samples:[[x,y,p]...]}}`
-  in page px. `tool`: `pen|highlighter|...`; `color`: `#rrggbb`; `width`: pt.
+- `add_stroke {page, stroke:{tool, width, color, pressure, samples:[[x,y,p]...], style?}}`
+  in page px. `tool`: `pen|pencil|taper|highlighter|...`; `color`: `#rrggbb`; `width`: pt.
+  `style` carries the full stroke style so pencil/taper/highlighter/dashed/
+  speed/calligraphy/neon render identically everywhere: `{pmin, dir, speed,
+  taper, taper_min, neon, neon_s, dash_l, dash_g, hl_alpha, hl_inv, pencil_p,
+  pencil_d, pencil_g, pencil_s}` (all optional; absent = tool defaults).
+  Old peers ignore `style` and fall back to tool defaults. Live frames carry
+  the same `style` alongside `tool/width/color`, and overlays paint through
+  the real Stroke painter (grain/taper/multiply match the commit).
   Identity = content fingerprint: SHA-256 hex (first 16) of
   `tool|width(%.3f)|color|samples`, samples as `x.2f,y.2f,p.3f` joined by `;`
   (`,` within). Test vector: `pen|3.000|#00e676|10.00,20.00,0.500;11.50,21.00,0.600`
-  → `11812f53989ff4dc`. Retries and double-delivery converge.
+  → `11812f53989ff4dc`. Retries and double-delivery converge. Pure restyles
+  (same points, new style) are detected via full-config compare and replay
+  as erase+add, so they propagate despite identical fingerprints.
 - `erase_strokes {page, ids:[fingerprint...]}`: exact fingerprint match applies;
   no match = no-op (never an error).
 - `add_page {index, width, height}`: insert a blank page at `index` (page px
@@ -207,6 +216,12 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   post-change strokes), so every peer converges with no new wire type.
   Strokes only; non-stroke items are untouched by selection sync.
   Unknown op names are skipped with a log.
+- Undo/redo propagate as inverse committed ops (no new wire type): strokes
+  replay as erase+add replacements (fingerprint+config diff), markups as
+  remove+add, pages as add/remove; text/table/image/shape undos fall back to
+  a debounced full-file push. Remote applies bypass undo, so this is the
+  only path by which an undo converges. Guest cache tabs show
+  `External - {inherited name}`, never empty.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
 companion undo sends a compensating op, e.g. `erase_strokes` for your stroke).

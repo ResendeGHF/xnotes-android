@@ -262,17 +262,18 @@ class CompanionEngine(
         x: Double,
         y: Double,
         p: Double,
+        style: WireStrokeStyle? = null,
     ) {
         send(
             SyncMsg.Live(
                 nextSeq(), fileId, page, strokeId, tool, width, color,
-                listOf(WireSample(x, y, p)), done = false,
+                listOf(WireSample(x, y, p)), done = false, style = style,
             ),
         )
     }
 
-    fun finishStroke(fileId: String, page: Int, strokeId: String, tool: String, width: Double, color: String) {
-        send(SyncMsg.Live(nextSeq(), fileId, page, strokeId, tool, width, color, emptyList(), done = true))
+    fun finishStroke(fileId: String, page: Int, strokeId: String, tool: String, width: Double, color: String, style: WireStrokeStyle? = null) {
+        send(SyncMsg.Live(nextSeq(), fileId, page, strokeId, tool, width, color, emptyList(), done = true, style = style))
     }
 
     // --- room drags (live preview + committed edit, mirroring strokes) ---
@@ -714,7 +715,7 @@ class CompanionEngine(
 
     private fun onLive(m: SyncMsg.Live) {
         if (m.samples.isEmpty() && !m.done) return
-        liveOverlay?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done)
+        liveOverlay?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done, m.style)
         host.onLiveDirty()
     }    private fun onRoomLive(m: SyncMsg.RoomLive) {
         if (m.done) {

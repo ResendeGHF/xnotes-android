@@ -21,6 +21,25 @@ data class SyncFileEntry(
 /** One stroke sample in page px. */
 data class WireSample(val x: Double, val y: Double, val p: Double)
 
+/** Full stroke style (pencil/taper/highlighter/dashed/speed/calligraphy/neon). All nullable for backward compat. */
+data class WireStrokeStyle(
+    val pmin: Double? = null,
+    val dir: Double? = null,
+    val speed: Double? = null,
+    val taper: Boolean? = null,
+    val taperMin: Double? = null,
+    val neon: Boolean? = null,
+    val neonS: Double? = null,
+    val dashL: Double? = null,
+    val dashG: Double? = null,
+    val hlAlpha: Double? = null,
+    val hlInv: Boolean? = null,
+    val pencilP: Double? = null,
+    val pencilD: Double? = null,
+    val pencilG: Double? = null,
+    val pencilS: Double? = null,
+)
+
 /** A stroke as it crosses the wire. */
 data class WireStroke(
     val tool: String,
@@ -28,6 +47,7 @@ data class WireStroke(
     val color: String,
     val pressure: Boolean,
     val samples: List<WireSample>,
+    val style: WireStrokeStyle? = null,
 )
 
 /**
@@ -147,6 +167,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
     var width = 0.0
     var color = ""
     var samples: List<WireSample>? = null
+    var style: WireStrokeStyle? = null
     var done = false
     var sideways = false
     var split = 0.0
@@ -192,6 +213,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "color" -> color = stringOr(p, "")
             "pressure" -> Unit // parsed inside stroke objects; ignored at top level
             "samples" -> samples = sampleListOr(p)
+            "style" -> style = styleOr(p)
             "done" -> done = boolOr(p, false)
             "sideways" -> sideways = boolOr(p, false)
             "split" -> split = doubleOr(p, 0.0)
@@ -223,7 +245,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "op" -> SyncMsg.Op(seq, id, baseVersion, version, dedupe, ops ?: emptyList())
         "op_ack" -> SyncMsg.OpAck(seq, replyTo, id, version)
         "resync" -> SyncMsg.Resync(seq, id, version)
-        "live" -> SyncMsg.Live(seq, id, page, strokeId, tool, width, color, samples ?: emptyList(), done)
+        "live" -> SyncMsg.Live(seq, id, page, strokeId, tool, width, color, samples ?: emptyList(), done, style)
         "room_live" -> SyncMsg.RoomLive(seq, id, page, sideways, split, resume, shift, liveId, done)
         "presence" -> SyncMsg.Presence(seq, id, page)
         "heartbeat" -> SyncMsg.Heartbeat(seq)
@@ -387,6 +409,7 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             }
             w.endArray()
             w.name("done").value(msg.done)
+            msg.style?.let { writeStrokeStyle(w, it) }
             w.endObject()
         }
         is SyncMsg.RoomLive -> {
@@ -502,6 +525,7 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
                 w.endArray()
             }
             w.endArray()
+            op.stroke.style?.let { writeStrokeStyle(w, it) }
             w.endObject()
             w.endObject()
         }
@@ -641,6 +665,73 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.endObject()
         }
     }
+}
+
+/** Wire `style` object for strokes/live (pencil/taper/highlighter/dashed/speed/calligraphy/neon). Nulls omitted; old peers skip it. */
+private fun writeStrokeStyle(w: JsonWrite, s: WireStrokeStyle) {
+    w.name("style").beginObject()
+    s.pmin?.let { w.name("pmin").value(it) }
+    s.dir?.let { w.name("dir").value(it) }
+    s.speed?.let { w.name("speed").value(it) }
+    s.taper?.let { w.name("taper").value(it) }
+    s.taperMin?.let { w.name("taper_min").value(it) }
+    s.neon?.let { w.name("neon").value(it) }
+    s.neonS?.let { w.name("neon_s").value(it) }
+    s.dashL?.let { w.name("dash_l").value(it) }
+    s.dashG?.let { w.name("dash_g").value(it) }
+    s.hlAlpha?.let { w.name("hl_alpha").value(it) }
+    s.hlInv?.let { w.name("hl_inv").value(it) }
+    s.pencilP?.let { w.name("pencil_p").value(it) }
+    s.pencilD?.let { w.name("pencil_d").value(it) }
+    s.pencilG?.let { w.name("pencil_g").value(it) }
+    s.pencilS?.let { w.name("pencil_s").value(it) }
+    w.endObject()
+}
+
+private fun styleOr(p: JsonPull): WireStrokeStyle? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var pmin: Double? = null
+    var dir: Double? = null
+    var speed: Double? = null
+    var taper: Boolean? = null
+    var taperMin: Double? = null
+    var neon: Boolean? = null
+    var neonS: Double? = null
+    var dashL: Double? = null
+    var dashG: Double? = null
+    var hlAlpha: Double? = null
+    var hlInv: Boolean? = null
+    var pencilP: Double? = null
+    var pencilD: Double? = null
+    var pencilG: Double? = null
+    var pencilS: Double? = null
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "pmin" -> pmin = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "dir" -> dir = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "speed" -> speed = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "taper" -> taper = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else { p.skipValue(); null }
+            "taper_min" -> taperMin = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "neon" -> neon = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else { p.skipValue(); null }
+            "neon_s" -> neonS = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "dash_l" -> dashL = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "dash_g" -> dashG = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "hl_alpha" -> hlAlpha = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "hl_inv" -> hlInv = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else { p.skipValue(); null }
+            "pencil_p" -> pencilP = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "pencil_d" -> pencilD = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "pencil_g" -> pencilG = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "pencil_s" -> pencilS = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    val out = WireStrokeStyle(pmin, dir, speed, taper, taperMin, neon, neonS, dashL, dashG, hlAlpha, hlInv, pencilP, pencilD, pencilG, pencilS)
+    return out.takeIf { it != WireStrokeStyle() }
 }
 
 private fun fileListOr(p: JsonPull): List<SyncFileEntry>? {
@@ -991,6 +1082,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var color = ""
         var pressure = false
         var samples: List<WireSample>? = null
+        var strokeStyle: WireStrokeStyle? = null
         var ids: List<String>? = null
         var index = 0
         var sideways = false
@@ -1045,6 +1137,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                             "color" -> color = stringOr(p, "")
                             "pressure" -> pressure = boolOr(p, false)
                             "samples" -> samples = sampleListOr(p)
+                            "style" -> strokeStyle = styleOr(p)
                             else -> p.skipValue()
                         }
                     }
@@ -1065,7 +1158,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         }
         p.endObject()
         out += when (name) {
-            "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList()))
+            "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList(), strokeStyle))
             "erase_strokes" -> SyncOp.EraseStrokes(page, ids ?: emptyList())
             "add_markup" -> markup?.let { SyncOp.AddMarkup(page, it) } ?: SyncOp.Unknown("add_markup")
             "remove_markup" -> SyncOp.RemoveMarkup(page, ids ?: emptyList())
@@ -1203,7 +1296,7 @@ fun WireMarkup.toTextMarkup(): TextMarkup? {
     return TextMarkup(
         id, type, color, intensity,
         quads.map { TextQuad(it.l.toFloat(), it.t.toFloat(), it.r.toFloat(), it.b.toFloat(), it.q) },
-        text, note, created, modified,
+        text, note, created, modified, link,
     )
 }
 

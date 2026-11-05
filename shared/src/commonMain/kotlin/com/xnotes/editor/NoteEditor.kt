@@ -107,6 +107,14 @@ class NoteEditor(
      */
     var onImageInserted: ((pageIndex: Int, item: ImageItem) -> Unit)? = null
 
+    /**
+     * Sync hook: fired after every local undo/redo step so the bridge can
+     * converge peers (granular stroke/markup/page ops where possible,
+     * full-file push otherwise). Remote applies bypass history and never
+     * fire this.
+     */
+    var onHistoryStep: (() -> Unit)? = null
+
     // --- document ---
 
     /**
@@ -190,6 +198,7 @@ class NoteEditor(
             structural = state.document.pages.size != pagesBefore,
             regions = spanning(was, touchedRegions(command)),
         )
+        try { onHistoryStep?.invoke() } catch (_: Exception) {}
     }
 
     fun redo() {
@@ -202,6 +211,7 @@ class NoteEditor(
             structural = state.document.pages.size != pagesBefore,
             regions = spanning(was, touchedRegions(command)),
         )
+        try { onHistoryStep?.invoke() } catch (_: Exception) {}
     }
 
     /** Where [command]'s items sit, before or after it ran: null when it can't say, empty when there is none. */

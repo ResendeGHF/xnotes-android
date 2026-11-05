@@ -538,7 +538,7 @@ class SyncEngineTest {
             r.scale(state.zoom, state.zoom)
             overlay.draw(r)
         }
-        assertTrue("live run must paint, got ${r.ops}", r.ops.any { it == "strokePolyline" })
+        assertTrue("live run must paint, got ${r.ops} ribbons=${r.ribbonRuns}", r.ops.any { it == "strokePolyline" || it == "fillPath" || it == "strokePath" } || r.ribbonRuns.isNotEmpty() || r.pathFills.isNotEmpty())
         // The same run must flag partial damage (never a silent full frame).
         val damage = overlay.dirtyViewportRect()
         assertTrue("live run produced no damage", damage != null && damage.w > 0 && damage.h > 0)
@@ -554,7 +554,7 @@ class SyncEngineTest {
             r2.scale(state.zoom, state.zoom)
             overlay.draw(r2)
         }
-        assertTrue("run must be gone after commit, got ${r2.ops}", r2.ops.none { it == "strokePolyline" })
+        assertTrue("run must be gone after commit, got ${r2.ops}", r2.ops.none { it == "strokePolyline" || it == "fillPath" || it == "strokePath" } && r2.ribbonRuns.isEmpty())
     }
 
     @Test fun liveFrameUpdatesOverlayOld() {
@@ -576,9 +576,10 @@ class SyncEngineTest {
                 color: String,
                 samples: List<WireSample>,
                 done: Boolean,
+                style: com.xnotes.sync.WireStrokeStyle?,
             ) {
                 overlays++
-                super.update(file, page, strokeId, tool, width, color, samples, done)
+                super.update(file, page, strokeId, tool, width, color, samples, done, style)
             }
         }
         e.bytesReceived(
