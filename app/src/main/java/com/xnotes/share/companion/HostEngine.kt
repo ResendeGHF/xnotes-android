@@ -286,11 +286,29 @@ class HostEngine(
     private fun onFetch(msg: JSONObject) {
         val id = msg.optString("id")
         if (id.isEmpty()) return
-        if (!policyAllows(id)) return
+        if (!policyAllows(id)) {
+            // Silent drops leave the guest on "Fetching…" forever: say why.
+            host.onError("Fetch denied (not shared): ${displayName(id)}")
+            return
+        }
         io.execute {
-            val bytes = serveBytes(id) ?: return@execute
+            val bytes = serveBytes(id)
+            if (bytes == null) {
+                host.onError("Fetch failed (unreadable): ${displayName(id)}")
+                return@execute
+            }
             val version = headVersion(id)
             val total = bytes.size.toLong()
+            if (total == 0L) {
+                // Empty files still need one chunk or the guest waits forever.
+                send(
+                    JSONObject().put("t", "file").put("id", id).put("version", version)
+                        .put("total", 0).put("offset", 0)
+                        .put("data", "")
+                        .put("last", true),
+                )
+                return@execute
+            }
             var offset = msg.optLong("offset", 0L).coerceIn(0L, total)
             while (offset < total) {
                 val end = minOf(offset + CHUNK, total)
