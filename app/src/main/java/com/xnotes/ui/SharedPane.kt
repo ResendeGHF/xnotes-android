@@ -23,6 +23,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,13 +48,14 @@ import com.xnotes.ui.theme.toComposeColor
 fun SharedPane() {
     val palette = LocalPalette.current
     val context = LocalContext.current
-    val sharing by CompanionService.active.collectAsState()
+    val sharing by CompanionService.sharingOn.collectAsState()
     val port by CompanionService.listenPort.collectAsState()
     val peers by CompanionService.peers.collectAsState()
     val guests by CompanionService.guests.collectAsState()
     val guestIndex by CompanionService.guestIndex.collectAsState()
     val sasIn by CompanionService.sasInbound.collectAsState()
     val sasOut by CompanionService.sasOutbound.collectAsState()
+    LaunchedEffect(Unit) { CompanionService.syncFlagFlows(context) }
 
     var host by remember { mutableStateOf("") }
     var portText by remember { mutableStateOf("") }
@@ -89,7 +91,7 @@ fun SharedPane() {
             Switch(
                 checked = sharing,
                 onCheckedChange = {
-                    if (it) CompanionService.start(context) else CompanionService.stop(context)
+                    if (it) CompanionService.setSharingEnabled(context, true) else CompanionService.setSharingEnabled(context, false)
                 },
             )
         }

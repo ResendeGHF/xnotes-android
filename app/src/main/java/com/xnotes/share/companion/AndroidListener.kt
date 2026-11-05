@@ -20,9 +20,11 @@ import org.json.JSONObject
  * records its fingerprint; the application layer ([HostHandshake] / Room
  * pins) decides whether that fingerprint may proceed past pairing.
  *
- * Port: binds [basePort], bumping until free ([basePort]..[basePort]+29), so
- * two phones on one LAN (or a phone next to a Linux companion on 42317) can
- * all listen at once. The bound port is [boundPort].
+ * Port: binds [basePort], bumping until free ([basePort]..[basePort]+29).
+ * Android phones listen on a different base port than the Linux companion
+ * (42317): the two features stay separate, probes never hit the wrong side,
+ * and several phones on one LAN can all listen at once.
+ * The bound port is [boundPort].
  *
  * Pure JVM (no android.*), so it unit-tests on the host.
  */
@@ -34,7 +36,7 @@ class AndroidListener(
     var onLost: (peerFp: String) -> Unit = {},
 ) {
     companion object {
-        const val DEFAULT_PORT = 42317
+        const val DEFAULT_PORT = 42327
         const val PORT_TRIES = 30
         private const val HEARTBEAT_MS = 20_000L
         private const val SILENCE_LIMIT_MS = 60_000L

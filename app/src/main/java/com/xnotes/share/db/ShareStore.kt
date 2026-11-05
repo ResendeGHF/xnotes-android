@@ -68,6 +68,36 @@ class ShareStore private constructor(
         dao.deleteDevice(fp)
     }
 
+    /**
+     * Revoke every grant naming [rootUri] or anything beneath it, across all
+     * devices. Call this BEFORE deleting: document ids are path-derived, so a
+     * same-named file recreated later would otherwise inherit the dead file's
+     * shares (matching purgeDeleted's view-state cleanup).
+     */
+    suspend fun revokeSubtree(rootUri: String) {
+        val (auth, rootId) = try {
+            val u = android.net.Uri.parse(rootUri)
+            (u.authority ?: return) to
+                (android.provider.DocumentsContract.getDocumentId(u) ?: return)
+        } catch (_: Exception) {
+            return
+        }
+        for (g in runCatching { dao.allGrants() }.getOrDefault(emptyList())) {
+            if (g.fileId == rootUri) {
+                runCatching { dao.removeGrant(g.deviceFp, g.fileId) }
+                continue
+            }
+            val id = runCatching {
+                val u = android.net.Uri.parse(g.fileId)
+                if (u.authority != auth) null
+                else android.provider.DocumentsContract.getDocumentId(u)
+            }.getOrNull() ?: continue
+            if (id == rootId || id.startsWith("$rootId/")) {
+                runCatching { dao.removeGrant(g.deviceFp, g.fileId) }
+            }
+        }
+    }
+
     suspend fun rename(fp: String, nickname: String?) {
         dao.rename(fp, nickname?.takeIf { it.isNotBlank() })
     }

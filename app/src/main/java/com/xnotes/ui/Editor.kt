@@ -751,6 +751,7 @@ class Editor(
     var autosaveUri: String? = null
         private set
     private val autosaveScope = kotlinx.coroutines.MainScope()
+    private val purgeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
 
     /** The note autosave's debounce timer. Cancelled freely: nothing has been written yet. */
     private var noteDebounceJob: kotlinx.coroutines.Job? = null
@@ -7258,6 +7259,7 @@ class Editor(
         invalidateThumb(docUri)
         dropPinsWithin(docUri)
         dropRecentsWithin(docUri)
+        dropGrantsWithin(docUri)
         runCatching { noteLinkIndex.remove(docUri) }
     }
 
@@ -7277,6 +7279,17 @@ class Editor(
     private fun dropPinsWithin(docUri: String) {
         val key = documentKey(docUri)
         autosaveScope.launch { savePins(pinnedFolders.filterNot { com.xnotes.core.util.DocKeys.within(documentKey(it.uri), key) }) }
+    }
+
+    /**
+     * Revoke every share grant at or under [docUri], before the delete lands:
+     * grant ids are path-derived, so a same-named file recreated later would
+     * otherwise inherit the dead file's shares.
+     */
+    private fun dropGrantsWithin(docUri: String) {
+        purgeScope.launch {
+            runCatching { com.xnotes.share.db.ShareStore.of(appContext).revokeSubtree(docUri) }
+        }
     }
 
     /**

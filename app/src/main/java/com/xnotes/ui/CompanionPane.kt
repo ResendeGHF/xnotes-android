@@ -22,6 +22,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,9 +54,10 @@ fun CompanionPane() {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val status by CompanionService.status.collectAsState()
-    val sharing by CompanionService.active.collectAsState()
+    val companionOn by CompanionService.companionOn.collectAsState()
     val codeNeeded by CompanionService.codeNeeded.collectAsState()
     val store = remember { ShareStore.of(context.applicationContext) }
+    LaunchedEffect(Unit) { CompanionService.syncFlagFlows(context) }
     val allDevices by store.devices.collectAsState(initial = emptyList())
     val devices = remember(allDevices) { allDevices.filter { it.kind == com.xnotes.share.db.DeviceKind.LINUX } }
     val activeDevice by store.activeDevice.collectAsState(initial = null)
@@ -106,13 +108,13 @@ fun CompanionPane() {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Companion sharing", color = palette.text.toComposeColor(), modifier = Modifier.weight(1f))
             Switch(
-                checked = sharing,
+                checked = companionOn,
                 onCheckedChange = {
                     if (it) {
                         saveTarget()
-                        CompanionService.start(context)
+                        CompanionService.setCompanionEnabled(context, true)
                     } else {
-                        CompanionService.stop(context)
+                        CompanionService.setCompanionEnabled(context, false)
                     }
                 },
             )
@@ -128,7 +130,7 @@ fun CompanionPane() {
             placeholder = { Text(android.os.Build.MODEL ?: "Android", fontSize = 13.sp) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
-            enabled = sharing,
+            enabled = companionOn,
         )
         Spacer(Modifier.height(8.dp))
         Text(
@@ -146,7 +148,7 @@ fun CompanionPane() {
             LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 items(devices, key = { it.fp }) { d ->
                     Row(
-                        Modifier.fillMaxWidth().clickable(enabled = sharing) {
+                        Modifier.fillMaxWidth().clickable(enabled = companionOn) {
                             if (!d.active) CompanionService.switchDevice(context, d.fp)
                         }.padding(vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -154,7 +156,7 @@ fun CompanionPane() {
                         RadioButton(
                             selected = d.active,
                             onClick = { if (!d.active) CompanionService.switchDevice(context, d.fp) },
-                            enabled = sharing,
+                            enabled = companionOn,
                         )
                         Spacer(Modifier.width(6.dp))
                         Column(Modifier.weight(1f)) {
@@ -171,7 +173,7 @@ fun CompanionPane() {
                                 renameTarget = d
                                 renameText = d.nickname ?: ""
                             },
-                            enabled = sharing,
+                            enabled = companionOn,
                         ) { Text("Rename", fontSize = 12.sp) }
                         TextButton(
                             onClick = {
@@ -179,9 +181,9 @@ fun CompanionPane() {
                                 editHost = d.host
                                 editPort = if (d.port > 0) d.port.toString() else ""
                             },
-                            enabled = sharing,
+                            enabled = companionOn,
                         ) { Text("Edit", fontSize = 12.sp) }
-                        TextButton(onClick = { forgetTarget = d }, enabled = sharing) {
+                        TextButton(onClick = { forgetTarget = d }, enabled = companionOn) {
                             Text("Forget", fontSize = 12.sp)
                         }
                     }
@@ -196,7 +198,7 @@ fun CompanionPane() {
                 label = { Text("Companion IP", fontSize = 13.sp) },
                 placeholder = { Text("127.0.0.1", fontSize = 13.sp) },
                 singleLine = true,
-                enabled = sharing,
+                enabled = companionOn,
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
@@ -206,7 +208,7 @@ fun CompanionPane() {
                 label = { Text("Port", fontSize = 13.sp) },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                enabled = sharing,
+                enabled = companionOn,
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
@@ -215,29 +217,20 @@ fun CompanionPane() {
                     val (target, port) = saveTarget() ?: return@Button
                     CompanionService.reconnect(context, target, port)
                                 },
-                enabled = sharing,
+                enabled = companionOn,
             ) { Text(if (devices.isEmpty()) "Pair" else "Add") }
         }
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { activeDevice?.let { CompanionService.switchDevice(context, it.fp) } }, enabled = sharing && activeDevice != null) {
+            Button(onClick = { activeDevice?.let { CompanionService.switchDevice(context, it.fp) } }, enabled = companionOn && activeDevice != null) {
                 Text("Connect")
             }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { CompanionService.disconnect() }, enabled = sharing) { Text("Disconnect") }
+            OutlinedButton(onClick = { CompanionService.disconnect() }, enabled = companionOn) { Text("Disconnect") }
             Spacer(Modifier.width(12.dp))
             Text(status.text, color = palette.textDim.toComposeColor(), fontSize = 12.sp)
         }
-        val listenPort by CompanionService.listenPort.collectAsState()
-        if (sharing && listenPort > 0) {
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "This phone also listens on port $listenPort — a friend's phone can pair with it from Phones.",
-                color = palette.textDim.toComposeColor(),
-                fontSize = 12.sp,
-            )
-        }
-        if (codeNeeded && sharing) {
+        if (codeNeeded && companionOn) {
             Spacer(Modifier.height(12.dp))
             Text("Enter the code shown on the desktop.", color = palette.text.toComposeColor(), fontSize = 13.sp)
             Spacer(Modifier.height(6.dp))
@@ -256,7 +249,7 @@ fun CompanionPane() {
                 }
             }
         }
-        if (status.paired != null && sharing) {
+        if (status.paired != null && companionOn) {
             Spacer(Modifier.height(8.dp))
             Text(
                 "Paired device: ${status.paired}",

@@ -1127,10 +1127,32 @@ class HostEngine(
             val ok = files.delete(id)
             if (ok) {
                 dropFile(id)
-                grants.setGranted(id, false)
+                // Revoke the whole subtree first: ids are path-derived, so a
+                // same-named file recreated later must not inherit these shares.
+                revokeTree(id)
                 pushIndexDelta()
             }
             send(JSONObject().put("t", "delete_result").put("in_reply_to", msg.optInt("seq", -1)).put("ok", ok))
+        }
+    }
+
+    /** Clear grants for [id] and everything beneath it (folders share whole subtrees). */
+    private fun revokeTree(id: String) {
+        grants.setGranted(id, false)
+        try {
+            val seen = HashSet<String>()
+            val queue = ArrayDeque<String>()
+            queue.add(id)
+            seen.add(id)
+            var guard = 0
+            while (queue.isNotEmpty() && guard++ < 5000) {
+                val dir = queue.removeFirst()
+                for (e in backend.listEntries(dir, onlyShared = false)) {
+                    if (!seen.add(e.uri)) continue
+                    if (e.isDir) queue.add(e.uri) else grants.setGranted(e.uri, false)
+                }
+            }
+        } catch (_: Exception) {
         }
     }
 

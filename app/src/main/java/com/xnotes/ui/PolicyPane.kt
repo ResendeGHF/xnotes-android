@@ -1,7 +1,5 @@
 package com.xnotes.ui
 
-import android.net.Uri
-import android.provider.DocumentsContract
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -83,14 +81,15 @@ fun PolicyPane(editor: Editor) {
     }
 
     var query by remember { mutableStateOf("") }
-    var entries by remember { mutableStateOf<List<ShareServerEntry>>(emptyList()) }
+    // One immutable snapshot per walk pass: rows pre-sorted and folder->file
+    // membership precomputed off the main thread, so opening the screen and
+    // every chunked update is just a pointer swap (no frame drops).
+    var snapshot by remember { mutableStateOf(PolicySnapshot(emptyList(), emptyMap())) }
     var scanning by remember { mutableStateOf(false) }
     var scanned by remember { mutableStateOf(0) }
     // Live checkbox state for the picked device; toggle flips one row.
     val shared: SnapshotStateSet<String> = remember { mutableStateSetOf() }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
-    // Snapshot used only for ordering (fixed per picker/load so rows never jump).
-    var sortShared by remember { mutableStateOf(setOf<String>()) }
 
     val scope = rememberCoroutineScope()
     fun notifyChanged() {
@@ -106,12 +105,10 @@ fun PolicyPane(editor: Editor) {
     LaunchedEffect(fp) {
         if (fp == null) {
             shared.clear()
-            sortShared = emptySet()
         } else {
-            val ids = withContext(Dispatchers.IO) { store.grantIds(fp) }.toSet()
+            val ids = withContext(Dispatchers.IO) { store.grantIds(fp) }
             shared.clear()
             shared.addAll(ids)
-            sortShared = ids
         }
     }
 
@@ -123,7 +120,7 @@ fun PolicyPane(editor: Editor) {
     }
 
     val root = editor.browseRoot
-    LaunchedEffect(root) {
+    LaunchedEffect(root, fp) {
         if (root == null) return@LaunchedEffect
         scanning = true
         withContext(Dispatchers.IO) {
@@ -138,22 +135,29 @@ fun PolicyPane(editor: Editor) {
             }
             runCatching {
                 val backend = ShareBackendImpl(context.applicationContext)
-                val sharedNow = store.grantIds(fp ?: "").toSet()
+                val orderBy = store.grantIds(fp ?: "").toSet()
+                val order = sharedFirst(orderBy)
                 // Phase 1: everything already shared — stat each URI directly.
-                val first = sharedNow.mapNotNull { uri ->
+                val first = orderBy.mapNotNull { uri ->
                     backend.statEntry(uri)?.let { ShareServerEntry(it.uri, it.name, it.size, it.mtime, it.kind, it.isDir) }
-                }
+                }.sortedWith(order)
                 val seen = HashSet<String>(first.size * 2)
                 first.forEach { seen.add(it.uri) }
-                entries = first
-                scanned = first.size
-                // Phase 2: the rest, in chunks.
+                run {
+                    val (sorted, kids) = buildSnapshot(first, emptyMap(), order)
+                    snapshot = PolicySnapshot(sorted, kids)
+                    scanned = first.size
+                }
+                // Phase 2: the rest, in chunks; parent links ride along so the
+                // folder->file map needs no O(folders x files) pass later.
                 val rest = ArrayList<ShareServerEntry>()
+                val parentOf = HashMap<String, String>()
                 val queue = ArrayDeque<String?>(listOf(null))
                 while (queue.isNotEmpty()) {
                     val dir = queue.removeFirst()
                     for (e in backend.listEntries(dir, onlyShared = false)) {
                         if (!seen.add(e.uri)) continue
+                        if (dir != null) parentOf[e.uri] = dir
                         if (e.isDir) {
                             queue.add(e.uri)
                             rest.add(ShareServerEntry(e.uri, e.name, e.size, e.mtime, "folder", true))
@@ -162,15 +166,14 @@ fun PolicyPane(editor: Editor) {
                         }
                     }
                     if (rest.size >= 250) {
-                        val snap = (first + rest).sortedWith(sharedFirst(sortShared))
-                        entries = snap
-                        scanned = snap.size
+                        val (sorted, kids) = buildSnapshot(first + rest, parentOf, order)
+                    snapshot = PolicySnapshot(sorted, kids)
+                    scanned = first.size + rest.size
                     }
                 }
-                val all = (first + rest).sortedWith(sharedFirst(sortShared))
-                entries = all
-                scanned = all.size
-                sortShared = withContext(Dispatchers.IO) { store.grantIds(fp ?: "").toSet() }
+                val (sorted, kids) = buildSnapshot(first + rest, parentOf, order)
+                snapshot = PolicySnapshot(sorted, kids)
+                scanned = first.size + rest.size
             }
         }
         scanning = false
@@ -181,27 +184,11 @@ fun PolicyPane(editor: Editor) {
         }
     }
 
-    // Descendant files per folder, for tri-state checkboxes (built once per walk).
-    val descendants = remember(entries) {
-        val byParent = HashMap<String, MutableList<ShareServerEntry>>()
-        val folders = entries.filter { it.isDir }.map { it.uri to docIdOf(it.uri) }.filter { it.second != null }
-        val files = entries.filterNot { it.isDir }
-        for (f in files) {
-            val id = docIdOf(f.uri) ?: continue
-            for ((folderUri, folderId) in folders) {
-                if (id != folderId && id.startsWith("$folderId/")) {
-                    byParent.getOrPut(folderUri) { ArrayList() }.add(f)
-                }
-            }
-        }
-        byParent
-    }
-
+    // Descendant files per folder come precomputed with the snapshot; the
+    // tri-state below is a set lookup, never a tree walk.
     val q = query.trim().lowercase()
-    val ordered = remember(entries, fp, sortShared) {
-        entries.sortedWith(sharedFirst(sortShared))
-    }
-    val shown = remember(ordered, q) {
+    val shown = remember(snapshot, q) {
+        val ordered = snapshot.entries
         if (q.isEmpty()) ordered else ordered.filter { it.lower.contains(q) }
     }
 
@@ -258,7 +245,7 @@ fun PolicyPane(editor: Editor) {
         Spacer(Modifier.height(4.dp))
         if (shown.isEmpty() && !scanning) {
             Text(
-                stringResource(if (entries.isEmpty()) com.xnotes.R.string.policy_empty else com.xnotes.R.string.policy_no_match),
+                stringResource(if (snapshot.entries.isEmpty()) com.xnotes.R.string.policy_empty else com.xnotes.R.string.policy_no_match),
                 color = palette.textDim.toComposeColor(),
                 fontSize = 13.sp,
             )
@@ -269,7 +256,7 @@ fun PolicyPane(editor: Editor) {
                     Row(
                         Modifier.fillMaxWidth().clickable(enabled = fp != null) {
                             if (e.isDir) {
-                                if (isShared || folderState(e, shared, descendants) == ToggleableState.Indeterminate) {
+                                if (isShared || folderState(e, shared, snapshot.descendants) == ToggleableState.Indeterminate) {
                                     setGranted(e.uri, false)
                                 } else {
                                     setGranted(e.uri, true)
@@ -283,9 +270,9 @@ fun PolicyPane(editor: Editor) {
                         if (e.isDir) {
                             TriStateCheckbox(
                                 state = if (isShared) ToggleableState.On
-                                else folderState(e, shared, descendants),
+                                else folderState(e, shared, snapshot.descendants),
                                 onClick = {
-                                    if (isShared || folderState(e, shared, descendants) == ToggleableState.Indeterminate) {
+                                    if (isShared || folderState(e, shared, snapshot.descendants) == ToggleableState.Indeterminate) {
                                         setGranted(e.uri, false)
                                     } else {
                                         setGranted(e.uri, true)
@@ -334,15 +321,42 @@ fun PolicyPane(editor: Editor) {
     }
 }
 
+/** One published walk pass: rows pre-sorted, folder->file membership precomputed. */
+private data class PolicySnapshot(
+    val entries: List<ShareServerEntry>,
+    val descendants: Map<String, Set<String>> = emptyMap(),
+)
+
+/** Sorted rows + folder->file membership for one walk pass (runs off the main thread). */
+private fun buildSnapshot(
+    all: List<ShareServerEntry>,
+    parents: Map<String, String>,
+    order: Comparator<ShareServerEntry>,
+): Pair<List<ShareServerEntry>, Map<String, Set<String>>> {
+    val sorted = all.sortedWith(order)
+    val kids = HashMap<String, MutableSet<String>>()
+    val folders = all.filter { it.isDir }.map { it.uri }.toSet()
+    for (f in all) {
+        if (f.isDir) continue
+        var p = parents[f.uri]
+        var guard = 0
+        while (p != null && guard++ < 64) {
+            if (p in folders) kids.getOrPut(p) { HashSet() }.add(f.uri)
+            p = parents[p]
+        }
+    }
+    return sorted to kids
+}
+
 /** Tri-state for a folder row: checked when granted, partial when a descendant is. */
 private fun folderState(
     folder: ShareServerEntry,
     shared: Set<String>,
-    descendants: Map<String, List<ShareServerEntry>>,
+    descendants: Map<String, Set<String>>,
 ): ToggleableState {
     if (folder.uri in shared) return ToggleableState.On
     val kids = descendants[folder.uri] ?: return ToggleableState.Off
-    return if (kids.any { it.uri in shared }) ToggleableState.Indeterminate else ToggleableState.Off
+    return if (kids.any { it in shared }) ToggleableState.Indeterminate else ToggleableState.Off
 }
 
 /** Shared entries first (fixed order after load), then folders, then by name. */
@@ -363,10 +377,6 @@ internal data class ShareServerEntry(
     /** Lowercased once, so searching never re-lowercases the whole list per keystroke. */
     val lower: String = name.lowercase()
 }
-
-private fun docIdOf(uri: String): String? = runCatching {
-    DocumentsContract.getDocumentId(Uri.parse(uri))
-}.getOrNull()
 
 private fun formatBytes(size: Long): String = when {
     size < 0 -> "?"

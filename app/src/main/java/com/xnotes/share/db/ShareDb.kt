@@ -125,6 +125,9 @@ interface ShareDao {
     @Query("DELETE FROM grants WHERE deviceFp = :fp AND fileId = :fileId")
     suspend fun removeGrant(fp: String, fileId: String)
 
+    @Query("SELECT * FROM grants")
+    suspend fun allGrants(): List<GrantEntity>
+
     @Query("DELETE FROM grants WHERE deviceFp = :fp")
     suspend fun clearGrants(fp: String)
 }

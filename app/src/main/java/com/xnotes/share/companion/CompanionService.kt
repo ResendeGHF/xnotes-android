@@ -49,6 +49,7 @@ class CompanionService : Service() {
     private var targetHost: String = "127.0.0.1"
     private var targetPort: Int = 42317
     private var starting = AtomicBoolean(false)
+    private var coreReady = false
     private val approvals = HashMap<String, (Boolean) -> Unit>()
     private var approvalSeq = 0
 
@@ -83,43 +84,85 @@ class CompanionService : Service() {
         runningService = null
         CompanionEditors.onTracked = null
         _active.value = false
+        _companionOn.value = false
+        _sharingOn.value = false
         shutdown()
         _status.value = Status("Off", null, false)
+        runCatching {
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_STOP_COMPANION -> {
+                setCompanionEnabled(this, false)
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_SHARING -> {
+                setSharingEnabled(this, false)
+                return START_NOT_STICKY
+            }
             ACTION_STOP -> {
-                stopSelf()
+                // Legacy single stop button: turn both halves off.
+                setCompanionEnabled(this, false)
+                setSharingEnabled(this, false)
                 return START_NOT_STICKY
             }
             ACTION_APPROVAL -> {
                 val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
                 val allow = intent.getBooleanExtra(EXTRA_ALLOW, false)
                 synchronized(approvals) { approvals.remove(token) }?.invoke(allow)
-                return START_STICKY
+                // Approval taps must never keep a switched-off service alive.
+                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
+                return START_NOT_STICKY
             }
             ACTION_SAS -> {
                 val key = intent.getStringExtra(EXTRA_SAS_KEY) ?: return START_NOT_STICKY
                 if (intent.getBooleanExtra(EXTRA_ALLOW, false)) confirmInboundSas(this, key)
                 else denyInboundSas(this, key)
-                return START_STICKY
+                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
+                return START_NOT_STICKY
             }
             ACTION_REFRESH -> {
                 engine?.refreshPolicy()
                 synchronized(peerLock) { peerSessions.values.forEach { it.engine.refreshPolicy() } }
-                return START_STICKY
+                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
+                return START_NOT_STICKY
             }
         }
-        startSession()
+        // Boot (or system restart): only come up when at least one feature
+        // is switched on. Otherwise stop immediately — no phantom notification.
+        if (!isCompanionOn(this) && !isSharingOn(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        ensureCore { applyEnabledFeatures() }
         return START_STICKY
     }
 
     // --- session ---
 
-    private fun startSession() {
+    /**
+     * One-time process setup: identity, store, backend, engines and the
+     * editor bridge. Idempotent; network halves start separately in
+     * [applyCompanionState]/[applySharingState].
+     */
+    private fun ensureCore(onReady: () -> Unit = {}) {
+        if (coreReady) {
+            main.post { onReady() }
+            return
+        }
+        synchronized(coreQueue) { coreQueue.add(onReady) }
         if (!starting.compareAndSet(false, true)) return
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, startingNotification(), fgsType())
+        // Claim foreground immediately: startForegroundService requires a
+        // notification within seconds, long before Room/crypto finish.
+        runCatching {
+            val compOn = isCompanionOn(this)
+            val id = if (compOn || !isSharingOn(this)) NOTIF_COMPANION else NOTIF_SHARING
+            ServiceCompat.startForeground(this, id, startingNotification(), fgsType())
+        }
         Thread({
             try {
                 val identity = ShareCrypto.loadOrCreate(filesDir)
@@ -173,27 +216,67 @@ class CompanionService : Service() {
                 this.backend = backend
                 this.engine = engine
                 this.ui = ui
-                _active.value = true
+                _active.value = isCompanionOn(this) || isSharingOn(this)
+                coreReady = true
+                starting.set(false)
                 main.post {
+                    _companionOn.value = isCompanionOn(this)
+                    _sharingOn.value = isSharingOn(this)
+                    _active.value = _companionOn.value || _sharingOn.value
                     // Files opened before the session started never fired onTracked
                     // while the engine existed: wire them now.
                     for (e in CompanionEditors.editors()) {
                         val uri = CompanionEditors.uriFor(e) ?: continue
                         attachEditor(e, uri)
                     }
-                    // Listen for Android peers (auto-increment port when busy)…
-                    startListener()
-                    // …redial the active companion (or the remembered address)…
-                    dialActive()
-                    // …and rejoin remembered guest sessions.
-                    autoDialGuests()
+                    applyEnabledFeatures()
+                    onReady()
+                    drainCoreQueue()
                 }
             } catch (e: Exception) {
                 postStatus("Start failed: ${e.message}")
                 starting.set(false)
-                stopSelf()
+                stopSelfIfIdle()
             }
         }, "companion-start").apply { isDaemon = true; start() }
+    }
+
+    /** Start every half whose flag is on; called once core is ready. */
+    private fun applyEnabledFeatures() {
+        if (isCompanionOn(this)) startCompanionDial() else stopCompanionDial()
+        if (isSharingOn(this)) startSharingNet() else stopSharingNet()
+        updateForeground()
+    }
+
+    /** No-op unless the core is up; used by passive paths that must never boot the service. */
+    private fun runIfCoreReady(fn: () -> Unit) {
+        if (coreReady) {
+            main.post { fn() }
+            return
+        }
+        synchronized(coreQueue) { coreQueue.add { main.post { fn() } } }
+    }
+
+    private val coreQueue = ArrayList<() -> Unit>()
+
+    /** Drain queued core waiters (runs on the main thread). */
+    private fun drainCoreQueue() {
+        val pending = synchronized(coreQueue) {
+            if (coreQueue.isEmpty()) return
+            ArrayList(coreQueue).also { coreQueue.clear() }
+        }
+        for (fn in pending) runCatching { fn() }
+    }
+
+    /** Stop the service when neither feature is on; otherwise refresh notifications. */
+    private fun stopSelfIfIdle() {
+        main.post {
+            if (!isCompanionOn(this) && !isSharingOn(this)) {
+                stopSelf()
+            } else {
+                updateForeground()
+            }
+        }
     }
 
     private var ui: PairingUi? = null
@@ -763,6 +846,52 @@ class CompanionService : Service() {
         }
     }
 
+    /** Start the Linux-companion half: dial the active (or remembered) device. */
+    private fun startCompanionDial() {
+        dialActive()
+        updateForeground()
+    }
+
+    /** Stop the Linux-companion half: drop the dial, keep everything else. */
+    private fun stopCompanionDial() {
+        runCatching { pairing?.close() }
+        runCatching { client?.disconnect() }
+        pairing = null
+        client = null
+        postStatus("Companion off.")
+        updateForeground()
+    }
+
+    /** Start the phone-sharing half: listen + rejoin remembered guests. */
+    private fun startSharingNet() {
+        if (listener == null) startListener()
+        autoDialGuests()
+        updateForeground()
+    }
+
+    /** Stop the phone-sharing half: drop listener, peers and guests. */
+    private fun stopSharingNet() {
+        runCatching { listener?.stop() }
+        listener = null
+        _listenPort.value = 0
+        synchronized(peerLock) {
+            peerSessions.values.forEach { runCatching { it.handshake.close() } }
+            peerSessions.clear()
+            guestSessions.values.forEach {
+                runCatching { it.pairing.close() }
+                runCatching { it.client.disconnect() }
+            }
+            guestSessions.clear()
+        }
+        _peers.value = emptyList()
+        _guests.value = emptyList()
+        _guestIndex.value = emptyMap()
+        _sasInbound.value = null
+        _sasOutbound.value = null
+        postStatus("Phone sharing off.")
+        updateForeground()
+    }
+
     private fun shutdown() {
         _active.value = false
         starting.set(false)
@@ -1069,9 +1198,12 @@ class CompanionService : Service() {
 
     private fun startingNotification(): Notification {
         ensureChannel(this)
+        val compOn = try { isCompanionOn(this) } catch (_: Exception) { true }
+        val title = if (compOn) getString(R.string.share_notif_title)
+        else getString(R.string.share_channel)
         return NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification_share)
-            .setContentTitle(getString(R.string.share_notif_title))
+            .setContentTitle(title)
             .setContentText(getString(R.string.share_starting))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -1081,30 +1213,93 @@ class CompanionService : Service() {
             .build()
     }
 
-    private fun notifyUp(device: String, port: Int) {
-        runCatching {
-            val open = packageManager.getLaunchIntentForPackage(packageName)
-                ?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
-            val stop = PendingIntent.getService(
-                this, 1, Intent(this, CompanionService::class.java).setAction(ACTION_STOP),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-            getSystemService(NotificationManager::class.java)?.notify(
-                NOTIFICATION_ID,
-                NotificationCompat.Builder(this, CHANNEL)
-                    .setSmallIcon(R.drawable.ic_notification_share)
-                    .setContentTitle(getString(R.string.share_notif_title))
-                    .setContentText(getString(R.string.companion_notif_text, device, port))
-                    .setOngoing(true)
-                    .setOnlyAlertOnce(true)
-                    .setSilent(true)
-                    .setCategory(NotificationCompat.CATEGORY_SERVICE)
-                    .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-                    .setContentIntent(open)
-                    .addAction(0, getString(R.string.share_stop), stop)
-                    .build(),
-            )
+    /** Ongoing notification for the Linux-companion half (own foreground id). */
+    private fun companionNotification(): Notification {
+        ensureChannel(this)
+        val open = packageManager.getLaunchIntentForPackage(packageName)
+            ?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
+        val stop = PendingIntent.getService(
+            this, 11, Intent(this, CompanionService::class.java).setAction(ACTION_STOP_COMPANION),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val label = _status.value.paired ?: _status.value.text
+        return NotificationCompat.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_notification_share)
+            .setContentTitle(getString(R.string.share_notif_title))
+            .setContentText(getString(R.string.companion_notif_text, label, targetPort))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setContentIntent(open)
+            .addAction(0, getString(R.string.share_stop), stop)
+            .build()
+    }
+
+    /** Ongoing notification for the phone-sharing half (own foreground id). */
+    private fun sharingNotification(): Notification {
+        ensureChannel(this)
+        val open = packageManager.getLaunchIntentForPackage(packageName)
+            ?.let { PendingIntent.getActivity(this, 2, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
+        val stop = PendingIntent.getService(
+            this, 12, Intent(this, CompanionService::class.java).setAction(ACTION_STOP_SHARING),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val port = _listenPort.value
+        val text = if (port > 0) "Listening for phones on port $port."
+        else getString(R.string.share_starting)
+        return NotificationCompat.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_notification_share)
+            .setContentTitle(getString(R.string.share_channel))
+            .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setContentIntent(open)
+            .addAction(0, getString(R.string.share_stop), stop)
+            .build()
+    }
+
+    /**
+     * Keep exactly one foreground notification per enabled half, none when
+     * both halves are off (then stop instead of lingering with a phantom
+     * "sharing is on" card).
+     */
+    private fun updateForeground() {
+        val compOn = isCompanionOn(this)
+        val shareOn = isSharingOn(this)
+        _companionOn.value = compOn
+        _sharingOn.value = shareOn
+        _active.value = compOn || shareOn
+        if (!compOn && !shareOn) {
+            runCatching {
+                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
+                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
+            }
+            stopSelf()
+            return
         }
+        try {
+            if (compOn && shareOn) {
+                ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
+                getSystemService(NotificationManager::class.java)?.notify(NOTIF_SHARING, sharingNotification())
+            } else if (compOn) {
+                ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
+                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
+            } else {
+                ServiceCompat.startForeground(this, NOTIF_SHARING, sharingNotification(), fgsType())
+                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun notifyUp(device: String, port: Int) {
+        // Companion dial finished: refresh its half (no-op when it is off).
+        runCatching { updateForeground() }
     }
 
     private fun fgsType(): Int =
@@ -1129,9 +1324,13 @@ class CompanionService : Service() {
 
     companion object {
         private const val CHANNEL = "companion"
-        private const val NOTIFICATION_ID = 43
+        private const val NOTIFICATION_ID = 43 // legacy single id; kept for cancel compat
+        private const val NOTIF_COMPANION = 43
+        private const val NOTIF_SHARING = 44
         private const val APPROVAL_ID = 100
         const val ACTION_STOP = "com.xnotes.share.companion.STOP"
+        const val ACTION_STOP_COMPANION = "com.xnotes.share.companion.STOP_COMPANION"
+        const val ACTION_STOP_SHARING = "com.xnotes.share.companion.STOP_SHARING"
         const val ACTION_REFRESH = "com.xnotes.share.companion.REFRESH"
         const val ACTION_APPROVAL = "com.xnotes.share.companion.APPROVAL"
         const val ACTION_SAS = "com.xnotes.share.companion.SAS"
@@ -1170,40 +1369,144 @@ class CompanionService : Service() {
         const val PREFS = "companion"
         const val KEY_IP = "companion_last_ip"
         const val KEY_PORT = "companion_last_port"
-        const val KEY_ENABLED = "companion_enabled"
+        const val KEY_ENABLED = "companion_enabled" // legacy: migrated to the two flags below
+        const val KEY_COMPANION = "companion_on"
+        const val KEY_SHARING = "sharing_on"
         const val KEY_NAME = "companion_own_name"
         const val KEY_GUESTS = "companion_guest_targets"
 
-        /** Start the service on app launch when sharing was left on. */
-        fun startIfEnabled(context: Context) {
-            val on = try {
-                context.getSharedPreferences(PREFS, 0).getBoolean(KEY_ENABLED, false)
+        private val _companionOn = MutableStateFlow(false)
+        /** Linux companion dialing is switched on. */
+        val companionOn: StateFlow<Boolean> = _companionOn.asStateFlow()
+        private val _sharingOn = MutableStateFlow(false)
+        /** Phone sharing (listener + guests) is switched on. */
+        val sharingOn: StateFlow<Boolean> = _sharingOn.asStateFlow()
+
+        private fun prefs(context: Context) = context.getSharedPreferences(PREFS, 0)
+
+        /** One-time migration from the old single toggle (which meant everything). */
+        private fun migrateFeatureFlags(context: Context) {
+            try {
+                val p = prefs(context)
+                if (!p.contains(KEY_COMPANION) && !p.contains(KEY_SHARING) && p.contains(KEY_ENABLED)) {
+                    val on = p.getBoolean(KEY_ENABLED, false)
+                    p.edit().putBoolean(KEY_COMPANION, on).putBoolean(KEY_SHARING, on)
+                        .remove(KEY_ENABLED).apply()
+                }
             } catch (_: Exception) {
-                false
             }
-            if (on) start(context)
         }
 
-        fun submitCode(context: Context, code: String) {
+        fun isCompanionOn(context: Context): Boolean = try {
+            migrateFeatureFlags(context)
+            prefs(context).getBoolean(KEY_COMPANION, false)
+        } catch (_: Exception) {
+            false
+        }
+
+        fun isSharingOn(context: Context): Boolean = try {
+            migrateFeatureFlags(context)
+            prefs(context).getBoolean(KEY_SHARING, false)
+        } catch (_: Exception) {
+            false
+        }
+
+        private fun setFlag(context: Context, key: String, on: Boolean) {
+            try {
+                migrateFeatureFlags(context)
+                prefs(context).edit().putBoolean(key, on).apply()
+            } catch (_: Exception) {
+            }
+        }
+
+        /** Start the service on app launch when either feature was left on. */
+        fun startIfEnabled(context: Context) {
+            syncFlagFlows(context)
+            if (!isCompanionOn(context) && !isSharingOn(context)) return
+            ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+        }
+
+        /** Push persisted toggles into the flows (cold UI before the service boots). */
+        fun syncFlagFlows(context: Context) {
+            try {
+                val comp = isCompanionOn(context)
+                val share = isSharingOn(context)
+                _companionOn.value = comp
+                _sharingOn.value = share
+                _active.value = comp || share
+            } catch (_: Exception) {
+            }
+        }
+
+        /**
+         * Switch the Linux-companion half on/off, independently of phone
+         * sharing. Turning it on boots the service when needed and dials;
+         * turning it off drops the dial and its notification.
+         */
+        fun setCompanionEnabled(context: Context, on: Boolean) {
+            setFlag(context, KEY_COMPANION, on)
+            _companionOn.value = on
+            _active.value = on || _sharingOn.value
             val svc = runningService
             if (svc == null) {
-                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
-                return
-            }
-            svc.main.post { svc.pairing?.submitCode(code) ?: svc.postStatus("Not connected yet — try again in a moment.") }
-        }
-
-        /** Re-dial an ad-hoc address without stopping sharing (pairing then registers it). */
-        fun reconnect(context: Context, host: String, port: Int) {            val svc = runningService
-            if (svc == null) {
-                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+                if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
                 return
             }
             svc.main.post {
+                if (!svc.coreReady) {
+                    svc.ensureCore { svc.applyEnabledFeatures() }
+                    return@post
+                }
+                if (on) svc.startCompanionDial() else svc.stopCompanionDial()
+                svc.updateForeground()
+            }
+        }
+
+        /**
+         * Switch the phone-sharing half on/off, independently of the Linux
+         * companion. Turning it on boots the service when needed, listens and
+         * redials remembered guests; turning it off drops the listener and
+         * every peer/guest session plus their notifications.
+         */
+        fun setSharingEnabled(context: Context, on: Boolean) {
+            setFlag(context, KEY_SHARING, on)
+            _sharingOn.value = on
+            _active.value = on || _companionOn.value
+            val svc = runningService
+            if (svc == null) {
+                if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+                return
+            }
+            svc.main.post {
+                if (!svc.coreReady) {
+                    svc.ensureCore { svc.applyEnabledFeatures() }
+                    return@post
+                }
+                if (on) svc.startSharingNet() else svc.stopSharingNet()
+                svc.updateForeground()
+            }
+        }
+
+        fun submitCode(context: Context, code: String) {
+            // Explicit pairing step: the companion half comes on with it.
+            setCompanionEnabled(context, true)
+            val svc = runningService ?: return
+            svc.main.post { svc.pairing?.submitCode(code) ?: svc.postStatus("Not connected yet — try again in a moment.") }
+        }
+
+        /** Re-dial an ad-hoc address (explicit: turns the companion half on). */
+        fun reconnect(context: Context, host: String, port: Int) {
+            setCompanionEnabled(context, true)
+            val svc = runningService ?: return
+            svc.main.post {
                 svc.targetHost = host
                 svc.targetPort = port
+                if (!svc.coreReady) {
+                    svc.ensureCore { svc.applyEnabledFeatures() }
+                    return@post
+                }
                 if (svc.engine == null) {
-                    svc.startSession()
+                    svc.ensureCore { svc.startCompanionDial() }
                 } else {
                     svc.dialDevice(null)
                 }
@@ -1215,16 +1518,28 @@ class CompanionService : Service() {
         /**
          * Dial an Android peer as guest (this phone reads that phone's files).
          * Several guests may be connected at once. When [port] is 0 the
-         * listener port is probed (42317..42347) so the user only types the IP.
+         * listener port is probed (42327..42356, the Android range) so the
+         * user only types the IP. Explicit ports (incl. legacy 42317 peers)
+         * are honored as given.
          */
         fun dialPeer(context: Context, host: String, port: Int) {
+            // Explicit user action: the phone-sharing half comes on with it.
+            if (!isSharingOn(context)) setSharingEnabled(context, true)
             val svc = runningService
             if (svc == null) {
-                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
-                // The fresh session auto-dials remembered guests only; retry shortly.
+                // Service is booting; queue the dial once its core is ready.
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                     runningService?.let { s ->
-                        s.main.post { s.startGuestSession(host, if (port > 0) port else 42317) }
+                        s.main.post {
+                            if (!s.coreReady) {
+                                s.ensureCore {
+                                    s.applyEnabledFeatures()
+                                    s.startGuestSession(host, if (port > 0) port else com.xnotes.share.companion.AndroidListener.DEFAULT_PORT)
+                                }
+                            } else {
+                                s.startGuestSession(host, if (port > 0) port else com.xnotes.share.companion.AndroidListener.DEFAULT_PORT)
+                            }
+                        }
                     }
                 }, 3000)
                 return
@@ -1242,18 +1557,18 @@ class CompanionService : Service() {
                         val found = probePeer(host)
                         svc.main.post {
                             if (found != null) svc.startGuestSession(host, found)
-                            else svc.postStatus("No phone found on $host (tried 42317–42347).")
+                            else svc.postStatus("No phone found on $host (tried 42327–42356).")
                         }
                     }, "peer-probe").apply { isDaemon = true; start() }
                 }
             }
         }
 
-        /** TCP probe for an Android listener on [host] (42317..42347). */
+        /** TCP probe for an Android listener on [host] (42327..42356). */
         private fun probePeer(host: String): Int? {
             val threads = ArrayList<Thread>()
             val found = java.util.concurrent.atomic.AtomicInteger(-1)
-            for (p in 42317..42347) {
+            for (p in com.xnotes.share.companion.AndroidListener.DEFAULT_PORT..com.xnotes.share.companion.AndroidListener.DEFAULT_PORT + com.xnotes.share.companion.AndroidListener.PORT_TRIES - 1) {
                 threads += Thread({
                     if (found.get() != -1) return@Thread
                     try {
@@ -1416,9 +1731,10 @@ class CompanionService : Service() {
 
         /** Make [fp] the active companion and dial it, parking the others. */
         fun switchDevice(context: Context, fp: String) {
+            // Explicit user action: the companion half comes on with it.
+            if (!isCompanionOn(context)) setCompanionEnabled(context, true)
             val svc = runningService
             if (svc == null) {
-                ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
                 // The fresh session dials the active device on its own.
                 Thread({
                     runCatching {
@@ -1529,27 +1845,30 @@ class CompanionService : Service() {
 
         @Volatile private var runningService: CompanionService? = null
 
+        /** Legacy single toggle (kept for compat): enables both halves. */
         fun start(context: Context) {
             ensureChannel(context)
-            try {
-                context.getSharedPreferences(PREFS, 0).edit().putBoolean(KEY_ENABLED, true).apply()
-            } catch (_: Exception) {
-            }
-            ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
+            setCompanionEnabled(context, true)
+            setSharingEnabled(context, true)
         }
 
+        /** Legacy single stop (kept for compat): disables both halves. */
         fun stop(context: Context) {
-            try {
-                context.getSharedPreferences(PREFS, 0).edit().putBoolean(KEY_ENABLED, false).apply()
-            } catch (_: Exception) {
-            }
-            context.stopService(Intent(context, CompanionService::class.java))
+            setCompanionEnabled(context, false)
+            setSharingEnabled(context, false)
         }
 
+        /**
+         * Push a policy refresh to the running session. Passive: never boots
+         * the service (that would resurrect a phantom notification after the
+         * user switched everything off).
+         */
         fun refreshPolicy(context: Context) {
-            ContextCompat.startForegroundService(
-                context, Intent(context, CompanionService::class.java).setAction(ACTION_REFRESH),
-            )
+            val svc = runningService ?: return
+            svc.main.post {
+                svc.engine?.refreshPolicy()
+                synchronized(svc.peerLock) { svc.peerSessions.values.forEach { it.engine.refreshPolicy() } }
+            }
         }
 
         private fun ensureChannel(context: Context) {

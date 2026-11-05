@@ -239,8 +239,7 @@ class HostEngineTest {
         assertEquals(true, docB.style.invertColors)
     }
 
-    @Test fun linkRequestGrantsAndAnswers() {
-        val f = engine()
+    @Test fun linkRequestGrantsAndAnswers() {        val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         b.addFile("f1", "todo.xnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
@@ -572,5 +571,30 @@ class HostEngineTest {
         assertEquals(1, docB.pages[0].items.size)
         val landed = docB.pages[0].items.single() as Stroke
         assertEquals(SyncWire.fingerprintOf(moved), SyncWire.fingerprintOf(landed))
+    }
+
+    @Test fun deleteFolderRevokesSubtreeGrants() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        b.addDir("d1", "notes")
+        b.addFile("f1", "todo.xnote", parent = "d1", bytes = ByteArray(100))
+        b.addFile("f2", "other.xnote", bytes = ByteArray(100))
+        b.files["d1"] = ByteArray(10)
+        f.policy.setShared("d1", true)
+        f.policy.setShared("f1", true)
+        f.policy.setShared("f2", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        var asked = false
+        h.approval = { _, _, _, respond ->
+            asked = true
+            respond(true)
+        }
+        e.onMessage(JSONObject().put("t", "delete_request").put("seq", 1).put("id", "d1").put("device", "Phone"))
+        assertEquals(true, asked)
+        assertEquals(true, h.lastOfType("delete_result").optBoolean("ok"))
+        // Folder grant and everything beneath it are gone; the unrelated file keeps its grant.
+        assertTrue(f.policy.sharedUris().none { it == "d1" || it == "f1" })
+        assertTrue(f.policy.sharedUris().contains("f2"))
     }
 }
