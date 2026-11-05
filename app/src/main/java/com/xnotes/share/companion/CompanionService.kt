@@ -910,6 +910,10 @@ class CompanionService : Service() {
             return
         }
         try {
+            // Stale id from when phone sharing had its own card; never posted now.
+            runCatching {
+                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
+            }
             ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
         } catch (_: Exception) {
         }
@@ -1004,14 +1008,20 @@ class CompanionService : Service() {
         }
 
         /**
-         * Switch the Linux-companion half on/off. Turning it on boots the
-         * service when needed and dials; turning it off drops the dial and
-         * its notification.
+         * Switch the Linux-companion half on/off. It is the single gate for
+         * every LAN-sharing notification: turning it on boots the service
+         * when needed, dials, and serves files over HTTP for the desktop
+         * companion; turning it off drops the dial, stops the HTTP server,
+         * and clears their notifications.
          */
         fun setCompanionEnabled(context: Context, on: Boolean) {
             setFlag(context, KEY_COMPANION, on)
             _companionOn.value = on
             _active.value = on
+            // The HTTP file server follows the same switch: it exists so the
+            // desktop companion can browse files, and must never notify alone.
+            if (on) com.xnotes.share.ShareService.start(context)
+            else com.xnotes.share.ShareService.stop(context)
             val svc = runningService
             if (svc == null) {
                 if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
@@ -1024,6 +1034,16 @@ class CompanionService : Service() {
                 }
                 if (on) svc.startCompanionDial() else svc.stopCompanionDial()
                 svc.updateForeground()
+            }
+        }
+
+        /** Drop lingering status cards when the companion half is switched off. */
+        fun cancelNotifications(context: Context) {
+            runCatching {
+                val nm = context.getSystemService(NotificationManager::class.java) ?: return
+                nm.cancel(NOTIF_COMPANION)
+                // Stale id from when phone sharing had its own card.
+                nm.cancel(NOTIF_SHARING)
             }
         }
 

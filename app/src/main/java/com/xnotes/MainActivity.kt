@@ -167,13 +167,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val settingsRepo = com.xnotes.settings.SettingsRepository(this)
         com.xnotes.settings.LiveSettings.prime(settingsRepo)
-        // Resume LAN sharing across restarts when the settings toggle is on.
-        if (com.xnotes.settings.LiveSettings.get(settingsRepo).prefs.shareEnabled) {
+        // The Companion switch is the single gate for every LAN-sharing
+        // notification: with it on, both the SYNC dial and the HTTP server
+        // come up (and notify); with it off, nothing may linger — cancel
+        // stale cards left by old builds or killed runs and stop all.
+        if (com.xnotes.share.companion.CompanionService.isCompanionOn(this)) {
             com.xnotes.share.ShareService.start(this)
+            com.xnotes.share.companion.CompanionService.startIfEnabled(this)
+        } else {
+            com.xnotes.share.companion.CompanionService.cancelNotifications(this)
+            com.xnotes.share.ShareService.cancelNotifications(this)
+            com.xnotes.share.ShareService.stop(this)
         }
-        // Resume companion sync across restarts when sharing was left on: the
-        // service redials the active paired companion on its own.
-        com.xnotes.share.companion.CompanionService.startIfEnabled(this)
         if (!orphanTabStoragePurged) {
             orphanTabStoragePurged = true
             purgeOrphanedTabStorage()

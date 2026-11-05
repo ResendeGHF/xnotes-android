@@ -233,6 +233,13 @@ class ShareService : Service() {
             context.stopService(Intent(context, ShareService::class.java))
         }
 
+        /** Drop a lingering status card when the service itself is not running. */
+        fun cancelNotifications(context: Context) {
+            runCatching {
+                context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+            }
+        }
+
         private fun ensureChannel(context: Context) {
             val nm = context.getSystemService(NotificationManager::class.java) ?: return
             if (nm.getNotificationChannel(CHANNEL) == null) {
