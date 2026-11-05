@@ -30,6 +30,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -141,10 +142,83 @@ fun CompanionPane(editor: Editor) {
             enabled = companionOn,
         )
         Spacer(Modifier.height(8.dp))
+        SectionHeader("Pair a new companion")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = host,
+                onValueChange = { host = it },
+                label = { Text("Companion IP", fontSize = 13.sp) },
+                placeholder = { Text("127.0.0.1", fontSize = 13.sp) },
+                singleLine = true,
+                enabled = companionOn,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            OutlinedTextField(
+                value = portText,
+                onValueChange = { portText = it.filter { c -> c.isDigit() }.take(5) },
+                label = { Text("Port", fontSize = 13.sp) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                enabled = companionOn,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    val (target, port) = saveTarget() ?: return@Button
+                    CompanionService.reconnect(context, target, port)
+                                },
+                enabled = companionOn,
+            ) { Text(if (devices.isEmpty()) "Pair" else "Add") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Connection", color = Color.White, fontSize = 13.sp)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                status.paired?.let { "Paired device: $it" } ?: status.text.ifEmpty { "Not connected" },
+                color = palette.textDim.toComposeColor(),
+                fontSize = 12.sp,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { activeDevice?.let { CompanionService.switchDevice(context, it.fp) } }, enabled = companionOn && activeDevice != null) {
+                Text("Connect")
+            }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(onClick = { CompanionService.disconnect() }, enabled = companionOn) { Text("Disconnect") }
+        }
+        if (codeNeeded && companionOn) {
+            Spacer(Modifier.height(12.dp))
+            Text("Enter the code shown on the desktop.", color = palette.text.toComposeColor(), fontSize = 13.sp)
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it.filter { c -> c.isDigit() }.take(6) },
+                    label = { Text("6-digit code", fontSize = 13.sp) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = { CompanionService.submitCode(context, code); code = "" }, enabled = code.length == 6) {
+                    Text("Send")
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = { showPolicy = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("Shared files — choose what the companion may see")
+        }
+
+        Spacer(Modifier.height(8.dp))
         SectionHeader("Paired companions (${devices.size})")
         if (devices.isEmpty()) {
             Text(
-                "None yet — pair one below, then type the code it shows.",
+                "None yet — pair a new companion above, then type the code it shows.",
                 color = palette.textDim.toComposeColor(),
                 fontSize = 12.sp,
             )
@@ -193,79 +267,6 @@ fun CompanionPane(editor: Editor) {
                     }
                 }
             }
-        }
-        Spacer(Modifier.height(8.dp))
-        SectionHeader("Pair a new companion")
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = host,
-                onValueChange = { host = it },
-                label = { Text("Companion IP", fontSize = 13.sp) },
-                placeholder = { Text("127.0.0.1", fontSize = 13.sp) },
-                singleLine = true,
-                enabled = companionOn,
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(Modifier.width(8.dp))
-            OutlinedTextField(
-                value = portText,
-                onValueChange = { portText = it.filter { c -> c.isDigit() }.take(5) },
-                label = { Text("Port", fontSize = 13.sp) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                enabled = companionOn,
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = {
-                    val (target, port) = saveTarget() ?: return@Button
-                    CompanionService.reconnect(context, target, port)
-                                },
-                enabled = companionOn,
-            ) { Text(if (devices.isEmpty()) "Pair" else "Add") }
-        }
-        Spacer(Modifier.height(8.dp))
-        SectionHeader("Connection")
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { activeDevice?.let { CompanionService.switchDevice(context, it.fp) } }, enabled = companionOn && activeDevice != null) {
-                Text("Connect")
-            }
-            Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { CompanionService.disconnect() }, enabled = companionOn) { Text("Disconnect") }
-            Spacer(Modifier.width(12.dp))
-            Text(status.text, color = palette.textDim.toComposeColor(), fontSize = 12.sp)
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = { showPolicy = true }, modifier = Modifier.fillMaxWidth()) {
-            Text("Shared files — choose what the companion may see")
-        }
-        if (codeNeeded && companionOn) {
-            Spacer(Modifier.height(12.dp))
-            Text("Enter the code shown on the desktop.", color = palette.text.toComposeColor(), fontSize = 13.sp)
-            Spacer(Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = code,
-                    onValueChange = { code = it.filter { c -> c.isDigit() }.take(6) },
-                    label = { Text("6-digit code", fontSize = 13.sp) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(onClick = { CompanionService.submitCode(context, code); code = "" }, enabled = code.length == 6) {
-                    Text("Send")
-                }
-            }
-        }
-        if (status.paired != null && companionOn) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "Paired device: ${status.paired}",
-                color = palette.textDim.toComposeColor(),
-                fontSize = 12.sp,
-            )
         }
     }
 
