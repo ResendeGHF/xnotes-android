@@ -61,6 +61,8 @@ fun SharedPane() {
     var portText by remember { mutableStateOf("") }
     var pendingCopy by remember { mutableStateOf<Triple<String, String, String>?>(null) }
     var forgetFp by remember { mutableStateOf<String?>(null) }
+    var renameFp by remember { mutableStateOf<String?>(null) }
+    var renameText by remember { mutableStateOf("") }
     val createDoc = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri ->
@@ -100,6 +102,24 @@ fun SharedPane() {
             else "Turn sharing on, then friends enter this phone's IP to pair.",
             color = palette.textDim.toComposeColor(),
             fontSize = 12.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        var ownName by remember {
+            mutableStateOf(
+                context.getSharedPreferences(CompanionService.PREFS, 0).getString(CompanionService.KEY_NAME, "") ?: "",
+            )
+        }
+        OutlinedTextField(
+            value = ownName,
+            onValueChange = {
+                ownName = it
+                CompanionService.setOwnName(context, it.trim())
+            },
+            label = { Text("This phone's nickname", fontSize = 13.sp) },
+            placeholder = { Text(android.os.Build.MODEL ?: "Android", fontSize = 13.sp) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = sharing,
         )
         Spacer(Modifier.height(4.dp))
 
@@ -284,6 +304,10 @@ fun SharedPane() {
                             maxLines = 1,
                         )
                     }
+                    TextButton(onClick = {
+                        renameFp = p.fp
+                        renameText = ""
+                    }) { Text("Rename", fontSize = 12.sp) }
                     TextButton(onClick = { forgetFp = p.fp }) { Text("Forget", fontSize = 12.sp) }
                 }
             }
@@ -302,6 +326,29 @@ fun SharedPane() {
             dismissButton = { TextButton(onClick = { forgetFp = null }) { Text("Cancel") } },
             title = { Text("Forget this phone?", fontSize = 15.sp) },
             text = { Text("Its pairing and grants are removed. It will have to pair again.", fontSize = 13.sp) },
+        )
+    }
+
+    renameFp?.let { fp ->
+        AlertDialog(
+            onDismissRequest = { renameFp = null },
+            title = { Text("Rename phone", fontSize = 16.sp) },
+            text = {
+                OutlinedTextField(
+                    value = renameText,
+                    onValueChange = { renameText = it },
+                    label = { Text("Nickname, just for you (blank clears it)", fontSize = 13.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    CompanionService.renameDevice(context, fp, renameText.trim())
+                    renameFp = null
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { renameFp = null }) { Text("Cancel") } },
         )
     }
 }

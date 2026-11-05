@@ -19,13 +19,14 @@ class GuestEngineTest {
     private fun tempDir(prefix: String): File =
         File(System.getProperty("java.io.tmpdir"), "$prefix-${System.nanoTime()}").apply { mkdirs() }
 
-    private class FakeHost : GuestEngine.GuestHost {
+    private open class FakeHost : GuestEngine.GuestHost {
         val sent = ArrayList<JSONObject>()
         var indexChanged = 0
         var fileReady: Triple<String, String, Boolean>? = null
         var result: Pair<Boolean, String>? = null
         var error: String? = null
-        override fun openDocument(cacheUri: String): com.xnotes.core.model.Document? = null
+        open val docs = HashMap<String, com.xnotes.core.model.Document>()
+        override fun openDocument(cacheUri: String): com.xnotes.core.model.Document? = docs[cacheUri]
         override fun repaintDocument(cacheUri: String) = Unit
         override fun repaintLive(cacheUri: String) = Unit
         override fun editorState(cacheUri: String): com.xnotes.canvas.CanvasState? = null
@@ -92,6 +93,123 @@ class GuestEngineTest {
         // Granted: the refreshed index covers the target, then it opens.
         e.onMessage(JSONObject().put("t", "link_result").put("id", "r1").put("ok", true))
         assertEquals(true to "", h.result)
+    }
+
+    private val fakeMeasurer = object : com.xnotes.core.pal.TextMeasurer {
+        override fun measure(text: String, font: com.xnotes.core.pal.FontSpec, wrapWidth: Double, flags: com.xnotes.core.pal.TextFlags) =
+            com.xnotes.core.geometry.Rect(0.0, 0.0, wrapWidth, 20.0)
+        override fun lineHeight(font: com.xnotes.core.pal.FontSpec): Double = 20.0
+        override fun metrics(font: com.xnotes.core.pal.FontSpec): com.xnotes.core.pal.LineMetrics =
+            com.xnotes.core.pal.LineMetrics(16.0, 4.0)
+        override fun advances(text: String, font: com.xnotes.core.pal.FontSpec): DoubleArray = DoubleArray(text.length) { 10.0 }
+    }
+
+    private fun blankXnoteBytes(): ByteArray {
+        val doc = com.xnotes.core.model.Document(mutableListOf(com.xnotes.core.model.Page(595.0, 842.0)))
+        val codec = com.xnotes.format.DocumentCodec(
+            object : com.xnotes.core.pal.ImageCodec {
+                override fun probeFile(path: String): com.xnotes.core.pal.ImageSize? = null
+            },
+            fakeMeasurer,
+        )
+        val out = java.io.ByteArrayOutputStream()
+        codec.write(doc, out)
+        return out.toByteArray()
+    }
+
+    private fun guestDoc(): com.xnotes.core.model.Document =
+        com.xnotes.core.model.Document(mutableListOf(com.xnotes.core.model.Page(595.0, 842.0)))
+
+    /** Drive a real fetch so [remoteId] binds to a cache file, then open it as a blank doc. */
+    private fun guestWithBoundDoc(doc: com.xnotes.core.model.Document, remoteId: String = "r1"): Triple<GuestEngine, FakeHost, ArrayList<JSONObject>> {
+        val h = FakeHost()
+        val sent = ArrayList<JSONObject>()
+        val e = GuestEngine("ab".repeat(32), GuestEngine.Sender { sent += it }, h, tempDir("guest2"), "Friend")
+        e.onMessage(indexMsg(remoteId))
+        e.fetch(remoteId, openNow = false)
+        val payload = blankXnoteBytes()
+        e.onMessage(
+            JSONObject().put("t", "file").put("id", remoteId).put("version", 2L)
+                .put("total", payload.size.toLong()).put("offset", 0)
+                .put("data", java.util.Base64.getEncoder().encodeToString(payload)).put("last", true),
+        )
+        // The cache write lands on the engine IO thread; wait for it, then open that file.
+        val end = System.currentTimeMillis() + 5000
+        while (System.currentTimeMillis() < end && e.boundUri(remoteId) == null) Thread.sleep(20)
+        val bound = e.boundUri(remoteId)
+        assert(bound != null)
+        h.docs[bound ?: ""] = doc
+        return Triple(e, h, sent)
+    }
+
+    private fun opMsg(file: String, base: Long, ops: JSONArray): JSONObject =
+        JSONObject().put("t", "op").put("file", file).put("base_version", base).put("version", base + 1)
+            .put("dedupe", "d" + System.nanoTime()).put("ops", ops)
+
+    private fun chunked(file: String, id: String, bytes: ByteArray, type: String, idKey: String): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        var off = 0
+        while (off < bytes.size) {
+            val end = minOf(off + 256, bytes.size)
+            out += JSONObject().put("t", type).put("file", file).put(idKey, id)
+                .put("total", bytes.size.toLong()).put("offset", off)
+                .put("data", java.util.Base64.getEncoder().encodeToString(bytes.sliceArray(off until end)))
+                .put("last", end >= bytes.size)
+            off = end
+        }
+        return out
+    }
+
+    @Test fun textAddUpsertAndRemove() {
+        val doc = guestDoc()
+        val (e, _, _) = guestWithBoundDoc(doc)
+        e.onMessage(opMsg("r1", 2L, JSONArray().put(
+            JSONObject().put("op", "add_text").put("page", 0).put("text",
+                com.xnotes.share.companion.SyncWire.toWireText(
+                    com.xnotes.core.model.TextItem(com.xnotes.core.geometry.Pt(1.0, 2.0), 100.0, 0.0, "hey",
+                        com.xnotes.core.model.Rgba(1, 2, 3, 255), 12.0, com.xnotes.core.pal.FontFace.MONO, fakeMeasurer)
+                        .also { it.uid = "gt1" }),
+            ),
+        )))
+        assertEquals(listOf("hey"), doc.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>().map { it.text })
+        e.onMessage(opMsg("r1", 3L, JSONArray().put(
+            JSONObject().put("op", "add_text").put("page", 0).put("text",
+                com.xnotes.share.companion.SyncWire.toWireText(
+                    com.xnotes.core.model.TextItem(com.xnotes.core.geometry.Pt(9.0, 9.0), 50.0, 0.0, "hey!",
+                        com.xnotes.core.model.Rgba(1, 2, 3, 255), 12.0, com.xnotes.core.pal.FontFace.MONO, fakeMeasurer)
+                        .also { it.uid = "gt1" }),
+            ),
+        )))
+        val texts = doc.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>()
+        assertEquals(1, texts.size)
+        assertEquals("hey!", texts.single().text)
+        e.onMessage(opMsg("r1", 4L, JSONArray().put(
+            JSONObject().put("op", "remove_text").put("page", 0).put("ids", JSONArray(listOf("gt1"))),
+        )))
+        assertTrue(doc.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>().isEmpty())
+    }
+
+    @Test fun audioAddAndRemove() {
+        val doc = guestDoc()
+        val (e, _, _) = guestWithBoundDoc(doc)
+        val wav = File.createTempFile("aud", ".m4a").also { it.writeBytes(ByteArray(48) { 3 }) }
+        val item = com.xnotes.core.model.AudioItem(
+            com.xnotes.core.model.AudioData(wav, "m4a", 2000, ByteArray(4) { 5 }),
+            com.xnotes.core.geometry.Rect(1.0, 2.0, 60.0, 20.0), "take", 9, fakeMeasurer,
+        ).also { it.uid = "ga1" }
+        val opAudio = com.xnotes.share.companion.SyncWire.toWireAudio("aud-ga1", item, 0)
+        for (c in chunked("r1", "aud-ga1", wav.readBytes(), "audio_data", "audio_id")) e.onMessage(c)
+        e.onMessage(opMsg("r1", 2L, JSONArray().put(
+            JSONObject().put("op", "add_audio").put("page", 0).put("audio", opAudio),
+        )))
+        val got = doc.pages[0].items.filterIsInstance<com.xnotes.core.model.AudioItem>()
+        assertEquals(1, got.size)
+        assertEquals("take", got.single().name)
+        e.onMessage(opMsg("r1", 3L, JSONArray().put(
+            JSONObject().put("op", "remove_audio").put("page", 0).put("ids", JSONArray(listOf("ga1"))),
+        )))
+        assertTrue(doc.pages[0].items.filterIsInstance<com.xnotes.core.model.AudioItem>().isEmpty())
+        wav.delete()
     }
 
     @Test fun fetchSkipsSocketOnCacheHit() {

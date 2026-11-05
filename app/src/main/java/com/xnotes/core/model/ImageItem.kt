@@ -36,6 +36,8 @@ class ImageItem(
     override val kind = KIND
     override val resizable = true
     override var locked = false
+    /** Stable sync id, persisted; assigned at creation, derived on read for legacy items. */
+    var uid: String = ""
     override var link: String? = null
     override var group: Int? = null
     override var sync: SyncMark? = null

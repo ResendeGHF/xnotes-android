@@ -615,6 +615,146 @@ class HostEngineTest {
         assertEquals(1.2, back.config.pencilPressure, 0.0)
     }
 
+    private val fakeMeasurer = object : com.xnotes.core.pal.TextMeasurer {
+        override fun measure(text: String, font: com.xnotes.core.pal.FontSpec, wrapWidth: Double, flags: com.xnotes.core.pal.TextFlags) =
+            com.xnotes.core.geometry.Rect(0.0, 0.0, wrapWidth, 20.0)
+        override fun lineHeight(font: com.xnotes.core.pal.FontSpec): Double = 20.0
+        override fun metrics(font: com.xnotes.core.pal.FontSpec): com.xnotes.core.pal.LineMetrics =
+            com.xnotes.core.pal.LineMetrics(16.0, 4.0)
+        override fun advances(text: String, font: com.xnotes.core.pal.FontSpec): DoubleArray = DoubleArray(text.length) { 10.0 }
+    }
+
+    private fun textBox(text: String, uid: String): com.xnotes.core.model.TextItem =
+        com.xnotes.core.model.TextItem(
+            com.xnotes.core.geometry.Pt(10.0, 20.0), 200.0, 0.0, text,
+            com.xnotes.core.model.Rgba(10, 20, 30, 255), 14.0,
+            com.xnotes.core.pal.FontFace.MONO, fakeMeasurer,
+        ).also { it.uid = uid }
+
+    private fun tableBox(uid: String, cell: String): com.xnotes.core.model.TableItem =
+        com.xnotes.core.model.TableItem(
+            com.xnotes.core.geometry.Rect(0.0, 0.0, 200.0, 100.0),
+            listOf(0.5, 0.5), listOf(1.0),
+            com.xnotes.core.model.Rgba(0, 0, 0, 255), 2.0, listOf(listOf(cell, "")),
+        ).also { it.uid = uid }
+
+    @Test fun textAddUpsertAndRemove() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        fa.engine.submitLocalText("u1", 0, textBox("hello", "t1"), "tx1")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertEquals(listOf("hello"), docB.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>().map { it.text })
+        // Same uid re-sent (move/restyle): upserts in place, no duplicate.
+        val moved = textBox("hello!", "t1")
+        fa.engine.submitLocalText("u1", 0, moved, "tx2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertEquals(listOf("hello!"), docB.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>().map { it.text })
+        fa.engine.submitLocalTextRemove("u1", 0, listOf("t1"), "tx3")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertTrue(docB.pages[0].items.filterIsInstance<com.xnotes.core.model.TextItem>().isEmpty())
+    }
+
+    @Test fun tableAddAndRemove() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        fa.engine.submitLocalTable("u1", 0, tableBox("tb1", "a1"), "tb1")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertEquals("a1", docB.pages[0].items.filterIsInstance<com.xnotes.core.model.TableItem>().single().cell(0, 0))
+        fa.engine.submitLocalTableRemove("u1", 0, listOf("tb1"), "tb2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertTrue(docB.pages[0].items.filterIsInstance<com.xnotes.core.model.TableItem>().isEmpty())
+    }
+
+    @Test fun audioAddAndRemove() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        val wav = File.createTempFile("aud", ".m4a").also { it.writeBytes(ByteArray(64) { 7 }) }
+        val item = com.xnotes.core.model.AudioItem(
+            com.xnotes.core.model.AudioData(wav, "m4a", 3000, ByteArray(8) { 9 }),
+            com.xnotes.core.geometry.Rect(5.0, 5.0, 120.0, 40.0), "rec", 4, fakeMeasurer,
+        ).also { it.uid = "au1" }
+        fa.engine.submitLocalAudio("u1", 0, "aud-au1", item, "au1")
+        // audio_data + audio_peaks + op all fan out; deliver in order.
+        for (m in fa.host.sent.filter { it.optString("t") == "audio_data" || it.optString("t") == "audio_peaks" || it.optString("t") == "op" }) {
+            fb.engine.onMessage(m)
+        }
+        val got = docB.pages[0].items.filterIsInstance<com.xnotes.core.model.AudioItem>()
+        assertEquals(1, got.size)
+        assertEquals("rec", got.single().name)
+        assertEquals(4, got.single().rid)
+        fa.engine.submitLocalAudioRemove("u1", 0, listOf("au1"), "au2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertTrue(docB.pages[0].items.filterIsInstance<com.xnotes.core.model.AudioItem>().isEmpty())
+        wav.delete()
+    }
+
+    @Test fun imageRemoveByUid() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        val png = File.createTempFile("img", ".bin").also { it.writeBytes(ByteArray(32) { 1 }) }
+        val item = com.xnotes.core.model.ImageItem(
+            com.xnotes.core.model.ImageData(png, 10, 10),
+            com.xnotes.core.geometry.Rect(0.0, 0.0, 50.0, 50.0),
+        ).also { it.uid = "im1" }
+        fa.engine.submitLocalImage("u1", 0, "img-im1", png.readBytes(), 10, 10,
+            com.xnotes.core.geometry.Rect(0.0, 0.0, 50.0, 50.0), 0, 0.0, false, false, null, "im1", uid = "im1")
+        // image_data chunk(s) then the op, in order.
+        for (m in fa.host.sent.filter { it.optString("t") == "image_data" || it.optString("t") == "op" }) {
+            fb.engine.onMessage(m)
+        }
+        assertEquals(1, docB.pages[0].items.filterIsInstance<com.xnotes.core.model.ImageItem>().size)
+        fa.engine.submitLocalImageRemove("u1", 0, listOf("im1"), "im2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertTrue(docB.pages[0].items.filterIsInstance<com.xnotes.core.model.ImageItem>().isEmpty())
+        png.delete()
+    }
+
+    @Test fun strokeSyncMarkRoundTrips() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        val st = stroke().also { it.sync = com.xnotes.core.model.SyncMark(7, 1234) }
+        fa.engine.submitLocalStroke("u1", 0, st, "s1")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        val landed = docB.pages[0].items.filterIsInstance<Stroke>().single()
+        assertEquals(7, landed.sync?.rid)
+        assertEquals(1234, landed.sync?.ms)
+    }
+
     @Test fun deleteFolderRevokesSubtreeGrants() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)

@@ -3563,6 +3563,7 @@ class Editor(
         page.items.add(item)
         state.appendToCache(page, item)
         history.push(AddItem(page, item))
+        onAudioInserted?.invoke(index, item)
         doc.dirty = true
         refreshContent()
         controller.selectPlaced(index, listOf(item))
@@ -5169,10 +5170,25 @@ class Editor(
     var onImageInserted: ((pageIndex: Int, item: com.xnotes.core.model.ImageItem) -> Unit)? = null
 
     /**
+     * Sync hook: fired for every explicit local audio insert (attached file or
+     * finished recording) so the bridge can send bytes + peaks and submit a
+     * matching `add_audio` op. Remote audio ops apply directly and never fire this.
+     */
+    var onAudioInserted: ((pageIndex: Int, item: com.xnotes.core.model.AudioItem) -> Unit)? = null
+
+    /**
      * Sync hook: the whole file changed shape beyond ops (PDF joined, cover
      * set). The bridge pushes the full bytes; the far side reloads.
      */
     var onFileContentReplaced: (() -> Unit)? = null
+
+    /**
+     * Sync hook: one local history step (undo or redo) just applied. The
+     * bridge translates content items (text/table/image/audio) into granular
+     * uid-keyed ops and returns true when nothing remains for the pushFile
+     * fallback. Strokes, markups and pages keep their own undo paths.
+     */
+    var onHistoryStepSync: ((command: Command) -> Boolean)? = null
 
     /**
      * Sync hook: a fresh local markup commit (add/remove/retype/note), as
@@ -9969,12 +9985,22 @@ class Editor(
         val replacements = ArrayList<com.xnotes.canvas.StrokeReplacement>()
         val addedMarkups = ArrayList<Pair<Int, com.xnotes.core.model.TextMarkup>>()
         val removedMarkupIds = ArrayList<Pair<Int, String>>()
-        // Command-level hint: any text/table/image/shape touch converges via pushFile.
-        // Stroke/markup/page commands below fan out as granular ops instead.
-        try {
-            val touched = command?.touched { null }
-            if (touched != null && touched.any { it.second !is com.xnotes.core.model.Stroke }) pushedFile = true
-        } catch (_: Exception) {}
+        // Content items (text/table/image/audio) converge via granular uid-keyed
+        // ops through onHistoryStepSync; strokes/markups/pages fan out below.
+        // Anything else (shapes, tape, labels, sticky notes, groups) still
+        // needs the full-file push.
+        val contentHandled = try {
+            if (command != null) onHistoryStepSync?.invoke(command) == true else false
+        } catch (_: Exception) {
+            false
+        }
+        if (!contentHandled) {
+            try {
+                val touched = command?.touched { null }
+                if (touched != null && touched.any { it.second !is com.xnotes.core.model.Stroke }) pushedFile = true
+            } catch (_: Exception) {
+            }
+        }
         for (pi in 0 until common) {
             val beforeItems = itemsBefore.getOrNull(pi) ?: emptyList()
             val afterItems = pagesNow[pi].items

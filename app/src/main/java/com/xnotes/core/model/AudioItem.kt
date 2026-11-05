@@ -28,6 +28,8 @@ class AudioItem(
     override val mirrorable = false
     override val exported = false
     override var locked = false
+    /** Stable sync id, persisted; assigned at creation, derived on read for legacy items. */
+    var uid: String = ""
     override var group: Int? = null
 
     /** Where the open player stands on this recording, in ms, or -1 while none is open on it. Never saved. */

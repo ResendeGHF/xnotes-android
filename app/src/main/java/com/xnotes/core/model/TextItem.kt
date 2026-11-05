@@ -44,6 +44,8 @@ class TextItem(
     override var link: String? = null
     override var group: Int? = null
     override var sync: SyncMark? = null
+    /** Stable sync id, persisted; assigned at creation, derived on read for legacy items. */
+    var uid: String = ""
 
     val font get() = FontSpec(pointSize, face, bold, italic)
 

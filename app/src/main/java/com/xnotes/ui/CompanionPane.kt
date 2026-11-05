@@ -53,7 +53,7 @@ import java.util.Date
 fun CompanionPane() {
     val palette = LocalPalette.current
     val context = LocalContext.current
-    val status by CompanionService.status.collectAsState()
+    val status by CompanionService.companionStatus.collectAsState()
     val companionOn by CompanionService.companionOn.collectAsState()
     val codeNeeded by CompanionService.codeNeeded.collectAsState()
     val store = remember { ShareStore.of(context.applicationContext) }

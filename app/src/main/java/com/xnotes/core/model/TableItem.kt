@@ -28,6 +28,8 @@ class TableItem(
     override val kind = KIND
     override val resizable = true
     override var locked = false
+    /** Stable sync id, persisted; assigned at creation, derived on read for legacy items. */
+    var uid: String = ""
     override var link: String? = null
 
     val colFractions: MutableList<Double> = colFractions.toMutableList()

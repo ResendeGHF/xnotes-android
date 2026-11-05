@@ -20,11 +20,12 @@ import com.xnotes.share.ShareBackendImpl
 import com.xnotes.share.ShareCrypto
 import com.xnotes.ui.Editor
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import org.json.JSONObject
 
 /**
  * Host side of SYNC.md v1, in the foreground while sharing is on: dials the
@@ -88,6 +89,8 @@ class CompanionService : Service() {
         _sharingOn.value = false
         shutdown()
         _status.value = Status("Off", null, false)
+        _companionStatus.value = Status("Off", null, false)
+        _sharingStatus.value = Status("Off", null, false)
         runCatching {
             getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
             getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
@@ -199,9 +202,9 @@ class CompanionService : Service() {
                 val ui = object : PairingUi {
                     override fun showCodeEntry() {
                         _codeNeeded.value = true
-                        postStatus("Enter the code shown on the companion.")
+                        postCompanionStatus("Enter the code shown on the companion.")
                     }
-                    override fun showStatus(s: String) = postStatus(s)
+                    override fun showStatus(s: String) = postCompanionStatus(s)
                     override fun pairingDone(name: String) {
                         starting.set(false)
                         _codeNeeded.value = false
@@ -210,7 +213,7 @@ class CompanionService : Service() {
 
                     override fun pairingFailed(reason: String) {
                         _codeNeeded.value = false
-                        postStatus(reason)
+                        postCompanionStatus(reason)
                     }
                 }
                 this.backend = backend
@@ -234,7 +237,7 @@ class CompanionService : Service() {
                     drainCoreQueue()
                 }
             } catch (e: Exception) {
-                postStatus("Start failed: ${e.message}")
+                postCompanionStatus("Start failed: ${e.message}")
                 starting.set(false)
                 stopSelfIfIdle()
             }
@@ -343,7 +346,11 @@ class CompanionService : Service() {
             }
 
             override fun onError(reason: String) {
-                _status.value = Status(reason, _status.value.paired, connected = false)
+                main.post {
+                    _companionStatus.value = Status(reason, _companionStatus.value.paired, connected = false)
+                    _sharingStatus.value = Status(reason, _sharingStatus.value.paired, _sharingStatus.value.connected)
+                    mirrorStatus()
+                }
             }
         }
 
@@ -419,19 +426,26 @@ class CompanionService : Service() {
                         kotlinx.coroutines.runBlocking {
                             store.remember(peerFp, name, host, port, kind = if (wasSas) com.xnotes.share.db.DeviceKind.PHONE else null)
                             // First companion ever becomes active; otherwise the
-                            // active one keeps its slot.
-                            if (store.activeDeviceOnce() == null) {
+                            // active one keeps its slot. SAS (phone) peers must
+                            // never take the companion dial slot.
+                            if (!wasSas && store.activeDeviceOnce() == null) {
                                 store.setActive(peerFp)
                             }
                         }
                         grants.activeFp = peerFp
                         kotlinx.coroutines.runBlocking { grants.refreshBlocking(peerFp) }
                         val dev = kotlinx.coroutines.runBlocking { store.device(peerFp) }
-                        main.post { _status.value = Status("Connected to ${dev?.displayName ?: name}.", dev?.displayName ?: name, connected = true) }
+                        main.post {
+                            _companionStatus.value = Status("Connected to ${dev?.displayName ?: name}.", dev?.displayName ?: name, connected = true)
+                            mirrorStatus()
+                        }
                     }
                 }, "companion-remember").apply { isDaemon = true; start() }
             } else {
-                main.post { _status.value = Status("Connected to $name.", name, connected = true) }
+                main.post {
+                    _companionStatus.value = Status("Connected to $name.", name, connected = true)
+                    mirrorStatus()
+                }
             }
         }
         val client = CompanionClient(
@@ -455,7 +469,8 @@ class CompanionService : Service() {
                     }
                     val label = known?.displayName ?: pins.nameFor(peerFp)
                     main.post {
-                        _status.value = Status("Connected. Pairing…", label, connected = true)
+                        _companionStatus.value = Status("Connected. Pairing…", label, connected = true)
+                        mirrorStatus()
                         pairing.onConnected(peerFp)
                     }
                 }
@@ -464,27 +479,54 @@ class CompanionService : Service() {
         client.onMessage = { msg -> main.post { route(msg) } }
         client.onDisconnected = { willRetry ->
             main.post {
-                if (!willRetry) _status.value = Status("Disconnected.", _status.value.paired, connected = false)
+                if (!willRetry) {
+                    _companionStatus.value = Status("Disconnected.", _companionStatus.value.paired, connected = false)
+                    mirrorStatus()
+                }
             }
         }
-        client.onError = { err -> postStatus(err) }
+        client.onError = { err -> postCompanionStatus(err) }
         this.pairing = pairing
         this.client = client
         main.post {
             val label = dev?.displayName ?: pins.all().firstOrNull()?.name
-            _status.value = Status("Connecting…", label, connected = false)
+            _companionStatus.value = Status("Connecting…", label, connected = false)
+            mirrorStatus()
         }
         client.connect()
     }
 
+    private fun postCompanionStatus(s: String) {
+        main.post {
+            _companionStatus.value = Status(s, _companionStatus.value.paired, _companionStatus.value.connected)
+            mirrorStatus()
+        }
+    }
+
+    private fun postSharingStatus(s: String) {
+        main.post {
+            _sharingStatus.value = Status(s, _sharingStatus.value.paired, _sharingStatus.value.connected)
+            mirrorStatus()
+        }
+    }
+
+    /** Legacy combined status mirrors the enabled half (companion wins when both on). */
+    private fun mirrorStatus() {
+        _status.value = if (isCompanionOn(this)) _companionStatus.value else _sharingStatus.value
+    }
+
     private fun postStatus(s: String) {
-        main.post { _status.value = Status(s, _status.value.paired, _status.value.connected) }
+        // Old single-half callers (now split below); default to companion to
+        // preserve prior behavior until each site is repointed.
+        postCompanionStatus(s)
     }
 
     private fun route(msg: JSONObject) {
-        when (msg.optString("t")) {
-            "hello_ack", "pair_result" -> pairing?.onMessage(msg)
-            else -> engine?.onMessage(msg)
+        runCatching {
+            when (msg.optString("t")) {
+                "hello_ack", "pair_result" -> pairing?.onMessage(msg)
+                else -> engine?.onMessage(msg)
+            }
         }
     }
 
@@ -521,9 +563,9 @@ class CompanionService : Service() {
             l.start()
             listener = l
             _listenPort.value = l.boundPort
-            postStatus("Listening for phones on port ${l.boundPort}.")
+            postSharingStatus("Listening for phones on port ${l.boundPort}.")
         } catch (e: Exception) {
-            postStatus("Phone listener failed: ${e.message}")
+            postSharingStatus("Phone listener failed: ${e.message}")
         }
     }
 
@@ -559,16 +601,16 @@ class CompanionService : Service() {
                             peerSessions[key]?.engine?.refreshPolicy()
                             _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
                             publishPeers()
-                            postStatus("$name connected.")
+                            postSharingStatus("$name connected.")
                         }
                     }, "peer-remember").apply { isDaemon = true; start() }
                 }
                 override fun pairingFailed(peerFp: String, reason: String) {
                     _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-                    postStatus("Pairing failed: $reason")
+                    postSharingStatus("Pairing failed: $reason")
                     publishPeers()
                 }
-                override fun showStatus(s: String) = postStatus(s)
+                override fun showStatus(s: String) = postSharingStatus(s)
             },
             HostHandshake.Sender { conn.send(it) },
         )
@@ -591,8 +633,8 @@ class CompanionService : Service() {
 
     private fun onPeerMessage(fp: String, msg: JSONObject) {
         val s = synchronized(peerLock) { peerSessions[fp.lowercase()] } ?: return
-        s.handshake.onMessage(fp, msg)
-        s.engine.onMessage(msg)
+        runCatching { s.handshake.onMessage(fp, msg) }
+        runCatching { s.engine.onMessage(msg) }
     }
 
     private fun onPeerLost(fp: String) {
@@ -614,9 +656,11 @@ class CompanionService : Service() {
             // user can redial them as a guest; inbound ones show connected.
             val fps = (byFp.keys + connected).sorted()
             main.post {
-                _peers.value = fps.map { fp ->
+                _peers.value = fps.mapNotNull { fp ->
                     val dev = byFp[fp]
-                    PeerInfo(fp, dev?.displayName ?: "phone", fp in connected, dev?.kind ?: com.xnotes.share.db.DeviceKind.PHONE)
+                    val kind = dev?.kind ?: com.xnotes.share.db.DeviceKind.PHONE
+                    if (kind != com.xnotes.share.db.DeviceKind.PHONE) return@mapNotNull null
+                    PeerInfo(fp, dev?.displayName ?: "phone", fp in connected, kind)
                 }
             }
         }, "peers-publish").apply { isDaemon = true; start() }
@@ -670,16 +714,16 @@ class CompanionService : Service() {
             if (openNow) {
                 main.post {
                     CompanionService.onOpenGuestFile?.invoke(cacheUri)
-                        ?: postStatus("Shared file is ready.")
+                        ?: postSharingStatus("Shared file is ready.")
                 }
             }
         }
         override fun onResult(hostFp: String, ok: Boolean, reason: String) {
-            postStatus(if (ok) "Done." else "Declined${if (reason.isNotEmpty()) ": $reason" else "."}")
+            postSharingStatus(if (ok) "Done." else "Declined${if (reason.isNotEmpty()) ": $reason" else "."}")
         }
         override fun onLinkResult(hostFp: String, remoteId: String, ok: Boolean, reason: String) {
             if (!ok) {
-                postStatus("No access${if (reason.isNotEmpty()) ": $reason" else "."}")
+                postSharingStatus("No access${if (reason.isNotEmpty()) ": $reason" else "."}")
                 return
             }
             // Granted: the pushed index now covers the target; fetch and open it.
@@ -688,7 +732,7 @@ class CompanionService : Service() {
             } ?: return
             eng.fetch(remoteId, openNow = true)
         }
-        override fun onError(reason: String) = postStatus(reason)
+        override fun onError(reason: String) = postSharingStatus(reason)
     }
 
     /**
@@ -734,7 +778,7 @@ class CompanionService : Service() {
                 session.engine.onDisconnected(!willRetry)
             }
         }
-        client.onError = { err -> postStatus(err) }
+        client.onError = { err -> postSharingStatus(err) }
         synchronized(peerLock) { guestSessions[key] = session }
         rememberGuestTarget(key)
         publishGuests()
@@ -742,22 +786,24 @@ class CompanionService : Service() {
     }
 
     private fun guestRoute(s: GuestSession, msg: JSONObject) {
-        when (msg.optString("t")) {
-            "hello_ack", "pair_result" -> s.pairing.onMessage(msg)
-            else -> s.engine.onMessage(msg)
+        runCatching {
+            when (msg.optString("t")) {
+                "hello_ack", "pair_result" -> s.pairing.onMessage(msg)
+                else -> s.engine.onMessage(msg)
+            }
         }
     }
 
     private fun guestPairingUi(key: String): PairingUi = object : PairingUi {
         override fun showCodeEntry() = Unit
-        override fun showStatus(s: String) = postStatus(s)
+        override fun showStatus(s: String) = postSharingStatus(s)
         override fun pairingDone(name: String) {
             _sasOutbound.value?.takeIf { it.key == key }?.let { _sasOutbound.value = null }
-            postStatus("Paired with $name.")
+            postSharingStatus("Paired with $name.")
         }
         override fun pairingFailed(reason: String) {
             _sasOutbound.value?.takeIf { it.key == key }?.let { _sasOutbound.value = null }
-            postStatus("Pairing failed: $reason")
+            postSharingStatus("Pairing failed: $reason")
         }
     }
 
@@ -858,7 +904,7 @@ class CompanionService : Service() {
         runCatching { client?.disconnect() }
         pairing = null
         client = null
-        postStatus("Companion off.")
+        postCompanionStatus("Companion off.")
         updateForeground()
     }
 
@@ -888,7 +934,7 @@ class CompanionService : Service() {
         _guestIndex.value = emptyMap()
         _sasInbound.value = null
         _sasOutbound.value = null
-        postStatus("Phone sharing off.")
+        postSharingStatus("Phone sharing off.")
         updateForeground()
     }
 
@@ -1019,6 +1065,7 @@ class CompanionService : Service() {
                 }
             }
         }
+        editor.onHistoryStepSync = { cmd -> syncContentCommand(editor, uri, guest, cmd) }
         editor.onPageStyleChanged = { entries, docStyle, docMargins ->
             // Style/margin commits carry no undo step; the callback fires once per set.
             if (guest != null) guest.submitLocalPageStyle(uri, entries, docStyle, docMargins, newDedupe())
@@ -1036,48 +1083,24 @@ class CompanionService : Service() {
                 }
             }
         }
-        // Text/table/shape/image edits have no granular op yet: converge via
-        // debounced full-file push (real-time, no divergence). Strokes/markups/
-        // pages/rooms/images-inserts already fan out above and are excluded.
+        // Text/table/image/audio edits fan out as granular uid-keyed ops both
+        // ways (upsert on change, remove on delete); strokes/markups/pages/rooms
+        // keep their dedicated hooks. Anything else converges via debounced
+        // full-file push (host only; guests have no push path for it).
         val prevPush = editor.history.onPush
         editor.history.onPush = { cmd ->
             try { prevPush?.invoke(cmd) } catch (_: Exception) {}
-            val name = cmd.javaClass.simpleName
-            val isGranular = name == "AddMarkups" || name == "RemoveMarkup" || name == "ReplaceMarkup" ||
-                name == "CompositeCommand" || name.startsWith("AddPage") || name.startsWith("DeletePage") ||
-                name.startsWith("MovePages")
-            // Stroke commits (AddItem/EraseItems/ReplacePageItems with only strokes)
-            // already sync via controller hooks; only non-stroke content falls through here.
-            var strokeOnly = false
-            try {
-                val added = cmd.added()
-                if (added.isNotEmpty() && added.all { it is com.xnotes.core.model.Stroke }) {
-                    // AddItem(stroke) committed via onStrokeCommitted, not here.
-                    strokeOnly = true
-                } else if (added.isEmpty()) {
-                    // Erase/replace of strokes only -> handled via onStrokesErased/Replaced.
-                    // Heuristic: touched items are all strokes.
-                    val touched = try { cmd.touched { null } } catch (_: Exception) { null }
-                    if (touched != null && touched.isNotEmpty() && touched.all { it.second is com.xnotes.core.model.Stroke }) {
-                        strokeOnly = true
-                    }
-                }
-            } catch (_: Exception) {}
-            if (!isGranular && !strokeOnly) {
-                pushFileSoon(uri, guest)
+            val covered = try {
+                syncContentCommand(editor, uri, guest, cmd)
+            } catch (_: Exception) {
+                false
             }
-        }
-        editor.onImageInserted = { page, item ->
-            val id = newDedupe()
-            runCatching { item.image.file.readBytes() }.getOrNull()?.let { bytes ->
-                val part = item.part?.let { com.xnotes.core.geometry.Rect(it.x, it.y, it.right, it.bottom) }
-                if (guest != null) {
-                    guest.submitLocalImage(uri, page, id, bytes, item.image.width, item.image.height,
-                        item.rect, item.orientation, item.angle, item.flip.x, item.flip.y, part, id)
-                } else eachHost {
-                    it.submitLocalImage(uri, page, id, bytes, item.image.width, item.image.height,
-                        item.rect, item.orientation, item.angle, item.flip.x, item.flip.y, part, id)
-                }
+            if (!covered) {
+                val name = cmd.javaClass.simpleName
+                val isGranular = name == "AddMarkups" || name == "RemoveMarkup" || name == "ReplaceMarkup" ||
+                    name == "CompositeCommand" || name.startsWith("AddPage") || name.startsWith("DeletePage") ||
+                    name.startsWith("MovePages")
+                if (!isGranular) pushFileSoon(uri, guest)
             }
         }
         editor.controller.onRoomPreviewDone = {
@@ -1116,6 +1139,128 @@ class CompanionService : Service() {
     private val pushDebounce = HashMap<String, Runnable>()
 
     private fun newDedupe(): String = "h${dedupeCounter++}-${System.nanoTime().toString(16)}"
+
+    /**
+     * Translate one local history step into uid-keyed content ops (text, table,
+     * image, audio), both as host and as guest. Strokes keep their dedicated
+     * hooks and are skipped here. Returns true when nothing remains for the
+     * pushFile fallback (every touched non-stroke item was covered).
+     *
+     * Removes come from pages that no longer hold the uid; everything still
+     * present upserts its current snapshot, so creates, moves, resizes,
+     * restyles and cell or text edits all converge with one code path.
+     */
+    private fun syncContentCommand(editor: Editor, uri: String, guest: GuestEngine?, cmd: com.xnotes.core.history.Command): Boolean {
+        val doc = try { editor.state.document } catch (_: Exception) { return false }
+        val touched = try {
+            cmd.touched { item -> doc.pages.firstOrNull { p -> p.items.any { it === item } } }
+        } catch (_: Exception) { null } ?: return false
+        val content = touched.filter { it.second !is com.xnotes.core.model.Stroke }
+        if (content.isEmpty()) return true
+        var covered = true
+        val byPage = content.groupBy({ it.first }, { it.second })
+        for ((page, items) in byPage) {
+            val pi = doc.pages.indexOf(page)
+            if (pi < 0) continue
+            val cur = doc.pages[pi].items
+            val curByUid = HashMap<String, com.xnotes.core.model.CanvasItem>()
+            for (it in cur) uidOf(it)?.takeIf { u -> u.isNotEmpty() }?.let { u -> curByUid[u] = it }
+            val touchedUids = LinkedHashSet<String>()
+            for (it in items) uidOf(it)?.takeIf { u -> u.isNotEmpty() }?.let { u -> touchedUids.add(u) }
+            val removed = touchedUids.filter { it !in curByUid }
+            val added = touchedUids.filter { it in curByUid }.mapNotNull { curByUid[it] }
+            val ops = JSONArray()
+            for (uid in removed) {
+                val kind = kindOfUid(items, uid) ?: kindOfUid(cur, uid) ?: "text"
+                when (kind) {
+                    "table" -> ops.put(JSONObject().put("op", "remove_table").put("page", pi).put("ids", JSONArray(listOf(uid))))
+                    "image" -> ops.put(JSONObject().put("op", "remove_image").put("page", pi).put("ids", JSONArray(listOf(uid))))
+                    "audio" -> ops.put(JSONObject().put("op", "remove_audio").put("page", pi).put("ids", JSONArray(listOf(uid))))
+                    else -> ops.put(JSONObject().put("op", "remove_text").put("page", pi).put("ids", JSONArray(listOf(uid))))
+                }
+            }
+            for (it in added) {
+                when (it) {
+                    is com.xnotes.core.model.TextItem -> {
+                        if (it.uid.isEmpty()) it.uid = newDedupe()
+                        ops.put(JSONObject().put("op", "add_text").put("page", pi).put("text", SyncWire.toWireText(it)))
+                    }
+                    is com.xnotes.core.model.TableItem -> {
+                        if (it.uid.isEmpty()) it.uid = newDedupe()
+                        ops.put(JSONObject().put("op", "add_table").put("page", pi).put("table", SyncWire.toWireTable(it)))
+                    }
+                    is com.xnotes.core.model.ImageItem -> {
+                        if (it.uid.isEmpty()) it.uid = newDedupe()
+                        val bytes = runCatching { it.image.file.readBytes() }.getOrNull() ?: continue
+                        val imageId = "img-" + it.uid
+                        sendContentBytes(uri, guest, fileOf(editor, uri), imageId, bytes, kind = "image")
+                        val op = JSONObject().put("op", "add_image").put("page", pi).put("image_id", imageId)
+                            .put("width", it.image.width).put("height", it.image.height)
+                            .put("rect", JSONArray().put(it.rect.x).put(it.rect.y).put(it.rect.w).put(it.rect.h))
+                            .put("orientation", it.orientation).put("angle", it.angle)
+                        if (it.flip.x) op.put("flip_x", true)
+                        if (it.flip.y) op.put("flip_y", true)
+                        it.part?.let { q -> op.put("part", JSONArray().put(q.x).put(q.y).put(q.right).put(q.bottom)) }
+                        op.put("uid", it.uid)
+                        ops.put(op)
+                    }
+                    is com.xnotes.core.model.AudioItem -> {
+                        if (it.uid.isEmpty()) it.uid = newDedupe()
+                        val bytes = runCatching { it.audio.file.readBytes() }.getOrNull() ?: continue
+                        val audioId = "aud-" + it.uid
+                        sendContentBytes(uri, guest, fileOf(editor, uri), audioId, bytes, kind = "audio")
+                        sendContentBytes(uri, guest, fileOf(editor, uri), audioId, it.audio.peaks, kind = "peaks")
+                        ops.put(JSONObject().put("op", "add_audio").put("page", pi).put("audio", SyncWire.toWireAudio(audioId, it, pi)))
+                    }
+                    else -> covered = false
+                }
+            }
+            if (ops.length() > 0) {
+                val id = newDedupe()
+                if (guest != null) guest.submitContentOps(fileOf(editor, uri), ops, id)
+                else eachHost { it.submitContentOps(uri, ops, id) }
+            }
+            if (items.any { it !is com.xnotes.core.model.TextItem && it !is com.xnotes.core.model.TableItem && it !is com.xnotes.core.model.ImageItem && it !is com.xnotes.core.model.AudioItem }) covered = false
+        }
+        return covered
+    }
+
+    private fun uidOf(item: com.xnotes.core.model.CanvasItem): String? = when (item) {
+        is com.xnotes.core.model.TextItem -> item.uid
+        is com.xnotes.core.model.TableItem -> item.uid
+        is com.xnotes.core.model.ImageItem -> item.uid
+        is com.xnotes.core.model.AudioItem -> item.uid
+        else -> null
+    }
+
+    private fun kindOfUid(items: List<com.xnotes.core.model.CanvasItem>, uid: String): String? {
+        val it = items.firstOrNull { uidOf(it) == uid } ?: return null
+        return when (it) {
+            is com.xnotes.core.model.TextItem -> "text"
+            is com.xnotes.core.model.TableItem -> "table"
+            is com.xnotes.core.model.ImageItem -> "image"
+            is com.xnotes.core.model.AudioItem -> "audio"
+            else -> null
+        }
+    }
+
+    private fun fileOf(editor: Editor, uri: String): String {
+        val g = guestForCacheUri(uri)
+        return if (g != null) "" else uri
+    }
+
+    private fun sendContentBytes(uri: String, guest: GuestEngine?, file: String, id: String, bytes: ByteArray, kind: String) {
+        val target = if (file.isNotEmpty()) file else uri
+        if (guest != null) {
+            if (kind == "audio") guest.sendAudioBytes(target, id, bytes)
+            else if (kind == "peaks") guest.sendAudioPeaks(target, id, bytes)
+            else guest.sendImageBytes(target, id, bytes)
+        } else eachHost {
+            if (kind == "audio") it.sendAudioBytes(uri, id, bytes)
+            else if (kind == "peaks") it.sendAudioPeaks(uri, id, bytes)
+            else it.sendImageBytes(uri, id, bytes)
+        }
+    }
 
     /**
      * Debounced full-file push for content ops have no wire form (text/table
@@ -1177,10 +1322,10 @@ class CompanionService : Service() {
             if (engine.remoteIndex().any { it.id == targetId }) {
                 engine.fetch(targetId, openNow = true)
             } else if (engine.isConnected()) {
-                postStatus("Asking the owner for access…")
+                postSharingStatus("Asking the owner for access…")
                 engine.requestLinkAccess(targetId)
             } else {
-                postStatus("Not connected.")
+                postSharingStatus("Not connected.")
             }
         }
     }
@@ -1199,6 +1344,7 @@ class CompanionService : Service() {
         editor.onImageInserted = null
         editor.onFileContentReplaced = null
         editor.onMarkupsChanged = null
+        editor.onHistoryStepSync = null
         editor.onPageStyleChanged = null
         editor.controller.onMarkupsErased = null
         editor.onOpenSharedNoteLink = null
@@ -1280,7 +1426,7 @@ class CompanionService : Service() {
             this, 11, Intent(this, CompanionService::class.java).setAction(ACTION_STOP_COMPANION),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val label = _status.value.paired ?: _status.value.text
+        val label = _companionStatus.value.paired ?: _companionStatus.value.text
         return NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification_share)
             .setContentTitle(getString(R.string.share_notif_title))
@@ -1398,6 +1544,12 @@ class CompanionService : Service() {
 
         private val _status = MutableStateFlow(Status("Off", null, false))
         val status: StateFlow<Status> = _status.asStateFlow()
+        private val _companionStatus = MutableStateFlow(Status("Off", null, false))
+        /** Linux-companion half status; Companion screen observes this only. */
+        val companionStatus: StateFlow<Status> = _companionStatus.asStateFlow()
+        private val _sharingStatus = MutableStateFlow(Status("Off", null, false))
+        /** Phone-sharing half status; Shared screen observes this only. */
+        val sharingStatus: StateFlow<Status> = _sharingStatus.asStateFlow()
         private val _codeNeeded = MutableStateFlow(false)
         val codeNeeded: StateFlow<Boolean> = _codeNeeded.asStateFlow()
         private val _active = MutableStateFlow(false)
@@ -1549,7 +1701,7 @@ class CompanionService : Service() {
             // Explicit pairing step: the companion half comes on with it.
             setCompanionEnabled(context, true)
             val svc = runningService ?: return
-            svc.main.post { svc.pairing?.submitCode(code) ?: svc.postStatus("Not connected yet — try again in a moment.") }
+            svc.main.post { svc.pairing?.submitCode(code) ?: svc.postCompanionStatus("Not connected yet — try again in a moment.") }
         }
 
         /** Re-dial an ad-hoc address (explicit: turns the companion half on). */
@@ -1604,18 +1756,18 @@ class CompanionService : Service() {
             }
             svc.main.post {
                 if (svc.sharedVersions == null) {
-                    svc.postStatus("Sharing is still starting — try again in a moment.")
+                    svc.postSharingStatus("Sharing is still starting — try again in a moment.")
                     return@post
                 }
                 if (port in 1..65535) {
                     svc.startGuestSession(host, port)
                 } else {
-                    svc.postStatus("Probing $host for a phone…")
+                    svc.postSharingStatus("Probing $host for a phone…")
                     Thread({
                         val found = probePeer(host)
                         svc.main.post {
                             if (found != null) svc.startGuestSession(host, found)
-                            else svc.postStatus("No phone found on $host (tried 42327–42356).")
+                            else svc.postSharingStatus("No phone found on $host (tried 42327–42356).")
                         }
                     }, "peer-probe").apply { isDaemon = true; start() }
                 }
@@ -1697,7 +1849,7 @@ class CompanionService : Service() {
             svc.main.post {
                 _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
                 synchronized(svc.peerLock) { svc.peerSessions[key] }?.handshake?.setApproved(key, true)
-                    ?: svc.postStatus("That phone already left.")
+                    ?: svc.postSharingStatus("That phone already left.")
             }
         }
 
@@ -1790,7 +1942,8 @@ class CompanionService : Service() {
                         _sasInbound.value?.takeIf { it.key == fp }?.let { _sasInbound.value = null }
                         svc.publishPeers()
                         svc.publishGuests()
-                        _status.value = Status("Forgot phone.", _status.value.paired, connected = false)
+                        _sharingStatus.value = Status("Forgot phone.", _sharingStatus.value.paired, connected = false)
+                        svc.mirrorStatus()
                     }
                 }
             }, "peer-forget").apply { isDaemon = true; start() }
@@ -1844,7 +1997,8 @@ class CompanionService : Service() {
                         if (svc.grants?.activeFp == fp) {
                             svc.grants?.activeFp = null
                             svc.client?.disconnect()
-                            _status.value = Status("Forgot companion.", null, connected = false)
+                            _companionStatus.value = Status("Forgot companion.", null, connected = false)
+                            svc.mirrorStatus()
                         }
                     }
                 }
@@ -1881,7 +2035,8 @@ class CompanionService : Service() {
                     runningService?.let { svc ->
                         svc.main.post {
                             if (svc.grants?.activeFp == fp && dev != null) {
-                                _status.value = _status.value.copy(paired = dev.displayName)
+                                _companionStatus.value = _companionStatus.value.copy(paired = dev.displayName)
+                                svc.mirrorStatus()
                             }
                         }
                     }
@@ -1905,7 +2060,8 @@ class CompanionService : Service() {
                 svc.main.post {
                     svc.client?.autoReconnect = false
                     svc.client?.disconnect()
-                    _status.value = Status("Disconnected.", _status.value.paired, connected = false)
+                    _companionStatus.value = Status("Disconnected.", _companionStatus.value.paired, connected = false)
+                    svc.mirrorStatus()
                 }
             }
         }

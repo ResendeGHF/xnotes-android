@@ -108,6 +108,8 @@ class GuestEngine(
             "live" -> onLive(msg)
             "room_live" -> onRoomLive(msg)
             "image_data" -> onImageChunk(msg)
+        "audio_data" -> onAudioChunk(msg, peaks = false)
+        "audio_peaks" -> onAudioChunk(msg, peaks = true)
             "presence" -> synchronized(lock) {
                 val file = msg.optString("file")
                 if (file.isNotEmpty()) hostPresence[file] = msg.optInt("page", -1)
@@ -315,6 +317,33 @@ class GuestEngine(
                 }
                 "add_image" -> {
                     if (applyRemoteImage(cacheUri, file, op)) changed = true
+                }
+                "remove_image" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
+                    if (ids.isNotEmpty() && applyImageRemove(cacheUri, file, op.optInt("page", 0), ids)) changed = true
+                }
+                "add_text" -> {
+                    val t = op.optJSONObject("text") ?: JSONObject()
+                    if (applyTextAdd(cacheUri, file, op.optInt("page", 0), t)) changed = true
+                }
+                "remove_text" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
+                    if (ids.isNotEmpty() && applyTextRemove(cacheUri, file, op.optInt("page", 0), ids)) changed = true
+                }
+                "add_table" -> {
+                    val t = op.optJSONObject("table") ?: JSONObject()
+                    if (applyTableAdd(cacheUri, file, op.optInt("page", 0), t)) changed = true
+                }
+                "remove_table" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
+                    if (ids.isNotEmpty() && applyTableRemove(cacheUri, file, op.optInt("page", 0), ids)) changed = true
+                }
+                "add_audio" -> {
+                    if (applyRemoteAudio(cacheUri, file, op)) changed = true
+                }
+                "remove_audio" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
+                    if (ids.isNotEmpty() && applyAudioRemove(cacheUri, file, op.optInt("page", 0), ids)) changed = true
                 }
                 "add_markup" -> {
                     val m = op.optJSONObject("markup")?.let { SyncWire.markupFrom(it) }
@@ -695,6 +724,7 @@ class GuestEngine(
             flip = com.xnotes.core.geometry.Flip.of(op.optBoolean("flip_x", false), op.optBoolean("flip_y", false)),
             part = part,
         )
+        item.uid = op.optString("uid").ifEmpty { op.optString("image_id") }
         val uri = cacheUri
         if (uri != null) host.openDocument(uri)?.let { doc ->
             val pg = doc.pages.getOrNull(page) ?: run {
@@ -705,6 +735,19 @@ class GuestEngine(
                 dest.delete()
                 return false
             }
+            (findByUid(pg, item.uid) as? com.xnotes.core.model.ImageItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) {
+                    cur.rect = item.rect
+                    cur.orientation = item.orientation
+                    cur.angle = item.angle
+                    cur.flip = item.flip
+                    cur.part = item.part
+                    doc.dirty = true
+                    host.repaintDocument(uri)
+                    return true
+                }
+            }
             pg.items.add(item)
             doc.dirty = true
             host.editorState(uri)?.appendToCache(pg, item)
@@ -714,11 +757,331 @@ class GuestEngine(
         val ok = modifyCache(file) { doc ->
             val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
             if (item.rect.w <= 0 || item.rect.h <= 0) return@modifyCache false
+            (findByUid(pg, item.uid) as? com.xnotes.core.model.ImageItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) {
+                    cur.rect = item.rect
+                    cur.orientation = item.orientation
+                    cur.angle = item.angle
+                    cur.flip = item.flip
+                    cur.part = item.part
+                    return@modifyCache true
+                }
+            }
             pg.items.add(item)
             true
         }
         if (!ok) dest.delete()
         return ok
+    }
+
+    /** Find a shareable item by stable uid on [pg]. */
+    private fun findByUid(pg: com.xnotes.core.model.Page, uid: String): com.xnotes.core.model.CanvasItem? {
+        if (uid.isEmpty()) return null
+        for (it in pg.items) {
+            val u = (it as? com.xnotes.core.model.TextItem)?.uid
+                ?: (it as? com.xnotes.core.model.TableItem)?.uid
+                ?: (it as? com.xnotes.core.model.ImageItem)?.uid
+                ?: (it as? com.xnotes.core.model.AudioItem)?.uid
+                ?: continue
+            if (u == uid) return it
+        }
+        return null
+    }
+
+    private fun nativeText(t: JSONObject): com.xnotes.core.model.TextItem? {
+        val uid = t.optString("uid")
+        if (uid.isEmpty()) return null
+        return com.xnotes.core.model.TextItem(
+            pos = com.xnotes.core.geometry.Pt(t.optDouble("x"), t.optDouble("y")),
+            width = t.optDouble("width", com.xnotes.core.model.TextItem.DEFAULT_WIDTH),
+            height = t.optDouble("height", 0.0),
+            text = t.optString("text"),
+            rgba = RemoteLiveStrokes.parseColor(t.optString("color")) ?: com.xnotes.core.model.Rgba(20, 20, 20, 255),
+            pointSize = t.optDouble("point_size", com.xnotes.core.model.TextItem.DEFAULT_POINT_SIZE),
+            face = com.xnotes.core.pal.FontFace.fromId(t.optString("face")),
+            measurer = com.xnotes.platform.AndroidTextMeasurer(),
+            bold = t.optBoolean("bold", false), italic = t.optBoolean("italic", false),
+            underline = t.optBoolean("underline", false), strike = t.optBoolean("strike", false),
+            align = when (t.optString("align")) {
+                "center" -> com.xnotes.core.pal.HAlign.CENTER
+                "right" -> com.xnotes.core.pal.HAlign.RIGHT
+                else -> com.xnotes.core.pal.HAlign.LEFT
+            },
+            math = t.optBoolean("math", false),
+        ).also {
+            it.uid = uid
+            it.link = t.optString("link").ifEmpty { null }
+        }
+    }
+
+    private fun nativeTable(t: JSONObject): com.xnotes.core.model.TableItem? {
+        val uid = t.optString("uid")
+        if (uid.isEmpty()) return null
+        fun doubles(a: org.json.JSONArray?): List<Double> {
+            if (a == null) return emptyList()
+            return List(a.length()) { a.optDouble(it, Double.NaN) }.filter { it.isFinite() }
+        }
+        val cols = doubles(t.optJSONArray("cols"))
+        val rows = doubles(t.optJSONArray("rows"))
+        if (cols.isEmpty() || rows.isEmpty()) return null
+        val cells = t.optJSONArray("cells")?.let { arr ->
+            List(rows.size) { r ->
+                val row = arr.optJSONArray(r)
+                List(cols.size) { c -> row?.optString(c, "").orEmpty() }
+            }
+        } ?: emptyList()
+        return com.xnotes.core.model.TableItem(
+            com.xnotes.core.geometry.Rect(t.optDouble("x"), t.optDouble("y"), t.optDouble("w"), t.optDouble("h")),
+            cols, rows,
+            com.xnotes.core.model.Rgba(0, 0, 0, 255).let { com.xnotes.canvas.RemoteLiveStrokes.parseColor(t.optString("stroke_color")) ?: it },
+            if (t.isNull("stroke_width")) 2.0 else t.optDouble("stroke_width", 2.0),
+            cells,
+        ).also {
+            it.uid = uid
+            it.link = t.optString("link").ifEmpty { null }
+        }
+    }
+
+    private fun applyToPage(cacheUri: String?, file: String, page: Int, fn: (com.xnotes.core.model.Page) -> Boolean): Boolean {
+        val uri = cacheUri
+        if (uri != null) host.openDocument(uri)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (!fn(pg)) return false
+            doc.dirty = true
+            host.editorState(uri)?.invalidatePage(pg)
+            host.repaintDocument(uri)
+            return true
+        }
+        return modifyCache(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
+            fn(pg)
+        }
+    }
+
+    /** Apply a committed remote text box (upsert by uid). */
+    private fun applyTextAdd(cacheUri: String?, file: String, page: Int, t: JSONObject): Boolean {
+        val fresh = nativeText(t) ?: return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            (findByUid(pg, fresh.uid) as? com.xnotes.core.model.TextItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) pg.items[i] = fresh
+            } ?: pg.items.add(fresh)
+            true
+        }
+    }
+
+    private fun applyTextRemove(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            if (pg.items.none { (it as? com.xnotes.core.model.TextItem)?.uid in ids }) return@applyToPage false
+            pg.items.removeAll { (it as? com.xnotes.core.model.TextItem)?.uid in ids }
+            true
+        }
+    }
+
+    /** Apply a committed remote table (upsert by uid). */
+    private fun applyTableAdd(cacheUri: String?, file: String, page: Int, t: JSONObject): Boolean {
+        val fresh = nativeTable(t) ?: return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            (findByUid(pg, fresh.uid) as? com.xnotes.core.model.TableItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) pg.items[i] = fresh
+            } ?: pg.items.add(fresh)
+            true
+        }
+    }
+
+    private fun applyTableRemove(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            if (pg.items.none { (it as? com.xnotes.core.model.TableItem)?.uid in ids }) return@applyToPage false
+            pg.items.removeAll { (it as? com.xnotes.core.model.TableItem)?.uid in ids }
+            true
+        }
+    }
+
+    private fun applyImageRemove(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            if (pg.items.none { (it as? com.xnotes.core.model.ImageItem)?.uid in ids }) return@applyToPage false
+            pg.items.removeAll { (it as? com.xnotes.core.model.ImageItem)?.uid in ids }
+            true
+        }
+    }
+
+    private fun applyAudioRemove(cacheUri: String?, file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        return applyToPage(cacheUri, file, page) { pg ->
+            if (pg.items.none { (it as? com.xnotes.core.model.AudioItem)?.uid in ids }) return@applyToPage false
+            pg.items.removeAll { (it as? com.xnotes.core.model.AudioItem)?.uid in ids }
+            true
+        }
+    }
+
+    // --- audio (chunked bytes + peaks first, then the placing op) ---
+
+    private class AudioAsm(val file: String, val total: Long, val buf: java.io.ByteArrayOutputStream, var filled: Long = 0)
+    private val audioAsm = HashMap<String, AudioAsm>()
+    private val audioPeaksAsm = HashMap<String, AudioAsm>()
+    private val pendingAudioOps = HashMap<String, ArrayList<Triple<String, String, JSONObject>>>()
+    private val audioBytes = HashMap<String, Pair<String, ByteArray>>()
+    private val audioPeaks = HashMap<String, Pair<String, ByteArray>>()
+    private val audioOrder = ArrayDeque<String>()
+
+    private fun onAudioChunk(msg: JSONObject, peaks: Boolean) {
+        val file = msg.optString("file")
+        if (file.isEmpty()) return
+        val id = msg.optString("audio_id")
+        if (id.isEmpty()) return
+        val total = msg.optLong("total", -1)
+        val offset = msg.optLong("offset", -1)
+        if (total < 0 || total > HostEngine.AUDIO_MAX_BYTES || offset < 0 || offset > total) {
+            dropAudio(id)
+            return
+        }
+        if (total == 0L) {
+            if (!msg.optBoolean("last", false)) {
+                dropAudio(id)
+                return
+            }
+            if (peaks) {
+                audioPeaks[id] = file to ByteArray(0)
+                flushAudioPeaks(id)
+            } else {
+                rememberAudio(id, file, ByteArray(0))
+                flushAudio(id)
+            }
+            return
+        }
+        val map = if (peaks) audioPeaksAsm else audioAsm
+        val asm = map.getOrPut(id) { AudioAsm(file, total, java.io.ByteArrayOutputStream(total.coerceAtMost(HostEngine.AUDIO_MAX_BYTES).toInt())) }
+        if (asm.total != total || asm.file != file) {
+            dropAudio(id)
+            return
+        }
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(msg.optString("data"))
+        } catch (_: Exception) {
+            dropAudio(id)
+            return
+        }
+        if (offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            dropAudio(id)
+            return
+        }
+        asm.buf.write(bytes)
+        asm.filled += bytes.size
+        if (!msg.optBoolean("last", false) && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            dropAudio(id)
+            return
+        }
+        (if (peaks) audioPeaksAsm else audioAsm).remove(id)
+        val data = asm.buf.toByteArray()
+        if (peaks) {
+            audioPeaks[id] = file to data
+            flushAudioPeaks(id)
+        } else {
+            rememberAudio(id, file, data)
+            flushAudio(id)
+        }
+    }
+
+    private fun dropAudio(id: String) {
+        audioAsm.remove(id)
+        audioPeaksAsm.remove(id)
+        pendingAudioOps.remove(id)
+    }
+
+    private fun rememberAudio(id: String, file: String, bytes: ByteArray) {
+        audioBytes[id] = file to bytes
+        audioOrder.remove(id)
+        audioOrder.addLast(id)
+        while (audioOrder.size > HostEngine.AUDIO_KEPT) {
+            if (audioBytes.size <= 1 || audioOrder.isEmpty()) break
+            val oldest = audioOrder.removeFirst()
+            audioBytes.remove(oldest)
+            audioPeaks.remove(oldest)
+        }
+    }
+
+    private fun flushAudio(id: String) {
+        val pend = pendingAudioOps.remove(id) ?: return
+        val (file, bytes) = audioBytes[id] ?: return
+        val peaks = audioPeaks[id]?.takeIf { it.first == file }?.second ?: ByteArray(0)
+        for ((cacheUri, f, op) in pend) if (f == file) applyAudioBytes(cacheUri, f, op, bytes, peaks)
+    }
+
+    private fun flushAudioPeaks(id: String) {
+        val pend = pendingAudioOps[id] ?: return
+        val (file, bytes) = audioBytes[id] ?: return
+        val peaks = audioPeaks[id]?.takeIf { it.first == file }?.second ?: return
+        pendingAudioOps.remove(id)
+        for ((cacheUri, f, op) in pend) if (f == file) applyAudioBytes(cacheUri, f, op, bytes, peaks)
+    }
+
+    private fun applyRemoteAudio(cacheUri: String?, file: String, op: JSONObject): Boolean {
+        val audio = op.optJSONObject("audio") ?: return false
+        val id = audio.optString("audio_id")
+        if (id.isEmpty()) return false
+        val ready = audioBytes[id]?.takeIf { it.first == file }
+        if (ready != null) {
+            val peaks = audioPeaks[id]?.takeIf { it.first == file }?.second ?: ByteArray(0)
+            return applyAudioBytes(cacheUri, file, op, ready.second, peaks)
+        }
+        val pend = pendingAudioOps.getOrPut(id) { ArrayList() }
+        pend += Triple(cacheUri ?: "", file, op.optJSONObject("audio")!!)
+        while (pendingAudioOps.values.sumOf { it.size } > 16) {
+            val first = pendingAudioOps.keys.firstOrNull() ?: break
+            val list = pendingAudioOps[first]!!
+            list.removeAt(0)
+            if (list.isEmpty()) pendingAudioOps.remove(first)
+        }
+        return false
+    }
+
+    private fun applyAudioBytes(cacheUri: String?, file: String, op: JSONObject, bytes: ByteArray, peaks: ByteArray): Boolean {
+        val audio = op.optJSONObject("audio") ?: return false
+        val page = op.optInt("page", 0)
+        val safeId = audio.optString("audio_id").filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(64).ifEmpty { "aud" }
+        val ext = audio.optString("ext").lowercase().takeIf { it.matches(Regex("[a-z0-9]{1,5}")) } ?: "m4a"
+        val dest = try {
+            imageDir.mkdirs()
+            File.createTempFile("aud-$safeId-", ".$ext", imageDir)
+        } catch (_: Exception) {
+            return false
+        }
+        try {
+            dest.writeBytes(bytes)
+        } catch (_: Exception) {
+            dest.delete()
+            return false
+        }
+        val uid = audio.optString("uid").ifEmpty { audio.optString("audio_id") }
+        val rid = audio.optInt("rid", 0).takeIf { it != 0 }
+            ?: com.xnotes.core.audio.RecordingIds.next(docItems(file, page))
+        val item = com.xnotes.core.model.AudioItem(
+            com.xnotes.core.model.AudioData(dest, ext, audio.optInt("duration_ms", 0), peaks),
+            com.xnotes.core.geometry.Rect(audio.optDouble("x"), audio.optDouble("y"), audio.optDouble("w"), audio.optDouble("h")),
+            audio.optString("name").ifEmpty { "audio" },
+            rid,
+            com.xnotes.platform.AndroidTextMeasurer(),
+        )
+        item.uid = uid
+        return applyToPage(cacheUri, file, page) { pg ->
+            if (item.rect.w <= 0 || item.rect.h <= 0) return@applyToPage false
+            (findByUid(pg, item.uid) as? com.xnotes.core.model.AudioItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) pg.items[i] = item
+            } ?: pg.items.add(item)
+            true
+        }.also { ok -> if (!ok) dest.delete() }
+    }
+
+    private fun docItems(file: String, page: Int): List<com.xnotes.core.model.CanvasItem> {
+        val uri = synchronized(lock) { bound[file] } ?: return emptyList()
+        return host.openDocument(uri)?.pages?.getOrNull(page)?.items ?: emptyList()
     }
 
     // --- live strokes ---
@@ -899,6 +1262,7 @@ class GuestEngine(
     }
 
     private fun submitLocalOps(file: String, ops: JSONArray, dedupe: String) {
+
         val base = synchronized(lock) { versions[file] ?: 1L }
         synchronized(lock) {
             val q = sentDedupes.getOrPut(file) { ArrayDeque() }
@@ -910,6 +1274,9 @@ class GuestEngine(
                 .put("base_version", base).put("ops", ops).put("dedupe", dedupe),
         )
     }
+    /** Content ops from the service history hook (uid-keyed text/table/image/audio). */
+    fun submitContentOps(id: String, ops: JSONArray, dedupe: String) = submitLocalOps(id, ops, dedupe)
+
 
     /** A local image insert: chunked bytes first, then the placing op. */
     fun submitLocalImage(
@@ -917,6 +1284,7 @@ class GuestEngine(
         width: Int, height: Int, rect: com.xnotes.core.geometry.Rect,
         orientation: Int, angle: Double, flipX: Boolean, flipY: Boolean, part: com.xnotes.core.geometry.Rect?,
         dedupe: String,
+        uid: String = "",
     ) {
         val file = remoteIdOf(cacheUri) ?: return
         sendImageBytes(file, imageId, bytes)
@@ -927,11 +1295,97 @@ class GuestEngine(
         if (flipX) op.put("flip_x", true)
         if (flipY) op.put("flip_y", true)
         part?.let { op.put("part", JSONArray().put(it.x).put(it.y).put(it.right).put(it.bottom)) }
+        if (uid.isNotEmpty()) op.put("uid", uid)
         submitLocalOps(file, JSONArray().put(op), dedupe)
     }
 
+    /** A local text-box commit to broadcast (full snapshot, upserted by uid). */
+    fun submitLocalText(cacheUri: String, page: Int, item: com.xnotes.core.model.TextItem, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (item.uid.isEmpty()) item.uid = java.util.UUID.randomUUID().toString()
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "add_text").put("page", page).put("text", SyncWire.toWireText(item))), dedupe)
+    }
+
+    fun submitLocalTextRemove(cacheUri: String, page: Int, uids: List<String>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (uids.isEmpty()) return
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "remove_text").put("page", page).put("ids", JSONArray(uids))), dedupe)
+    }
+
+    fun submitLocalTable(cacheUri: String, page: Int, item: com.xnotes.core.model.TableItem, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (item.uid.isEmpty()) item.uid = java.util.UUID.randomUUID().toString()
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "add_table").put("page", page).put("table", SyncWire.toWireTable(item))), dedupe)
+    }
+
+    fun submitLocalTableRemove(cacheUri: String, page: Int, uids: List<String>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (uids.isEmpty()) return
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "remove_table").put("page", page).put("ids", JSONArray(uids))), dedupe)
+    }
+
+    fun submitLocalImageMove(cacheUri: String, page: Int, imageId: String, item: com.xnotes.core.model.ImageItem, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        val op = JSONObject().put("op", "add_image").put("page", page).put("image_id", imageId)
+            .put("width", item.image.width).put("height", item.image.height)
+            .put("rect", JSONArray().put(item.rect.x).put(item.rect.y).put(item.rect.w).put(item.rect.h))
+            .put("orientation", item.orientation).put("angle", item.angle)
+        if (item.flip.x) op.put("flip_x", true)
+        if (item.flip.y) op.put("flip_y", true)
+        item.part?.let { op.put("part", JSONArray().put(it.x).put(it.y).put(it.right).put(it.bottom)) }
+        if (item.uid.isNotEmpty()) op.put("uid", item.uid)
+        submitLocalOps(file, JSONArray().put(op), dedupe)
+    }
+
+    fun submitLocalImageRemove(cacheUri: String, page: Int, ids: List<String>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (ids.isEmpty()) return
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "remove_image").put("page", page).put("ids", JSONArray(ids))), dedupe)
+    }
+
+    fun submitLocalAudio(cacheUri: String, page: Int, audioId: String, item: com.xnotes.core.model.AudioItem, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (item.uid.isEmpty()) item.uid = java.util.UUID.randomUUID().toString()
+        val bytes = runCatching { item.audio.file.readBytes() }.getOrNull() ?: return
+        sendAudioBytes(file, audioId, bytes)
+        sendAudioPeaks(file, audioId, item.audio.peaks)
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "add_audio").put("page", page).put("audio", SyncWire.toWireAudio(audioId, item, page))), dedupe)
+    }
+
+    fun submitLocalAudioRemove(cacheUri: String, page: Int, ids: List<String>, dedupe: String) {
+        val file = remoteIdOf(cacheUri) ?: return
+        if (ids.isEmpty()) return
+        submitLocalOps(file, JSONArray().put(JSONObject().put("op", "remove_audio").put("page", page).put("ids", JSONArray(ids))), dedupe)
+    }
+
+    fun sendAudioBytes(file: String, audioId: String, bytes: ByteArray) {
+        sendChunked(file, audioId, bytes, "audio_data", "audio_id")
+    }
+
+    fun sendAudioPeaks(file: String, audioId: String, peaks: ByteArray) {
+        sendChunked(file, audioId, peaks, "audio_peaks", "audio_id")
+    }
+
+    private fun sendChunked(file: String, id: String, bytes: ByteArray, type: String, idKey: String) {
+        if (bytes.isEmpty()) {
+            send(JSONObject().put("t", type).put("file", file).put(idKey, id)
+                .put("total", 0).put("offset", 0).put("data", "").put("last", true))
+            return
+        }
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + HostEngine.IMAGE_CHUNK, bytes.size)
+            send(JSONObject().put("t", type).put("file", file).put(idKey, id)
+                .put("total", bytes.size).put("offset", offset)
+                .put("data", java.util.Base64.getEncoder().encodeToString(bytes.sliceArray(offset until end)))
+                .put("last", end >= bytes.size))
+            offset = end
+        }
+    }
+
     /** Chunked image bytes ahead of their op (256 KiB frames, base64 like file chunks). */
-    private fun sendImageBytes(file: String, imageId: String, bytes: ByteArray) {
+    /** Chunked image bytes ahead of their op (256 KiB frames, base64 like file chunks). */
+    fun sendImageBytes(file: String, imageId: String, bytes: ByteArray) {
         if (bytes.isEmpty()) {
             send(JSONObject().put("t", "image_data").put("file", file).put("image_id", imageId)
                 .put("total", 0).put("offset", 0).put("data", "").put("last", true))

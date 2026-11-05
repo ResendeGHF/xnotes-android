@@ -483,6 +483,7 @@ class DocumentCodec(
         if (item.angle != 0.0) j.name("angle").value(item.angle)
         if (item.flip != Flip.NONE) j.name("flip").value(item.flip.id)
         item.part?.let { j.name("part").beginArray().value(it.x).value(it.y).value(it.w).value(it.h).endArray() }
+        if (item.uid.isNotEmpty()) j.name("uid").value(item.uid)
         item.sync?.let { writeSync(j, it) }
         if (item.locked) j.name("locked").value(true)
         item.link?.let { j.name("link").value(it) }
@@ -498,6 +499,7 @@ class DocumentCodec(
         j.name("rid").value(a.rid)
         j.name("name").value(a.name)
         j.name("duration_ms").value(a.audio.durationMs)
+        if (a.uid.isNotEmpty()) j.name("uid").value(a.uid)
         if (a.audio.peaks.isNotEmpty()) j.name("peaks").value(java.util.Base64.getEncoder().encodeToString(a.audio.peaks))
         if (a.locked) j.name("locked").value(true)
         a.group?.let { j.name("group").value(it) }
@@ -530,6 +532,7 @@ class DocumentCodec(
         if (t.strike) j.name("strike").value(true)
         if (t.align != com.xnotes.core.pal.HAlign.LEFT) j.name("align").value(t.align.name.lowercase())
         if (t.math) j.name("math").value(true)
+        if (t.uid.isNotEmpty()) j.name("uid").value(t.uid)
         t.sync?.let { writeSync(j, it) }
         if (t.locked) j.name("locked").value(true)
         t.link?.let { j.name("link").value(it) }
@@ -631,6 +634,7 @@ class DocumentCodec(
         writeRgba(j, t.strokeRgba)
         j.name("stroke_width").value(t.strokeWidth)
         if (t.locked) j.name("locked").value(true)
+        if (t.uid.isNotEmpty()) j.name("uid").value(t.uid)
         t.link?.let { j.name("link").value(it) }
         t.group?.let { j.name("group").value(it) }
         if (t.hasCells()) {
@@ -1107,6 +1111,7 @@ class DocumentCodec(
         val sync: SyncMark?,
         val group: Int? = null,
         val part: Rect? = null,
+        val uid: String? = null,
     ) : Pending(index, asset)
 
     private class PendingAudio(
@@ -1119,6 +1124,7 @@ class DocumentCodec(
         val peaks: ByteArray,
         val locked: Boolean,
         val group: Int? = null,
+        val uid: String? = null,
     ) : Pending(index, asset)
 
     /**
@@ -1290,6 +1296,7 @@ class DocumentCodec(
         var locked = false
         var link: String? = null
         var group: Int? = null
+        var uid: String? = null
         var kind: String? = null
         var id: Int? = null
         var connector: ConnectorScratch? = null
@@ -1463,6 +1470,7 @@ class DocumentCodec(
                 "locked" -> s.locked = boolOr(p, false)
                 "link" -> s.link = stringOr(p, "").ifEmpty { null }
                 "group" -> s.group = intOrNull(p)
+                "uid" -> s.uid = stringOr(p, "").ifEmpty { null }
                 "rid" -> s.rid = intOr(p, 0)
                 "name" -> s.name = stringOr(p, "")
                 "duration_ms" -> s.durationMs = intOr(p, 0)
@@ -1489,7 +1497,7 @@ class DocumentCodec(
                     pending.add(
                         PendingImage(
                             items.size + pending.size, asset, s.rect, s.srcW, s.srcH,
-                            s.orientation, s.angle, Flip.fromId(s.flip), s.locked, s.id, s.link, sync, s.group, s.part,
+                            s.orientation, s.angle, Flip.fromId(s.flip), s.locked, s.id, s.link, sync, s.group, s.part, s.uid,
                         ),
                     )
                 }
@@ -1497,7 +1505,7 @@ class DocumentCodec(
             AudioItem.KIND -> {
                 val asset = s.asset
                 if (!asset.isNullOrEmpty()) {
-                    pending.add(PendingAudio(items.size + pending.size, asset, s.rect, s.rid, s.name, s.durationMs, s.peaks ?: ByteArray(0), s.locked, s.group))
+                    pending.add(PendingAudio(items.size + pending.size, asset, s.rect, s.rid, s.name, s.durationMs, s.peaks ?: ByteArray(0), s.locked, s.group, s.uid))
                 }
             }
             TextItem.KIND -> items.add(
@@ -1520,13 +1528,19 @@ class DocumentCodec(
                     },
                     measurer = textMeasurer,
                     math = s.textMath,
-                ),
+                ).also { t ->
+                    t.uid = s.uid?.takeIf { it.isNotEmpty() } ?: legacyUid("text", t, items.size)
+                },
             )
             ShapeItem.KIND, ShapeItem.GLYPHS_KIND, ShapeItem.FILL_KIND -> {
                 val c = s.connector
                 items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
             }
-            TableItem.KIND -> buildTable(s)?.let { items.add(it) }
+            TableItem.KIND -> buildTable(s)?.let { t ->
+            t.uid = s.uid?.takeIf { it.isNotEmpty() } ?: legacyUid("table", t, items.size)
+            if (s.link != null) t.link = s.link
+            items.add(t)
+        }
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
             NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
             StickyNoteItem.KIND -> buildSticky(s)?.let { items.add(it) }
@@ -1539,6 +1553,50 @@ class DocumentCodec(
         if (s.link != null && items.size > before) items[before].link = s.link
         if (s.group != null && items.size > before) items[before].group = s.group
         if (sync != null && items.size > before) items[before].sync = sync
+    }
+
+    /**
+     * Stable id for an item that predates per-item uids, so peers that read the
+     * same bytes derive the same id and a remove-by-uid converges. Position and
+     * content render identically on every host (locale-independent decimals).
+     */
+    internal fun legacyUid(kind: String, item: CanvasItem, index: Int): String {
+        val b = item.bounds()
+        val parts = ArrayList<String>()
+        parts += kind
+        parts += "x" + canonical2(b.left)
+        parts += "y" + canonical2(b.top)
+        parts += "w" + canonical2(b.w)
+        parts += "h" + canonical2(b.h)
+        parts += "i$index"
+        when (item) {
+            is TextItem -> {
+                parts += "t" + item.text
+                parts += "c" + item.rgba.r + "," + item.rgba.g + "," + item.rgba.b + "," + item.rgba.a
+                parts += "s" + canonical2(item.pointSize)
+                parts += "f" + item.face.id
+            }
+            is TableItem -> {
+                parts += "n" + item.cols + "x" + item.rows
+                for (r in 0 until item.rows) for (c in 0 until item.cols) parts += item.cell(c, r)
+            }
+            else -> {}
+        }
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(parts.joinToString("|").toByteArray(Charsets.UTF_8))
+        return "legacy-" + digest.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    /** Two decimals, locale-independent (`-0.00` normalizes to `0.00`). */
+    internal fun canonical2(v: Double): String {
+        if (!v.isFinite()) return "0.00"
+        val r = kotlin.math.round(v * 100.0) / 100.0
+        val n = if (r == 0.0) 0.0 else r
+        val neg = n < 0.0
+        val a = kotlin.math.abs(n)
+        val whole = a.toLong()
+        val frac = ((a - whole) * 100.0 + 0.5).toLong().coerceIn(0, 99)
+        return (if (neg) "-" else "") + "$whole." + (if (frac < 10) "0$frac" else "$frac")
     }
 
     /** A tape, or null without the points it runs along. A strip or a rectangle keeps its axis's two ends. */
@@ -2054,6 +2112,7 @@ class DocumentCodec(
                 it.link = spec.link
                 it.sync = spec.sync
                 it.group = spec.group
+                it.uid = spec.uid ?: legacyUid("image", it, spec.index)
             }
     }
 
@@ -2065,6 +2124,7 @@ class DocumentCodec(
             .also {
                 it.locked = spec.locked
                 it.group = spec.group
+                it.uid = spec.uid ?: legacyUid("audio", it, spec.index)
             }
     }
 

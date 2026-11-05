@@ -28,13 +28,15 @@ object SyncWire {
     fun toWire(stroke: Stroke): JSONObject {
         val samples = JSONArray()
         for (s in stroke.samples) samples.put(JSONArray().put(s.x).put(s.y).put(s.pressure))
-        return JSONObject()
+        val o = JSONObject()
             .put("tool", stroke.tool.id)
             .put("width", stroke.config.baseWidth)
             .put("color", hexColor(stroke.config.rgba))
             .put("pressure", stroke.config.pressureEnabled)
             .put("samples", samples)
             .put("style", toWireStyle(stroke.tool, stroke.config))
+        stroke.sync?.let { o.put("sync", JSONObject().put("rid", it.rid).put("ms", it.ms)) }
+        return o
     }
 
     /**
@@ -96,6 +98,9 @@ object SyncWire {
         val width = o.optDouble("width", 3.0)
         val pressure = o.optBoolean("pressure", true)
         val cfg = styleFrom(tool, width, color, pressure, o.optJSONObject("style"))
+        val sync = o.optJSONObject("sync")?.let {
+            com.xnotes.core.model.SyncMark(it.optInt("rid", -1).takeIf { r -> r >= 0 } ?: return null, it.optInt("ms", 0))
+        }
         val samples = ArrayList<Sample>()
         val arr = o.optJSONArray("samples") ?: JSONArray()
         for (i in 0 until arr.length()) {
@@ -104,7 +109,7 @@ object SyncWire {
             samples += Sample(t.optDouble(0), t.optDouble(1), if (t.length() > 2) t.optDouble(2) else 1.0)
         }
         if (samples.isEmpty()) return null
-        return Stroke(tool, cfg, samples)
+        return Stroke(tool, cfg, samples).also { it.sync = sync }
     }
 
     fun hexColor(c: Rgba): String =
@@ -212,6 +217,88 @@ object SyncWire {
             invertImages = if (o.isNull("invert_images")) null else o.optBoolean("invert_images"),
         )
     }
+
+    /** Fingerprint key for an image/audio payload (first 16 hex of SHA-256). */
+    fun payloadId(bytes: ByteArray): String {
+        val d = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return d.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    /** Canonical two decimals, locale-independent; must match the Linux writer byte for byte. */
+    fun canonical2(v: Double): String {
+        if (!v.isFinite()) return "0.00"
+        val r = kotlin.math.round(v * 100.0) / 100.0
+        val n = if (r == 0.0) 0.0 else r
+        val neg = n < 0.0
+        val a = kotlin.math.abs(n)
+        val whole = a.toLong()
+        val frac = ((a - whole) * 100.0 + 0.5).toLong().coerceIn(0, 99)
+        return (if (neg) "-" else "") + "$whole." + (if (frac < 10) "0$frac" else "$frac")
+    }
+
+    /**
+     * Stable id for an item that predates per-item uids, so peers that read the
+     * same bytes derive the same id. Mirrors the Linux derivation exactly.
+     */
+    fun legacyUid(kind: String, pos: DoubleArray, size: DoubleArray, index: Int, parts: List<String>): String {
+        val all = ArrayList<String>()
+        all += kind
+        all += "x" + canonical2(pos[0])
+        all += "y" + canonical2(pos[1])
+        all += "w" + canonical2(size[0])
+        all += "h" + canonical2(size[1])
+        all += "i$index"
+        all.addAll(parts)
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(all.joinToString("|").toByteArray(Charsets.UTF_8))
+        return "legacy-" + digest.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    /** Wire form of a text box, for add_text ops. */
+    fun toWireText(t: com.xnotes.core.model.TextItem): JSONObject =
+        JSONObject()
+            .put("uid", t.uid).put("x", t.pos.x).put("y", t.pos.y)
+            .put("width", t.width).put("height", t.height).put("text", t.text)
+            .put("color", hexAlpha(t.rgba)).put("point_size", t.pointSize)
+            .put("face", t.face.id)
+            .put("bold", t.bold).put("italic", t.italic)
+            .put("underline", t.underline).put("strike", t.strike)
+            .put("align", t.align.name.lowercase()).put("math", t.math)
+            .put("link", t.link ?: "")
+
+    /** Wire form of a table, for add_table ops. */
+    fun toWireTable(t: com.xnotes.core.model.TableItem): JSONObject {
+        val o = JSONObject()
+            .put("uid", t.uid).put("x", t.rect.x).put("y", t.rect.y)
+            .put("w", t.rect.w).put("h", t.rect.h)
+            .put("cols", org.json.JSONArray(t.colFractions))
+            .put("rows", org.json.JSONArray(t.rowFractions))
+            .put("stroke_color", hexColor(t.strokeRgba)).put("stroke_width", t.strokeWidth)
+            .put("link", t.link ?: "")
+        if (t.hasCells()) {
+            val cells = org.json.JSONArray()
+            for (r in 0 until t.rows) {
+                val row = org.json.JSONArray()
+                for (c in 0 until t.cols) row.put(t.cell(c, r))
+                cells.put(row)
+            }
+            o.put("cells", cells)
+        }
+        return o
+    }
+
+    /** Wire form of an audio pill, for add_audio ops (bytes travel separately). */
+    fun toWireAudio(
+        audioId: String,
+        item: com.xnotes.core.model.AudioItem,
+        page: Int,
+    ): JSONObject =
+        JSONObject()
+            .put("audio_id", audioId).put("uid", item.uid).put("page", page)
+            .put("x", item.rect.x).put("y", item.rect.y)
+            .put("w", item.rect.w).put("h", item.rect.h)
+            .put("name", item.name).put("rid", item.rid)
+            .put("ext", item.audio.ext).put("duration_ms", item.audio.durationMs)
 
     /** Wire form of page margins. */
     fun toWireMargins(m: com.xnotes.core.model.PageMargins): JSONObject {
