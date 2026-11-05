@@ -20,6 +20,8 @@ import com.xnotes.R
 import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.share.ShareBackendImpl
 import com.xnotes.share.ShareCrypto
+import com.xnotes.share.ShareProtocol
+import com.xnotes.share.ShareService
 import com.xnotes.ui.Editor
 import java.io.File
 import org.json.JSONArray
@@ -914,11 +916,11 @@ class CompanionService : Service() {
             this, 11, Intent(this, CompanionService::class.java).setAction(ACTION_STOP_COMPANION),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val label = _companionStatus.value.paired ?: _companionStatus.value.text
-        return NotificationCompat.Builder(this, CHANNEL)
+        val address = ShareService.hostAddresses().firstOrNull() ?: "…"
+        val note = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification_share)
             .setContentTitle(getString(R.string.share_notif_title))
-            .setContentText(getString(R.string.companion_notif_text, label, targetPort))
+            .setContentText(getString(R.string.share_notif_text, address, ShareProtocol.DEFAULT_PORT))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
@@ -926,7 +928,10 @@ class CompanionService : Service() {
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(open)
             .addAction(0, getString(R.string.share_stop), stop)
-            .build()
+        identity?.let { id ->
+            note.setSubText(getString(R.string.share_notif_fp, ShareCrypto.displayFingerprint(id.fingerprintHex).take(23)) + "…")
+        }
+        return note.build()
     }
 
     /**
@@ -1056,10 +1061,10 @@ class CompanionService : Service() {
             setFlag(context, KEY_COMPANION, on)
             _companionOn.value = on
             _active.value = on
-            // The HTTP file server follows the same switch: it exists so the
-            // desktop companion can browse files, and must never notify alone.
-            if (on) com.xnotes.share.ShareService.start(context)
-            else com.xnotes.share.ShareService.stop(context)
+            // The HTTP file server has no toggle of its own: keep it stopped
+            // so it can never notify on its own. (The desktop HTTP companion
+            // path is dormant until it gets an explicit switch.)
+            if (!on) ShareService.stop(context)
             val svc = runningService
             if (svc == null) {
                 if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))

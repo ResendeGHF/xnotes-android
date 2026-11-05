@@ -48,15 +48,11 @@ class ShareService : Service() {
     override fun onBind(intent: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopSharing()
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            else -> startSharing()
-        }
-        return START_STICKY
+        // HTTP serving is currently unwired (no toggle): never come up, so it
+        // can never notify — this also stops sticky resurrections quietly.
+        if (intent?.action == ACTION_STOP) stopSharing()
+        stopSelf()
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
