@@ -39,9 +39,8 @@ class ShareStore private constructor(
     override suspend fun grantIds(fp: String): List<String> = dao.grantIds(fp)
 
     /**
-     * Remember a companion (pairing, reconnect with new address/name). The
-     * Linux dial path passes [makeActive] so the first companion ever becomes
-     * the active dial target; Android peers never take that slot.
+     * Remember a companion (pairing, reconnect with new address/name).
+     * [makeActive] makes the first companion ever the active dial target.
      */
     suspend fun remember(fp: String, name: String, host: String, port: Int, makeActive: Boolean = false, kind: String? = null) {
         val now = System.currentTimeMillis()

@@ -28,10 +28,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Host side of SYNC.md v1, in the foreground while sharing is on: dials the
- * Linux companion over mutual-TLS, serves the shared index and file bytes,
- * applies companion ops to open documents (or straight to files), broadcasts
- * local commits, and streams live strokes both ways with no batching.
+ * Host side of SYNC.md v1, in the foreground while the companion half is on:
+ * dials the Linux companion over mutual-TLS, serves the shared index and
+ * file bytes, applies companion ops to open documents (or straight to
+ * files), broadcasts local commits, and streams live strokes both ways with
+ * no batching.
  *
  * Everything runs off the main thread except model access, which hops there.
  */
@@ -54,18 +55,6 @@ class CompanionService : Service() {
     private val approvals = HashMap<String, (Boolean) -> Unit>()
     private var approvalSeq = 0
 
-    // --- Android-to-Android (multi-peer) ---
-
-    /** Versions shared by every host engine serving this device's files. */
-    private var sharedVersions: SyncVersions? = null
-    private var listener: AndroidListener? = null
-    private var guestCacheDir: File? = null
-    private val peerLock = Any()
-    private val peerSessions = HashMap<String, PeerSession>()
-    private val guestSessions = HashMap<String, GuestSession>()
-    /** Display names by peer fp (Room lookup is async; UI needs it now). */
-    private val peerNames = HashMap<String, String>()
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -86,14 +75,11 @@ class CompanionService : Service() {
         CompanionEditors.onTracked = null
         _active.value = false
         _companionOn.value = false
-        _sharingOn.value = false
         shutdown()
         _status.value = Status("Off", null, false)
         _companionStatus.value = Status("Off", null, false)
-        _sharingStatus.value = Status("Off", null, false)
         runCatching {
             getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
-            getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
         }
     }
 
@@ -103,41 +89,23 @@ class CompanionService : Service() {
                 setCompanionEnabled(this, false)
                 return START_NOT_STICKY
             }
-            ACTION_STOP_SHARING -> {
-                setSharingEnabled(this, false)
-                return START_NOT_STICKY
-            }
-            ACTION_STOP -> {
-                // Legacy single stop button: turn both halves off.
-                setCompanionEnabled(this, false)
-                setSharingEnabled(this, false)
-                return START_NOT_STICKY
-            }
             ACTION_APPROVAL -> {
                 val token = intent.getStringExtra(EXTRA_TOKEN) ?: return START_NOT_STICKY
                 val allow = intent.getBooleanExtra(EXTRA_ALLOW, false)
                 synchronized(approvals) { approvals.remove(token) }?.invoke(allow)
                 // Approval taps must never keep a switched-off service alive.
-                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
-                return START_NOT_STICKY
-            }
-            ACTION_SAS -> {
-                val key = intent.getStringExtra(EXTRA_SAS_KEY) ?: return START_NOT_STICKY
-                if (intent.getBooleanExtra(EXTRA_ALLOW, false)) confirmInboundSas(this, key)
-                else denyInboundSas(this, key)
-                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
+                if (!coreReady && !isCompanionOn(this)) stopSelf()
                 return START_NOT_STICKY
             }
             ACTION_REFRESH -> {
                 engine?.refreshPolicy()
-                synchronized(peerLock) { peerSessions.values.forEach { it.engine.refreshPolicy() } }
-                if (!coreReady && !isCompanionOn(this) && !isSharingOn(this)) stopSelf()
+                if (!coreReady && !isCompanionOn(this)) stopSelf()
                 return START_NOT_STICKY
             }
         }
-        // Boot (or system restart): only come up when at least one feature
-        // is switched on. Otherwise stop immediately — no phantom notification.
-        if (!isCompanionOn(this) && !isSharingOn(this)) {
+        // Boot (or system restart): only come up when the companion half is
+        // switched on. Otherwise stop immediately — no phantom notification.
+        if (!isCompanionOn(this)) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -148,9 +116,9 @@ class CompanionService : Service() {
     // --- session ---
 
     /**
-     * One-time process setup: identity, store, backend, engines and the
-     * editor bridge. Idempotent; network halves start separately in
-     * [applyCompanionState]/[applySharingState].
+     * One-time process setup: identity, store, backend, engine and the
+     * editor bridge. Idempotent; the network half starts separately in
+     * [applyEnabledFeatures].
      */
     private fun ensureCore(onReady: () -> Unit = {}) {
         if (coreReady) {
@@ -162,9 +130,7 @@ class CompanionService : Service() {
         // Claim foreground immediately: startForegroundService requires a
         // notification within seconds, long before Room/crypto finish.
         runCatching {
-            val compOn = isCompanionOn(this)
-            val id = if (compOn || !isSharingOn(this)) NOTIF_COMPANION else NOTIF_SHARING
-            ServiceCompat.startForeground(this, id, startingNotification(), fgsType())
+            ServiceCompat.startForeground(this, NOTIF_COMPANION, startingNotification(), fgsType())
         }
         Thread({
             try {
@@ -192,7 +158,6 @@ class CompanionService : Service() {
                 this.store = store
                 this.grants = grants
                 val versions = SyncVersions(shareDir)
-                this.sharedVersions = versions
                 val host = hostBridge { msg -> client?.send(msg) }
                 val engine = HostEngine(
                     backend, BackendFiles(backend), grants, shareDir, host, deviceName,
@@ -219,13 +184,12 @@ class CompanionService : Service() {
                 this.backend = backend
                 this.engine = engine
                 this.ui = ui
-                _active.value = isCompanionOn(this) || isSharingOn(this)
+                _active.value = isCompanionOn(this)
                 coreReady = true
                 starting.set(false)
                 main.post {
                     _companionOn.value = isCompanionOn(this)
-                    _sharingOn.value = isSharingOn(this)
-                    _active.value = _companionOn.value || _sharingOn.value
+                    _active.value = _companionOn.value
                     // Files opened before the session started never fired onTracked
                     // while the engine existed: wire them now.
                     for (e in CompanionEditors.editors()) {
@@ -244,10 +208,9 @@ class CompanionService : Service() {
         }, "companion-start").apply { isDaemon = true; start() }
     }
 
-    /** Start every half whose flag is on; called once core is ready. */
+    /** Start the companion half whose flag is on; called once core is ready. */
     private fun applyEnabledFeatures() {
         if (isCompanionOn(this)) startCompanionDial() else stopCompanionDial()
-        if (isSharingOn(this)) startSharingNet() else stopSharingNet()
         updateForeground()
     }
 
@@ -271,10 +234,10 @@ class CompanionService : Service() {
         for (fn in pending) runCatching { fn() }
     }
 
-    /** Stop the service when neither feature is on; otherwise refresh notifications. */
+    /** Stop the service when the companion half is off; otherwise refresh notifications. */
     private fun stopSelfIfIdle() {
         main.post {
-            if (!isCompanionOn(this) && !isSharingOn(this)) {
+            if (!isCompanionOn(this)) {
                 stopSelf()
             } else {
                 updateForeground()
@@ -285,11 +248,9 @@ class CompanionService : Service() {
     private var ui: PairingUi? = null
 
     /**
-     * Document-access bridge for a [HostEngine], sending over [sendFn]. One
-     * instance serves the dialed Linux companion; each inbound Android peer
-     * gets its own with its connection's sender. All engines share the
-     * [SyncVersions] store and the open-document registry, so concurrent
-     * editors of one file see one version.
+     * Document-access bridge for the [HostEngine], sending over [sendFn].
+     * Serves the dialed Linux companion through the open-document registry,
+     * so the on-screen editor and the sync engine converge on one version.
      */
     private fun hostBridge(sendFn: (JSONObject) -> Unit): HostEngine.HostEngineHost =
         object : HostEngine.HostEngineHost {
@@ -348,7 +309,6 @@ class CompanionService : Service() {
             override fun onError(reason: String) {
                 main.post {
                     _companionStatus.value = Status(reason, _companionStatus.value.paired, connected = false)
-                    _sharingStatus.value = Status(reason, _sharingStatus.value.paired, _sharingStatus.value.connected)
                     mirrorStatus()
                 }
             }
@@ -417,25 +377,16 @@ class CompanionService : Service() {
         }
         val sender = PairingClient.Sender { msg -> client?.send(msg) }
         val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, ui ?: return, sender)
-        pairing.listenPort = listener?.boundPort ?: 0
-        var sasPeer = false
-        // An Android peer answers hello_ack in SAS mode; surface it the same way.
-        pairing.onSasPeer = { sas, name ->
-            sasPeer = true
-            _sasOutbound.value = SasRequest(dev?.fp ?: "$host:$port", name, sas, inbound = false)
-        }
         pairing.onPaired = { name ->
             val peerFp = pairing.peerFingerprint
             if (peerFp != null) {
-                val wasSas = sasPeer
                 Thread({
                     runCatching {
                         kotlinx.coroutines.runBlocking {
-                            store.remember(peerFp, name, host, port, kind = if (wasSas) com.xnotes.share.db.DeviceKind.PHONE else null)
+                            store.remember(peerFp, name, host, port)
                             // First companion ever becomes active; otherwise the
-                            // active one keeps its slot. SAS (phone) peers must
-                            // never take the companion dial slot.
-                            if (!wasSas && store.activeDeviceOnce() == null) {
+                            // active one keeps its slot.
+                            if (store.activeDeviceOnce() == null) {
                                 store.setActive(peerFp)
                             }
                         }
@@ -510,22 +461,9 @@ class CompanionService : Service() {
         }
     }
 
-    private fun postSharingStatus(s: String) {
-        main.post {
-            _sharingStatus.value = Status(s, _sharingStatus.value.paired, _sharingStatus.value.connected)
-            mirrorStatus()
-        }
-    }
-
-    /** Legacy combined status mirrors the enabled half (companion wins when both on). */
+    /** Legacy combined status mirrors the companion half. */
     private fun mirrorStatus() {
-        _status.value = if (isCompanionOn(this)) _companionStatus.value else _sharingStatus.value
-    }
-
-    private fun postStatus(s: String) {
-        // Old single-half callers (now split below); default to companion to
-        // preserve prior behavior until each site is repointed.
-        postCompanionStatus(s)
+        _status.value = _companionStatus.value
     }
 
     private fun route(msg: JSONObject) {
@@ -534,368 +472,6 @@ class CompanionService : Service() {
                 "hello_ack", "pair_result" -> pairing?.onMessage(msg)
                 else -> engine?.onMessage(msg)
             }
-        }
-    }
-
-    // --- Android peers: inbound hosting ---
-
-    private class PeerSession(
-        val fp: String,
-        val conn: AndroidListener.PeerConn,
-        val handshake: HostHandshake,
-        val engine: HostEngine,
-        val grants: PeerGrants,
-    )
-
-    private class GuestSession(
-        val key: String,
-        val host: String,
-        val port: Int,
-        val client: CompanionClient,
-        val pairing: PairingClient,
-        val engine: GuestEngine,
-        var fp: String? = null,
-    )
-
-    /** Start the inbound TLS listener (auto-increment port when busy). */
-    private fun startListener() {
-        val identity = identity ?: return
-        guestCacheDir = File(cacheDir, "guest").apply { mkdirs() }
-        guestCachePrefix = "file://" + guestCacheDir!!.absolutePath
-        val l = AndroidListener(identity)
-        l.onPeer = { fp, conn -> main.post { onPeer(fp, conn) } }
-        l.onMessage = { fp, msg -> main.post { onPeerMessage(fp, msg) } }
-        l.onLost = { fp -> main.post { onPeerLost(fp) } }
-        try {
-            l.start()
-            listener = l
-            _listenPort.value = l.boundPort
-            postSharingStatus("Listening for phones on port ${l.boundPort}.")
-        } catch (e: Exception) {
-            postSharingStatus("Phone listener failed: ${e.message}")
-        }
-    }
-
-    private fun onPeer(fp: String, conn: AndroidListener.PeerConn) {
-        val store = store ?: return
-        val pins = pins ?: return
-        val backend = backend ?: return
-        val versions = sharedVersions ?: return
-        val identity = identity ?: return
-        val key = fp.lowercase()
-        synchronized(peerLock) { peerSessions.remove(key) }?.let { runCatching { it.handshake.close() } }
-        val grants = PeerGrants(store, key)
-        val handshake = HostHandshake(
-            deviceName, identity.fingerprintHex, pins,
-            object : HostHandshake.Events {
-                override fun showSasApproval(peerFp: String, deviceName: String, sas: String) {
-                    _sasInbound.value = SasRequest(key, deviceName, sas, inbound = true)
-                    askSasApproval(key, deviceName, sas)
-                }
-                override fun pairingDone(peerFp: String, name: String) {
-                    Thread({
-                        val port = synchronized(peerLock) {
-                            peerSessions[key]?.handshake?.listenPortFor(key) ?: 0
-                        }
-                        synchronized(peerLock) { peerNames[key] = name }
-                        runCatching {
-                            kotlinx.coroutines.runBlocking {
-                                store.remember(key, name, conn.remoteHost, port, kind = com.xnotes.share.db.DeviceKind.PHONE)
-                                grants.refresh()
-                            }
-                        }
-                        main.post {
-                            peerSessions[key]?.engine?.refreshPolicy()
-                            _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-                            publishPeers()
-                            postSharingStatus("$name connected.")
-                        }
-                    }, "peer-remember").apply { isDaemon = true; start() }
-                }
-                override fun pairingFailed(peerFp: String, reason: String) {
-                    _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-                    postSharingStatus("Pairing failed: $reason")
-                    publishPeers()
-                }
-                override fun showStatus(s: String) = postSharingStatus(s)
-            },
-            HostHandshake.Sender { conn.send(it) },
-        )
-        val eng = HostEngine(
-            backend, BackendFiles(backend), grants, File(filesDir, "share"),
-            hostBridge { conn.send(it) }, deviceName,
-            imageDir = File(cacheDir, "sync-images").apply { mkdirs() },
-            store = versions,
-        )
-        synchronized(peerLock) { peerSessions[key] = PeerSession(key, conn, handshake, eng, grants) }
-        Thread({
-            runCatching { kotlinx.coroutines.runBlocking { grants.refresh() } }
-            main.post {
-                peerSessions[key]?.engine?.refreshPolicy()
-                publishPeers()
-            }
-        }, "peer-grants").apply { isDaemon = true; start() }
-        publishPeers()
-    }
-
-    private fun onPeerMessage(fp: String, msg: JSONObject) {
-        val s = synchronized(peerLock) { peerSessions[fp.lowercase()] } ?: return
-        runCatching { s.handshake.onMessage(fp, msg) }
-        runCatching { s.engine.onMessage(msg) }
-    }
-
-    private fun onPeerLost(fp: String) {
-        val key = fp.lowercase()
-        synchronized(peerLock) { peerSessions.remove(key) }?.let { runCatching { it.handshake.close() } }
-        _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-        publishPeers()
-    }
-
-    private fun publishPeers() {
-        val s = store ?: return
-        Thread({
-            val devs = runCatching {
-                kotlinx.coroutines.runBlocking { s.devicesOnce() }
-            }.getOrDefault(emptyList())
-            val byFp = devs.associateBy { it.fp.lowercase() }
-            val connected = synchronized(peerLock) { peerSessions.keys.toSet() }
-            // Known phones (paired before, currently offline) stay listed so the
-            // user can redial them as a guest; inbound ones show connected.
-            val fps = (byFp.keys + connected).sorted()
-            main.post {
-                _peers.value = fps.mapNotNull { fp ->
-                    val dev = byFp[fp]
-                    val kind = dev?.kind ?: com.xnotes.share.db.DeviceKind.PHONE
-                    if (kind != com.xnotes.share.db.DeviceKind.PHONE) return@mapNotNull null
-                    PeerInfo(fp, dev?.displayName ?: "phone", fp in connected, kind)
-                }
-            }
-        }, "peers-publish").apply { isDaemon = true; start() }
-    }
-
-    // --- Android peers: outbound guest sessions ---
-
-    private fun guestBridge(): GuestEngine.GuestHost = object : GuestEngine.GuestHost {
-        override fun openDocument(cacheUri: String) =
-            CompanionEditors.editorFor(cacheUri)?.state?.document
-        override fun repaintDocument(cacheUri: String) {
-            main.post { CompanionEditors.editorFor(cacheUri)?.syncRepaint() }
-        }
-        override fun repaintLive(cacheUri: String) {
-            main.post {
-                val editor = CompanionEditors.editorFor(cacheUri)
-                editor?.syncLiveRender(editor.controller.remoteLive?.dirtyViewportRect())
-            }
-        }
-        override fun editorState(cacheUri: String): com.xnotes.canvas.CanvasState? =
-            CompanionEditors.editorFor(cacheUri)?.state
-        override fun structureChanged(cacheUri: String) {
-            main.post { CompanionEditors.editorFor(cacheUri)?.syncStructureChanged() }
-        }
-        override fun previewRoom(cacheUri: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
-            main.post {
-                val editor = CompanionEditors.editorFor(cacheUri) ?: return@post
-                if (editor.controller.roomGestureActive) return@post
-                editor.controller.previewRemoteRoom(page, sideways, split, resume, shift)
-            }
-        }
-        override fun clearRoomPreview(cacheUri: String) {
-            main.post { CompanionEditors.editorFor(cacheUri)?.controller?.clearRemoteRoom() }
-        }
-        override fun applyRoomEdit(cacheUri: String, page: Int, sideways: Boolean, open: Boolean, a: Double, b: Double): Boolean {
-            val editor = CompanionEditors.editorFor(cacheUri) ?: return false
-            if (!editor.controller.applyRemoteRoomEdit(page, sideways, open, a, b)) return false
-            editor.syncStructureChanged()
-            return true
-        }
-        override fun liveOverlay(cacheUri: String): RemoteLiveStrokes? =
-            CompanionEditors.editorFor(cacheUri)?.controller?.remoteLive
-        override fun onIndexChanged(hostFp: String) {
-            val eng = synchronized(peerLock) {
-                guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
-            } ?: return
-            _guestIndex.value = _guestIndex.value + (hostFp to eng.remoteIndex())
-            publishGuests()
-        }
-        override fun onFileReady(hostFp: String, remoteId: String, cacheUri: String, version: Long, openNow: Boolean) {
-            if (openNow) {
-                main.post {
-                    CompanionService.onOpenGuestFile?.invoke(cacheUri)
-                        ?: postSharingStatus("Shared file is ready.")
-                }
-            }
-        }
-        override fun onResult(hostFp: String, ok: Boolean, reason: String) {
-            postSharingStatus(if (ok) "Done." else "Declined${if (reason.isNotEmpty()) ": $reason" else "."}")
-        }
-        override fun onLinkResult(hostFp: String, remoteId: String, ok: Boolean, reason: String) {
-            if (!ok) {
-                postSharingStatus("No access${if (reason.isNotEmpty()) ": $reason" else "."}")
-                return
-            }
-            // Granted: the pushed index now covers the target; fetch and open it.
-            val eng = synchronized(peerLock) {
-                guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
-            } ?: return
-            eng.fetch(remoteId, openNow = true)
-        }
-        override fun onError(reason: String) = postSharingStatus(reason)
-    }
-
-    /**
-     * Dial an Android peer as guest. Several may be connected at once; each
-     * gets its own TLS client, SAS pairing and [GuestEngine].
-     */
-    private fun startGuestSession(host: String, port: Int) {
-        val identity = identity ?: return
-        val pins = pins ?: return
-        val store = store ?: return
-        val cacheRoot = guestCacheDir ?: return
-        val key = "$host:$port"
-        synchronized(peerLock) { guestSessions.remove(key) }?.let {
-            runCatching { it.pairing.close() }
-            runCatching { it.client.disconnect() }
-        }
-        val scoped = File(cacheRoot, key.replace(Regex("[^A-Za-z0-9.-]"), "_")).apply { mkdirs() }
-        val client = CompanionClient(host, port, identity, pinnedFp = null, autoReconnect = true)
-        val engine = GuestEngine("", GuestEngine.Sender { client.send(it) }, guestBridge(), scoped, key)
-        engine.isConnected = { client.connected }
-        val sender = PairingClient.Sender { msg -> client.send(msg) }
-        val pairing = PairingClient(deviceName, identity.fingerprintHex, pins, guestPairingUi(key), sender)
-        pairing.listenPort = listener?.boundPort ?: 0
-        pairing.onSasPeer = { sas, name -> _sasOutbound.value = SasRequest(key, name, sas, inbound = false) }
-        pairing.onPaired = { name -> onGuestPaired(key, name) }
-        val session = GuestSession(key, host, port, client, pairing, engine)
-        // Route through main like the Linux path (engines assume main-thread calls).
-        client.onConnected = { fp ->
-            main.post {
-                engine.hostFp = fp.lowercase()
-                session.fp = fp.lowercase()
-                pairing.onConnected(fp)
-                publishGuests()
-            }
-        }
-        client.onMessage = { msg -> main.post { guestRoute(session, msg) } }
-        client.onDisconnected = { willRetry ->
-            main.post {
-                if (!willRetry) {
-                    _guestIndex.value = _guestIndex.value - (session.fp ?: key)
-                    publishGuests()
-                }
-                session.engine.onDisconnected(!willRetry)
-            }
-        }
-        client.onError = { err -> postSharingStatus(err) }
-        synchronized(peerLock) { guestSessions[key] = session }
-        rememberGuestTarget(key)
-        publishGuests()
-        client.connect()
-    }
-
-    private fun guestRoute(s: GuestSession, msg: JSONObject) {
-        runCatching {
-            when (msg.optString("t")) {
-                "hello_ack", "pair_result" -> s.pairing.onMessage(msg)
-                else -> s.engine.onMessage(msg)
-            }
-        }
-    }
-
-    private fun guestPairingUi(key: String): PairingUi = object : PairingUi {
-        override fun showCodeEntry() = Unit
-        override fun showStatus(s: String) = postSharingStatus(s)
-        override fun pairingDone(name: String) {
-            _sasOutbound.value?.takeIf { it.key == key }?.let { _sasOutbound.value = null }
-            postSharingStatus("Paired with $name.")
-        }
-        override fun pairingFailed(reason: String) {
-            _sasOutbound.value?.takeIf { it.key == key }?.let { _sasOutbound.value = null }
-            postSharingStatus("Pairing failed: $reason")
-        }
-    }
-
-    private fun onGuestPaired(key: String, name: String) {
-        val s = synchronized(peerLock) { guestSessions[key] } ?: return
-        val fp = s.pairing.peerFingerprint ?: return
-        s.fp = fp.lowercase()
-        synchronized(peerLock) { peerNames[fp.lowercase()] = name }
-        s.engine.peerName = name
-        s.engine.start()
-        Thread({
-            runCatching {
-                kotlinx.coroutines.runBlocking { store?.remember(fp.lowercase(), name, s.host, s.port, kind = com.xnotes.share.db.DeviceKind.PHONE) }
-            }
-            main.post { publishGuests() }
-        }, "guest-remember").apply { isDaemon = true; start() }
-        publishGuests()
-    }
-
-    private fun publishGuests() {
-        main.post {
-            val idx = _guestIndex.value
-            _guests.value = synchronized(peerLock) {
-                guestSessions.values.map { s ->
-                    val fp = s.fp
-                    GuestInfo(
-                        key = s.key,
-                        fp = fp,
-                        name = synchronized(peerLock) { fp?.let { peerNames[it] } } ?: s.engine.peerName,
-                        connected = fp != null,
-                        fileCount = fp?.let { idx[it]?.size } ?: 0,
-                    )
-                }
-            }
-        }
-    }
-
-    /** Notification approval for an inbound SAS request (works screen-off). */
-    private fun askSasApproval(key: String, device: String, sas: String) {
-        val allow = PendingIntent.getService(
-            this, key.hashCode(), Intent(this, CompanionService::class.java).setAction(ACTION_SAS)
-                .putExtra(EXTRA_SAS_KEY, key).putExtra(EXTRA_ALLOW, true),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val deny = PendingIntent.getService(
-            this, -key.hashCode(), Intent(this, CompanionService::class.java).setAction(ACTION_SAS)
-                .putExtra(EXTRA_SAS_KEY, key).putExtra(EXTRA_ALLOW, false),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val note = NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification_share)
-            .setContentTitle("Pair with $device? Code: $sas")
-            .setContentText("Confirm this code matches the one on their phone.")
-            .setOngoing(false)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_SOCIAL)
-            .addAction(0, getString(R.string.companion_allow), allow)
-            .addAction(0, getString(R.string.companion_deny), deny)
-            .setTimeoutAfter(120_000L)
-            .setDeleteIntent(deny)
-            .build()
-        getSystemService(NotificationManager::class.java)?.notify(APPROVAL_ID + approvalSeq++, note)
-    }
-
-    /** Remember a guest dial target so it auto-connects on next launch. */
-    private fun rememberGuestTarget(key: String) {
-        try {
-            val prefs = getSharedPreferences(PREFS, 0)
-            val cur = prefs.getStringSet(KEY_GUESTS, emptySet())?.toMutableSet() ?: mutableSetOf()
-            if (cur.add(key)) prefs.edit().putStringSet(KEY_GUESTS, cur).apply()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun autoDialGuests() {
-        val targets = try {
-            getSharedPreferences(PREFS, 0).getStringSet(KEY_GUESTS, emptySet())?.toList() ?: emptyList()
-        } catch (_: Exception) {
-            emptyList()
-        }
-        for (key in targets) {
-            val host = key.substringBeforeLast(':')
-            val port = key.substringAfterLast(':').toIntOrNull() ?: continue
-            if (host.isEmpty() || port !in 1..65535) continue
-            startGuestSession(host, port)
         }
     }
 
@@ -915,36 +491,6 @@ class CompanionService : Service() {
         updateForeground()
     }
 
-    /** Start the phone-sharing half: listen + rejoin remembered guests. */
-    private fun startSharingNet() {
-        if (listener == null) startListener()
-        autoDialGuests()
-        updateForeground()
-    }
-
-    /** Stop the phone-sharing half: drop listener, peers and guests. */
-    private fun stopSharingNet() {
-        runCatching { listener?.stop() }
-        listener = null
-        _listenPort.value = 0
-        synchronized(peerLock) {
-            peerSessions.values.forEach { runCatching { it.handshake.close() } }
-            peerSessions.clear()
-            guestSessions.values.forEach {
-                runCatching { it.pairing.close() }
-                runCatching { it.client.disconnect() }
-            }
-            guestSessions.clear()
-        }
-        _peers.value = emptyList()
-        _guests.value = emptyList()
-        _guestIndex.value = emptyMap()
-        _sasInbound.value = null
-        _sasOutbound.value = null
-        postSharingStatus("Phone sharing off.")
-        updateForeground()
-    }
-
     private fun shutdown() {
         _active.value = false
         starting.set(false)
@@ -954,23 +500,6 @@ class CompanionService : Service() {
         client = null
         engine = null
         backend = null
-        runCatching { listener?.stop() }
-        listener = null
-        _listenPort.value = 0
-        synchronized(peerLock) {
-            peerSessions.values.forEach { runCatching { it.handshake.close() } }
-            peerSessions.clear()
-            guestSessions.values.forEach {
-                runCatching { it.pairing.close() }
-                runCatching { it.client.disconnect() }
-            }
-            guestSessions.clear()
-        }
-        _peers.value = emptyList()
-        _guests.value = emptyList()
-        _guestIndex.value = emptyMap()
-        _sasInbound.value = null
-        _sasOutbound.value = null
         CompanionEditors.onTracked = null
     }
 
@@ -979,21 +508,12 @@ class CompanionService : Service() {
     private fun attachEditor(editor: Editor, uri: String) {
         val engine = engine ?: return
         if (CompanionEditors.uriFor(editor) != uri) return
-        val guest = guestForCacheUri(uri)
-        if (guest != null) {
-            // Shared docs resolve note-link taps through the sync host:
-            // open when shared, ask the owner for permission when not.
-            editor.onOpenSharedNoteLink = { targetId -> openGuestLink(guest, targetId) }
-        } else {
-            editor.onOpenSharedNoteLink = null
-        }
         val overlay = RemoteLiveStrokes(editor.state).also { it.showingFile = uri }
         editor.controller.remoteLive = overlay
         editor.controller.onStrokeStarted = {
             // A previous gesture that never committed (dismiss tap): close its run first.
             pendingLive.remove(editor)?.let { stale ->
-                if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style)
-                else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
+                eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
             }
         }
         editor.controller.onStrokeSample = { page, x, y, p ->
@@ -1001,14 +521,7 @@ class CompanionService : Service() {
         }
         editor.controller.onStrokeCommitted = { page, stroke ->
             val live = pendingLive.remove(editor)
-            if (guest != null) {
-                if (live != null) {
-                    guest.finishStroke(uri, page, live.id, live.tool, live.width, live.color, live.style)
-                    guest.submitLocalStroke(uri, page, stroke, live.id)
-                } else {
-                    guest.submitLocalStroke(uri, page, stroke, newDedupe())
-                }
-            } else if (live != null) {
+            if (live != null) {
                 eachHost {
                     it.finishStroke(uri, page, live.id, live.tool, live.width, live.color, live.style)
                     it.submitLocalStroke(uri, page, stroke, live.id)
@@ -1021,19 +534,13 @@ class CompanionService : Service() {
         editor.controller.onStrokesErased = { page, strokes ->
             val ids = strokes.map { SyncWire.fingerprintOf(it) }
             if (ids.isNotEmpty()) {
-                if (guest != null) guest.submitLocalErase(uri, page, ids, newDedupe())
-                else {
-                    val id = newDedupe()
-                    eachHost { it.submitLocalErase(uri, page, ids, id) }
-                }
+                val id = newDedupe()
+                eachHost { it.submitLocalErase(uri, page, ids, id) }
             }
         }
         editor.controller.onStrokesReplaced = { changes ->
-            if (guest != null) guest.submitLocalReplacements(uri, changes, newDedupe())
-            else {
-                val id = newDedupe()
-                eachHost { it.submitLocalReplacements(uri, changes, id) }
-            }
+            val id = newDedupe()
+            eachHost { it.submitLocalReplacements(uri, changes, id) }
         }
         editor.controller.onRoomPreview = { page, sideways, split, resume, shift ->
             var live = pendingRoom
@@ -1041,64 +548,47 @@ class CompanionService : Service() {
                 live = PendingRoom(uri, page, newDedupe())
                 pendingRoom = live
             }
-            if (guest != null) guest.roomPreview(uri, page, live.id, sideways, split, resume, shift)
-            else eachHost { it.roomPreview(uri, page, live.id, sideways, split, resume, shift) }
+            eachHost { it.roomPreview(uri, page, live.id, sideways, split, resume, shift) }
         }
         editor.controller.onRoomCommitted = { edit ->
             val live = pendingRoom?.takeIf { it.uri == uri && it.page == edit.page }
             pendingRoom = null
             val id = live?.id ?: newDedupe()
             val (split, resume, shift) = if (edit.open) Triple(edit.a, edit.a, edit.b - edit.a) else Triple(edit.a, edit.b, edit.a - edit.b)
-            if (guest != null) {
-                guest.finishRoom(uri, edit.page, id, edit.sideways, split, resume, shift)
-                if (edit.open) guest.submitLocalRoomOpen(uri, edit.page, edit.sideways, edit.a, edit.b - edit.a, id)
-                else guest.submitLocalRoomClose(uri, edit.page, edit.sideways, edit.a, edit.b, id)
-            } else {
-                eachHost { it.finishRoom(uri, edit.page, id, edit.sideways, split, resume, shift) }
-                if (edit.open) eachHost { it.submitLocalRoomOpen(uri, edit.page, edit.sideways, edit.a, edit.b - edit.a, id) }
-                else eachHost { it.submitLocalRoomClose(uri, edit.page, edit.sideways, edit.a, edit.b, id) }
-            }
+            eachHost { it.finishRoom(uri, edit.page, id, edit.sideways, split, resume, shift) }
+            if (edit.open) eachHost { it.submitLocalRoomOpen(uri, edit.page, edit.sideways, edit.a, edit.b - edit.a, id) }
+            else eachHost { it.submitLocalRoomClose(uri, edit.page, edit.sideways, edit.a, edit.b, id) }
         }
         editor.onFileContentReplaced = {
-            // Host docs fan out a full-file push; guest docs already sync op-by-op.
-            if (guest == null) eachHost { it.pushFile(uri) }
+            eachHost { it.pushFile(uri) }
         }
         editor.onMarkupsChanged = { added, removed ->
             if (added.isNotEmpty() || removed.isNotEmpty()) {
-                if (guest != null) guest.submitLocalMarkups(uri, added, removed, newDedupe())
-                else {
-                    val id = newDedupe()
-                    eachHost { it.submitLocalMarkups(uri, added, removed, id) }
-                }
+                val id = newDedupe()
+                eachHost { it.submitLocalMarkups(uri, added, removed, id) }
             }
         }
-        editor.onHistoryStepSync = { cmd -> syncContentCommand(editor, uri, guest, cmd) }
+        editor.onHistoryStepSync = { cmd -> syncContentCommand(editor, uri, cmd) }
         editor.onPageStyleChanged = { entries, docStyle, docMargins ->
             // Style/margin commits carry no undo step; the callback fires once per set.
-            if (guest != null) guest.submitLocalPageStyle(uri, entries, docStyle, docMargins, newDedupe())
-            else {
-                val id = newDedupe()
-                eachHost { it.submitLocalPageStyle(uri, entries, docStyle, docMargins, id) }
-            }
+            val id = newDedupe()
+            eachHost { it.submitLocalPageStyle(uri, entries, docStyle, docMargins, id) }
         }
         editor.controller.onMarkupsErased = { page, ids ->
             if (ids.isNotEmpty()) {
-                if (guest != null) guest.submitLocalMarkups(uri, emptyList(), ids.map { page to it }, newDedupe())
-                else {
-                    val id = newDedupe()
-                    eachHost { it.submitLocalMarkups(uri, emptyList(), ids.map { page to it }, id) }
-                }
+                val id = newDedupe()
+                eachHost { it.submitLocalMarkups(uri, emptyList(), ids.map { page to it }, id) }
             }
         }
         // Text/table/image/audio edits fan out as granular uid-keyed ops both
         // ways (upsert on change, remove on delete); strokes/markups/pages/rooms
         // keep their dedicated hooks. Anything else converges via debounced
-        // full-file push (host only; guests have no push path for it).
+        // full-file push.
         val prevPush = editor.history.onPush
         editor.history.onPush = { cmd ->
             try { prevPush?.invoke(cmd) } catch (_: Exception) {}
             val covered = try {
-                syncContentCommand(editor, uri, guest, cmd)
+                syncContentCommand(editor, uri, cmd)
             } catch (_: Exception) {
                 false
             }
@@ -1107,32 +597,27 @@ class CompanionService : Service() {
                 val isGranular = name == "AddMarkups" || name == "RemoveMarkup" || name == "ReplaceMarkup" ||
                     name == "CompositeCommand" || name.startsWith("AddPage") || name.startsWith("DeletePage") ||
                     name.startsWith("MovePages")
-                if (!isGranular) pushFileSoon(uri, guest)
+                if (!isGranular) pushFileSoon(uri)
             }
         }
         editor.controller.onRoomPreviewDone = {
             pendingRoom?.takeIf { it.uri == uri }?.let {
                 pendingRoom = null
-                if (guest != null) guest.finishRoom(uri, it.page, it.id, false, 0.0, 0.0, 0.0)
-                else eachHost { e -> e.finishRoom(uri, it.page, it.id, false, 0.0, 0.0, 0.0) }
+                eachHost { e -> e.finishRoom(uri, it.page, it.id, false, 0.0, 0.0, 0.0) }
             }
         }
         editor.state.onPageChanged = { page ->
-            if (guest != null) guest.presence(uri, page)
-            else eachHost { it.presence(uri, page) }
+            eachHost { it.presence(uri, page) }
         }
         editor.onPageInserted = { index, w, h ->
             val id = newDedupe()
-            if (guest != null) guest.submitLocalPageAdd(uri, index, w, h, id)
-            else eachHost { it.submitLocalPageAdd(uri, index, w, h, id) }
+            eachHost { it.submitLocalPageAdd(uri, index, w, h, id) }
         }
         editor.onPageRemoved = { index ->
             val id = newDedupe()
-            if (guest != null) guest.submitLocalPageRemove(uri, index, id)
-            else eachHost { it.submitLocalPageRemove(uri, index, id) }
+            eachHost { it.submitLocalPageRemove(uri, index, id) }
         }
-        if (guest != null) guest.presence(uri, editor.state.currentPageIndex())
-        else eachHost { it.presence(uri, editor.state.currentPageIndex()) }
+        eachHost { it.presence(uri, editor.state.currentPageIndex()) }
     }
 
     private data class LiveStroke(val uri: String, val page: Int, val id: String, val tool: String, val width: Double, val color: String, val style: org.json.JSONObject? = null)
@@ -1149,15 +634,15 @@ class CompanionService : Service() {
 
     /**
      * Translate one local history step into uid-keyed content ops (text, table,
-     * image, audio), both as host and as guest. Strokes keep their dedicated
+     * image, audio) for the host engine. Strokes keep their dedicated
      * hooks and are skipped here. Returns true when nothing remains for the
      * pushFile fallback (every touched non-stroke item was covered).
      *
      * Removes come from pages that no longer hold the uid; everything still
-     * present upserts its current snapshot, so creates, moves, resizes,
-     * restyles and cell or text edits all converge with one code path.
+     * present upserts its current snapshot, so creates, moves, restyles and
+     * cell or text edits all converge with one code path.
      */
-    private fun syncContentCommand(editor: Editor, uri: String, guest: GuestEngine?, cmd: com.xnotes.core.history.Command): Boolean {
+    private fun syncContentCommand(editor: Editor, uri: String, cmd: com.xnotes.core.history.Command): Boolean {
         val doc = try { editor.state.document } catch (_: Exception) { return false }
         val touched = try {
             cmd.touched { item -> doc.pages.firstOrNull { p -> p.items.any { it === item } } }
@@ -1200,7 +685,7 @@ class CompanionService : Service() {
                         if (it.uid.isEmpty()) it.uid = newDedupe()
                         val bytes = runCatching { it.image.file.readBytes() }.getOrNull() ?: continue
                         val imageId = "img-" + it.uid
-                        sendContentBytes(uri, guest, fileOf(editor, uri), imageId, bytes, kind = "image")
+                        sendContentBytes(uri, imageId, bytes, kind = "image")
                         val op = JSONObject().put("op", "add_image").put("page", pi).put("image_id", imageId)
                             .put("width", it.image.width).put("height", it.image.height)
                             .put("rect", JSONArray().put(it.rect.x).put(it.rect.y).put(it.rect.w).put(it.rect.h))
@@ -1215,8 +700,8 @@ class CompanionService : Service() {
                         if (it.uid.isEmpty()) it.uid = newDedupe()
                         val bytes = runCatching { it.audio.file.readBytes() }.getOrNull() ?: continue
                         val audioId = "aud-" + it.uid
-                        sendContentBytes(uri, guest, fileOf(editor, uri), audioId, bytes, kind = "audio")
-                        sendContentBytes(uri, guest, fileOf(editor, uri), audioId, it.audio.peaks, kind = "peaks")
+                        sendContentBytes(uri, audioId, bytes, kind = "audio")
+                        sendContentBytes(uri, audioId, it.audio.peaks, kind = "peaks")
                         ops.put(JSONObject().put("op", "add_audio").put("page", pi).put("audio", SyncWire.toWireAudio(audioId, it, pi)))
                     }
                     else -> covered = false
@@ -1224,8 +709,7 @@ class CompanionService : Service() {
             }
             if (ops.length() > 0) {
                 val id = newDedupe()
-                if (guest != null) guest.submitContentOps(fileOf(editor, uri), ops, id)
-                else eachHost { it.submitContentOps(uri, ops, id) }
+                eachHost { it.submitContentOps(uri, ops, id) }
             }
             if (items.any { it !is com.xnotes.core.model.TextItem && it !is com.xnotes.core.model.TableItem && it !is com.xnotes.core.model.ImageItem && it !is com.xnotes.core.model.AudioItem }) covered = false
         }
@@ -1251,18 +735,8 @@ class CompanionService : Service() {
         }
     }
 
-    private fun fileOf(editor: Editor, uri: String): String {
-        val g = guestForCacheUri(uri)
-        return if (g != null) "" else uri
-    }
-
-    private fun sendContentBytes(uri: String, guest: GuestEngine?, file: String, id: String, bytes: ByteArray, kind: String) {
-        val target = if (file.isNotEmpty()) file else uri
-        if (guest != null) {
-            if (kind == "audio") guest.sendAudioBytes(target, id, bytes)
-            else if (kind == "peaks") guest.sendAudioPeaks(target, id, bytes)
-            else guest.sendImageBytes(target, id, bytes)
-        } else eachHost {
+    private fun sendContentBytes(uri: String, id: String, bytes: ByteArray, kind: String) {
+        eachHost {
             if (kind == "audio") it.sendAudioBytes(uri, id, bytes)
             else if (kind == "peaks") it.sendAudioPeaks(uri, id, bytes)
             else it.sendImageBytes(uri, id, bytes)
@@ -1272,11 +746,10 @@ class CompanionService : Service() {
     /**
      * Debounced full-file push for content ops have no wire form (text/table
      * edits, image moves/removes, shape refills): collapses a typing burst
-     * into one reload so peers converge in real time without per-keystroke
-     * full files.
+     * into one reload so the companion converges in real time without
+     * per-keystroke full files.
      */
-    private fun pushFileSoon(uri: String, guest: GuestEngine?) {
-        if (guest != null) return // guest docs already sync op-by-op; host fans file
+    private fun pushFileSoon(uri: String) {
         synchronized(pushDebounce) { pushDebounce.remove(uri)?.let { main.removeCallbacks(it) } }
         val r = Runnable {
             synchronized(pushDebounce) { pushDebounce.remove(uri) }
@@ -1287,14 +760,12 @@ class CompanionService : Service() {
     }
 
     private fun liveSample(editor: Editor, uri: String, page: Int, x: Double, y: Double, p: Double) {
-        val guest = guestForCacheUri(uri)
-        if (guest == null && engine == null && peerSessions.isEmpty()) return
+        if (engine == null) return
         var live = pendingLive[editor]
         if (live != null && (live.uri != uri || live.page != page)) {
             // Crossed onto another page mid-stroke: close this run, open the next.
             val stale = live
-            if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style)
-            else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
+            eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
             live = null
         }
         if (live == null) {
@@ -1304,40 +775,13 @@ class CompanionService : Service() {
             live = LiveStroke(uri, page, newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba), style).also { pendingLive[editor] = it }
         }
         val cur = live ?: return
-        if (guest != null) guest.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p, cur.style)
-        else eachHost { it.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p, cur.style) }
+        eachHost { it.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p, cur.style) }
     }
 
-    /** Every host engine serving this device's files (Linux companion + inbound peers). */
+    /** The host engine serving this device's files to the Linux companion. */
     private fun eachHost(fn: (HostEngine) -> Unit) {
         engine?.let(fn)
-        synchronized(peerLock) { peerSessions.values.forEach { fn(it.engine) } }
     }
-
-    /** The guest engine owning a fetched peer file, or null for own files. */
-    private fun guestForCacheUri(uri: String): GuestEngine? {
-        val prefix = guestCachePrefix ?: return null
-        if (!uri.startsWith(prefix)) return null
-        return synchronized(peerLock) {
-            guestSessions.values.mapNotNull { it.engine }.firstOrNull { it.isGuestUri(uri) }
-        }
-    }
-
-    /** Follow a note-link tap from a guest document (open or permission request). */
-    private fun openGuestLink(engine: GuestEngine, targetId: String) {
-        main.post {
-            if (engine.remoteIndex().any { it.id == targetId }) {
-                engine.fetch(targetId, openNow = true)
-            } else if (engine.isConnected()) {
-                postSharingStatus("Asking the owner for access…")
-                engine.requestLinkAccess(targetId)
-            } else {
-                postSharingStatus("Not connected.")
-            }
-        }
-    }
-
-    @Volatile private var guestCachePrefix: String? = null
 
     private fun detachEditor(editor: Editor) {
         editor.controller.onStrokeStarted = null
@@ -1354,7 +798,6 @@ class CompanionService : Service() {
         editor.onHistoryStepSync = null
         editor.onPageStyleChanged = null
         editor.controller.onMarkupsErased = null
-        editor.onOpenSharedNoteLink = null
         editor.controller.onRoomPreview = null
         editor.controller.onRoomCommitted = null
         editor.controller.onRoomPreviewDone = null
@@ -1448,62 +891,26 @@ class CompanionService : Service() {
             .build()
     }
 
-    /** Ongoing notification for the phone-sharing half (own foreground id). */
-    private fun sharingNotification(): Notification {
-        ensureChannel(this)
-        val open = packageManager.getLaunchIntentForPackage(packageName)
-            ?.let { PendingIntent.getActivity(this, 2, it, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
-        val stop = PendingIntent.getService(
-            this, 12, Intent(this, CompanionService::class.java).setAction(ACTION_STOP_SHARING),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val port = _listenPort.value
-        val text = if (port > 0) "Listening for phones on port $port."
-        else getString(R.string.share_starting)
-        return NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification_share)
-            .setContentTitle(getString(R.string.share_channel))
-            .setContentText(text)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setContentIntent(open)
-            .addAction(0, getString(R.string.share_stop), stop)
-            .build()
-    }
-
     /**
-     * Keep exactly one foreground notification per enabled half, none when
-     * both halves are off (then stop instead of lingering with a phantom
+     * Keep the single foreground notification while the companion half is on;
+     * none when it is off (then stop instead of lingering with a phantom
      * "sharing is on" card).
      */
     private fun updateForeground() {
         val compOn = isCompanionOn(this)
-        val shareOn = isSharingOn(this)
         _companionOn.value = compOn
-        _sharingOn.value = shareOn
-        _active.value = compOn || shareOn
-        if (!compOn && !shareOn) {
+        _active.value = compOn
+        if (!compOn) {
             runCatching {
                 getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
+                // Stale id from when phone sharing had its own card.
                 getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
             }
             stopSelf()
             return
         }
         try {
-            if (compOn && shareOn) {
-                ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
-                getSystemService(NotificationManager::class.java)?.notify(NOTIF_SHARING, sharingNotification())
-            } else if (compOn) {
-                ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
-                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_SHARING)
-            } else {
-                ServiceCompat.startForeground(this, NOTIF_SHARING, sharingNotification(), fgsType())
-                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_COMPANION)
-            }
+            ServiceCompat.startForeground(this, NOTIF_COMPANION, companionNotification(), fgsType())
         } catch (_: Exception) {
         }
     }
@@ -1518,97 +925,47 @@ class CompanionService : Service() {
 
     data class Status(val text: String, val paired: String?, val connected: Boolean)
 
-    /** An inbound Android peer (this phone hosts files for it). */
-    data class PeerInfo(val fp: String, val name: String, val connected: Boolean, val kind: String = com.xnotes.share.db.DeviceKind.PHONE)
-
-    /** An outbound Android peer (this phone reads that phone's files). */
-    data class GuestInfo(
-        val key: String,
-        val fp: String?,
-        val name: String,
-        val connected: Boolean,
-        val fileCount: Int,
-    )
-
-    /** A mutual-confirm SAS code shown on both phones. */
-    data class SasRequest(val key: String, val name: String, val sas: String, val inbound: Boolean)
-
     companion object {
         private const val CHANNEL = "companion"
         private const val NOTIFICATION_ID = 43 // legacy single id; kept for cancel compat
         private const val NOTIF_COMPANION = 43
         private const val NOTIF_SHARING = 44
         private const val APPROVAL_ID = 100
-        const val ACTION_STOP = "com.xnotes.share.companion.STOP"
         const val ACTION_STOP_COMPANION = "com.xnotes.share.companion.STOP_COMPANION"
-        const val ACTION_STOP_SHARING = "com.xnotes.share.companion.STOP_SHARING"
         const val ACTION_REFRESH = "com.xnotes.share.companion.REFRESH"
         const val ACTION_APPROVAL = "com.xnotes.share.companion.APPROVAL"
-        const val ACTION_SAS = "com.xnotes.share.companion.SAS"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_ALLOW = "allow"
-        const val EXTRA_SAS_KEY = "sas_key"
 
         private val _status = MutableStateFlow(Status("Off", null, false))
         val status: StateFlow<Status> = _status.asStateFlow()
         private val _companionStatus = MutableStateFlow(Status("Off", null, false))
         /** Linux-companion half status; Companion screen observes this only. */
         val companionStatus: StateFlow<Status> = _companionStatus.asStateFlow()
-        private val _sharingStatus = MutableStateFlow(Status("Off", null, false))
-        /** Phone-sharing half status; Shared screen observes this only. */
-        val sharingStatus: StateFlow<Status> = _sharingStatus.asStateFlow()
         private val _codeNeeded = MutableStateFlow(false)
         val codeNeeded: StateFlow<Boolean> = _codeNeeded.asStateFlow()
         private val _active = MutableStateFlow(false)
         val active: StateFlow<Boolean> = _active.asStateFlow()
-        private val _listenPort = MutableStateFlow(0)
-        /** This phone's listener port for Android peers (0 while down). */
-        val listenPort: StateFlow<Int> = _listenPort.asStateFlow()
-        private val _peers = MutableStateFlow<List<PeerInfo>>(emptyList())
-        /** Paired Android phones (inbound hosting), with connection state. */
-        val peers: StateFlow<List<PeerInfo>> = _peers.asStateFlow()
-        private val _guests = MutableStateFlow<List<GuestInfo>>(emptyList())
-        /** Outbound guest sessions (this phone reads their files). */
-        val guests: StateFlow<List<GuestInfo>> = _guests.asStateFlow()
-        private val _guestIndex = MutableStateFlow<Map<String, List<GuestEngine.RemoteEntry>>>(emptyMap())
-        /** Remote shared index per guest host fingerprint. */
-        val guestIndex: StateFlow<Map<String, List<GuestEngine.RemoteEntry>>> = _guestIndex.asStateFlow()
-        private val _sasInbound = MutableStateFlow<SasRequest?>(null)
-        /** Inbound SAS approval waiting for the user's verdict. */
-        val sasInbound: StateFlow<SasRequest?> = _sasInbound.asStateFlow()
-        private val _sasOutbound = MutableStateFlow<SasRequest?>(null)
-        /** Outbound SAS code to confirm against the other phone. */
-        val sasOutbound: StateFlow<SasRequest?> = _sasOutbound.asStateFlow()
-
-        /** Opens a fetched guest file in the editor; wired by MainActivity. */
-        var onOpenGuestFile: ((String) -> Unit)? = null
 
         const val PREFS = "companion"
         const val KEY_IP = "companion_last_ip"
         const val KEY_PORT = "companion_last_port"
         const val KEY_ENABLED = "companion_enabled" // legacy: migrated to the two flags below
         const val KEY_COMPANION = "companion_on"
-        const val KEY_SHARING = "sharing_on"
         const val KEY_NAME = "companion_own_name"
-        const val KEY_GUESTS = "companion_guest_targets"
 
         private val _companionOn = MutableStateFlow(false)
         /** Linux companion dialing is switched on. */
         val companionOn: StateFlow<Boolean> = _companionOn.asStateFlow()
-        private val _sharingOn = MutableStateFlow(false)
-        /** Phone sharing (listener + guests) is switched on. */
-        val sharingOn: StateFlow<Boolean> = _sharingOn.asStateFlow()
-
         private fun prefs(context: Context) = context.getSharedPreferences(PREFS, 0)
 
-        /** One-time migration from the old single toggle (which meant everything). */
+        /** One-time migration from the old single toggle. */
         private fun migrateFeatureFlags(context: Context) {
             try {
                 val p = prefs(context)
-                if (!p.contains(KEY_COMPANION) && !p.contains(KEY_SHARING) && p.contains(KEY_ENABLED)) {
+                if (!p.contains(KEY_COMPANION) && p.contains(KEY_ENABLED)) {
                     val on = p.getBoolean(KEY_ENABLED, false)
-                    p.edit().putBoolean(KEY_COMPANION, on).putBoolean(KEY_SHARING, on)
-                        .remove(KEY_ENABLED).apply()
+                    p.edit().putBoolean(KEY_COMPANION, on).remove(KEY_ENABLED).apply()
                 }
             } catch (_: Exception) {
             }
@@ -1617,13 +974,6 @@ class CompanionService : Service() {
         fun isCompanionOn(context: Context): Boolean = try {
             migrateFeatureFlags(context)
             prefs(context).getBoolean(KEY_COMPANION, false)
-        } catch (_: Exception) {
-            false
-        }
-
-        fun isSharingOn(context: Context): Boolean = try {
-            migrateFeatureFlags(context)
-            prefs(context).getBoolean(KEY_SHARING, false)
         } catch (_: Exception) {
             false
         }
@@ -1639,7 +989,7 @@ class CompanionService : Service() {
         /** Start the service on app launch when either feature was left on. */
         fun startIfEnabled(context: Context) {
             syncFlagFlows(context)
-            if (!isCompanionOn(context) && !isSharingOn(context)) return
+            if (!isCompanionOn(context)) return
             ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
         }
 
@@ -1647,23 +997,21 @@ class CompanionService : Service() {
         fun syncFlagFlows(context: Context) {
             try {
                 val comp = isCompanionOn(context)
-                val share = isSharingOn(context)
                 _companionOn.value = comp
-                _sharingOn.value = share
-                _active.value = comp || share
+                _active.value = comp
             } catch (_: Exception) {
             }
         }
 
         /**
-         * Switch the Linux-companion half on/off, independently of phone
-         * sharing. Turning it on boots the service when needed and dials;
-         * turning it off drops the dial and its notification.
+         * Switch the Linux-companion half on/off. Turning it on boots the
+         * service when needed and dials; turning it off drops the dial and
+         * its notification.
          */
         fun setCompanionEnabled(context: Context, on: Boolean) {
             setFlag(context, KEY_COMPANION, on)
             _companionOn.value = on
-            _active.value = on || _sharingOn.value
+            _active.value = on
             val svc = runningService
             if (svc == null) {
                 if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
@@ -1675,31 +1023,6 @@ class CompanionService : Service() {
                     return@post
                 }
                 if (on) svc.startCompanionDial() else svc.stopCompanionDial()
-                svc.updateForeground()
-            }
-        }
-
-        /**
-         * Switch the phone-sharing half on/off, independently of the Linux
-         * companion. Turning it on boots the service when needed, listens and
-         * redials remembered guests; turning it off drops the listener and
-         * every peer/guest session plus their notifications.
-         */
-        fun setSharingEnabled(context: Context, on: Boolean) {
-            setFlag(context, KEY_SHARING, on)
-            _sharingOn.value = on
-            _active.value = on || _companionOn.value
-            val svc = runningService
-            if (svc == null) {
-                if (on) ContextCompat.startForegroundService(context, Intent(context, CompanionService::class.java))
-                return
-            }
-            svc.main.post {
-                if (!svc.coreReady) {
-                    svc.ensureCore { svc.applyEnabledFeatures() }
-                    return@post
-                }
-                if (on) svc.startSharingNet() else svc.stopSharingNet()
                 svc.updateForeground()
             }
         }
@@ -1728,232 +1051,6 @@ class CompanionService : Service() {
                     svc.dialDevice(null)
                 }
             }
-        }
-
-        // --- Android-to-Android phones ---
-
-        /**
-         * Dial an Android peer as guest (this phone reads that phone's files).
-         * Several guests may be connected at once. When [port] is 0 the
-         * listener port is probed (42327..42356, the Android range) so the
-         * user only types the IP. Explicit ports (incl. legacy 42317 peers)
-         * are honored as given.
-         */
-        fun dialPeer(context: Context, host: String, port: Int) {
-            // Explicit user action: the phone-sharing half comes on with it.
-            if (!isSharingOn(context)) setSharingEnabled(context, true)
-            val svc = runningService
-            if (svc == null) {
-                // Service is booting; queue the dial once its core is ready.
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    runningService?.let { s ->
-                        s.main.post {
-                            if (!s.coreReady) {
-                                s.ensureCore {
-                                    s.applyEnabledFeatures()
-                                    s.startGuestSession(host, if (port > 0) port else com.xnotes.share.companion.AndroidListener.DEFAULT_PORT)
-                                }
-                            } else {
-                                s.startGuestSession(host, if (port > 0) port else com.xnotes.share.companion.AndroidListener.DEFAULT_PORT)
-                            }
-                        }
-                    }
-                }, 3000)
-                return
-            }
-            svc.main.post {
-                if (svc.sharedVersions == null) {
-                    svc.postSharingStatus("Sharing is still starting — try again in a moment.")
-                    return@post
-                }
-                if (port in 1..65535) {
-                    svc.startGuestSession(host, port)
-                } else {
-                    svc.postSharingStatus("Probing $host for a phone…")
-                    Thread({
-                        val found = probePeer(host)
-                        svc.main.post {
-                            if (found != null) svc.startGuestSession(host, found)
-                            else svc.postSharingStatus("No phone found on $host (tried 42327–42356).")
-                        }
-                    }, "peer-probe").apply { isDaemon = true; start() }
-                }
-            }
-        }
-
-        /** TCP probe for an Android listener on [host] (42327..42356). */
-        private fun probePeer(host: String): Int? {
-            val threads = ArrayList<Thread>()
-            val found = java.util.concurrent.atomic.AtomicInteger(-1)
-            for (p in com.xnotes.share.companion.AndroidListener.DEFAULT_PORT..com.xnotes.share.companion.AndroidListener.DEFAULT_PORT + com.xnotes.share.companion.AndroidListener.PORT_TRIES - 1) {
-                threads += Thread({
-                    if (found.get() != -1) return@Thread
-                    try {
-                        java.net.Socket().use { s ->
-                            s.connect(java.net.InetSocketAddress(host, p), 900)
-                            found.compareAndSet(-1, p)
-                        }
-                    } catch (_: Exception) {
-                    }
-                }).apply { isDaemon = true; start() }
-            }
-            val deadline = System.currentTimeMillis() + 4000
-            for (t in threads) {
-                val left = deadline - System.currentTimeMillis()
-                if (left <= 0) break
-                runCatching { t.join(left) }
-                if (found.get() != -1) break
-            }
-            return found.get().takeIf { it != -1 }
-        }
-
-        /** Fetch a peer file into the cache; it opens in the editor on arrival. */
-        fun fetchShared(context: Context, hostFp: String, remoteId: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                val eng = synchronized(svc.peerLock) {
-                    svc.guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
-                } ?: return@post
-                eng.fetch(remoteId, openNow = true)
-            }
-        }
-
-        /** Cached bytes of a peer file, for the save-a-copy flow. */
-        fun readGuestBytes(hostFp: String, remoteId: String): ByteArray? {
-            val svc = runningService ?: return null
-            val eng = synchronized(svc.peerLock) {
-                svc.guestSessions.values.firstOrNull { it.fp == hostFp }?.engine
-            } ?: return null
-            return eng.cachedBytes(remoteId)
-        }
-
-        /**
-         * Open a note-link target shared by a connected host: fetches and
-         * opens it. Returns true when a guest session covers [uri].
-         */
-        fun openSharedTarget(uri: String): Boolean {
-            val svc = runningService ?: return false
-            val eng = synchronized(svc.peerLock) {
-                svc.guestSessions.values.mapNotNull { it.engine }
-                    .firstOrNull { e -> e.remoteIndex().any { it.id == uri } }
-            } ?: return false
-            svc.main.post { eng.fetch(uri, openNow = true) }
-            return true
-        }
-
-        /** Display name for a guest cache URI ("External - {name}"), or null. */
-        fun guestDisplayName(cacheUri: String): String? {
-            val svc = runningService ?: return null
-            return synchronized(svc.peerLock) {
-                svc.guestSessions.values.mapNotNull { it.engine }
-                    .firstNotNullOfOrNull { it.displayNameForCache(cacheUri) }
-            }
-        }
-
-        /** Allow an inbound peer whose SAS matches ([key] from [sasInbound]). */
-        fun confirmInboundSas(context: Context, key: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-                synchronized(svc.peerLock) { svc.peerSessions[key] }?.handshake?.setApproved(key, true)
-                    ?: svc.postSharingStatus("That phone already left.")
-            }
-        }
-
-        /** Deny an inbound pairing request. */
-        fun denyInboundSas(context: Context, key: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                _sasInbound.value?.takeIf { it.key == key }?.let { _sasInbound.value = null }
-                val s = synchronized(svc.peerLock) { svc.peerSessions.remove(key) }
-                s?.handshake?.setApproved(key, false)
-                s?.conn?.close()
-                svc.publishPeers()
-            }
-        }
-
-        /** Confirm the outbound SAS matches the other phone's screen. */
-        fun confirmOutboundSas(key: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                val s = synchronized(svc.peerLock) { svc.guestSessions[key] }
-                if (s != null) s.pairing.confirmSas()
-                else svc.pairing?.confirmSas()
-            }
-        }
-
-        /** Cancel an outbound SAS pairing (drops the guest session). */
-        fun cancelOutboundSas(key: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                _sasOutbound.value?.takeIf { it.key == key }?.let { _sasOutbound.value = null }
-                synchronized(svc.peerLock) { svc.guestSessions.remove(key) }?.let {
-                    runCatching { it.pairing.close() }
-                    runCatching { it.client.disconnect() }
-                } ?: svc.pairing?.cancelPairing()
-                svc.publishGuests()
-            }
-        }
-
-        /** Disconnect a guest session (it stays remembered for auto-connect). */
-        fun disconnectGuest(key: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                synchronized(svc.peerLock) { svc.guestSessions.remove(key) }?.let {
-                    runCatching { it.pairing.close() }
-                    runCatching { it.client.disconnect() }
-                }
-                svc.publishGuests()
-            }
-        }
-
-        /** Forget a phone entirely: drop pins, grants, sessions and auto-connect. */
-        fun forgetPeer(context: Context, fp: String) {
-            Thread({
-                runCatching {
-                    val store = com.xnotes.share.db.ShareStore.of(context)
-                    val dev = kotlinx.coroutines.runBlocking { store.device(fp) }
-                    if (dev != null) {
-                        CompanionPins.of(File(context.filesDir, "share")).unpin(dev.name)
-                    }
-                    kotlinx.coroutines.runBlocking { store.forget(fp) }
-                    try {
-                        val prefs = context.getSharedPreferences(PREFS, 0)
-                        val cur = prefs.getStringSet(KEY_GUESTS, emptySet())?.toMutableSet() ?: mutableSetOf()
-                        if (cur.removeIf { it == fp || it.startsWith("$fp:") }) {
-                            prefs.edit().putStringSet(KEY_GUESTS, cur).apply()
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-                runningService?.let { svc ->
-                    svc.main.post {
-                        synchronized(svc.peerLock) {
-                            svc.peerSessions.remove(fp)?.let {
-                                runCatching { it.handshake.close() }
-                            }
-                            svc.guestSessions.entries.removeIf { e ->
-                                (e.value.fp == fp).also { drop ->
-                                    if (drop) {
-                                        runCatching { e.value.pairing.close() }
-                                        runCatching { e.value.client.disconnect() }
-                                    }
-                                }
-                            }
-                            svc.peerNames.remove(fp)
-                        }
-                        if (svc.grants?.activeFp == fp) {
-                            svc.grants?.activeFp = null
-                            svc.client?.disconnect()
-                        }
-                        _sasInbound.value?.takeIf { it.key == fp }?.let { _sasInbound.value = null }
-                        svc.publishPeers()
-                        svc.publishGuests()
-                        _sharingStatus.value = Status("Forgot phone.", _sharingStatus.value.paired, connected = false)
-                        svc.mirrorStatus()
-                    }
-                }
-            }, "peer-forget").apply { isDaemon = true; start() }
         }
 
         /** Make [fp] the active companion and dial it, parking the others. */
@@ -2075,17 +1172,15 @@ class CompanionService : Service() {
 
         @Volatile private var runningService: CompanionService? = null
 
-        /** Legacy single toggle (kept for compat): enables both halves. */
+        /** Legacy single toggle (kept for compat): enables the companion half. */
         fun start(context: Context) {
             ensureChannel(context)
             setCompanionEnabled(context, true)
-            setSharingEnabled(context, true)
         }
 
-        /** Legacy single stop (kept for compat): disables both halves. */
+        /** Legacy single stop (kept for compat): disables the companion half. */
         fun stop(context: Context) {
             setCompanionEnabled(context, false)
-            setSharingEnabled(context, false)
         }
 
         /**
@@ -2097,7 +1192,6 @@ class CompanionService : Service() {
             val svc = runningService ?: return
             svc.main.post {
                 svc.engine?.refreshPolicy()
-                synchronized(svc.peerLock) { svc.peerSessions.values.forEach { it.engine.refreshPolicy() } }
             }
         }
 

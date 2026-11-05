@@ -1129,12 +1129,6 @@ private fun EditorScreen(
             scope.launch { openTab(editor, uriStr); Unit }
         }
 
-        // Guest files land here straight from the sync service (tap a shared
-        // file, or follow a note link), without needing the Shared screen.
-        androidx.compose.runtime.SideEffect {
-            com.xnotes.share.companion.CompanionService.onOpenGuestFile = { uri -> openTreeFile(uri) }
-        }
-
         /** Switch the pane that owns [uri] to it, or load it there when it is not open yet. */
         fun activateTab(uri: String, secondary: Boolean = false) {
             val target = if (secondary) editor.secondaryPane() else editor
@@ -1170,9 +1164,6 @@ private fun EditorScreen(
                 from.goToPage(page.coerceIn(0, from.state.document.pages.lastIndex.coerceAtLeast(0)))
                 return
             }
-            // A host's shared file opens from its guest cache (permission flow
-            // included); everything else takes the local path below.
-            if (com.xnotes.share.companion.CompanionService.openSharedTarget(uri)) return
             val other = if (from.pane == com.xnotes.ui.Pane.PRIMARY) editor.secondary else editor
             val target = if (other?.noteOpen == true) other else from
             if (target === from) {
@@ -2088,40 +2079,15 @@ private fun EditorScreen(
             )
             }
         }
-        // Text-anchored note links (NOTE_LINK markups): pick a shared file or a
-        // recent note as the target, then mark the stashed selection with it.
+        // Text-anchored note links (NOTE_LINK markups): pick a recent note as
+        // the target, then mark the stashed selection with it.
         if (markupLinkPicking) {
-            val guestIndex by com.xnotes.share.companion.CompanionService.guestIndex.collectAsState()
             val recents = editor.recentDocs
             com.xnotes.ui.AlertDialog(
                 onDismissRequest = { markupLinkPicking = false; markupLinkSel = null; markupLinkEditor = null },
                 title = { androidx.compose.material3.Text(stringResource(R.string.note_link)) },
                 text = {
                     androidx.compose.foundation.lazy.LazyColumn(modifier = androidx.compose.ui.Modifier.heightIn(max = 320.dp)) {
-                        val shared = guestIndex.flatMap { (fp, entries) ->
-                            entries.filter { it.kind == 0 }.map { Triple(fp, it.id, it.path) }
-                        }.sortedBy { it.third.lowercase() }
-                        if (shared.isNotEmpty()) {
-                            item {
-                                androidx.compose.material3.Text(
-                                    "Shared with me",
-                                    style = androidx.compose.material3.MaterialTheme.typography.labelLarge,
-                                )
-                            }
-                            items(shared, key = { (fp, id, _) -> "s:$fp:$id" }) { (_, id, path) ->
-                                androidx.compose.material3.TextButton(onClick = {
-                                    val ed = markupLinkEditor ?: editor
-                                    markupLinkSel?.let { sel ->
-                                        ed.markSelection(sel, com.xnotes.core.model.MarkupType.NOTE_LINK, link = id)
-                                    }
-                                    markupLinkPicking = false
-                                    markupLinkSel = null
-                                    markupLinkEditor = null
-                                }) {
-                                    androidx.compose.material3.Text(path.substringAfterLast('/').ifEmpty { "note" }, maxLines = 1)
-                                }
-                            }
-                        }
                         val mine = recents.filter { it.uri != editor.openDocumentUri }.take(20)
                         if (mine.isNotEmpty()) {
                             item {
@@ -2144,9 +2110,9 @@ private fun EditorScreen(
                                 }
                             }
                         }
-                        if (shared.isEmpty() && mine.isEmpty()) {
+                        if (mine.isEmpty()) {
                             item {
-                                androidx.compose.material3.Text("No linkable notes yet — share a file or open a note first.")
+                                androidx.compose.material3.Text("No linkable notes yet — open a note first.")
                             }
                         }
                     }
@@ -3087,11 +3053,7 @@ private suspend fun openInto(
 ): String? {
     val resolver = context.contentResolver
     val uri = Uri.parse(uriStr)
-    // Guest cache files (file://…/guest/…) have hash names on disk; show the
-    // host's inherited name instead, never empty.
-    val guestName = com.xnotes.share.companion.CompanionService.guestDisplayName(uriStr)
-    val name = guestName
-        ?: displayNameOf(resolver, uri)
+    val name = displayNameOf(resolver, uri)
         ?: uri.lastPathSegment?.substringAfterLast('/').orEmpty()
 
     val expected = if (name.endsWith(".pdf", ignoreCase = true)) {

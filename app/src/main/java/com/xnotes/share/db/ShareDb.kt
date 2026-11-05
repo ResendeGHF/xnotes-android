@@ -37,7 +37,7 @@ val ShareMigration1To2 = object : androidx.room.migration.Migration(1, 2) {
     }
 }
 
-/** One paired device: the Linux companion (this phone dials it) or an Android phone. */
+/** One paired device: a Linux companion (this phone dials it when active). */
 @androidx.room.Entity(tableName = "devices")
 data class DeviceEntity(
     /** Lowercase hex SHA-256 of the peer's cert: the stable identity. */
@@ -53,7 +53,7 @@ data class DeviceEntity(
     val lastSeen: Long = 0L,
     /** The companion to dial; the others stay remembered but disconnected. */
     val active: Boolean = false,
-    /** [DeviceKind.LINUX] (desktop companion) or [DeviceKind.PHONE] (Android peer). */
+    /** [DeviceKind.LINUX] (desktop companion). */
     val kind: String = DeviceKind.LINUX,
 ) {
     val displayName: String get() = nickname?.takeIf { it.isNotBlank() } ?: name.ifEmpty { "$host:$port" }
@@ -63,8 +63,6 @@ data class DeviceEntity(
 object DeviceKind {
     /** The desktop Linux companion (dialed when active). */
     const val LINUX = "linux"
-    /** An Android phone (guest sessions + inbound hosting). */
-    const val PHONE = "phone"
 }
 
 /** One shared file-or-folder grant, scoped to a single companion. */

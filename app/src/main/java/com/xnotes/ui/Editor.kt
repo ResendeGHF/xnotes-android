@@ -5212,14 +5212,10 @@ class Editor(
         docMargins: com.xnotes.core.model.PageMargins?,
     ) -> Unit)? = null
 
-    /** Resolve a note link tap (markup or card) to open/fetch/request. */
-    var onOpenSharedNoteLink: ((targetId: String) -> Unit)? = null
-
-    /** Open a note-link target: a local URI, a shared file, or a permission request. */
+    /** Open a note-link target: a local URI. */
     fun openNoteLink(targetId: String, page: Int = 0) {
         // NoteLinkItem cards carry their page; markup links open the target's first page.
         onOpenNoteLink?.invoke(targetId, page)
-            ?: onOpenSharedNoteLink?.invoke(targetId)
             ?: say(appContext.getString(R.string.note_link_cannot_open))
     }
 

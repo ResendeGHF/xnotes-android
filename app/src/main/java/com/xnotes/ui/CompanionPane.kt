@@ -46,8 +46,7 @@ import java.util.Date
 /**
  * Companion pane: the desktop Linux companion this phone knows, which one is
  * active, and pairing new ones. At most one companion is connected; the rest
- * stay remembered but disconnected until picked. Android phones live on the
- * Shared screen instead.
+ * stay remembered but disconnected until picked.
  */
 @Composable
 fun CompanionPane() {

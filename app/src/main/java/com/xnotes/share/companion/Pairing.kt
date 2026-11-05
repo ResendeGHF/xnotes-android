@@ -30,25 +30,6 @@ object Pairing {
     /** Display form of a fingerprint: `AB:CD:…`. */
     fun displayFingerprint(hex: String): String =
         hex.chunked(2).joinToString(":").uppercase()
-
-    /**
-     * Mutual-confirm short authentication string for Android-to-Android
-     * pairing: both sides display it and each confirms the match.
-     *
-     * Derived from both certificate fingerprints (order-independent), so a
-     * relay MITM presenting its own cert cannot produce the same SAS on both
-     * ends. Six decimal digits, zero-padded.
-     */
-    fun sasFor(fpA: String, fpB: String): String {
-        val (x, y) = if (fpA.lowercase() <= fpB.lowercase()) fpA.lowercase() to fpB.lowercase()
-            else fpB.lowercase() to fpA.lowercase()
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest("$x|$y".toByteArray(Charsets.UTF_8))
-        val n = ((digest[0].toInt() and 0xFF) shl 16) or
-            ((digest[1].toInt() and 0xFF) shl 8) or
-            (digest[2].toInt() and 0xFF)
-        return "%06d".format(n % 1_000_000)
-    }
 }
 
 /**

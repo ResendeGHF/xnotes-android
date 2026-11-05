@@ -1158,8 +1158,7 @@ private fun ShareSection() {
     val palette = LocalPalette.current
     val status by com.xnotes.share.companion.CompanionService.status.collectAsState()
     val companionOn by com.xnotes.share.companion.CompanionService.companionOn.collectAsState()
-    val sharingOn by com.xnotes.share.companion.CompanionService.sharingOn.collectAsState()
-    val sharing = companionOn || sharingOn
+    val sharing = companionOn
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SectionTitle(stringResource(R.string.pref_sharing))
         Text(stringResource(R.string.pref_share_help), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
@@ -1173,7 +1172,7 @@ private fun ShareSection() {
             Text(paired, color = palette.text.toComposeColor(), fontSize = 13.sp)
         }
         Text(
-            "Turn Companion on and pair from the Companion screen, or turn Phone sharing on from the Shared screen.",
+            "Turn Companion on and pair from the Companion screen.",
             color = palette.textDim.toComposeColor(),
             fontSize = 12.sp,
         )
