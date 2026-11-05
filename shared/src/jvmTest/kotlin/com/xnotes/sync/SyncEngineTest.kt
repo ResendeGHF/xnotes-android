@@ -1,5 +1,8 @@
 package com.xnotes.sync
 
+import com.xnotes.core.model.MarkupType
+import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.platform.fileOf
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -58,6 +61,8 @@ class SyncEngineTest {
         override fun onDeleteResult(ok: Boolean, reason: String?) = Unit
         override fun onCreateResult(ok: Boolean, id: String?, reason: String?) = Unit
 
+        override fun onLinkResult(id: String, ok: Boolean, reason: String?) = Unit
+
         override fun onError(reason: String) {
             error = reason
         }
@@ -97,6 +102,20 @@ class SyncEngineTest {
             images += ImageRec(fileId, page, image, bytes)
         }
 
+        val markups = ArrayList<MarkupRec>()
+        data class MarkupRec(val file: String, val page: Int, val added: List<TextMarkup>, val removedIds: List<String>)
+
+        override fun applyRemoteMarkups(fileId: String, page: Int, added: List<TextMarkup>, removedIds: List<String>) {
+            markups += MarkupRec(fileId, page, added, removedIds)
+        }
+
+        val pageStyles = ArrayList<PageStyleRec>()
+        data class PageStyleRec(val file: String, val entries: List<PageStyleEntry>, val docStyle: WirePageStyle?, val docMargins: WireMargins?)
+
+        override fun applyRemotePageStyle(fileId: String, entries: List<PageStyleEntry>, docStyle: WirePageStyle?, docMargins: WireMargins?) {
+            pageStyles += PageStyleRec(fileId, entries, docStyle, docMargins)
+        }
+
         override fun applyResync(fileId: String, version: Long) {
             resynced = fileId to version
         }
@@ -107,6 +126,52 @@ class SyncEngineTest {
     private fun engine(host: FakeHost = FakeHost(), dir: File? = null): Pair<CompanionEngine, FakeHost> {
         val d = dir ?: File(System.getProperty("java.io.tmpdir"), "sync-eng-${System.nanoTime()}").apply { mkdirs() }
         return CompanionEngine(host, fileOf(d.path), "linux-test", "aa".repeat(32)) to host
+    }
+
+    private fun engineWithDisk(host: FakeHost = FakeHost(), dir: File? = null): Triple<CompanionEngine, FakeHost, File> {
+        val d = dir ?: File(System.getProperty("java.io.tmpdir"), "sync-eng-${System.nanoTime()}").apply { mkdirs() }
+        val cache = File(d, "file-cache").apply { mkdirs() }
+        return Triple(CompanionEngine(host, fileOf(d.path), "linux-test", "aa".repeat(32), fileOf(cache.path)), host, cache)
+    }
+
+    @Test fun diskCacheSurvivesRestart() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "sync-disk-${System.nanoTime()}").apply { mkdirs() }
+        val (e1, h1) = engineWithDisk(dir = dir).let { it.first to it.second }
+        e1.onConnected()
+        e1.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 41L, 10L))),
+            ),
+        )
+        e1.requestOpen("u1")
+        assertTrue(h1.lastSent() is SyncMsg.Fetch)
+        e1.bytesReceived(
+            SyncFrames.encode(SyncMsg.FileChunk(2, "u1", 41L, 10L, 0L, base64Of("0123456789".toByteArray()), last = true)),
+        )
+        assertEquals("u1", h1.fileReady)
+        // A fresh engine over the same dir serves the unchanged file without any fetch.
+        val (e2, h2) = engineWithDisk(dir = dir).let { it.first to it.second }
+        e2.onConnected()
+        e2.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 41L, 10L))),
+            ),
+        )
+        h2.out.clear()
+        e2.requestOpen("u1")
+        assertEquals("u1", h2.fileReady)
+        assertTrue(h2.out.none { it is SyncMsg.Fetch })
+        assertEquals("0123456789", e2.fileBytes("u1")!!.decodeToString())
+        // A newer advertised version refetches.
+        e2.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(2, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 42L, 10L))),
+            ),
+        )
+        h2.out.clear()
+        h2.fileReady = null
+        e2.requestOpen("u1")
+        assertTrue(h2.lastSent() is SyncMsg.Fetch)
     }
 
     @Test fun fingerprintVector() {
@@ -187,6 +252,102 @@ class SyncEngineTest {
         e.bytesReceived(SyncFrames.encode(SyncMsg.Resync(6, "u1", 50L)))
         assertEquals("u1" to 50L, h.resynced)
         assertTrue(h.lastSent() is SyncMsg.Fetch)
+    }
+
+    @Test fun markupOpsApplyAndRoundTrip() {
+        val (e, h) = engine()
+        e.onConnected()
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 41L, 10L))),
+            ),
+        )
+        val markup = WireMarkup(
+            "m1", "highlight", "#00e676", 0.5,
+            listOf(WireQuad(1.0, 2.0, 3.0, 4.0, 0)),
+            "hello", null, 1000L, 2000L, link = null,
+        )
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(3, "u1", 41L, 42L, "d-m1", listOf(SyncOp.AddMarkup(0, markup)))))
+        assertEquals(1, h.markups.size)
+        val rec = h.markups.single()
+        assertEquals("u1", rec.file)
+        assertEquals(0, rec.page)
+        assertEquals(1, rec.added.size)
+        assertEquals("m1", rec.added.single().id)
+        assertEquals(MarkupType.HIGHLIGHT, rec.added.single().type)
+        assertEquals(Rgba(0, 230, 118, 255), rec.added.single().color)
+        assertTrue(rec.removedIds.isEmpty())
+        // The wire form round-trips through the JSON codec.
+        val frame = SyncFrames.encode(SyncMsg.Op(4, "u1", 42L, 43L, "d-m2", listOf(SyncOp.AddMarkup(0, markup))))
+        val back = SyncFrames.Decoder().feed(frame).single()
+        assertEquals(markup, ((back as SyncMsg.Op).ops.single() as SyncOp.AddMarkup).markup)
+        // Removal by id.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 43L, 44L, "d-m3", listOf(SyncOp.RemoveMarkup(0, listOf("m1"))))))
+        assertEquals(2, h.markups.size)
+        assertEquals(listOf("m1"), h.markups.last().removedIds)
+    }
+
+    @Test fun pageStyleOpsApplyAndRoundTrip() {
+        val (e, h) = engine()
+        e.onConnected()
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 41L, 10L))),
+            ),
+        )
+        val style = WirePageStyle("#ffffff", "lines", "#0000ff80", 64.0, null, mapOf("a" to 1.5), mapOf("c" to "#ff0000"), true, false)
+        e.bytesReceived(
+            SyncFrames.encode(
+                SyncMsg.Op(
+                    3, "u1", 41L, 42L, "d-s1",
+                    listOf(
+                        SyncOp.PageStyle(
+                            listOf(PageStyleEntry(0, style, WireMargins(0.1, 0.1, 0.1, 0.1))),
+                            style, null,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(1, h.pageStyles.size)
+        val rec = h.pageStyles.single()
+        assertEquals("u1", rec.file)
+        assertEquals(1, rec.entries.size)
+        assertEquals(0, rec.entries.single().index)
+        assertEquals(style, rec.entries.single().style)
+        assertEquals(WireMargins(0.1, 0.1, 0.1, 0.1), rec.entries.single().margins)
+        assertEquals(style, rec.docStyle)
+        assertNull(rec.docMargins)
+        // Round-trips through the JSON codec.
+        val back = SyncFrames.Decoder().feed(
+            SyncFrames.encode(SyncMsg.Op(4, "u1", 42L, 43L, "d-s2", listOf(SyncOp.PageStyle(listOf(PageStyleEntry(1, style, null)), null, WireMargins(0.05, 0.05, 0.05, 0.05))))),
+        ).single()
+        val rt = ((back as SyncMsg.Op).ops.single() as SyncOp.PageStyle)
+        assertEquals(1, rt.entries.size)
+        assertEquals(1, rt.entries.single().index)
+        assertEquals(style, rt.entries.single().style)
+        assertEquals(WireMargins(0.05, 0.05, 0.05, 0.05), rt.docMargins)
+    }
+
+    @Test fun linkRequestAndResultRoundTrip() {
+        val (e, h) = engine()
+        e.onConnected()
+        // The guest asks; the request encodes.
+        e.requestLinkAccess("f9")
+        val sent = h.lastSent()
+        assertTrue(sent is SyncMsg.LinkRequest && sent.id == "f9")
+        // The host answers; the result surfaces with its id.
+        var got: Triple<String, Boolean, String?>? = null
+        val h2 = object : SyncEngineHost by h {
+            override fun onLinkResult(id: String, ok: Boolean, reason: String?) {
+                got = Triple(id, ok, reason)
+            }
+        }
+        val d = File(System.getProperty("java.io.tmpdir"), "sync-eng-${System.nanoTime()}").apply { mkdirs() }
+        val e2 = CompanionEngine(h2, fileOf(d.path), "linux-test", "aa".repeat(32))
+        e2.onConnected()
+        e2.bytesReceived(SyncFrames.encode(SyncMsg.LinkResult(3, 1, "f9", true, null)))
+        assertEquals(Triple("f9", true, null), got)
     }
 
     @Test fun pageOpsApplyAndEchoIsDropped() {

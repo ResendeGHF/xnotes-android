@@ -426,6 +426,8 @@ char* xn_editor_pdf_selected_text(const xn_editor* editor);
 int xn_editor_pdf_selection_rect(const xn_editor* editor, double* out_xywh);
 /* Marks the selection (XN_MARK_*) on each page it covers, one undo step. */
 void xn_editor_pdf_mark(xn_editor* editor, int type);
+/* Links the current PDF text selection to the shared file [targetId], one undo step. Returns nonzero on success. */
+int xn_editor_pdf_link(xn_editor* editor, const char* target_id);
 void xn_editor_pdf_clear(xn_editor* editor);
 /* The markup tool's mode ("select", "highlight", "underline", "strikeout", "squiggly"; free it), set by id. */
 char* xn_editor_markup_mode(const xn_editor* editor);
@@ -637,6 +639,10 @@ typedef struct xn_page_style {
 void xn_editor_page_style(const xn_editor* editor, int all_pages, xn_page_style* out);
 /* Replace it; the canvas redraws, the note is marked changed (a style is not an undo step). */
 void xn_editor_set_page_style(xn_editor* editor, int all_pages, const xn_page_style* style);
+/* Note-level color-inversion view override (mirrored with the host over page_style). */
+int xn_editor_view_invert(const xn_editor* editor);
+/* Set it; images = -1 keeps, else 0/1. Fires the sync submit; remote applies bypass it. */
+void xn_editor_set_view_invert(xn_editor* editor, int on, int images);
 
 /* --- pages --- */
 

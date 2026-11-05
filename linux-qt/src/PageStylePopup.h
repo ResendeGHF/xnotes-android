@@ -36,6 +36,7 @@ private:
     QCheckBox* defaultLineColor_;
     QLabel* opacityLabel_;
     QSlider* opacity_;
+    QCheckBox* invert_;
 
     void load();
     void apply();

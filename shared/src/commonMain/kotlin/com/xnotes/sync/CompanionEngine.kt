@@ -3,9 +3,12 @@ package com.xnotes.sync
 import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.core.platform.File
 import com.xnotes.core.platform.Lock
+import com.xnotes.core.platform.asPath
+import com.xnotes.core.platform.fileOf
 import com.xnotes.core.platform.monotonicNanos
 import com.xnotes.core.platform.withLock
 import kotlin.random.Random
+import okio.ByteString.Companion.encodeUtf8
 
 /**
  * The companion side of SYNC.md v1: pairing, shared-file index, fetch, committed
@@ -24,6 +27,13 @@ class CompanionEngine(
     var deviceName: String,
     /** Our own certificate fingerprint (lowercase hex), sent in `hello`. */
     val ownCertFp: String,
+    /**
+     * Persistent fetch cache root (null disables it): fetched files land as
+     * `<sha256(fileId)>` plus `meta.json` (id→version/size/used), so a
+     * reconnect serves unchanged files from disk instead of refetching them
+     * whole. Memory cache stays the hot path; disk is the cold spare.
+     */
+    private val fileCacheDir: File? = null,
 ) {
     /** The far side's live runs, painted by the canvas overlay (wired by the host). */
     var liveOverlay: RemoteLiveStrokes? = null
@@ -192,11 +202,24 @@ class CompanionEngine(
             host.onFileReady(id)
             return
         }
+        // Cold spare: an unchanged disk copy promotes without any socket traffic.
+        if (cached == null && version != null && diskVersion(id) == version) {
+            diskBytes(id)?.let { bytes ->
+                withLock(lock) { fileCache[id] = CachedFile(version, bytes, nowMs()) }
+                host.onFileReady(id)
+                return
+            }
+        }
         send(SyncMsg.Fetch(nextSeq(), id, 0L, 0L))
     }
 
     fun requestDelete(id: String) {
         send(SyncMsg.DeleteRequest(nextSeq(), id, deviceName))
+    }
+
+    /** Ask the host for access to a link target; the answer lands in `onLinkResult`. */
+    fun requestLinkAccess(id: String) {
+        send(SyncMsg.LinkRequest(nextSeq(), id, deviceName))
     }
 
     fun requestCreate(dirId: String?, name: String, kind: Int) {
@@ -343,8 +366,9 @@ class CompanionEngine(
             is SyncMsg.Heartbeat -> Unit
             is SyncMsg.DeleteResult -> host.onDeleteResult(msg.ok, msg.reason)
             is SyncMsg.CreateResult -> host.onCreateResult(msg.ok, msg.id, msg.reason)
+            is SyncMsg.LinkResult -> host.onLinkResult(msg.id, msg.ok, msg.reason)
             is SyncMsg.Hello, is SyncMsg.PairRequest, is SyncMsg.Fetch,
-            is SyncMsg.DeleteRequest, is SyncMsg.CreateRequest,
+            is SyncMsg.DeleteRequest, is SyncMsg.CreateRequest, is SyncMsg.LinkRequest,
             is SyncMsg.Unknown,
             -> Unit // host-side or future messages; ignored here
         }
@@ -425,6 +449,7 @@ class CompanionEngine(
                         index.remove(id)
                         versions.remove(id)
                         fileCache.remove(id)
+                        dropDisk(id)
                         hostPresence.remove(id)
                     }
                 }
@@ -459,6 +484,7 @@ class CompanionEngine(
             versions[m.id] = m.version
             evictLocked()
         }
+        persistFile(m.id, m.version, data)
         liveOverlay?.clearFile(m.id)
         host.onFileReady(m.id)
     }
@@ -470,6 +496,175 @@ class CompanionEngine(
             if (fileCache.size <= 1) break
             fileCache.remove(oldest.key)
             total -= oldest.value.bytes.size
+        }
+    }
+
+    // --- persistent fetch cache (cold spare for big files) ---
+
+    private data class DiskMeta(val version: Long, val size: Long, var used: Long)
+
+    /** Key → meta, loaded lazily (null = disabled or unreadable). */
+    private var diskMeta: MutableMap<String, DiskMeta>? = null
+    private var diskMetaLoaded = false
+
+    private fun cacheKey(id: String): String =
+        id.encodeUtf8().sha256().hex()
+
+    private fun meta(): MutableMap<String, DiskMeta>? {
+        val dir = fileCacheDir ?: return null
+        if (!diskMetaLoaded) {
+            diskMetaLoaded = true
+            diskMeta = LinkedHashMap()
+            try {
+                val f = fileOf(dir, "meta.json")
+                val text = okio.FileSystem.SYSTEM.read(f.asPath()) { readUtf8() }
+                // Tiny shape-specific parse: {"files":{"<hex>":{"version":N,"size":N,"used":N},...}}.
+                val filesBody = text.substringAfter("\"files\":{", "").substringBeforeLast("}}", "")
+                if (filesBody.isNotEmpty()) {
+                    for (entry in splitTopLevel(filesBody)) {
+                        val key = entry.substringBefore("\":{").trim().trim('"')
+                        if (key.any { it !in '0'..'9' && it !in 'a'..'f' }) continue
+                        val body = entry.substringAfter("\":{", "")
+                        fun num(name: String): Long {
+                            val after = body.substringAfter("\"$name\":", "")
+                            if (after.isEmpty()) return 0L
+                            val end = after.indexOfFirst { it == ',' || it == '}' }
+                            return (if (end < 0) after else after.substring(0, end)).trim().toLongOrNull() ?: 0L
+                        }
+                        diskMeta!![key] = DiskMeta(num("version"), num("size"), num("used"))
+                    }
+                }
+            } catch (_: Exception) {
+                diskMeta = LinkedHashMap()
+            }
+        }
+        return diskMeta
+    }
+
+    /** Split a `{...}` body's top-level comma-separated entries (no nesting inside values here). */
+    private fun splitTopLevel(body: String): List<String> {
+        val out = ArrayList<String>()
+        var depth = 0
+        var start = 0
+        var inStr = false
+        var i = 0
+        while (i < body.length) {
+            val c = body[i]
+            if (c == '"' && (i == 0 || body[i - 1] != '\\')) inStr = !inStr
+            if (!inStr) {
+                if (c == '{') depth++
+                else if (c == '}') depth--
+                else if (c == ',' && depth == 0) {
+                    out += body.substring(start, i)
+                    start = i + 1
+                }
+            }
+            i++
+        }
+        if (start < body.length) out += body.substring(start)
+        return out
+    }
+
+    private fun saveMetaLocked() {
+        val dir = fileCacheDir ?: return
+        val meta = diskMeta ?: return
+        try {
+            // Tiny controlled JSON (hex keys, numeric values): no escaping needed.
+            val sb = StringBuilder("{\"files\":{")
+            var first = true
+            for ((key, m) in meta) {
+                if (!first) sb.append(',')
+                first = false
+                sb.append('"').append(key).append("\":{\"version\":").append(m.version)
+                    .append(",\"size\":").append(m.size)
+                    .append(",\"used\":").append(m.used).append('}')
+            }
+            sb.append("}}")
+            val fs = okio.FileSystem.SYSTEM
+            val tmp = fileOf(dir, "meta.json.tmp")
+            val dst = fileOf(dir, "meta.json")
+            fs.createDirectories(dir.asPath())
+            fs.write(tmp.asPath()) { write(sb.toString().encodeToByteArray()) }
+            try {
+                fs.delete(dst.asPath())
+            } catch (_: Exception) {
+            }
+            fs.atomicMove(tmp.asPath(), dst.asPath())
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Disk version of [id], or null when absent/disabled. */
+    private fun diskVersion(id: String): Long? {
+        val m = withLock(lock) { meta() }
+        return withLock(lock) { m?.get(cacheKey(id))?.version }
+    }
+
+    /** Disk bytes of [id], promoting its recency, or null. */
+    private fun diskBytes(id: String): ByteArray? {
+        val dir = fileCacheDir ?: return null
+        val key = cacheKey(id)
+        val m = withLock(lock) { meta()?.get(key) } ?: return null
+        return try {
+            val bytes = okio.FileSystem.SYSTEM.read(fileOf(dir, key).asPath()) { readByteArray() }
+            if (bytes.size.toLong() != m.size) {
+                dropDisk(id)
+                return null
+            }
+            withLock(lock) {
+                meta()?.get(key)?.used = nowMs()
+            }
+            bytes
+        } catch (_: Exception) {
+            dropDisk(id)
+            null
+        }
+    }
+
+    /** Record freshly fetched bytes on disk (disabled = no-op). */
+    private fun persistFile(id: String, version: Long, data: ByteArray) {
+        val dir = fileCacheDir ?: return
+        val key = cacheKey(id)
+        try {
+            val fs = okio.FileSystem.SYSTEM
+            fs.createDirectories(dir.asPath())
+            fs.write(fileOf(dir, key).asPath()) { write(data) }
+            withLock(lock) {
+                val meta = meta() ?: return
+                meta[key] = DiskMeta(version, data.size.toLong(), nowMs())
+                evictDiskLocked(dir, meta)
+                saveMetaLocked()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun evictDiskLocked(dir: File, meta: MutableMap<String, DiskMeta>) {
+        val fs = okio.FileSystem.SYSTEM
+        var total = meta.values.sumOf { it.size }
+        while (total > DISK_CACHE_BYTES || meta.size > DISK_CACHE_FILES) {
+            val oldest = meta.minByOrNull { it.value.used } ?: break
+            if (meta.size <= 1) break
+            meta.remove(oldest.key)
+            total -= oldest.value.size
+            try {
+                fs.delete(fileOf(dir, oldest.key).asPath())
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Forget [id]'s disk copy (it left the shared set). */
+    private fun dropDisk(id: String) {
+        val dir = fileCacheDir ?: return
+        val key = cacheKey(id)
+        try {
+            withLock(lock) {
+                if (meta()?.remove(key) == null) return
+                saveMetaLocked()
+            }
+            okio.FileSystem.SYSTEM.delete(fileOf(dir, key).asPath())
+        } catch (_: Exception) {
         }
     }
 
@@ -489,6 +684,9 @@ class CompanionEngine(
             when (op) {
                 is SyncOp.AddStroke -> host.applyRemoteStroke(m.file, op.page, op.stroke)
                 is SyncOp.EraseStrokes -> host.applyRemoteErase(m.file, op.page, op.ids)
+                is SyncOp.AddMarkup -> op.markup.toTextMarkup()?.let { host.applyRemoteMarkups(m.file, op.page, listOf(it), emptyList()) }
+                is SyncOp.RemoveMarkup -> host.applyRemoteMarkups(m.file, op.page, emptyList(), op.ids)
+                is SyncOp.PageStyle -> host.applyRemotePageStyle(m.file, op.entries, op.docStyle, op.docMargins)
                 is SyncOp.AddPage -> host.applyRemotePageAdd(m.file, op.index, op.width, op.height)
                 is SyncOp.RemovePage -> host.applyRemotePageRemove(m.file, op.index)
                 is SyncOp.OpenRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, true, op.at, op.at + op.size)
@@ -628,6 +826,10 @@ class CompanionEngine(
 
         /** File bytes kept, oldest first. */
         const val FILE_CACHE_BYTES = 64L * 1024 * 1024
+
+        /** Disk fetch cache: 256 MiB / 256 files, oldest-used first. */
+        const val DISK_CACHE_BYTES = 256L * 1024 * 1024
+        const val DISK_CACHE_FILES = 256
 
         /** Dedupe ids remembered per file. */
         const val DEDUPE_KEPT = 64

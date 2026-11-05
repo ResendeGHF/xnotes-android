@@ -334,7 +334,7 @@ class AddPage(
 }
 
 /** Several commands applied as one undoable unit: redo in order, undo in reverse. */
-class CompositeCommand(private val commands: List<Command>) : Command {
+class CompositeCommand(val commands: List<Command>) : Command {
     override fun redo() {
         for (c in commands) c.redo()
     }

@@ -198,6 +198,15 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
         apply();
     });
 
+    // Color inversion mirrors with the host over page_style (both directions).
+    invert_ = new QCheckBox(QStringLiteral("Invert colors"), this);
+    col->addWidget(invert_);
+    connect(invert_, &QCheckBox::toggled, this, [this](bool on) {
+        if (syncing_) return;
+        xn_editor_set_view_invert(editor_, on ? 1 : 0, -1);
+        load();
+    });
+
     setMinimumWidth(420);
     load();
 }
@@ -232,6 +241,7 @@ void PageStylePopup::load() {
     lineColor_->setIcon(swatchIcon(fromRgba(line | 0xFF), 16));
     opacity_->setValue(int(std::lround((line & 0xFF) / 2.55)));
     opacityLabel_->setText(QStringLiteral("Line opacity: %1%").arg(opacity_->value()));
+    invert_->setChecked(xn_editor_view_invert(editor_) != 0);
     syncing_ = false;
 }
 

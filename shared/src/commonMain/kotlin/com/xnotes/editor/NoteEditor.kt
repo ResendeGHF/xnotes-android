@@ -20,6 +20,7 @@ import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Orientation
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.PageMargins
+import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.MarkupType
@@ -133,9 +134,9 @@ class NoteEditor(
      * Marks the PDF text [sel] as [type] in the ink colour at the markup intensity: one markup on each
      * note page it covers, as one undo step. [texts] drops its selection once the marks are made.
      */
-    fun markText(texts: PdfTextController, sel: TextSelection, type: MarkupType, textOf: (Int) -> PageText?) {
+    fun markText(texts: PdfTextController, sel: TextSelection, type: MarkupType, link: String? = null, textOf: (Int) -> PageText?) {
         val cfg = controller.configFor(Tool.MARKUP)
-        val made = Markups.of(sel, textOf, type, controller.inkColor, cfg.markupIntensity, epochMillisNow())
+        val made = Markups.of(sel, textOf, type, controller.inkColor, cfg.markupIntensity, epochMillisNow(), link)
         texts.clear()
         val byPage = made.groupBy({ it.first }, { it.second })
         val steps = byPage
@@ -149,6 +150,7 @@ class NoteEditor(
         for ((i, marks) in byPage) state.document.pages.getOrNull(i)?.let { state.rebakeBackground(it, marks) }
         host.contentChanged()
         host.requestRender()
+        for ((i, marks) in byPage) onMarkupsAdded?.invoke(i, marks)
     }
 
     // --- tools ---
@@ -480,12 +482,35 @@ class NoteEditor(
     val currentPageStyle: PageStyle
         get() = state.document.pages.getOrNull(state.currentPageIndex())?.style ?: PageStyle()
 
+    /**
+     * Fresh local text markups (from text selection), for sync: page index to
+     * the markups made. Remote applies never fire this.
+     */
+    var onMarkupsAdded: ((page: Int, markups: List<TextMarkup>) -> Unit)? = null
+
+    /**
+     * Fresh local style/margin commits, for sync: per-page (index, style,
+     * margins) plus the document-wide defaults. Styles and margins never ride
+     * the undo stack, so unlike ops this fires on every set, not on undo.
+     * Null style/margins in an entry (or doc field) leave that part alone.
+     */
+    var onPageStyleChanged: ((
+        entries: List<Triple<Int, PageStyle?, PageMargins?>>,
+        docStyle: PageStyle?,
+        docMargins: PageMargins?,
+    ) -> Unit)? = null
+
     /** Replace the document-wide ("All Pages") style override. */
     fun setDocumentStyle(style: PageStyle) {
         val prev = state.document.style
         if (prev == style) return
         state.document.style = style
         applyStyleChange(prev, style, state.document.pages.toList())
+        onPageStyleChanged?.invoke(
+            state.document.pages.mapIndexed { i, p -> Triple(i, p.style, p.margins) },
+            state.document.style,
+            null,
+        )
     }
 
     /** Replace the current page's style override. */
@@ -495,6 +520,11 @@ class NoteEditor(
         if (prev == style) return
         page.style = style
         applyStyleChange(prev, style, listOf(page))
+        onPageStyleChanged?.invoke(
+            listOf(Triple(state.currentPageIndex(), page.style, null)),
+            null,
+            null,
+        )
     }
 
     // --- page margins (extra paper on any edge): document-wide ("All Pages") and per-page ---
@@ -511,6 +541,11 @@ class NoteEditor(
         if (state.document.margins == margins) return
         state.document.margins = margins
         applyMarginChange()
+        onPageStyleChanged?.invoke(
+            state.document.pages.mapIndexed { i, p -> Triple<Int, PageStyle?, PageMargins?>(i, null, p.margins) },
+            null,
+            state.document.margins,
+        )
     }
 
     /** Replace the current page's margin override. */
@@ -519,6 +554,11 @@ class NoteEditor(
         if (page.margins == margins) return
         page.margins = margins
         applyMarginChange()
+        onPageStyleChanged?.invoke(
+            listOf(Triple<Int, PageStyle?, PageMargins?>(state.currentPageIndex(), null, page.margins)),
+            null,
+            null,
+        )
     }
 
     /**

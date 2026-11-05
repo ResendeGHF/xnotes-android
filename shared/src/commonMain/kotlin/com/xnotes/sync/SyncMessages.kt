@@ -1,5 +1,9 @@
 package com.xnotes.sync
 
+import com.xnotes.core.model.MarkupType
+import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.TextMarkup
+import com.xnotes.core.pdf.TextQuad
 import com.xnotes.format.JsonPull
 import com.xnotes.format.JsonWrite
 import okio.ByteString.Companion.decodeBase64
@@ -46,10 +50,61 @@ data class WireImage(
     val part: List<Double>?,
 )
 
+/** One box of a text markup, in points as displayed. */
+data class WireQuad(val l: Double, val t: Double, val r: Double, val b: Double, val q: Int)
+
+/** A page style snapshot for the wire; null = inherit (leave the field empty). */
+data class WirePageStyle(
+    val pageColor: String?,
+    val template: String?,
+    /** `#rrggbb` or `#rrggbbaa` (alpha = line opacity). */
+    val patternColor: String?,
+    val spacing: Double?,
+    val accentColor: String?,
+    val params: Map<String, Double>,
+    /** Named colors as `#rrggbb`. */
+    val colors: Map<String, String>,
+    val invertColors: Boolean?,
+    val invertImages: Boolean?,
+)
+
+/** Page margins for the wire (fractions of W/H); null = inherit. */
+data class WireMargins(val l: Double?, val t: Double?, val r: Double?, val b: Double?)
+
+/** One page's style assignment in a page_style op (index into the current pages). */
+data class PageStyleEntry(val index: Int, val style: WirePageStyle?, val margins: WireMargins?)
+
+/** A PDF text markup (highlight/underline/strikeout/squiggly) for the wire. */
+data class WireMarkup(
+    val id: String,
+    /** MarkupType id ("highlight", "underline", "strikeout", "squiggly"). */
+    val type: String,
+    /** Opaque ink color as `#rrggbb`. */
+    val color: String,
+    val intensity: Double,
+    val quads: List<WireQuad>,
+    val text: String,
+    val note: String?,
+    val created: Long,
+    val modified: Long,
+    /** Note-link target (a stable file id on the host) for `note_link` markups. */
+    val link: String?,
+)
+
 /** Committed ops inside an `op` frame. */
 sealed interface SyncOp {
     data class AddStroke(val page: Int, val stroke: WireStroke) : SyncOp
     data class EraseStrokes(val page: Int, val ids: List<String>) : SyncOp
+    /** Mark PDF text on [page] (highlight/underline/strikeout/squiggly). */
+    data class AddMarkup(val page: Int, val markup: WireMarkup) : SyncOp
+    /** Take text markups off [page] by id. */
+    data class RemoveMarkup(val page: Int, val ids: List<String>) : SyncOp
+    /**
+     * Set page styles: [entries] assign style/margins per page index;
+     * [docStyle]/[docMargins] replace the document-wide defaults.
+     * Null fields inside a snapshot leave that field alone (inherit).
+     */
+    data class PageStyle(val entries: List<PageStyleEntry>, val docStyle: WirePageStyle?, val docMargins: WireMargins?) : SyncOp
     /** Insert a blank page at [index] ([width]/[height] in page px, from the sender's page). */
     data class AddPage(val index: Int, val width: Double, val height: Double) : SyncOp
     /** Remove the page at [index]; no-op when it would empty the note or is out of range. */
@@ -177,6 +232,8 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "delete_result" -> SyncMsg.DeleteResult(seq, replyTo, ok, reason)
         "create_request" -> SyncMsg.CreateRequest(seq, deviceName, dirId, name, kind)
         "create_result" -> SyncMsg.CreateResult(seq, replyTo, ok, id.takeIf { it.isNotEmpty() }, reason)
+        "link_request" -> SyncMsg.LinkRequest(seq, id, deviceName)
+        "link_result" -> SyncMsg.LinkResult(seq, replyTo, id, ok, reason)
         else -> SyncMsg.Unknown(t ?: "", seq)
     }
 }
@@ -403,6 +460,24 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             msg.reason?.let { w.name("reason").value(it) }
             w.endObject()
         }
+        is SyncMsg.LinkRequest -> {
+            w.beginObject()
+            w.name("t").value("link_request")
+            w.name("seq").value(msg.seq)
+            w.name("id").value(msg.id)
+            w.name("device").value(msg.device)
+            w.endObject()
+        }
+        is SyncMsg.LinkResult -> {
+            w.beginObject()
+            w.name("t").value("link_result")
+            w.name("seq").value(msg.seq)
+            w.name("in_reply_to").value(msg.inReplyTo)
+            w.name("id").value(msg.id)
+            w.name("ok").value(msg.ok)
+            msg.reason?.let { w.name("reason").value(it) }
+            w.endObject()
+        }
         else -> Unit // handshake messages are written by SyncFrames
     }
 }
@@ -437,6 +512,71 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.name("ids").beginArray()
             for (id in op.ids) w.value(id)
             w.endArray()
+            w.endObject()
+        }
+        is SyncOp.AddMarkup -> {
+            w.beginObject()
+            w.name("op").value("add_markup")
+            w.name("page").value(op.page)
+            w.name("markup").beginObject()
+            w.name("id").value(op.markup.id)
+            w.name("type").value(op.markup.type)
+            w.name("color").value(op.markup.color)
+            w.name("intensity").value(op.markup.intensity)
+            w.name("quads").beginArray()
+            for (q in op.markup.quads) {
+                w.beginArray()
+                w.value(q.l)
+                w.value(q.t)
+                w.value(q.r)
+                w.value(q.b)
+                w.value(q.q.toDouble())
+                w.endArray()
+            }
+            w.endArray()
+            w.name("text").value(op.markup.text)
+            op.markup.note?.let { w.name("note").value(it) }
+            op.markup.link?.let { w.name("link").value(it) }
+            w.name("created").value(op.markup.created.toDouble())
+            w.name("modified").value(op.markup.modified.toDouble())
+            w.endObject()
+            w.endObject()
+        }
+        is SyncOp.RemoveMarkup -> {
+            w.beginObject()
+            w.name("op").value("remove_markup")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
+            w.endObject()
+        }
+        is SyncOp.PageStyle -> {
+            w.beginObject()
+            w.name("op").value("page_style")
+            w.name("entries").beginArray()
+            for (e in op.entries) {
+                w.beginObject()
+                w.name("index").value(e.index)
+                e.style?.let { writePageStyleBody(w, it) }
+                e.margins?.let {
+                    w.name("margins").beginObject()
+                    writeMarginsBody(w, it)
+                    w.endObject()
+                }
+                w.endObject()
+            }
+            w.endArray()
+            op.docStyle?.let {
+                w.name("doc_style").beginObject()
+                writePageStyleBody(w, it)
+                w.endObject()
+            }
+            op.docMargins?.let {
+                w.name("doc_margins").beginObject()
+                writeMarginsBody(w, it)
+                w.endObject()
+            }
             w.endObject()
         }
         is SyncOp.AddPage -> {
@@ -573,6 +713,264 @@ private fun sampleListOr(p: JsonPull): List<WireSample>? {
     return out
 }
 
+/** Page-style keys inside an entry or doc_style object (no wrapper of its own). */
+private fun writePageStyleBody(w: JsonWrite, s: WirePageStyle) {    s.pageColor?.let { w.name("page_color").value(it) }
+    s.template?.let { w.name("template").value(it) }
+    s.patternColor?.let { w.name("pattern_color").value(it) }
+    s.spacing?.let { w.name("spacing").value(it) }
+    s.accentColor?.let { w.name("accent_color").value(it) }
+    if (s.params.isNotEmpty()) {
+        w.name("params").beginObject()
+        for ((k, v) in s.params) w.name(k).value(v)
+        w.endObject()
+    }
+    if (s.colors.isNotEmpty()) {
+        w.name("colors").beginObject()
+        for ((k, v) in s.colors) w.name(k).value(v)
+        w.endObject()
+    }
+    s.invertColors?.let { w.name("invert_colors").value(it) }
+    s.invertImages?.let { w.name("invert_images").value(it) }
+}
+
+/** A `markup` object inside an add_markup op, or null when malformed. */
+private fun markupOr(p: JsonPull): WireMarkup? {    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var id = ""
+    var type = ""
+    var color = ""
+    var intensity = 0.5
+    var quads: List<WireQuad>? = null
+    var text = ""
+    var note: String? = null
+    var link: String? = null
+    var created = 0L
+    var modified = 0L
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "id" -> id = stringOr(p, "")
+            "type" -> type = stringOr(p, "")
+            "color" -> color = stringOr(p, "")
+            "intensity" -> intensity = doubleOr(p, 0.5)
+            "quads" -> {
+                if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+                    p.skipValue()
+                } else {
+                    val list = ArrayList<WireQuad>()
+                    p.beginArray()
+                    while (p.hasNext()) {
+                        val nums = numberListOr(p)
+                        if (nums != null && nums.size >= 5) {
+                            list += WireQuad(nums[0], nums[1], nums[2], nums[3], nums[4].toInt())
+                        }
+                    }
+                    p.endArray()
+                    quads = list
+                }
+            }
+            "text" -> text = stringOr(p, "")
+            "note" -> note = stringOrNull(p)
+            "link" -> link = stringOrNull(p)
+            "created" -> created = longOr(p, 0L)
+            "modified" -> modified = longOr(p, 0L)
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (id.isEmpty() || quads == null) return null
+    return WireMarkup(id, type, color, intensity, quads, text, note, created, modified, link)
+}
+
+/** An `entries` array inside a page_style op. */
+private fun entriesOr(p: JsonPull): ArrayList<PageStyleEntry>? {
+    if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+        p.skipValue()
+        return null
+    }
+    val out = ArrayList<PageStyleEntry>()
+    p.beginArray()
+    while (p.hasNext()) {
+        if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+            p.skipValue()
+            continue
+        }
+        var index = -1
+        var style: WirePageStyle? = null
+        var margins: WireMargins? = null
+        // Style keys sit flat in the entry; collect them, then build.
+        var pageColor: String? = null
+        var template: String? = null
+        var patternColor: String? = null
+        var spacing: Double? = null
+        var accentColor: String? = null
+        var params: Map<String, Double> = emptyMap()
+        var colors: Map<String, String> = emptyMap()
+        var invertColors: Boolean? = null
+        var invertImages: Boolean? = null
+        p.beginObject()
+        while (p.hasNext()) {
+            when (p.nextName()) {
+                "index" -> index = intOr(p, -1)
+                "page_color" -> pageColor = stringOrNull(p)
+                "template" -> template = stringOrNull(p)
+                "pattern_color" -> patternColor = stringOrNull(p)
+                "spacing" -> spacing = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                    p.skipValue()
+                    null
+                }
+                "accent_color" -> accentColor = stringOrNull(p)
+                "params" -> params = stringDoubleMapOr(p) ?: emptyMap()
+                "colors" -> colors = stringStringMapOr(p) ?: emptyMap()
+                "invert_colors" -> invertColors = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else {
+                    p.skipValue()
+                    null
+                }
+                "invert_images" -> invertImages = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else {
+                    p.skipValue()
+                    null
+                }
+                "margins" -> margins = marginsOr(p)
+                else -> p.skipValue()
+            }
+        }
+        p.endObject()
+        if (index >= 0) {
+            val hasStyle = pageColor != null || template != null || patternColor != null || spacing != null ||
+                accentColor != null || params.isNotEmpty() || colors.isNotEmpty() ||
+                invertColors != null || invertImages != null
+            if (hasStyle) {
+                style = WirePageStyle(pageColor, template, patternColor, spacing, accentColor, params, colors, invertColors, invertImages)
+            }
+            out += PageStyleEntry(index, style, margins)
+        }
+    }
+    p.endArray()
+    return out
+}
+
+/** A style-keys object (entry body already consumed key by key is not reusable here). */
+private fun styleBodyOr(p: JsonPull): WirePageStyle? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    p.beginObject()
+    var pageColor: String? = null
+    var template: String? = null
+    var patternColor: String? = null
+    var spacing: Double? = null
+    var accentColor: String? = null
+    var params: Map<String, Double> = emptyMap()
+    var colors: Map<String, String> = emptyMap()
+    var invertColors: Boolean? = null
+    var invertImages: Boolean? = null
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "page_color" -> pageColor = stringOrNull(p)
+            "template" -> template = stringOrNull(p)
+            "pattern_color" -> patternColor = stringOrNull(p)
+            "spacing" -> spacing = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                p.skipValue()
+                null
+            }
+            "accent_color" -> accentColor = stringOrNull(p)
+            "params" -> params = stringDoubleMapOr(p) ?: emptyMap()
+            "colors" -> colors = stringStringMapOr(p) ?: emptyMap()
+            "invert_colors" -> invertColors = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else {
+                p.skipValue()
+                null
+            }
+            "invert_images" -> invertImages = if (p.peek() == JsonPull.Token.BOOLEAN) p.nextBoolean() else {
+                p.skipValue()
+                null
+            }
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    return WirePageStyle(pageColor, template, patternColor, spacing, accentColor, params, colors, invertColors, invertImages)
+}
+
+/** Margin keys inside a margins object (no wrapper of its own); nulls omitted. */
+private fun writeMarginsBody(w: JsonWrite, m: WireMargins) {
+    m.l?.let { w.name("l").value(it) }
+    m.t?.let { w.name("t").value(it) }
+    m.r?.let { w.name("r").value(it) }
+    m.b?.let { w.name("b").value(it) }
+}
+
+/** A `margins` object, or null when malformed. */
+private fun marginsOr(p: JsonPull): WireMargins? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var l: Double? = null
+    var t: Double? = null
+    var r: Double? = null
+    var b: Double? = null
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "l" -> l = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                p.skipValue()
+                null
+            }
+            "t" -> t = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                p.skipValue()
+                null
+            }
+            "r" -> r = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                p.skipValue()
+                null
+            }
+            "b" -> b = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+                p.skipValue()
+                null
+            }
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    return WireMargins(l, t, r, b)
+}
+
+private fun stringDoubleMapOr(p: JsonPull): Map<String, Double>? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    val out = LinkedHashMap<String, Double>()
+    p.beginObject()
+    while (p.hasNext()) {
+        val k = p.nextName()
+        out[k] = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else {
+            p.skipValue()
+            Double.NaN
+        }
+    }
+    p.endObject()
+    return out.filterValues { !it.isNaN() }
+}
+
+private fun stringStringMapOr(p: JsonPull): Map<String, String>? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    val out = LinkedHashMap<String, String>()
+    p.beginObject()
+    while (p.hasNext()) {
+        val k = p.nextName()
+        stringOrNull(p)?.let { out[k] = it }
+    }
+    p.endObject()
+    return out
+}
+
 private fun opListOr(p: JsonPull): List<SyncOp>? {
     if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
         p.skipValue()
@@ -607,6 +1005,10 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var flipX = false
         var flipY = false
         var part: List<Double>? = null
+        var markup: WireMarkup? = null
+        var entries: ArrayList<PageStyleEntry>? = null
+        var docStyle: WirePageStyle? = null
+        var docMargins: WireMargins? = null
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
@@ -627,6 +1029,13 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                 "flip_x" -> flipX = boolOr(p, false)
                 "flip_y" -> flipY = boolOr(p, false)
                 "part" -> part = numberListOr(p)
+                "markup" -> markup = markupOr(p)
+                "entries" -> entries = entriesOr(p)
+                "doc_style" -> docStyle = if (p.peek() == JsonPull.Token.BEGIN_OBJECT) styleBodyOr(p) else {
+                    p.skipValue()
+                    null
+                }
+                "doc_margins" -> docMargins = marginsOr(p)
                 "stroke" -> if (p.peek() == JsonPull.Token.BEGIN_OBJECT) {
                     p.beginObject()
                     while (p.hasNext()) {
@@ -658,6 +1067,9 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         out += when (name) {
             "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList()))
             "erase_strokes" -> SyncOp.EraseStrokes(page, ids ?: emptyList())
+            "add_markup" -> markup?.let { SyncOp.AddMarkup(page, it) } ?: SyncOp.Unknown("add_markup")
+            "remove_markup" -> SyncOp.RemoveMarkup(page, ids ?: emptyList())
+            "page_style" -> SyncOp.PageStyle(entries ?: emptyList(), docStyle, docMargins)
             "add_page" -> SyncOp.AddPage(index, width, height)
             "remove_page" -> SyncOp.RemovePage(index)
             "open_room" -> SyncOp.OpenRoom(page, sideways, at, size)
@@ -732,9 +1144,89 @@ internal fun boolOr(p: JsonPull, def: Boolean): Boolean =
 /** Base64 of [bytes] for file chunks. */
 internal fun base64Of(bytes: ByteArray): String = bytes.toByteString().base64()
 
+/** Wire form of a page style snapshot, for page_style ops. */
+fun com.xnotes.core.model.PageStyle.toWirePageStyle(): WirePageStyle = WirePageStyle(
+    pageColor = pageColor?.let { hex6(it.r, it.g, it.b) },
+    template = template,
+    patternColor = patternColor?.let { hex8(it.r, it.g, it.b, it.a) },
+    spacing = spacing,
+    accentColor = accentColor?.let { hex6(it.r, it.g, it.b) },
+    params = params.orEmpty(),
+    colors = colors.orEmpty().mapValues { hex8(it.value.r, it.value.g, it.value.b, it.value.a) },
+    invertColors = null,
+    invertImages = null,
+)
+
+/** Model form of a received style snapshot (linux PageStyle has no invert fields; they are dropped). */
+fun WirePageStyle.toPageStyle(): com.xnotes.core.model.PageStyle = com.xnotes.core.model.PageStyle(
+    pageColor = pageColor?.let { parseMarkupColor(it) },
+    template = template,
+    patternColor = patternColor?.let { parseMarkupColor(it) },
+    spacing = spacing,
+    accentColor = accentColor?.let { parseMarkupColor(it) },
+    params = params.ifEmpty { null },
+    colors = colors.mapNotNull { (k, v) -> parseMarkupColor(v)?.let { k to it } }.toMap().ifEmpty { null },
+)
+
+/** Wire form of page margins. */
+fun com.xnotes.core.model.PageMargins.toWireMargins(): WireMargins = WireMargins(left, top, right, bottom)
+
+/** Model form of received margins. */
+fun WireMargins.toPageMargins(): com.xnotes.core.model.PageMargins =
+    com.xnotes.core.model.PageMargins(left = l, top = t, right = r, bottom = b)
+
 /** Bytes of a base64 chunk, or null when malformed. */
 internal fun bytesOfBase64(s: String): ByteArray? = try {
     s.decodeBase64()?.toByteArray()
 } catch (_: Exception) {
     null
+}
+
+/** Wire form of a markup, for add_markup ops. */
+fun TextMarkup.toWireMarkup(): WireMarkup = WireMarkup(
+    id = id,
+    type = type.id,
+    color = hex6(color.r, color.g, color.b),
+    intensity = intensity,
+    quads = quads.map { WireQuad(it.left.toDouble(), it.top.toDouble(), it.right.toDouble(), it.bottom.toDouble(), it.quarter) },
+    text = text,
+    note = note,
+    created = created,
+    modified = modified,
+    link = link,
+)
+
+/** Model form of a received markup, or null when the type/color is unknown. */
+fun WireMarkup.toTextMarkup(): TextMarkup? {
+    val type = MarkupType.fromId(type) ?: return null
+    val color = parseMarkupColor(color) ?: return null
+    return TextMarkup(
+        id, type, color, intensity,
+        quads.map { TextQuad(it.l.toFloat(), it.t.toFloat(), it.r.toFloat(), it.b.toFloat(), it.q) },
+        text, note, created, modified,
+    )
+}
+
+private fun hex6(r: Int, g: Int, b: Int): String {
+    // Locale-independent lowercase hex (String.format is locale-sensitive on JVM).
+    val c = "0123456789abcdef"
+    fun h(v: Int) = "${c[(v shr 4) and 0xF]}${c[v and 0xF]}"
+    return "#${h(r)}${h(g)}${h(b)}"
+}
+
+private fun hex8(r: Int, g: Int, b: Int, a: Int): String {
+    val c = "0123456789abcdef"
+    fun h(v: Int) = "${c[(v shr 4) and 0xF]}${c[v and 0xF]}"
+    return "#${h(r)}${h(g)}${h(b)}${h(a)}"
+}
+
+private fun parseMarkupColor(s: String): Rgba? {
+    val h = s.removePrefix("#")
+    if (h.length != 6 && h.length != 8) return null
+    val v = h.toLongOrNull(16) ?: return null
+    return if (h.length == 6) {
+        Rgba((v shr 16).toInt() and 0xFF, (v shr 8).toInt() and 0xFF, v.toInt() and 0xFF, 255)
+    } else {
+        Rgba((v shr 24).toInt() and 0xFF, (v shr 16).toInt() and 0xFF, (v shr 8).toInt() and 0xFF, v.toInt() and 0xFF)
+    }
 }

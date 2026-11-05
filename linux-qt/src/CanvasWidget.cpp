@@ -254,7 +254,17 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
         QPainter p(&frame_);
         renderFrame(p, kept);
     }
-    out.drawImage(QPointF(0, 0), frame_);
+    // Note-level color inversion, mirrored with the host: invert the composed
+    // frame pixels. Vector ink, ruling, paper and markups all flip; placed
+    // images and PDF rasters flip with them (the host can keep images
+    // un-inverted per note, which the frame pass cannot separate — v1 limit).
+    if (editor_ && xn_editor_view_invert(editor_)) {
+        QImage inv = frame_.convertToFormat(QImage::Format_ARGB32);
+        inv.invertPixels();
+        out.drawImage(QPointF(0, 0), inv);
+    } else {
+        out.drawImage(QPointF(0, 0), frame_);
+    }
 }
 
 void CanvasWidget::send(int action, int actionIndex, int buttons, const std::vector<xn_pointer>& pointers, bool hover) {

@@ -248,4 +248,18 @@ sealed interface SyncMsg {
         val id: String?,
         val reason: String?,
     ) : SyncMsg
+
+    /**
+     * Ask the host for access to [id] (a note link's target): the host shows
+     * an approval, grants on allow, and answers [LinkResult].
+     */
+    data class LinkRequest(override val seq: Int, val id: String, val device: String) : SyncMsg
+
+    data class LinkResult(
+        override val seq: Int,
+        val inReplyTo: Int,
+        val id: String,
+        val ok: Boolean,
+        val reason: String?,
+    ) : SyncMsg
 }

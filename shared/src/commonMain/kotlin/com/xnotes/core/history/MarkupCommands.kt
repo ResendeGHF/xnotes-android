@@ -7,7 +7,7 @@ import com.xnotes.core.model.TextMarkup
 // Markup edits are built before the edit and applied with redo(), then pushed. None touches an item.
 
 /** Put [markups] on top of [page]'s. */
-class AddMarkups(private val page: Page, private val markups: List<TextMarkup>) : Command {
+class AddMarkups(val page: Page, val markups: List<TextMarkup>) : Command {
     override fun redo() {
         val now = page.markups
         val fresh = markups.filter { m -> now.none { it === m } }
@@ -24,7 +24,7 @@ class AddMarkups(private val page: Page, private val markups: List<TextMarkup>) 
 }
 
 /** Take [markup] off [page]; undo puts it back where it was in the stack. */
-class RemoveMarkup(private val page: Page, private val markup: TextMarkup) : Command {
+class RemoveMarkup(val page: Page, val markup: TextMarkup) : Command {
     private val index = page.markups.indexOfFirst { it === markup }
 
     override fun redo() {
@@ -43,7 +43,7 @@ class RemoveMarkup(private val page: Page, private val markup: TextMarkup) : Com
 }
 
 /** Put [after] in [before]'s place on [page]: a restyle or a note. */
-class ReplaceMarkup(private val page: Page, private val before: TextMarkup, private val after: TextMarkup) : Command {
+class ReplaceMarkup(val page: Page, val before: TextMarkup, val after: TextMarkup) : Command {
     override fun redo() = swap(before, after)
 
     override fun undo() = swap(after, before)

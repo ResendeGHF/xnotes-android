@@ -393,6 +393,36 @@ fun xnNoteClose(note: COpaquePointer?) {
 // --- editor -------------------------------------------------------------------------------------
 
 internal class CEditor(note: CNote, private val host: xn_host) {
+    /**
+     * Note-level color-inversion view override, mirrored with the host over
+     * page_style (the host owns it; this phone only holds the view). The Qt
+     * frame inverter reads it; [viewInvertImages] gates image inversion.
+     */
+    var viewInvert: Boolean = false
+    var viewInvertImages: Boolean? = null
+
+    /** The local invert toggle changed: submit a page_style carrying it. */
+    var onViewInvertChanged: (() -> Unit)? = null
+
+    /** A note-link tap with the target file id. */
+    var onNoteLinkTap: ((targetId: String) -> Unit)? = null
+
+    /** Local toggle entry (fires [onViewInvertChanged]); remote applies set the fields directly. */
+    fun setViewInvert(on: Boolean, images: Boolean?) {
+        viewInvert = on
+        viewInvertImages = images
+        requestRender()
+        onViewInvertChanged?.invoke()
+    }
+    /**
+     * Fresh local markup commits (from the markup menu or the eraser), as
+     * (added page→markups, removed page→ids). SyncBridge sets this to submit
+     * matching add_markup/remove_markup ops; remote applies never fire it.
+     */
+    var onLocalMarkups: ((
+        added: List<Pair<Int, TextMarkup>>,
+        removedIds: List<Pair<Int, String>>,
+    ) -> Unit)? = null
     private val scheduler = CScheduler(host)
     val history = History()
     private var palette: ChromePalette = ChromePalette.DARK
@@ -594,8 +624,13 @@ internal class CEditor(note: CNote, private val host: xn_host) {
         controller.onMarkupTap = { at, _ ->
             val hit = markupHit(at)
             if (hit != null) {
-                pressedMarkup = state.document.pages[hit.first] to hit.second
-                host.context_menu?.invoke(host.ctx, at.x, at.y, 0)
+                val link = hit.second.takeIf { it.type == MarkupType.NOTE_LINK }?.link
+                if (link != null) {
+                    onNoteLinkTap?.invoke(link)
+                } else {
+                    pressedMarkup = state.document.pages[hit.first] to hit.second
+                    host.context_menu?.invoke(host.ctx, at.x, at.y, 0)
+                }
                 true
             } else {
                 false
@@ -608,11 +643,14 @@ internal class CEditor(note: CNote, private val host: xn_host) {
         val (page, before) = pressedMarkup ?: return
         val note = text?.takeIf { it.isNotEmpty() }
         if (note == before.note) return
-        history.push(ReplaceMarkup(page, before, before.copy(note = note, modified = epochMillisNow())))
+        val after = before.copy(note = note, modified = epochMillisNow())
+        history.push(ReplaceMarkup(page, before, after))
         state.document.dirty = true
         state.invalidatePage(page)
         host.content_changed!!.invoke(host.ctx)
         requestRender()
+        val pageIndex = state.document.pages.indexOf(page)
+        if (pageIndex >= 0) onLocalMarkups?.invoke(listOf(pageIndex to after), listOf(pageIndex to before.id))
     }
 
     /** The tapped markup taken off its page, as one undo step. */
@@ -624,6 +662,8 @@ internal class CEditor(note: CNote, private val host: xn_host) {
         state.invalidatePage(page)
         host.content_changed!!.invoke(host.ctx)
         requestRender()
+        val pageIndex = state.document.pages.indexOf(page)
+        if (pageIndex >= 0) onLocalMarkups?.invoke(emptyList(), listOf(pageIndex to markup.id))
     }
 
     init {
@@ -1230,6 +1270,15 @@ fun xnEditorSetPageStyle(editor: COpaquePointer?, allPages: Int, style: CPointer
 @CName("xn_editor_add_page")
 fun xnEditorAddPage(editor: COpaquePointer?) = guard(Unit) { editor!!.editor().editor.addPage() }
 
+@CName("xn_editor_view_invert")
+fun xnEditorViewInvert(editor: COpaquePointer?): Int = guard(0) { if (editor!!.editor().viewInvert) 1 else 0 }
+
+@CName("xn_editor_set_view_invert")
+fun xnEditorSetViewInvert(editor: COpaquePointer?, on: Int, images: Int) = guard(Unit) {
+    val ce = editor!!.editor()
+    ce.setViewInvert(on != 0, if (images < 0) ce.viewInvertImages else images != 0)
+}
+
 @CName("xn_editor_delete_current_page")
 fun xnEditorDeleteCurrentPage(editor: COpaquePointer?) = guard(Unit) { editor!!.editor().editor.deleteCurrentPage() }
 
@@ -1542,6 +1591,18 @@ fun xnEditorPdfMark(editor: COpaquePointer?, type: Int) = guard(Unit) {
     val sel = ce.pdfText.selection ?: return@guard
     val markup = MarkupType.entries.getOrNull(type) ?: return@guard
     ce.editor.markText(ce.pdfText, sel, markup) { page -> ce.pdfTexts.peek(page) }
+}
+
+@CName("xn_editor_pdf_link")
+fun xnEditorPdfLink(editor: COpaquePointer?, target: String?): Int = guard(0) {
+    val ce = editor!!.editor()
+    val sel = ce.pdfText.selection ?: return@guard 0
+    val id = target?.takeIf { it.isNotEmpty() } ?: return@guard 0
+    val keep = ce.controller.inkColor
+    ce.controller.inkColor = com.xnotes.core.model.Rgba(64, 156, 255)
+    ce.editor.markText(ce.pdfText, sel, MarkupType.NOTE_LINK, id) { page -> ce.pdfTexts.peek(page) }
+    ce.controller.inkColor = keep
+    1
 }
 
 @CName("xn_editor_pdf_clear")

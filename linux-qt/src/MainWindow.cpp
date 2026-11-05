@@ -546,6 +546,7 @@ void MainWindow::buildUi() {
     connect(canvas_, &CanvasWidget::contentChanged, selectionBar_, &SelectionBar::refresh);
     textBar_ = new PdfTextBar(canvas_);
     connect(canvas_, &CanvasWidget::selectionMenu, this, [this](bool shown, QRectF) { textBar_->onMenu(shown); });
+    connect(textBar_, &PdfTextBar::linkRequested, this, &MainWindow::linkFromSelection);
     connect(canvas_, &CanvasWidget::viewChanged, textBar_, &PdfTextBar::refresh);
     connect(canvas_, &CanvasWidget::contentChanged, textBar_, &PdfTextBar::refresh);
     connect(canvas_, &CanvasWidget::contextMenu, this, &MainWindow::showContextMenu);
@@ -1092,8 +1093,43 @@ void MainWindow::openSharedReady(const QString& id) {
     syncPresence();
 }
 
-void MainWindow::reopenSharedFile(const QString& id) {
-    if (boundFileId_ != id) return;
+void MainWindow::linkFromSelection() {
+    auto* e = canvas_->editor();
+    auto* server = companion_;
+    if (!e || !server || !server->running() || !server->sync()) return;
+    // Shared files by display path; the link stores the file id.
+    QStringList names;
+    QHash<QString, QString> idByName;
+    const int n = xn_sync_file_count(server->sync());
+    for (int i = 0; i < n; i++) {
+        char* id = nullptr;
+        char* path = nullptr;
+        int kind = 0;
+        long long version = 0, size = 0;
+        if (xn_sync_file_info(server->sync(), i, &id, &path, &kind, &version, &size) == 0 || kind != 0) {
+            xn_free_string(id);
+            xn_free_string(path);
+            continue;
+        }
+        const QString qid = QString::fromUtf8(id);
+        QString name = QString::fromUtf8(path).section(QLatin1Char('/'), -1);
+        if (name.isEmpty()) name = qid;
+        xn_free_string(id);
+        xn_free_string(path);
+        if (idByName.contains(name)) continue;
+        idByName.insert(name, qid);
+        names << name;
+    }
+    if (names.isEmpty()) return;
+    std::sort(names.begin(), names.end());
+    bool ok = false;
+    const QString picked = QInputDialog::getItem(this, tr("Link to note"), tr("Shared file:"), names, 0, false, &ok);
+    if (!ok) return;
+    const QString target = idByName.value(picked);
+    if (!target.isEmpty()) xn_editor_pdf_link(e, target.toUtf8().constData());
+}
+
+void MainWindow::reopenSharedFile(const QString& id) {    if (boundFileId_ != id) return;
     if (canvas_->editor()) companion_->unbindEditor(canvas_->editor());
     boundFileId_.clear();
     statusBar()->showMessage(QStringLiteral("Reloading the shared file…"), 2000);

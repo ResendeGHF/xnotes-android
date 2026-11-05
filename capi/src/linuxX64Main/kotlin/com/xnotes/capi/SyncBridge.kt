@@ -5,13 +5,17 @@ package com.xnotes.capi
 import com.xnotes.capi.c.xn_host
 import com.xnotes.canvas.RemoteLiveStrokes
 import com.xnotes.canvas.RoomEdit
+import com.xnotes.canvas.StrokeReplacement
 import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Page
+import com.xnotes.core.model.PageMargins
+import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
+import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.platform.File
 import com.xnotes.core.platform.asPath
 import com.xnotes.core.platform.fileOf
@@ -23,7 +27,15 @@ import com.xnotes.sync.SyncEngineHost
 import com.xnotes.sync.SyncFileEntry
 import com.xnotes.sync.SyncFingerprint
 import com.xnotes.sync.SyncOp
+import com.xnotes.sync.PageStyleEntry
 import com.xnotes.sync.WireImage
+import com.xnotes.sync.WireMargins
+import com.xnotes.sync.WirePageStyle
+import com.xnotes.sync.toPageStyle
+import com.xnotes.sync.toPageMargins
+import com.xnotes.sync.toWireMarkup
+import com.xnotes.sync.toWirePageStyle
+import com.xnotes.sync.toWireMargins
 import com.xnotes.sync.WireSample
 import com.xnotes.sync.WireStroke
 import kotlinx.cinterop.CPointer
@@ -46,7 +58,7 @@ import kotlin.random.Random
  * bypassing undo; remote live runs paint in the interaction overlay.
  */
 internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName: String, ownFp: String) : SyncEngineHost {
-    val engine = CompanionEngine(this, fileOf(pinsDir), deviceName, ownFp)
+    val engine = CompanionEngine(this, fileOf(pinsDir), deviceName, ownFp, fileOf(fileOf(pinsDir), "file-cache"))
 
     /** Sync file id to the editor showing it. */
     private val bindings = HashMap<String, CEditor>()
@@ -100,6 +112,13 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         editor.editor.onPageInserted = null
         editor.editor.onPageRemoved = null
         editor.editor.onImageInserted = null
+        editor.editor.onMarkupsAdded = null
+        editor.editor.onPageStyleChanged = null
+        editor.onViewInvertChanged = null
+        editor.onNoteLinkTap = null
+        editor.onLocalMarkups = null
+        editor.controller.onStrokesReplaced = null
+        editor.controller.onMarkupsErased = null
         dropImageFiles(fileId)
         bindings.remove(fileId)
         active.remove(editor)
@@ -116,6 +135,11 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         c.onStrokeSample = { page, x, y, p -> onSample(editor, page, x, y, p) }
         c.onStrokeCommitted = { page, stroke -> onCommitted(editor, page, stroke) }
         c.onStrokesErased = { page, strokes -> onErased(editor, page, strokes) }
+        c.onStrokesReplaced = { changes -> onStrokesReplaced(editor, changes) }
+        c.onMarkupsErased = { page, ids -> onMarkupsRemoved(editor, page, ids) }
+        editor.onViewInvertChanged = { onViewInvertChanged(editor) }
+        editor.onNoteLinkTap = { targetId -> onNoteLinkTap(editor, targetId) }
+        editor.onLocalMarkups = { added, removedIds -> onLocalMarkups(editor, added, removedIds) }
         c.onRoomPreview = { page, sideways, split, resume, shift -> onRoomPreview(editor, page, sideways, split, resume, shift) }
         c.onRoomCommitted = { edit -> onRoomCommitted(editor, edit) }
         c.onRoomPreviewDone = { onRoomPreviewDone(editor) }
@@ -123,6 +147,8 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         editor.editor.onPageInserted = { index, w, h -> onPageInserted(editor, index, w, h) }
         editor.editor.onPageRemoved = { index -> onPageRemoved(editor, index) }
         editor.editor.onImageInserted = { page, item -> onImageInserted(editor, page, item) }
+        editor.editor.onMarkupsAdded = { page, markups -> onLocalMarkupsAdded(editor, page, markups) }
+        editor.editor.onPageStyleChanged = { entries, docStyle, docMargins -> onLocalPageStyle(editor, entries, docStyle, docMargins) }
     }
 
     // --- local gestures out ---
@@ -133,7 +159,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val fileId = reverse[editor] ?: return
         val tool = editor.controller.tool
         if (!tool.isStroke) return
-        val cfg = editor.controller.configFor(tool)
+        val cfg = editor.controller.resolvedStrokeConfig(tool)
         active[editor] = ActiveStroke(
             fileId, page, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
             tool.id, cfg.baseWidth, hexColor(cfg.rgba),
@@ -146,7 +172,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             // Crossed onto another page mid-stroke: close this run, open the next.
             engine.finishStroke(a.fileId, a.page, a.id, a.tool, a.width, a.color)
             val tool = editor.controller.tool
-            val cfg = editor.controller.configFor(tool)
+            val cfg = editor.controller.resolvedStrokeConfig(tool)
             a = ActiveStroke(a.fileId, page, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", tool.id, cfg.baseWidth, hexColor(cfg.rgba))
             active[editor] = a
         }
@@ -171,6 +197,92 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val ids = strokes.map { SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) }
         if (ids.isEmpty()) return
         engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.EraseStrokes(page, ids)))
+    }
+
+    private fun onStrokesReplaced(editor: CEditor, changes: List<StrokeReplacement>) {
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val ops = ArrayList<SyncOp>()
+        for (c in changes) {
+            if (c.removed.isNotEmpty()) {
+                ops += SyncOp.EraseStrokes(
+                    c.erasePage,
+                    c.removed.map { SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) },
+                )
+            }
+            for (s in c.added) ops += SyncOp.AddStroke(c.addPage, wireOf(s))
+        }
+        if (ops.isEmpty()) return
+        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+    }
+
+    private fun onMarkupsRemoved(editor: CEditor, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemoveMarkup(page, ids)))
+    }
+
+    private fun onNoteLinkTap(editor: CEditor, targetId: String) {
+        if (targetId.isEmpty()) return
+        if (engine.files().any { it.id == targetId }) {
+            engine.requestOpen(targetId)
+        } else {
+            engine.requestLinkAccess(targetId)
+        }
+    }
+
+    private fun onViewInvertChanged(editor: CEditor) {        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val ce = bindings[fileId] ?: return
+        // Synthesize a doc-level snapshot carrying the toggle; the host
+        // honors explicit invert flags (nulls keep its own).
+        val docStyle = ce.state.document.style.toWirePageStyle()
+            .copy(invertColors = ce.viewInvert, invertImages = ce.viewInvertImages)
+        engine.submitOp(
+            fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
+            listOf(SyncOp.PageStyle(emptyList(), docStyle, null)),
+        )
+    }
+
+    private fun onLocalMarkups(editor: CEditor, added: List<Pair<Int, TextMarkup>>, removedIds: List<Pair<Int, String>>) {
+        if (added.isEmpty() && removedIds.isEmpty()) return
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        val ops = ArrayList<SyncOp>()
+        for ((page, m) in added) ops += SyncOp.AddMarkup(page, m.toWireMarkup())
+        for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
+            ops += SyncOp.RemoveMarkup(page, ids)
+        }
+        if (ops.isEmpty()) return
+        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+    }
+
+    private fun onLocalMarkupsAdded(editor: CEditor, page: Int, markups: List<TextMarkup>) {
+        onLocalMarkups(editor, markups.map { page to it }, emptyList())
+    }
+
+    private fun onLocalPageStyle(
+        editor: CEditor,
+        entries: List<Triple<Int, PageStyle?, PageMargins?>>,
+        docStyle: PageStyle?,
+        docMargins: PageMargins?,
+    ) {
+        if (entries.isEmpty() && docStyle == null && docMargins == null) return
+        val fileId = reverse[editor] ?: return
+        val base = headOf(fileId) ?: return
+        engine.submitOp(
+            fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
+            listOf(
+                SyncOp.PageStyle(
+                    entries.map { (index, style, margins) ->
+                        PageStyleEntry(index, style?.toWirePageStyle(), margins?.toWireMargins())
+                    },
+                    docStyle?.toWirePageStyle(),
+                    docMargins?.toWireMargins(),
+                ),
+            ),
+        )
     }
 
     private fun onPageInserted(editor: CEditor, index: Int, w: Double, h: Double) {
@@ -363,6 +475,50 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         ce.requestRender()
     }
 
+    override fun applyRemoteMarkups(fileId: String, page: Int, added: List<TextMarkup>, removedIds: List<String>) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (removedIds.isNotEmpty()) {
+            pg.markups = pg.markups.filter { it.id !in removedIds }
+        }
+        val fresh = added.filter { a -> pg.markups.none { it.id == a.id } }
+        if (removedIds.isEmpty() && fresh.isEmpty()) return
+        if (fresh.isNotEmpty()) pg.markups = pg.markups + fresh
+        doc.dirty = true
+        ce.state.rebakeBackground(pg, fresh)
+        ce.requestRender()
+    }
+
+    override fun applyRemotePageStyle(fileId: String, entries: List<PageStyleEntry>, docStyle: WirePageStyle?, docMargins: WireMargins?) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        // Linux has no per-page invert model: the note-level flags drive the
+        // view override the frame inverter reads; the rest applies as usual.
+        val invert = docStyle?.invertColors ?: entries.firstNotNullOfOrNull { it.style?.invertColors }
+        if (invert != null && ce.viewInvert != invert) {
+            ce.viewInvert = invert
+            ce.viewInvertImages = docStyle?.invertImages
+                ?: entries.firstNotNullOfOrNull { it.style?.invertImages }
+            ce.requestRender()
+        }
+        if (docStyle != null) doc.style = docStyle.toPageStyle()
+        if (docMargins != null) doc.margins = docMargins.toPageMargins()
+        var relayout = docMargins != null
+        for (e in entries) {
+            val pg = doc.pages.getOrNull(e.index) ?: continue
+            e.style?.let { pg.style = it.toPageStyle() }
+            e.margins?.let { pg.margins = it.toPageMargins(); relayout = true }
+            ce.state.invalidateBackground(pg)
+        }
+        doc.dirty = true
+        if (relayout) {
+            ce.state.invalidatePageGeometry()
+            ce.state.relayout()
+        }
+        ce.requestRender()
+    }
+
     override fun applyRemotePageAdd(fileId: String, index: Int, width: Double, height: Double) {
         val ce = bindings[fileId] ?: return
         val doc = ce.state.document
@@ -445,6 +601,15 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     override fun clearRemoteRoomPreview(fileId: String) {
         bindings[fileId]?.controller?.clearRemoteRoom()
+    }
+
+    override fun onLinkResult(id: String, ok: Boolean, reason: String?) {
+        if (!ok) {
+            // The host shows the denial; the tap already explained itself.
+            return
+        }
+        // Granted: the index now covers the target, so fetch and open it.
+        engine.requestOpen(id)
     }
 
     override fun applyResync(fileId: String, version: Long) {

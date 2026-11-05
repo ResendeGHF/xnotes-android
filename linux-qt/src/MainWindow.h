@@ -51,6 +51,7 @@ public:
     void openSharedFile(const QString& id);
     void openSharedReady(const QString& id);
     void reopenSharedFile(const QString& id);
+    void linkFromSelection();
     void syncPresence();
     void setupCompanion();
     xn_note* note() const { return note_; }

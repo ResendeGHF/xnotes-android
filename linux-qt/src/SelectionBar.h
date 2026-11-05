@@ -44,6 +44,10 @@ public:
     /* The core's selection_menu: a text selection shows, or clears, here. */
     void onMenu(bool shown) { if (shown) refresh(); else hide(); }
 
+signals:
+    /* The Link button: pick a shared file to link the selection to. */
+    void linkRequested();
+
 private:
     CanvasWidget* canvas_;
 

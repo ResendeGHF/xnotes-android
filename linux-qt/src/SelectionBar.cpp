@@ -123,6 +123,7 @@ PdfTextBar::PdfTextBar(CanvasWidget* canvas) : QFrame(canvas), canvas_(canvas) {
     row->addWidget(actionButton(this, "underline", QStringLiteral("Underline"), mark(XN_MARK_UNDERLINE)));
     row->addWidget(actionButton(this, "strikethrough", QStringLiteral("Strikeout"), mark(XN_MARK_STRIKEOUT)));
     row->addWidget(actionButton(this, "text", QStringLiteral("Squiggly underline"), mark(XN_MARK_SQUIGGLY)));
+    row->addWidget(actionButton(this, "link", QStringLiteral("Link to note…"), [this] { emit linkRequested(); }));
     row->addWidget(actionButton(this, "copy", QStringLiteral("Copy"), [this] {
         auto* e = editor();
         if (!e) return;

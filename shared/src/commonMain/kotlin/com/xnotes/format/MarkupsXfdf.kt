@@ -84,6 +84,7 @@ object MarkupsXfdf {
             attr("coords", coords.joinToString(",") { num(it, 2) })
         }
         if (m.type != MarkupType.HIGHLIGHT) attr("xnotes:intensity", num(m.intensity, 3))
+        if (m.type == MarkupType.NOTE_LINK) m.link?.let { attr("xnotes:link", it) }
         attr("xnotes:quads", m.quads.joinToString(",") { q ->
             "${num(q.left.toDouble(), 3)},${num(q.top.toDouble(), 3)},${num(q.right.toDouble(), 3)},${num(q.bottom.toDouble(), 3)},${q.quarter}"
         })
@@ -191,6 +192,7 @@ object MarkupsXfdf {
             note = note,
             created = created ?: modified ?: 0L,
             modified = modified ?: created ?: 0L,
+            link = own(el, "link"),
         )
     }
 

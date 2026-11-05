@@ -1,5 +1,7 @@
 package com.xnotes.sync
 
+import com.xnotes.core.model.TextMarkup
+
 /**
  * What the companion engine needs from its host (the capi bridge on Linux):
  * transport, UI callbacks, and applying remote commits to open documents.
@@ -29,6 +31,9 @@ interface SyncEngineHost {
 
     /** The host answered a create request (`id` set when approved). */
     fun onCreateResult(ok: Boolean, id: String?, reason: String?)
+
+    /** The host answered a link-access request for [id]. */
+    fun onLinkResult(id: String, ok: Boolean, reason: String?)
 
     /** Fatal: close the socket and show [reason]. */
     fun onError(reason: String)
@@ -68,6 +73,21 @@ interface SyncEngineHost {
      * (PNG/JPEG/SVG as sent). Applies to the open document, bypassing undo.
      */
     fun applyRemoteImage(fileId: String, page: Int, image: WireImage, bytes: ByteArray)
+
+    /**
+     * Apply committed remote text markups on [page]: add [added] (skipping
+     * ids already present), remove [removedIds]. Bypasses undo like all
+     * remote ops; the host rebakes the background and repaints.
+     */
+    fun applyRemoteMarkups(fileId: String, page: Int, added: List<TextMarkup>, removedIds: List<String>)
+
+    /**
+     * Apply a committed remote page-style change: [entries] assign style
+     * and/or margins per page index; [docStyle]/[docMargins] replace the
+     * document-wide defaults. Bypasses undo; the host rebakes backgrounds,
+     * relayouts when margins move, and repaints.
+     */
+    fun applyRemotePageStyle(fileId: String, entries: List<PageStyleEntry>, docStyle: WirePageStyle?, docMargins: WireMargins?)
 
     /**
      * [fileId]'s head moved under us: drop the open document's state and
