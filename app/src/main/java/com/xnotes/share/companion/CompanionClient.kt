@@ -31,6 +31,13 @@ class CompanionClient(
     /** Pinned companion cert fingerprint (lowercase hex), or null for TOFU. */
     @Volatile var pinnedFp: String?,
     var autoReconnect: Boolean = true,
+    /**
+     * Optional pre-connect hook (runs on the worker thread): the app injects
+     * a Wi-Fi bind here so mobile data or a VPN cannot swallow the route to
+     * a same-LAN companion ("No route to host"). Null = default routing.
+     * Pure JVM stays untouched for host unit tests.
+     */
+    var socketBinder: ((java.net.Socket) -> Unit)? = null,
     var onConnected: (peerFp: String) -> Unit = {},
     var onMessage: (JSONObject) -> Unit = {},
     var onDisconnected: (willRetry: Boolean) -> Unit = {},
@@ -42,6 +49,12 @@ class CompanionClient(
         /** Reconnect delays: 2 s, 5 s, 15 s, then 30 s capped. */
         val BACKOFF_MS = longArrayOf(2_000L, 5_000L, 15_000L, 30_000L)
         private const val CONNECT_TIMEOUT_MS = 10_000
+
+        /** USB/`adb reverse` targets stay on default routing (never Wi-Fi-bound). */
+        fun isLoopbackHost(h: String): Boolean {
+            val s = h.trim().lowercase()
+            return s == "localhost" || s == "::1" || s == "127.0.0.1" || s.startsWith("127.")
+        }
     }
 
     private val running = AtomicBoolean(false)
@@ -132,13 +145,21 @@ class CompanionClient(
         try {
             val raw = ctx.socketFactory.createSocket()
             raw.tcpNoDelay = true
+            runCatching { socketBinder?.invoke(raw) }
             raw.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             sock = raw as SSLSocket
             sock.tcpNoDelay = true
             sock.startHandshake()
         } catch (e: Exception) {
             runCatching { /* raw socket closed by factory on failure paths */ }
-            onError("connect $host:$port: ${e.message}")
+            val why = e.message ?: e.javaClass.simpleName
+            val hint = if (!isLoopbackHost(host) &&
+                (why.contains("route", ignoreCase = true) ||
+                    why.contains("unreachable", ignoreCase = true) ||
+                    why.contains("timed out", ignoreCase = true) ||
+                    e is java.net.SocketTimeoutException)
+            ) " — same Wi-Fi as the desktop? VPN/ad-block off?" else ""
+            onError("connect $host:$port: $why$hint")
             onDisconnected(autoReconnect && running.get())
             return false
         }

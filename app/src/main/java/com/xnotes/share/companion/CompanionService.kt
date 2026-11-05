@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -321,6 +323,26 @@ class CompanionService : Service() {
         dialDevice(null)
     }
 
+    /**
+     * Force a dial socket out the Wi-Fi interface when one is up. Without
+     * this, mobile data or a VPN can become the default route and a
+     * same-LAN companion dial fails with "No route to host". Best effort:
+     * any failure falls back to default routing.
+     */
+    private fun bindWifi(sock: java.net.Socket) {
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            for (net in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(net) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    net.bindSocket(sock)
+                    return
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     /** Dial the active companion (or the remembered raw address when none is set). */
     private fun dialActive() {
         val store = store ?: return
@@ -422,6 +444,12 @@ class CompanionService : Service() {
             pinnedFp = dev?.fp,
             autoReconnect = true,
         )
+        // Pin the dial to Wi-Fi (never for loopback/USB): otherwise mobile
+        // data or a VPN can swallow the route and a same-LAN companion fails
+        // with "No route to host".
+        if (!CompanionClient.isLoopbackHost(host)) {
+            client.socketBinder = { sock -> bindWifi(sock) }
+        }
         client.onConnected = { peerFp ->
             Thread({
                 runCatching {
