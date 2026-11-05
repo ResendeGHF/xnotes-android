@@ -44,6 +44,13 @@ class PairingClient(
 
     /** This connection's peer fingerprint, for the device registry. */
     val peerFingerprint: String? get() = synchronized(lock) { peerFp }
+
+    /** True while a handshake step is in flight (hello sent, code shown, waiting). */
+    val isInFlight: Boolean
+        get() = synchronized(lock) {
+            state == State.HELLO_SENT || state == State.CODE_REQUIRED ||
+                state == State.SAS_REQUIRED || state == State.WAIT_RESULT
+        }
     /** Minimal send surface so tests need no socket. */
     fun interface Sender {
         fun send(msg: JSONObject)
@@ -51,6 +58,8 @@ class PairingClient(
 
     companion object {
         const val STEP_TIMEOUT_MS = 15_000L
+        /** Longer window while the user reads the desktop and types 6 digits. */
+        const val STEP_CODE_TIMEOUT_MS = 120_000L
         private const val VERSION = 1
         private const val APP = "xnotes-android"
     }
@@ -78,6 +87,17 @@ class PairingClient(
                 sender.send(hello())
                 armLocked()
                 state = State.HELLO_SENT
+                return
+            }
+            if (state == State.CODE_REQUIRED) {
+                // Redialed while the user is typing: re-hello so the host
+                // re-acks and the entry stays live instead of timing out.
+                state = State.HELLO_SENT
+                this.peerFp = peerFp
+                sender.send(hello())
+                armLocked()
+                ack = pendingAck
+                pendingAck = null
                 return
             }
             if (state != State.IDLE && state != State.FAILED) return
@@ -113,7 +133,7 @@ class PairingClient(
                     .put("code", code.trim()),
             )
             ui.showStatus("Waiting for approval on the desktop…")
-            armLocked()
+            armCodeLocked()
         }
     }
 
@@ -201,7 +221,7 @@ class PairingClient(
                 state = State.CODE_REQUIRED
                 ui.showCodeEntry()
                 ui.showStatus("Enter the 6-digit code shown on the desktop.")
-                armLocked()
+                armCodeLocked()
                 return
             }
             // Paired flag set but the fingerprint is not our pin: hostile or
@@ -239,14 +259,26 @@ class PairingClient(
     }
 
     private fun armLocked() {
+        armLockedMs(STEP_TIMEOUT_MS)
+    }
+
+    private fun armCodeLocked() {
+        armLockedMs(STEP_CODE_TIMEOUT_MS)
+    }
+
+    private fun armLockedMs(ms: Long) {
         timeout?.cancel(false)
-        timeout = timers.schedule({
+        timeout = try {
+            timers.schedule({
             synchronized(lock) {
                 if (state == State.HELLO_SENT || state == State.CODE_REQUIRED || state == State.SAS_REQUIRED || state == State.WAIT_RESULT) {
                     failLocked("Timed out waiting for the companion.")
                 }
             }
-        }, STEP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }, ms, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun cancelLocked() {

@@ -60,6 +60,9 @@ class CompanionClient(
     /** Fingerprint of the current/last connection's peer, if handshook. */
     fun peerFingerprint(): String? = lastPeerFp
 
+    /** True while this client targets [h]:[p] (for dial reuse checks). */
+    fun isTarget(h: String, p: Int): Boolean = h == host && p == port
+
     /** Next per-connection sequence number (resets to 1 on each connect). */
     fun nextSeq(): Int = seq.incrementAndGet()
 

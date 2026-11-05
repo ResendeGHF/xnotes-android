@@ -170,12 +170,16 @@ class HostHandshake(
     private fun arm() {
         synchronized(lock) {
             timeout?.cancel(false)
-            timeout = timers.schedule({
+            timeout = try {
+                timers.schedule({
                 synchronized(lock) {
                     pendingConfirms.clear()
                 }
                 events.showStatus("Pairing timed out.")
-            }, STEP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                }, STEP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 

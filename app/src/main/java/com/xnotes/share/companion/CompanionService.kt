@@ -396,12 +396,19 @@ class CompanionService : Service() {
         val store = store ?: return
         val grants = grants ?: return
         if (store == null || grants == null) return
+        val host = if (!dev?.host.isNullOrEmpty()) dev.host else targetHost
+        val port = if (dev != null && dev.port in 1..65535) dev.port else targetPort
+        // Reuse a live session while a handshake is in flight: toggle
+        // auto-dial plus a manual Pair tap (or two taps) must not tear down
+        // a pairing in progress — each new socket kills the previous one
+        // server-side and in-flight acks/results die with it (reconnect
+        // storm). A finished/failed pairing redials fresh so Pair retries.
+        val live = client
+        if (live != null && live.connected && live.isTarget(host, port) && pairing?.isInFlight == true) return
         runCatching { pairing?.close() }
         runCatching { client?.disconnect() }
         pairing = null
         client = null
-        val host = if (!dev?.host.isNullOrEmpty()) dev.host else targetHost
-        val port = if (dev != null && dev.port in 1..65535) dev.port else targetPort
         if (dev != null) {
             targetHost = host
             targetPort = port
