@@ -275,6 +275,13 @@ class InteractionController(
     var onStrokeStarted: ((page: Int) -> Unit)? = null
     /** A finished stroke committed to [page] by the local pointer (pen-up, crossings included). */
     var onStrokeCommitted: ((page: Int, stroke: Stroke) -> Unit)? = null
+    /**
+     * A recognized/drawn [ShapeItem] committed to [page] (hold-to-snap or the
+     * shape tool): the sync layer pushes the file at once and drops any live
+     * run the snap superseded, so the companion shows the final shape
+     * instead of stale raw ink.
+     */
+    var onShapeCommitted: ((page: Int, shape: ShapeItem) -> Unit)? = null
     /** Strokes the local eraser took off [page]. Area-erase splits are not reported. */
     var onStrokesErased: ((page: Int, strokes: List<Stroke>) -> Unit)? = null
     /**
@@ -1927,6 +1934,7 @@ class InteractionController(
         state.appendToCache(page, shape)
         history.push(AddItem(page, shape))
         state.document.dirty = true
+        onShapeCommitted?.invoke(pageIndex, shape)
         // The stroke was never added to the page, so clearing liveStroke makes the live ink preview
         // vanish the instant it snaps; the eventual pen-up in endDraw then commits nothing.
         liveStroke = null
@@ -3381,6 +3389,7 @@ class InteractionController(
             state.appendToCache(page, shape)
             history.push(AddItem(page, shape))
             state.document.dirty = true
+            onShapeCommitted?.invoke(pi, shape)
             onContentChanged()
             // A new shape stays selected, so it can be resized, turned or reshaped straight away.
             setSelection(listOf(Selected(pi, shape)))

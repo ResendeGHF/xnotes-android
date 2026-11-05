@@ -579,6 +579,13 @@ class CompanionService : Service() {
                 eachHost { it.submitLocalStroke(uri, page, stroke, id) }
             }
         }
+        editor.controller.onShapeCommitted = { _, _ ->
+            // The snap superseded any in-flight live run: forget it without
+            // painting raw ink on the companion, then push the new shape at
+            // once instead of waiting out the debounce.
+            pendingLive.remove(editor)
+            eachHost { it.pushFile(uri) }
+        }
         editor.controller.onStrokesErased = { page, strokes ->
             val ids = strokes.map { SyncWire.fingerprintOf(it) }
             if (ids.isNotEmpty()) {
@@ -835,6 +842,7 @@ class CompanionService : Service() {
         editor.controller.onStrokeStarted = null
         editor.controller.onStrokeSample = null
         editor.controller.onStrokeCommitted = null
+        editor.controller.onShapeCommitted = null
         editor.controller.onStrokesErased = null
         editor.controller.onStrokesReplaced = null
         editor.state.onPageChanged = null
