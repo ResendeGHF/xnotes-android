@@ -1028,7 +1028,7 @@ class CompanionService : Service() {
             }
         }
 
-        /** Start the service on app launch when either feature was left on. */
+        /** Start the service when the companion half is switched on. */
         fun startIfEnabled(context: Context) {
             syncFlagFlows(context)
             if (!isCompanionOn(context)) return

@@ -167,18 +167,16 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val settingsRepo = com.xnotes.settings.SettingsRepository(this)
         com.xnotes.settings.LiveSettings.prime(settingsRepo)
-        // The Companion switch is the single gate for every LAN-sharing
-        // notification: with it on, both the SYNC dial and the HTTP server
-        // come up (and notify); with it off, nothing may linger — cancel
-        // stale cards left by old builds or killed runs and stop all.
-        if (com.xnotes.share.companion.CompanionService.isCompanionOn(this)) {
-            com.xnotes.share.ShareService.start(this)
-            com.xnotes.share.companion.CompanionService.startIfEnabled(this)
-        } else {
-            com.xnotes.share.companion.CompanionService.cancelNotifications(this)
-            com.xnotes.share.ShareService.cancelNotifications(this)
-            com.xnotes.share.ShareService.stop(this)
+        // Every process start begins with companion sharing off: no service
+        // boot, no notifications, no redial. The switch opts in explicitly
+        // afterwards. Once per process only — never on rotation, which
+        // recreates the activity while a session may be live.
+        if (bootSharingReset.compareAndSet(false, true)) {
+            com.xnotes.share.companion.CompanionService.setCompanionEnabled(this, false)
         }
+        com.xnotes.share.companion.CompanionService.cancelNotifications(this)
+        com.xnotes.share.ShareService.cancelNotifications(this)
+        com.xnotes.share.ShareService.stop(this)
         if (!orphanTabStoragePurged) {
             orphanTabStoragePurged = true
             purgeOrphanedTabStorage()
@@ -368,6 +366,12 @@ class MainActivity : ComponentActivity() {
     private companion object {
         /** Tabs live only for this process, so their private dirs are garbage once it restarts. */
         @Volatile private var orphanTabStoragePurged = false
+        /**
+         * Companion sharing always boots off: set once per process (never on
+         * rotation, which recreates the activity in the same process), so a
+         * live session is never torn down by a config change.
+         */
+        private val bootSharingReset = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 }
 
