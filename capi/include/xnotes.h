@@ -295,6 +295,7 @@ int xn_sync_file_count(const xn_sync* sync);
 int xn_sync_file_info(const xn_sync* sync, int index, char** id, char** path, int* kind, long long* version, long long* size);
 char* xn_sync_file_path(xn_sync* sync, const char* id);
 void xn_sync_open(xn_sync* sync, const char* id);
+void xn_sync_resubscribe(xn_sync* sync);
 void xn_sync_close_file(xn_sync* sync, const char* id);
 void xn_sync_presence(xn_sync* sync, const char* id, int page);
 void xn_sync_request_delete(xn_sync* sync, const char* id);

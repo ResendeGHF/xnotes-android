@@ -1880,6 +1880,11 @@ fun xnSyncOpen(sync: COpaquePointer?, id: String?) = guard(Unit) {
     sync!!.sync().engine.requestOpen(id ?: return@guard)
 }
 
+@CName("xn_sync_resubscribe")
+fun xnSyncResubscribe(sync: COpaquePointer?) = guard(Unit) {
+    sync!!.sync().engine.resubscribe()
+}
+
 @CName("xn_sync_close_file")
 fun xnSyncCloseFile(sync: COpaquePointer?, id: String?) = guard(Unit) {
     sync!!.sync().engine.closeFile(id ?: return@guard)

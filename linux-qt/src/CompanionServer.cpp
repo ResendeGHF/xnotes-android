@@ -211,6 +211,10 @@ void CompanionServer::openFile(const QString& id) const {
     if (sync_) xn_sync_open(sync_, QFile::encodeName(id).constData());
 }
 
+void CompanionServer::refreshIndex() const {
+    if (sync_) xn_sync_resubscribe(sync_);
+}
+
 void CompanionServer::requestDelete(const QString& id) const {
     if (sync_) xn_sync_request_delete(sync_, QFile::encodeName(id).constData());
 }

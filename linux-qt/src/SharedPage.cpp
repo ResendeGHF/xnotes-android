@@ -6,6 +6,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QPushButton>
 #include <QStandardItemModel>
 #include <QTreeView>
 
@@ -16,12 +17,19 @@ SharedPage::SharedPage(QWidget* parent) : QWidget(parent) {
     outer->setContentsMargins(24, 24, 24, 24);
     outer->setSpacing(8);
 
+    auto* titleRow = new QHBoxLayout();
     auto* title = new QLabel(QStringLiteral("Shared with you"), this);
     QFont titleFont = title->font();
     titleFont.setPointSize(18);
     titleFont.setBold(true);
     title->setFont(titleFont);
-    outer->addWidget(title);
+    titleRow->addWidget(title);
+    titleRow->addStretch(1);
+    auto* refreshButton = new QPushButton(QStringLiteral("Refresh"), this);
+    refreshButton->setToolTip(QStringLiteral("Ask the phone for the latest shared files"));
+    titleRow->addWidget(refreshButton);
+    outer->addLayout(titleRow);
+    connect(refreshButton, &QPushButton::clicked, this, &SharedPage::refreshRequested);
 
     search_ = new QLineEdit(this);
     search_->setPlaceholderText(QStringLiteral("Search shared files"));

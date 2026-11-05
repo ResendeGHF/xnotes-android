@@ -908,6 +908,10 @@ void MainWindow::setupCompanion() {
     connect(browse_, &xn::BrowsePage::newNote, this, [this] { if (confirmDiscard()) newNote(); });
     connect(browse_, &xn::BrowsePage::openLocal, this, [this](const QString& path) { open(path); });
     connect(shared_, &xn::SharedPage::openShared, this, [this](const QString& id) { openSharedFile(id); });
+    connect(shared_, &xn::SharedPage::refreshRequested, this, [this] {
+        statusBar()->showMessage(QStringLiteral("Refreshing shared files…"), 2000);
+        companion_->refreshIndex();
+    });
     connect(home_, &xn::HomeScreen::serverToggled, this, [this](bool on) {
         if (on) companion_->start();
         else companion_->stop();

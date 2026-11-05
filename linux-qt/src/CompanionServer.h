@@ -52,6 +52,7 @@ public:
 
     /* Files: fetch one for opening, ask the host to delete/create. */
     void openFile(const QString& id) const;
+    void refreshIndex() const;
     void requestDelete(const QString& id) const;
     void requestCreate(const QString& dirId, const QString& name, int kind) const;
     void closeFile(const QString& id) const;

@@ -26,6 +26,7 @@ public:
 
 signals:
     void openShared(const QString& id);
+    void refreshRequested();
     void deleteShared(const QString& id);
     void createShared(const QString& dirId, const QString& name, int kind);
 

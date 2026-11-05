@@ -194,9 +194,13 @@ class CompanionEngine(
         fileCache[id]?.also { it.lastUsedMs = nowMs() }?.bytes
     }
 
+    /** Ask the host for a fresh full index (manual refresh button). */
+    fun resubscribe() {
+        send(SyncMsg.IndexSubscribe(nextSeq()))
+    }
+
     /** Open [id]: fetch when uncached, else hand over at once. */
-    fun requestOpen(id: String) {
-        val cached = withLock(lock) { fileCache[id] }
+    fun requestOpen(id: String) {        val cached = withLock(lock) { fileCache[id] }
         val version = withLock(lock) { versions[id] }
         if (cached != null && version != null && cached.version == version) {
             host.onFileReady(id)
