@@ -102,16 +102,13 @@ fun CompanionPane(editor: Editor) {
     }
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text("Companion", color = palette.text.toComposeColor(), fontSize = 20.sp)
-        Text(
-            "Dial a Linux companion over TLS, then type the 6-digit code it shows. " +
-                "For USB, run `adb reverse tcp:42317 tcp:42317` and use 127.0.0.1.",
-            color = palette.textDim.toComposeColor(),
-            fontSize = 12.sp,
-        )
-        Spacer(Modifier.height(4.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Companion sharing", color = palette.text.toComposeColor(), modifier = Modifier.weight(1f))
+            Text(
+                "Companion",
+                color = palette.text.toComposeColor(),
+                fontSize = 20.sp,
+                modifier = Modifier.weight(1f),
+            )
             Switch(
                 checked = companionOn,
                 onCheckedChange = {
@@ -124,7 +121,13 @@ fun CompanionPane(editor: Editor) {
                 },
             )
         }
-        Spacer(Modifier.height(4.dp))
+        Text(
+            "Dial a Linux companion over TLS, then type the 6-digit code it shows. " +
+                "For USB, run `adb reverse tcp:42317 tcp:42317` and use 127.0.0.1.",
+            color = palette.textDim.toComposeColor(),
+            fontSize = 12.sp,
+        )
+        SectionHeader("This device")
         OutlinedTextField(
             value = ownName,
             onValueChange = {
@@ -138,14 +141,10 @@ fun CompanionPane(editor: Editor) {
             enabled = companionOn,
         )
         Spacer(Modifier.height(8.dp))
-        Text(
-            "Paired companions (${devices.size}) — one active at a time",
-            color = palette.text.toComposeColor(),
-            fontSize = 13.sp,
-        )
+        SectionHeader("Paired companions (${devices.size})")
         if (devices.isEmpty()) {
             Text(
-                "None yet. Add one below, then type the code it shows.",
+                "None yet — pair one below, then type the code it shows.",
                 color = palette.textDim.toComposeColor(),
                 fontSize = 12.sp,
             )
@@ -196,6 +195,7 @@ fun CompanionPane(editor: Editor) {
             }
         }
         Spacer(Modifier.height(8.dp))
+        SectionHeader("Pair a new companion")
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = host,
@@ -226,6 +226,7 @@ fun CompanionPane(editor: Editor) {
             ) { Text(if (devices.isEmpty()) "Pair" else "Add") }
         }
         Spacer(Modifier.height(8.dp))
+        SectionHeader("Connection")
         Row(verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = { activeDevice?.let { CompanionService.switchDevice(context, it.fp) } }, enabled = companionOn && activeDevice != null) {
                 Text("Connect")
@@ -355,4 +356,17 @@ private fun relativeDate(ms: Long): String {
     } catch (_: Exception) {
         d.toString()
     }
+}
+
+/** Small section label used to group the companion screen blocks. */
+@Composable
+private fun SectionHeader(text: String) {
+    val palette = LocalPalette.current
+    Spacer(Modifier.height(10.dp))
+    Text(
+        text,
+        color = palette.text.toComposeColor(),
+        fontSize = 13.sp,
+    )
+    Spacer(Modifier.height(2.dp))
 }

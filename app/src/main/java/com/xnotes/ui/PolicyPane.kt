@@ -19,6 +19,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TriStateCheckbox
@@ -214,35 +215,6 @@ fun PolicyPane(editor: Editor, onBack: (() -> Unit)? = null) {
             )
         }
         Spacer(Modifier.height(4.dp))
-        // Share-all is always the first action: grants the whole tree to the
-        // picked companion in one tap. Disabled until a device is picked and
-        // the folder walk finishes, so it never grants a partial tree.
-        val deviceFp = fp
-        var sharingAll by remember(deviceFp) { mutableStateOf(false) }
-        Button(
-            onClick = {
-                val target = deviceFp ?: return@Button
-                sharingAll = true
-                scope.launch {
-                    withContext(Dispatchers.IO) {
-                        val uris = snapshot.entries.map { it.uri }
-                        for (uri in uris) {
-                            grants.setGranted(target, uri, true)
-                        }
-                        CompanionService.refreshPolicy(context)
-                    }
-                    val ids = withContext(Dispatchers.IO) { store.grantIds(target) }
-                    shared.clear()
-                    shared.addAll(ids)
-                    sharingAll = false
-                }
-            },
-            enabled = deviceFp != null && !scanning && !sharingAll,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(if (sharingAll) "Sharing…" else "Share all files with this companion")
-        }
-        Spacer(Modifier.height(4.dp))
         Text(
             stringResource(com.xnotes.R.string.policy_help, shared.size),
             color = palette.textDim.toComposeColor(),
@@ -286,6 +258,58 @@ fun PolicyPane(editor: Editor, onBack: (() -> Unit)? = null) {
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        Spacer(Modifier.height(6.dp))
+        // Bulk actions for the picked companion: grant the whole tree, or
+        // clear every grant. Disabled until a device is picked and the folder
+        // walk finishes, so they never act on a partial tree.
+        val deviceFp = fp
+        var bulkBusy by remember(deviceFp) { mutableStateOf(false) }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    val target = deviceFp ?: return@Button
+                    bulkBusy = true
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            for (uri in snapshot.entries.map { it.uri }) {
+                                grants.setGranted(target, uri, true)
+                            }
+                            CompanionService.refreshPolicy(context)
+                        }
+                        val ids = withContext(Dispatchers.IO) { store.grantIds(target) }
+                        shared.clear()
+                        shared.addAll(ids)
+                        bulkBusy = false
+                    }
+                },
+                enabled = deviceFp != null && !scanning && !bulkBusy,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(if (bulkBusy) "Working…" else "Share all files with this companion")
+            }
+            OutlinedButton(
+                onClick = {
+                    val target = deviceFp ?: return@OutlinedButton
+                    bulkBusy = true
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            for (uri in shared.toList()) {
+                                grants.setGranted(target, uri, false)
+                            }
+                            CompanionService.refreshPolicy(context)
+                        }
+                        val ids = withContext(Dispatchers.IO) { store.grantIds(target) }
+                        shared.clear()
+                        shared.addAll(ids)
+                        bulkBusy = false
+                    }
+                },
+                enabled = deviceFp != null && !bulkBusy && shared.isNotEmpty(),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(if (bulkBusy) "Working…" else "Remove all permissions")
+            }
+        }
         Spacer(Modifier.height(4.dp))
         if (shown.isEmpty() && !scanning) {
             Text(
