@@ -169,9 +169,10 @@ class PairingClient(
                 armCodeLocked()
                 return
             }
-            // Paired flag set but the fingerprint is not our pin: hostile or
-            // rotated companion. Fail rather than silently re-pairing.
-            failLocked("Companion fingerprint does not match the pin.")
+            // Paired flag set but the fingerprint is not our pin: the other
+            // side still has us paired (or its cert rotated). Refuse rather
+            // than silently re-pairing: forget it there too, then pair again.
+            failLocked("Companion fingerprint does not match the pin. If it was forgotten, forget this phone on the desktop too and pair again.")
         }
     }
 

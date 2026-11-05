@@ -151,7 +151,7 @@ class CompanionService : Service() {
                 val deviceName = prefs.getString(KEY_NAME, "")?.ifBlank { null }
                     ?: android.os.Build.MODEL ?: "Android"
                 this.deviceName = deviceName
-                this.targetHost = prefs.getString(KEY_IP, "")?.ifEmpty { null } ?: "127.0.0.1"
+                this.targetHost = prefs.getString(KEY_IP, "") ?: ""
                 this.targetPort = prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 42317
                 this.identity = identity
                 this.pins = pins
@@ -358,6 +358,12 @@ class CompanionService : Service() {
         if (store == null || grants == null) return
         val host = if (!dev?.host.isNullOrEmpty()) dev.host else targetHost
         val port = if (dev != null && dev.port in 1..65535) dev.port else targetPort
+        if (host.isEmpty()) {
+            // Nothing remembered (e.g. right after forgetting): never dial
+            // blindly. Pairing again sets an explicit target.
+            postCompanionStatus("No companion remembered — pair a new one.")
+            return
+        }
         // Reuse a live session while a handshake is in flight: toggle
         // auto-dial plus a manual Pair tap (or two taps) must not tear down
         // a pairing in progress — each new socket kills the previous one
@@ -1115,15 +1121,28 @@ class CompanionService : Service() {
                     }
                     // The pin file is keyed by name; unpin every alias just in case.
                     kotlinx.coroutines.runBlocking { store.forget(fp) }
+                    // Purge the remembered dial target so the forgotten
+                    // companion is never redialed: no address, no
+                    // auto-connect, until it is paired again from scratch.
+                    try {
+                        context.getSharedPreferences(PREFS, 0).edit()
+                            .remove(KEY_IP).remove(KEY_PORT).apply()
+                    } catch (_: Exception) {
+                    }
                 }
                 runningService?.let { svc ->
                     svc.main.post {
+                        svc.targetHost = ""
+                        svc.targetPort = 42317
                         if (svc.grants?.activeFp == fp) {
                             svc.grants?.activeFp = null
-                            svc.client?.disconnect()
-                            _companionStatus.value = Status("Forgot companion.", null, connected = false)
-                            svc.mirrorStatus()
                         }
+                        runCatching { svc.pairing?.close() }
+                        svc.pairing = null
+                        runCatching { svc.client?.disconnect() }
+                        svc.client = null
+                        _companionStatus.value = Status("Forgot companion.", null, connected = false)
+                        svc.mirrorStatus()
                     }
                 }
             }, "companion-forget").apply { isDaemon = true; start() }
