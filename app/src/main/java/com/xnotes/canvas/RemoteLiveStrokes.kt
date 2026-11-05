@@ -15,10 +15,14 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
     class Run(
         val file: String,
         val page: Int,
-        val width: Double,
-        val color: Rgba,
+        val tool: com.xnotes.core.tools.Tool,
+        val config: com.xnotes.core.tools.ToolConfig,
         val points: ArrayList<Pt> = ArrayList(),
-    )
+        val pressures: ArrayList<Double> = ArrayList(),
+    ) {
+        val width: Double get() = config.baseWidth
+        val color: Rgba get() = config.rgba
+    }
 
     /** The open file's sync id; runs for other files never draw. */
     var showingFile: String? = null
@@ -27,13 +31,34 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
 
     /** Append [samples] (page-local) to [strokeId]'s run, starting it first. */
     open fun update(file: String, page: Int, strokeId: String, width: Double, color: Rgba, samples: List<Pt>, done: Boolean) {
+        updateFull(file, page, strokeId, com.xnotes.core.tools.Tool.PEN,
+            com.xnotes.core.tools.ToolConfig(baseWidth = width, rgba = color),
+            samples, List(samples.size) { 1.0 }, done)
+    }
+
+    /**
+     * Full-style live update: tool + config travel with the run so pencil,
+     * taper, highlighter and dashed pens preview exactly as they will commit.
+     * Old callers without style funnel through [update].
+     */
+    open fun updateFull(
+        file: String,
+        page: Int,
+        strokeId: String,
+        tool: com.xnotes.core.tools.Tool,
+        config: com.xnotes.core.tools.ToolConfig,
+        samples: List<Pt>,
+        pressures: List<Double>,
+        done: Boolean,
+    ) {
         if (done) {
             runs.remove(strokeId)
             return
         }
-        val run = runs.getOrPut(strokeId) { Run(file, page, width, color) }
+        val run = runs.getOrPut(strokeId) { Run(file, page, tool, config) }
         if (run.file != file || run.page != page) return
         run.points.addAll(samples)
+        run.pressures.addAll(pressures.ifEmpty { List(samples.size) { 1.0 } })
     }
 
     /** Drop the run (its model landed). */
@@ -53,13 +78,29 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
         for ((_, run) in runs) {
             if (run.file != showing || run.points.size < 2) continue
             val pr = state.pageRects.getOrNull(run.page) ?: continue
-            // NOTE: the caller (drawOverlay) already translated to content space
-            // (origin + zoom); page coords only need the page offset + transform.
+            // Render through the real Stroke painter so pencil grain, taper,
+            // highlighter multiply and dashed rhythm match the commit exactly.
+            val stroke = runToStroke(run) ?: continue
             r.withSave {
                 r.translate(pr.left, pr.top)
                 state.applyPageTransform(r, state.document.pages[run.page])
-                r.strokePolyline(run.points, Pen(run.color, run.width, cosmetic = false))
+                stroke.paint(r)
             }
+        }
+    }
+
+    private fun runToStroke(run: Run): com.xnotes.core.model.Stroke? {
+        return try {
+            val n = run.points.size
+            val xs = DoubleArray(n) { run.points[it].x }
+            val ys = DoubleArray(n) { run.points[it].y }
+            val ps = DoubleArray(n) { run.pressures.getOrElse(it) { 1.0 } }
+            val ts = DoubleArray(n) { 0.0 }
+            val s = com.xnotes.core.model.Stroke(run.tool, run.config, emptyList(), 1.0, false, 1.0)
+            s.setSamples(xs, ys, ps, ts, n)
+            s
+        } catch (_: Exception) {
+            null
         }
     }
 

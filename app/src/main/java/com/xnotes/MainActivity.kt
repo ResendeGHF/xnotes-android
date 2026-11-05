@@ -3087,7 +3087,11 @@ private suspend fun openInto(
 ): String? {
     val resolver = context.contentResolver
     val uri = Uri.parse(uriStr)
-    val name = displayNameOf(resolver, uri)
+    // Guest cache files (file://…/guest/…) have hash names on disk; show the
+    // host's inherited name instead, never empty.
+    val guestName = com.xnotes.share.companion.CompanionService.guestDisplayName(uriStr)
+    val name = guestName
+        ?: displayNameOf(resolver, uri)
         ?: uri.lastPathSegment?.substringAfterLast('/').orEmpty()
 
     val expected = if (name.endsWith(".pdf", ignoreCase = true)) {

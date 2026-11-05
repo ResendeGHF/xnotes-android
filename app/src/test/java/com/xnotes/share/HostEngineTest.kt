@@ -573,6 +573,48 @@ class HostEngineTest {
         assertEquals(SyncWire.fingerprintOf(moved), SyncWire.fingerprintOf(landed))
     }
 
+    @Test fun markupReplaceUpsertsAndKeepsLink() {
+        val fa = engine()
+        val fb = engine()
+        for (f in listOf(fa, fb)) {
+            f.backend.addFile("u1", "n.xnote", bytes = ByteArray(100))
+            f.policy.setShared("u1", true)
+            f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        }
+        val docB = Document(mutableListOf(Page(595.0, 842.0)))
+        fb.host.docs["u1"] = docB
+        val quad = listOf(com.xnotes.core.pdf.TextQuad(0f, 0f, 10f, 5f, 0))
+        val m1 = com.xnotes.core.model.TextMarkup("m1", com.xnotes.core.model.MarkupType.NOTE_LINK,
+            com.xnotes.core.model.Rgba(255, 0, 0, 255), 0.9, quad, "t", null, 1L, 2L, "target1")
+        fa.engine.submitLocalMarkups("u1", listOf(0 to m1), emptyList(), "mk1")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertEquals(1, docB.pages[0].markups.size)
+        assertEquals("target1", docB.pages[0].markups.single().link)
+        // Recolor same id (ReplaceMarkup path emits remove+add): must converge, link kept.
+        val m2 = m1.copy(color = com.xnotes.core.model.Rgba(0, 255, 0, 255), modified = 3L)
+        assertEquals("target1", m2.link)
+        fa.engine.submitLocalMarkups("u1", listOf(0 to m2), listOf(0 to "m1"), "mk2")
+        fb.engine.onMessage(fa.host.lastOfType("op"))
+        assertEquals(1, docB.pages[0].markups.size)
+        assertEquals("#00ff00", com.xnotes.share.companion.SyncWire.hexColor(docB.pages[0].markups.single().color))
+        assertEquals("target1", docB.pages[0].markups.single().link)
+    }
+
+    @Test fun strokeStyleRoundTripsPencilTaper() {
+        val tool = com.xnotes.core.tools.Tool.PENCIL
+        val cfg = com.xnotes.core.tools.ToolConfig(baseWidth = 2.5, rgba = com.xnotes.core.model.Rgba(10, 20, 30, 255),
+            pressureEnabled = false, taperEnabled = true, taperMinFactor = 0.5,
+            pencilPressure = 1.2, pencilDensity = 0.8)
+        val stroke = com.xnotes.core.model.Stroke(tool, cfg, listOf(com.xnotes.core.stroke.Sample(1.0, 2.0, 0.5)))
+        val wire = com.xnotes.share.companion.SyncWire.toWire(stroke)
+        assertTrue(wire.has("style"))
+        val back = com.xnotes.share.companion.SyncWire.toNative(wire)!!
+        assertEquals(com.xnotes.core.tools.Tool.PENCIL, back.tool)
+        assertEquals(2.5, back.config.baseWidth, 0.0)
+        assertEquals(true, back.config.taperEnabled)
+        assertEquals(1.2, back.config.pencilPressure, 0.0)
+    }
+
     @Test fun deleteFolderRevokesSubtreeGrants() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)

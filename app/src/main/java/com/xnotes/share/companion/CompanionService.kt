@@ -939,8 +939,8 @@ class CompanionService : Service() {
         editor.controller.onStrokeStarted = {
             // A previous gesture that never committed (dismiss tap): close its run first.
             pendingLive.remove(editor)?.let { stale ->
-                if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color)
-                else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color) }
+                if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style)
+                else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
             }
         }
         editor.controller.onStrokeSample = { page, x, y, p ->
@@ -950,14 +950,14 @@ class CompanionService : Service() {
             val live = pendingLive.remove(editor)
             if (guest != null) {
                 if (live != null) {
-                    guest.finishStroke(uri, page, live.id, live.tool, live.width, live.color)
+                    guest.finishStroke(uri, page, live.id, live.tool, live.width, live.color, live.style)
                     guest.submitLocalStroke(uri, page, stroke, live.id)
                 } else {
                     guest.submitLocalStroke(uri, page, stroke, newDedupe())
                 }
             } else if (live != null) {
                 eachHost {
-                    it.finishStroke(uri, page, live.id, live.tool, live.width, live.color)
+                    it.finishStroke(uri, page, live.id, live.tool, live.width, live.color, live.style)
                     it.submitLocalStroke(uri, page, stroke, live.id)
                 }
             } else {
@@ -1036,6 +1036,37 @@ class CompanionService : Service() {
                 }
             }
         }
+        // Text/table/shape/image edits have no granular op yet: converge via
+        // debounced full-file push (real-time, no divergence). Strokes/markups/
+        // pages/rooms/images-inserts already fan out above and are excluded.
+        val prevPush = editor.history.onPush
+        editor.history.onPush = { cmd ->
+            try { prevPush?.invoke(cmd) } catch (_: Exception) {}
+            val name = cmd.javaClass.simpleName
+            val isGranular = name == "AddMarkups" || name == "RemoveMarkup" || name == "ReplaceMarkup" ||
+                name == "CompositeCommand" || name.startsWith("AddPage") || name.startsWith("DeletePage") ||
+                name.startsWith("MovePages")
+            // Stroke commits (AddItem/EraseItems/ReplacePageItems with only strokes)
+            // already sync via controller hooks; only non-stroke content falls through here.
+            var strokeOnly = false
+            try {
+                val added = cmd.added()
+                if (added.isNotEmpty() && added.all { it is com.xnotes.core.model.Stroke }) {
+                    // AddItem(stroke) committed via onStrokeCommitted, not here.
+                    strokeOnly = true
+                } else if (added.isEmpty()) {
+                    // Erase/replace of strokes only -> handled via onStrokesErased/Replaced.
+                    // Heuristic: touched items are all strokes.
+                    val touched = try { cmd.touched { null } } catch (_: Exception) { null }
+                    if (touched != null && touched.isNotEmpty() && touched.all { it.second is com.xnotes.core.model.Stroke }) {
+                        strokeOnly = true
+                    }
+                }
+            } catch (_: Exception) {}
+            if (!isGranular && !strokeOnly) {
+                pushFileSoon(uri, guest)
+            }
+        }
         editor.onImageInserted = { page, item ->
             val id = newDedupe()
             runCatching { item.image.file.readBytes() }.getOrNull()?.let { bytes ->
@@ -1074,7 +1105,7 @@ class CompanionService : Service() {
         else eachHost { it.presence(uri, editor.state.currentPageIndex()) }
     }
 
-    private data class LiveStroke(val uri: String, val page: Int, val id: String, val tool: String, val width: Double, val color: String)
+    private data class LiveStroke(val uri: String, val page: Int, val id: String, val tool: String, val width: Double, val color: String, val style: org.json.JSONObject? = null)
 
     private data class PendingRoom(val uri: String, val page: Int, val id: String)
 
@@ -1082,8 +1113,26 @@ class CompanionService : Service() {
 
     private val pendingLive = HashMap<Editor, LiveStroke>()
     private var dedupeCounter = 0
+    private val pushDebounce = HashMap<String, Runnable>()
 
     private fun newDedupe(): String = "h${dedupeCounter++}-${System.nanoTime().toString(16)}"
+
+    /**
+     * Debounced full-file push for content ops have no wire form (text/table
+     * edits, image moves/removes, shape refills): collapses a typing burst
+     * into one reload so peers converge in real time without per-keystroke
+     * full files.
+     */
+    private fun pushFileSoon(uri: String, guest: GuestEngine?) {
+        if (guest != null) return // guest docs already sync op-by-op; host fans file
+        synchronized(pushDebounce) { pushDebounce.remove(uri)?.let { main.removeCallbacks(it) } }
+        val r = Runnable {
+            synchronized(pushDebounce) { pushDebounce.remove(uri) }
+            eachHost { it.pushFile(uri) }
+        }
+        synchronized(pushDebounce) { pushDebounce[uri] = r }
+        main.postDelayed(r, 1200)
+    }
 
     private fun liveSample(editor: Editor, uri: String, page: Int, x: Double, y: Double, p: Double) {
         val guest = guestForCacheUri(uri)
@@ -1092,18 +1141,19 @@ class CompanionService : Service() {
         if (live != null && (live.uri != uri || live.page != page)) {
             // Crossed onto another page mid-stroke: close this run, open the next.
             val stale = live
-            if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color)
-            else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color) }
+            if (guest != null) guest.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style)
+            else eachHost { it.finishStroke(stale.uri, stale.page, stale.id, stale.tool, stale.width, stale.color, stale.style) }
             live = null
         }
         if (live == null) {
             val tool = editor.controller.tool
             val cfg = editor.controller.resolvedStrokeConfig(tool)
-            live = LiveStroke(uri, page, newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba)).also { pendingLive[editor] = it }
+            val style = SyncWire.toWireStyle(tool, cfg)
+            live = LiveStroke(uri, page, newDedupe(), tool.id, cfg.baseWidth, SyncWire.hexColor(cfg.rgba), style).also { pendingLive[editor] = it }
         }
         val cur = live ?: return
-        if (guest != null) guest.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p)
-        else eachHost { it.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p) }
+        if (guest != null) guest.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p, cur.style)
+        else eachHost { it.liveSample(uri, page, cur.id, cur.tool, cur.width, cur.color, x, y, p, cur.style) }
     }
 
     /** Every host engine serving this device's files (Linux companion + inbound peers). */
@@ -1155,6 +1205,14 @@ class CompanionService : Service() {
         editor.controller.onRoomPreview = null
         editor.controller.onRoomCommitted = null
         editor.controller.onRoomPreviewDone = null
+        // Restore the audio-stamp hook (attachEditor chains it); drop debounces.
+        try {
+            editor.history.onPush = { command ->
+                try {
+                    com.xnotes.ui.AudioRecording.stamp(editor, command.added())
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
         if (pendingRoom?.uri == CompanionEditors.uriFor(editor)) pendingRoom = null
         editor.controller.remoteLive = null
         pendingLive.remove(editor)
@@ -1622,6 +1680,15 @@ class CompanionService : Service() {
             } ?: return false
             svc.main.post { eng.fetch(uri, openNow = true) }
             return true
+        }
+
+        /** Display name for a guest cache URI ("External - {name}"), or null. */
+        fun guestDisplayName(cacheUri: String): String? {
+            val svc = runningService ?: return null
+            return synchronized(svc.peerLock) {
+                svc.guestSessions.values.mapNotNull { it.engine }
+                    .firstNotNullOfOrNull { it.displayNameForCache(cacheUri) }
+            }
         }
 
         /** Allow an inbound peer whose SAS matches ([key] from [sasInbound]). */

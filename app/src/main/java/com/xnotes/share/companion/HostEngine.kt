@@ -535,11 +535,14 @@ class HostEngine(
         dedupe: String,
     ) {
         val ops = JSONArray()
-        for ((page, m) in added) {
-            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
-        }
+        // Removes first: a recolor/retype reuses the same id, and the far
+        // side upserts on add — remove-then-add converges, add-then-remove
+        // would delete the replacement.
         for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
             ops.put(JSONObject().put("op", "remove_markup").put("page", page).put("ids", JSONArray(ids)))
+        }
+        for ((page, m) in added) {
+            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
         }
         if (ops.length() == 0) return
         submitLocalOps(uri, ops, dedupe)
@@ -661,8 +664,9 @@ class HostEngine(
     private fun applyMarkupAdd(file: String, page: Int, m: com.xnotes.core.model.TextMarkup): Boolean {
         host.openDocument(file)?.let { doc ->
             val pg = doc.pages.getOrNull(page) ?: return false
-            if (pg.markups.any { it.id == m.id }) return false
-            pg.markups = pg.markups + m
+            // Upsert: a same-id recolor/retype arrives as remove+add; the add
+            // must replace, not bounce off the not-yet-removed entry.
+            pg.markups = pg.markups.filter { it.id != m.id } + m
             doc.dirty = true
             host.editorState(file)?.rebakeBackground(pg, listOf(m))
             host.repaintDocument(file)
@@ -670,8 +674,7 @@ class HostEngine(
         }
         return modifyFile(file) { doc ->
             val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
-            if (pg.markups.any { it.id == m.id }) return@modifyFile false
-            pg.markups = pg.markups + m
+            pg.markups = pg.markups.filter { it.id != m.id } + m
             true
         }
     }
@@ -1038,21 +1041,22 @@ class HostEngine(
         x: Double,
         y: Double,
         p: Double,
+        style: JSONObject? = null,
     ) {
         val samples = JSONArray().put(JSONArray().put(x).put(y).put(p))
-        send(
-            JSONObject().put("t", "live").put("file", file).put("page", page)
-                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
-                .put("samples", samples).put("done", false),
-        )
+        val msg = JSONObject().put("t", "live").put("file", file).put("page", page)
+            .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+            .put("samples", samples).put("done", false)
+        if (style != null) msg.put("style", style)
+        send(msg)
     }
 
-    fun finishStroke(file: String, page: Int, strokeId: String, tool: String, width: Double, color: String) {
-        send(
-            JSONObject().put("t", "live").put("file", file).put("page", page)
-                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
-                .put("samples", JSONArray()).put("done", true),
-        )
+    fun finishStroke(file: String, page: Int, strokeId: String, tool: String, width: Double, color: String, style: JSONObject? = null) {
+        val msg = JSONObject().put("t", "live").put("file", file).put("page", page)
+            .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+            .put("samples", JSONArray()).put("done", true)
+        if (style != null) msg.put("style", style)
+        send(msg)
     }
 
     /** A local room-drag frame, straight to the socket (no batching, like strokes). */
@@ -1098,15 +1102,21 @@ class HostEngine(
         val samples = msg.optJSONArray("samples") ?: JSONArray()
         if (samples.length() == 0 && !msg.optBoolean("done", false)) return
         val color = com.xnotes.canvas.RemoteLiveStrokes.parseColor(msg.optString("color")) ?: return
+        val tool = com.xnotes.core.tools.Tool.fromId(msg.optString("tool")) ?: com.xnotes.core.tools.Tool.PEN
+        val width = msg.optDouble("width", 3.0)
+        val styleObj = msg.optJSONObject("style")
+        val cfg = SyncWire.styleFrom(tool, width, color, true, styleObj)
         val pts = ArrayList<com.xnotes.core.geometry.Pt>(samples.length())
+        val pressures = ArrayList<Double>(samples.length())
         for (i in 0 until samples.length()) {
             val s = samples.optJSONArray(i) ?: continue
             if (s.length() < 2) continue
             pts += com.xnotes.core.geometry.Pt(s.optDouble(0), s.optDouble(1))
+            pressures += if (s.length() > 2) s.optDouble(2, 1.0) else 1.0
         }
         val page = msg.optInt("page", 0)
         if (page !in doc.pages.indices) return
-        overlay.update(file, page, msg.optString("stroke_id"), msg.optDouble("width", 3.0), color, pts, msg.optBoolean("done", false))
+        overlay.updateFull(file, page, msg.optString("stroke_id"), tool, cfg, pts, pressures, msg.optBoolean("done", false))
         host.repaintLive(file)
     }
 

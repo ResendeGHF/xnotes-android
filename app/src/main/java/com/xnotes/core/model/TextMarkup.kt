@@ -51,7 +51,8 @@ class TextMarkup(
         color: Rgba = this.color,
         note: String? = this.note,
         modified: Long = this.modified,
-    ): TextMarkup = TextMarkup(id, type, color, intensity, quads, text, note, created, modified)
+        link: String? = this.link,
+    ): TextMarkup = TextMarkup(id, type, color, intensity, quads, text, note, created, modified, link)
 
     companion object {
         fun newId(): String = UUID.randomUUID().toString()

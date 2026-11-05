@@ -9900,11 +9900,15 @@ class Editor(
         if (controller.isEditingLabel) controller.commitTextEdit() // and so is a label being typed
         val command = history.nextUndo
         val pagesBefore = state.document.pages.toList()
+        // Snapshot per-page items/markups for sync diff (undo itself never fires sync hooks).
+        val itemsBefore = pagesBefore.map { it.items.toList() }
+        val markupsBefore = pagesBefore.map { it.markups.toList() }
         val viewed = viewedPage()
         val was = touchedRegions(command)
         history.undo()
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
+        emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
     }
 
     fun redo() {
@@ -9912,11 +9916,134 @@ class Editor(
         if (controller.isEditingLabel) controller.commitTextEdit()
         val command = history.nextRedo
         val pagesBefore = state.document.pages.toList()
+        val itemsBefore = pagesBefore.map { it.items.toList() }
+        val markupsBefore = pagesBefore.map { it.markups.toList() }
         val viewed = viewedPage()
         val was = touchedRegions(command)
         history.redo()
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
+        emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
+    }
+
+    /**
+     * Propagate an undo/redo to peers in real time via the existing op paths
+     * (no new wire type): stroke diffs replay as erase+add replacements,
+     * markup diffs as add/remove, page add/remove as page ops, and any other
+     * item change (text/table/image/shape) falls back to a full-file push.
+     * Remote applies bypass undo, so this is the only way an undo converges.
+     */
+    private fun emitUndoRedoSync(
+        itemsBefore: List<List<CanvasItem>>,
+        markupsBefore: List<List<com.xnotes.core.model.TextMarkup>>,
+        pagesBefore: List<Page>,
+        command: com.xnotes.core.history.Command?,
+    ) {
+        val pagesNow = state.document.pages
+        // Page add/remove (by identity): undo of AddPage/DeletePage, MovePages.
+        if (pagesNow.size != pagesBefore.size || pagesNow != pagesBefore) {
+            if (pagesNow.size < pagesBefore.size) {
+                // Page(s) gone: find first missing index.
+                for (i in pagesBefore.indices) {
+                    if (i >= pagesNow.size || pagesNow[i] !== pagesBefore[i]) {
+                        onPageRemoved?.invoke(i)
+                        break
+                    }
+                }
+            } else if (pagesNow.size > pagesBefore.size) {
+                for (i in pagesNow.indices) {
+                    if (i >= pagesBefore.size || pagesNow[i] !== pagesBefore[i]) {
+                        val pg = pagesNow[i]
+                        onPageInserted?.invoke(i, pg.width, pg.height)
+                        break
+                    }
+                }
+            } else {
+                // Reorder only: peers converge via full push (order has no op).
+                onFileContentReplaced?.invoke()
+                return
+            }
+        }
+        var pushedFile = false
+        val common = minOf(pagesBefore.size, pagesNow.size)
+        val replacements = ArrayList<com.xnotes.canvas.StrokeReplacement>()
+        val addedMarkups = ArrayList<Pair<Int, com.xnotes.core.model.TextMarkup>>()
+        val removedMarkupIds = ArrayList<Pair<Int, String>>()
+        // Command-level hint: any text/table/image/shape touch converges via pushFile.
+        // Stroke/markup/page commands below fan out as granular ops instead.
+        try {
+            val touched = command?.touched { null }
+            if (touched != null && touched.any { it.second !is com.xnotes.core.model.Stroke }) pushedFile = true
+        } catch (_: Exception) {}
+        for (pi in 0 until common) {
+            val beforeItems = itemsBefore.getOrNull(pi) ?: emptyList()
+            val afterItems = pagesNow[pi].items
+            if (beforeItems !== afterItems) {
+                // Fingerprint+config diff for strokes (catches moves/restyles that
+                // mutate in place, where identity sets would miss). Non-stroke
+                // changes fall back to pushFile (flagged above via command).
+                val beforeStrokes = beforeItems.filterIsInstance<com.xnotes.core.model.Stroke>()
+                val afterStrokes = afterItems.filterIsInstance<com.xnotes.core.model.Stroke>()
+                val beforeKeys = HashMap<String, ArrayList<com.xnotes.core.model.Stroke>>()
+                for (st in beforeStrokes) {
+                    val k = try {
+                        com.xnotes.core.stroke.StrokeFingerprint.of(st) + "|" + st.config.hashCode()
+                    } catch (_: Exception) { "id:${System.identityHashCode(st)}" }
+                    beforeKeys.getOrPut(k) { ArrayList() }.add(st)
+                }
+                val afterKeys = HashMap<String, ArrayList<com.xnotes.core.model.Stroke>>()
+                for (st in afterStrokes) {
+                    val k = try {
+                        com.xnotes.core.stroke.StrokeFingerprint.of(st) + "|" + st.config.hashCode()
+                    } catch (_: Exception) { "id:${System.identityHashCode(st)}" }
+                    afterKeys.getOrPut(k) { ArrayList() }.add(st)
+                }
+                val removedStrokes = ArrayList<com.xnotes.core.model.Stroke>()
+                val addedStrokes = ArrayList<com.xnotes.core.model.Stroke>()
+                for ((k, lst) in beforeKeys) {
+                    val have = afterKeys[k]?.size ?: 0
+                    if (lst.size > have) repeat(lst.size - have) { removedStrokes.add(lst[0]) }
+                }
+                for ((k, lst) in afterKeys) {
+                    val have = beforeKeys[k]?.size ?: 0
+                    if (lst.size > have) repeat(lst.size - have) { addedStrokes.add(lst[0]) }
+                }
+                if (removedStrokes.isNotEmpty() || addedStrokes.isNotEmpty()) {
+                    replacements += com.xnotes.canvas.StrokeReplacement(pi, removedStrokes, pi, addedStrokes)
+                }
+                // Non-stroke identity change also forces pushFile (text/table/image).
+                val beforeNon = beforeItems.filter { it !is com.xnotes.core.model.Stroke }
+                val afterNon = afterItems.filter { it !is com.xnotes.core.model.Stroke }
+                if (beforeNon.size != afterNon.size || beforeNon.zip(afterNon).any { (a, b) -> a !== b }) {
+                    pushedFile = true
+                }
+            }
+            val beforeMk = markupsBefore.getOrNull(pi) ?: emptyList()
+            val afterMk = pagesNow[pi].markups
+            if (beforeMk != afterMk) {
+                val beforeIds = beforeMk.map { it.id }.toSet()
+                val afterIds = afterMk.map { it.id }.toSet()
+                for (m in afterMk) if (m.id !in beforeIds) addedMarkups += pi to m
+                // Recolor/retype reuses the id: treat a same-id content change as remove+add.
+                for (m in beforeMk) {
+                    if (m.id !in afterIds) removedMarkupIds += pi to m.id
+                    else {
+                        val now = afterMk.firstOrNull { it.id == m.id }
+                        if (now !== m && now != null && (now.type != m.type || now.color != m.color || now.note != m.note || now.link != m.link)) {
+                            removedMarkupIds += pi to m.id
+                            addedMarkups += pi to now
+                        }
+                    }
+                }
+            }
+        }
+        if (replacements.isNotEmpty()) {
+            controller.onStrokesReplaced?.invoke(replacements)
+        }
+        if (addedMarkups.isNotEmpty() || removedMarkupIds.isNotEmpty()) {
+            onMarkupsChanged?.invoke(addedMarkups, removedMarkupIds)
+        }
+        if (pushedFile) onFileContentReplaced?.invoke()
     }
 
     /** Applies a markup edit (built, not yet applied) as one undo step. */

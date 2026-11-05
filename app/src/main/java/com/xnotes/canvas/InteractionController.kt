@@ -321,7 +321,10 @@ class InteractionController(
                 continue
             }
             // Untouched in place (a preview that settled back): stay quiet.
-            if (newPage == page && StrokeFingerprint.of(live) == StrokeFingerprint.of(frozen)) continue
+            // Fingerprint covers tool/width/color/samples; also compare full
+            // config so a pure restyle (taper/pencil/highlighter/dashed)
+            // still propagates as a replacement.
+            if (newPage == page && StrokeFingerprint.of(live) == StrokeFingerprint.of(frozen) && live.config == frozen.config) continue
             removed.getOrPut(page to newPage) { ArrayList() } += frozen
             added.getOrPut(page to newPage) { ArrayList() } += live
         }

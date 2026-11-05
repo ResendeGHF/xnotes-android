@@ -34,16 +34,68 @@ object SyncWire {
             .put("color", hexColor(stroke.config.rgba))
             .put("pressure", stroke.config.pressureEnabled)
             .put("samples", samples)
+            .put("style", toWireStyle(stroke.tool, stroke.config))
+    }
+
+    /**
+     * Full stroke style for the wire (pencil/taper/highlighter/dashed/speed/
+     * calligraphy/neon). Old peers ignore the `style` object and fall back to
+     * tool defaults + width/color/pressure, so this stays backward compatible.
+     */
+    fun toWireStyle(tool: Tool, cfg: ToolConfig): JSONObject {
+        val o = JSONObject()
+        o.put("pmin", cfg.pressureMinFactor)
+        o.put("dir", cfg.directionStrength)
+        o.put("speed", cfg.speedStrength)
+        if (cfg.taperEnabled) o.put("taper", true)
+        o.put("taper_min", cfg.taperMinFactor)
+        if (cfg.neon) o.put("neon", true)
+        o.put("neon_s", cfg.neonStrength)
+        o.put("dash_l", cfg.dashLength)
+        o.put("dash_g", cfg.dashGap)
+        o.put("hl_alpha", cfg.highlighterAlpha)
+        if (cfg.highlighterInverse) o.put("hl_inv", true)
+        o.put("pencil_p", cfg.pencilPressure)
+        o.put("pencil_d", cfg.pencilDensity)
+        o.put("pencil_g", cfg.pencilGrainSize)
+        o.put("pencil_s", cfg.pencilShadeResponse)
+        // Tool id already travels alongside; defaults below fill anything missing.
+        return o
+    }
+
+    /** Rebuild a ToolConfig from a `style` object + legacy width/color/pressure. */
+    fun styleFrom(tool: Tool, width: Double, color: Rgba, pressure: Boolean, o: JSONObject?): ToolConfig {
+        val base = try {
+            com.xnotes.core.tools.ToolDefaults.configFor(tool)
+        } catch (_: Exception) {
+            ToolConfig()
+        }.copy(baseWidth = width, rgba = color, pressureEnabled = pressure)
+        if (o == null) return base
+        return base.copy(
+            pressureMinFactor = if (o.isNull("pmin")) base.pressureMinFactor else o.optDouble("pmin", base.pressureMinFactor),
+            directionStrength = if (o.isNull("dir")) base.directionStrength else o.optDouble("dir", base.directionStrength),
+            speedStrength = if (o.isNull("speed")) base.speedStrength else o.optDouble("speed", base.speedStrength),
+            taperEnabled = if (o.isNull("taper")) base.taperEnabled else o.optBoolean("taper", base.taperEnabled),
+            taperMinFactor = if (o.isNull("taper_min")) base.taperMinFactor else o.optDouble("taper_min", base.taperMinFactor),
+            neon = if (o.isNull("neon")) base.neon else o.optBoolean("neon", base.neon),
+            neonStrength = if (o.isNull("neon_s")) base.neonStrength else o.optDouble("neon_s", base.neonStrength),
+            dashLength = if (o.isNull("dash_l")) base.dashLength else o.optDouble("dash_l", base.dashLength),
+            dashGap = if (o.isNull("dash_g")) base.dashGap else o.optDouble("dash_g", base.dashGap),
+            highlighterAlpha = if (o.isNull("hl_alpha")) base.highlighterAlpha else o.optDouble("hl_alpha", base.highlighterAlpha),
+            highlighterInverse = if (o.isNull("hl_inv")) base.highlighterInverse else o.optBoolean("hl_inv", base.highlighterInverse),
+            pencilPressure = if (o.isNull("pencil_p")) base.pencilPressure else o.optDouble("pencil_p", base.pencilPressure),
+            pencilDensity = if (o.isNull("pencil_d")) base.pencilDensity else o.optDouble("pencil_d", base.pencilDensity),
+            pencilGrainSize = if (o.isNull("pencil_g")) base.pencilGrainSize else o.optDouble("pencil_g", base.pencilGrainSize),
+            pencilShadeResponse = if (o.isNull("pencil_s")) base.pencilShadeResponse else o.optDouble("pencil_s", base.pencilShadeResponse),
+        )
     }
 
     fun toNative(o: JSONObject): Stroke? {
         val tool = Tool.fromId(o.optString("tool")) ?: return null
         val color = RemoteLiveStrokes.parseColor(o.optString("color")) ?: return null
-        val cfg = ToolConfig(
-            baseWidth = o.optDouble("width", 3.0),
-            rgba = color,
-            pressureEnabled = o.optBoolean("pressure", true),
-        )
+        val width = o.optDouble("width", 3.0)
+        val pressure = o.optBoolean("pressure", true)
+        val cfg = styleFrom(tool, width, color, pressure, o.optJSONObject("style"))
         val samples = ArrayList<Sample>()
         val arr = o.optJSONArray("samples") ?: JSONArray()
         for (i in 0 until arr.length()) {

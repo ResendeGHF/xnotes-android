@@ -383,8 +383,8 @@ class GuestEngine(
         val uri = cacheUri
         if (uri != null) host.openDocument(uri)?.let { doc ->
             val pg = doc.pages.getOrNull(page) ?: return false
-            if (pg.markups.any { it.id == m.id }) return false
-            pg.markups = pg.markups + m
+            // Upsert (same-id recolor/retype converges; see HostEngine).
+            pg.markups = pg.markups.filter { it.id != m.id } + m
             doc.dirty = true
             host.editorState(uri)?.rebakeBackground(pg, listOf(m))
             host.repaintDocument(uri)
@@ -392,8 +392,7 @@ class GuestEngine(
         }
         return modifyCache(file) { doc ->
             val pg = doc.pages.getOrNull(page) ?: return@modifyCache false
-            if (pg.markups.any { it.id == m.id }) return@modifyCache false
-            pg.markups = pg.markups + m
+            pg.markups = pg.markups.filter { it.id != m.id } + m
             true
         }
     }
@@ -733,15 +732,19 @@ class GuestEngine(
         val samples = msg.optJSONArray("samples") ?: JSONArray()
         if (samples.length() == 0 && !msg.optBoolean("done", false)) return
         val color = RemoteLiveStrokes.parseColor(msg.optString("color")) ?: return
+        val tool = com.xnotes.core.tools.Tool.fromId(msg.optString("tool")) ?: com.xnotes.core.tools.Tool.PEN
+        val cfg = SyncWire.styleFrom(tool, msg.optDouble("width", 3.0), color, true, msg.optJSONObject("style"))
         val pts = ArrayList<com.xnotes.core.geometry.Pt>(samples.length())
+        val pressures = ArrayList<Double>(samples.length())
         for (i in 0 until samples.length()) {
             val s = samples.optJSONArray(i) ?: continue
             if (s.length() < 2) continue
             pts += com.xnotes.core.geometry.Pt(s.optDouble(0), s.optDouble(1))
+            pressures += if (s.length() > 2) s.optDouble(2, 1.0) else 1.0
         }
         val page = msg.optInt("page", 0)
         if (page !in doc.pages.indices) return
-        overlay.update(file, page, msg.optString("stroke_id"), msg.optDouble("width", 3.0), color, pts, msg.optBoolean("done", false))
+        overlay.updateFull(file, page, msg.optString("stroke_id"), tool, cfg, pts, pressures, msg.optBoolean("done", false))
         host.repaintLive(uri)
     }
 
@@ -782,11 +785,12 @@ class GuestEngine(
     ) {
         val file = remoteIdOf(cacheUri) ?: return
         val ops = JSONArray()
-        for ((page, m) in added) {
-            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
-        }
+        // Removes first (same-id recolor/retype converges; see HostEngine).
         for ((page, ids) in removedIds.groupBy({ it.first }, { it.second })) {
             ops.put(JSONObject().put("op", "remove_markup").put("page", page).put("ids", JSONArray(ids)))
+        }
+        for ((page, m) in added) {
+            ops.put(JSONObject().put("op", "add_markup").put("page", page).put("markup", SyncWire.toWireMarkup(m)))
         }
         if (ops.length() == 0) return
         submitLocalOps(file, ops, dedupe)
@@ -944,23 +948,23 @@ class GuestEngine(
         }
     }
 
-    fun liveSample(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String, x: Double, y: Double, p: Double) {
+    fun liveSample(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String, x: Double, y: Double, p: Double, style: JSONObject? = null) {
         val file = remoteIdOf(cacheUri) ?: return
         val samples = JSONArray().put(JSONArray().put(x).put(y).put(p))
-        send(
-            JSONObject().put("t", "live").put("file", file).put("page", page)
-                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
-                .put("samples", samples).put("done", false),
-        )
+        val msg = JSONObject().put("t", "live").put("file", file).put("page", page)
+            .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+            .put("samples", samples).put("done", false)
+        if (style != null) msg.put("style", style)
+        send(msg)
     }
 
-    fun finishStroke(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String) {
+    fun finishStroke(cacheUri: String, page: Int, strokeId: String, tool: String, width: Double, color: String, style: JSONObject? = null) {
         val file = remoteIdOf(cacheUri) ?: return
-        send(
-            JSONObject().put("t", "live").put("file", file).put("page", page)
-                .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
-                .put("samples", JSONArray()).put("done", true),
-        )
+        val msg = JSONObject().put("t", "live").put("file", file).put("page", page)
+            .put("stroke_id", strokeId).put("tool", tool).put("width", width).put("color", color)
+            .put("samples", JSONArray()).put("done", true)
+        if (style != null) msg.put("style", style)
+        send(msg)
     }
 
     fun roomPreview(cacheUri: String, page: Int, liveId: String, sideways: Boolean, split: Double, resume: Double, shift: Double) {
@@ -1021,6 +1025,18 @@ class GuestEngine(
 
     /** Cache URI currently bound to [remoteId], if any. */
     fun boundUri(remoteId: String): String? = synchronized(lock) { bound[remoteId] }
+
+    /**
+     * Display name for a guest cache URI: "External - {inherited name}".
+     * The inherited name is the host's shared path basename, so a guest tab
+     * never shows an empty or hash title.
+     */
+    fun displayNameForCache(cacheUri: String): String? = synchronized(lock) {
+        val remoteId = bound.entries.firstOrNull { it.value == cacheUri }?.key ?: return null
+        val path = index[remoteId]?.path?.takeIf { it.isNotEmpty() } ?: remoteId
+        val base = path.substringAfterLast('/').ifEmpty { "note" }
+        "External - $base"
+    }
 
     private data class Meta(val version: Long, val path: String)
 
