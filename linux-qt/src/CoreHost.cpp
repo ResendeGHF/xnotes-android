@@ -5,6 +5,7 @@
 
 #include <QCoreApplication>
 #include <QFontMetricsF>
+#include <QMap>
 #include <QPdfDocument>
 #include <QImageReader>
 #include <QMutex>
@@ -214,16 +215,16 @@ void rFillEllipse(void* r, double cx, double cy, double rx, double ry, xn_rgba c
  * disc inside the stroke is left out where the quads on either side already cover it, which is
  * where the stroke barely turns and its width barely changes.
  */
-void rFillDiskRibbon(void* r, const float* centers, const float* radii, int from, int count, xn_rgba c) {
-    if (count <= 0) return;
-    QPainter* p = P(r);
-    const QTransform& t = p->deviceTransform();
-    const double scale = std::sqrt(std::abs(t.m11() * t.m22() - t.m12() * t.m21()));
+/* Union of the ribbon pieces over [from, from+count): quads bridging consecutive discs plus
+ * round discs where the quads leave gaps (ends when capped, hard turns, width steps).
+ * Every piece winds the same way, or the overlaps would cancel into holes. */
+void addRibbonUnion(QPainterPath& path, const float* centers, const float* radii,
+                    int from, int count, double scale,
+                    bool capStart, bool capEnd, bool endJoin) {
     const int end = from + count;
     auto x = [&](int i) { return double(centers[2 * i]); };
     auto y = [&](int i) { return double(centers[2 * i + 1]); };
 
-    QPainterPath path;
     path.setFillRule(Qt::WindingFill);
     QPolygonF quad(4);
     for (int i = from; i + 1 < end; i++) {
@@ -243,7 +244,8 @@ void rFillDiskRibbon(void* r, const float* centers, const float* radii, int from
 
     /* Whether the quads around point i leave a visible gap that only its disc fills. */
     auto discNeeded = [&](int i) {
-        if (i == from || i == end - 1) return true;  // the round ends
+        if (i == from) return capStart;  // the round start
+        if (i == end - 1) return capEnd || endJoin;  // the round end / seam join
         const double ax = x(i) - x(i - 1), ay = y(i) - y(i - 1), bx = x(i + 1) - x(i), by = y(i + 1) - y(i);
         const double la = std::hypot(ax, ay), lb = std::hypot(bx, by);
         const double rad = radii[i];
@@ -270,7 +272,90 @@ void rFillDiskRibbon(void* r, const float* centers, const float* radii, int from
         path.addPolygon(disc);
         path.closeSubpath();
     }
+}
+
+void rFillDiskRibbon(void* r, const float* centers, const float* radii, int from, int count, xn_rgba c) {
+    if (count <= 0) return;
+    QPainter* p = P(r);
+    const QTransform& t = p->deviceTransform();
+    const double scale = std::sqrt(std::abs(t.m11() * t.m22() - t.m12() * t.m21()));
+    QPainterPath path;
+    addRibbonUnion(path, centers, radii, from, count, scale, true, true, false);
     p->fillPath(path, toColor(c));
+}
+
+/* Pencil stipple tiles keyed by (density step, grain colour): generated once from the
+ * shared fixed-seed field (same bits as Android), then reused as a repeating brush. */
+struct PencilTileKey {
+    int density;
+    uint32_t rgb;
+    bool operator<(const PencilTileKey& o) const {
+        return density < o.density || (density == o.density && rgb < o.rgb);
+    }
+};
+QMap<PencilTileKey, QImage>& pencilTiles() {
+    static QMap<PencilTileKey, QImage> tiles;
+    return tiles;
+}
+
+QImage pencilTile(int densityKey, const QColor& grain) {
+    densityKey = std::clamp(densityKey, 0, 20);
+    const uint32_t rgb = (uint32_t(grain.red()) << 16) | (uint32_t(grain.green()) << 8) | uint32_t(grain.blue());
+    const PencilTileKey key{densityKey, rgb};
+    auto& tiles = pencilTiles();
+    auto it = tiles.find(key);
+    if (it != tiles.end()) return it.value();
+    if (tiles.size() > 256) tiles.clear();
+    static uint32_t mask[256 * 256];
+    int len = 256 * 256;
+    QImage img(256, 256, QImage::Format_ARGB32);
+    if (xn_pencil_tile(densityKey, mask, &len) && len == 256 * 256) {
+        const uint32_t g = (0xFFu << 24) | rgb;
+        for (int i = 0; i < 256 * 256; i++)
+            img.setPixel(i % 256, i / 256, mask[i] ? g : 0x00000000u);
+    } else {
+        img.fill(grain);
+    }
+    tiles.insert(key, img);
+    return img;
+}
+
+void rFillRibbonUnion(void* r, const float* centers, const float* radii, int from, int count,
+                      xn_rgba c, int overwrite, int endJoin, int capStart, int capEnd,
+                      double ox, double oy, double density, double shade, double grainSize) {
+    if (count <= 0) return;
+    QPainter* p = P(r);
+    const QTransform& t = p->deviceTransform();
+    const double scale = std::sqrt(std::abs(t.m11() * t.m22() - t.m12() * t.m21()));
+    QPainterPath path;
+    addRibbonUnion(path, centers, radii, from, count, scale, capStart != 0, capEnd != 0, endJoin != 0);
+    if (path.isEmpty()) return;
+    const QColor ink = toColor(c);
+    // Grain colour: shade mixes the ink toward white (1 = full ink).
+    const double sh = std::clamp(shade, 0.0, 1.0);
+    const QColor grain(
+        int(255 + (ink.red() - 255) * sh),
+        int(255 + (ink.green() - 255) * sh),
+        int(255 + (ink.blue() - 255) * sh));
+    const int dkey = std::clamp(int(std::round(std::clamp(density, 0.0, 1.0) * 20.0)), 0, 20);
+    const QImage tile = pencilTile(dkey, grain);
+    // 256 tile px span 40*grainSize content px: map image px to device px through the
+    // live transform so the tooth stays put at any zoom or page turn.
+    const double spanContent = 40.0 * std::max(0.1, grainSize);
+    const double spanDev = spanContent * scale;
+    const QPointF o0 = t.map(QPointF(0, 0));
+    const QPointF o1 = t.map(QPointF(ox, oy));
+    QBrush brush(tile);
+    QTransform bt;
+    bt.translate(o1.x() - o0.x(), o1.y() - o0.y());
+    bt.scale(spanDev / 256.0, spanDev / 256.0);
+    brush.setTransform(bt);
+    p->save();
+    if (overwrite) p->setCompositionMode(QPainter::CompositionMode_Source);
+    p->setBrush(brush);
+    p->setPen(Qt::NoPen);
+    p->fillPath(path, brush);
+    p->restore();
 }
 
 void rStrokePolyline(void* r, const double* xy, int n, int closed, const xn_pen* pen) {
@@ -403,7 +488,7 @@ void rDrawTextRun(void* r, const uint16_t* text, int len, double x, double basel
 
 const xn_renderer_vt kVtable = {
     rSave, rRestore, rSaveLayer, rTranslate, rScale, rRotate, rClipRect, rClipPolygon, rClear,
-    rFillRect, rFillPolygon, rFillEllipse, rFillDiskRibbon,
+    rFillRect, rFillPolygon, rFillEllipse, rFillDiskRibbon, rFillRibbonUnion,
     rStrokePolyline, rStrokeRect, rStrokeEllipse,
     rDrawSurface, rDrawImage, rDrawText, rDrawTextRun,
 };

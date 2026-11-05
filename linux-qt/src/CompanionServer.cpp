@@ -316,6 +316,7 @@ void CompanionServer::onTick() {
 
 void CompanionServer::sendThunk(void* ctx, const uint8_t* data, int len) {
     auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self) return;
     if (self->socket_ && data && len > 0) {
         self->socket_->write(reinterpret_cast<const char*>(data), len);
     }
@@ -323,11 +324,13 @@ void CompanionServer::sendThunk(void* ctx, const uint8_t* data, int len) {
 
 void CompanionServer::pairRequestThunk(void* ctx, const char* device, const char* fp) {
     auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !device || !fp) return;
     emit self->pairRequested(QString::fromUtf8(device), QString::fromUtf8(fp));
 }
 
 void CompanionServer::pairedThunk(void* ctx, const char* device) {
     auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !device) return;
     emit self->paired(QString::fromUtf8(device));
 }
 
@@ -336,15 +339,21 @@ void CompanionServer::indexChangedThunk(void* ctx) {
 }
 
 void CompanionServer::fileChangedThunk(void* ctx, const char* id) {
-    emit static_cast<CompanionServer*>(ctx)->fileReady(QString::fromUtf8(id));
+    auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !id) return;
+    emit self->fileReady(QString::fromUtf8(id));
 }
 
 void CompanionServer::fileGoneThunk(void* ctx, const char* id) {
-    emit static_cast<CompanionServer*>(ctx)->fileGone(QString::fromUtf8(id));
+    auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !id) return;
+    emit self->fileGone(QString::fromUtf8(id));
 }
 
 void CompanionServer::resyncThunk(void* ctx, const char* id, long long version) {
-    emit static_cast<CompanionServer*>(ctx)->resync(QString::fromUtf8(id), version);
+    auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !id) return;
+    emit self->resync(QString::fromUtf8(id), version);
 }
 
 void CompanionServer::liveDirtyThunk(void* ctx) {
@@ -363,7 +372,8 @@ void CompanionServer::createResultThunk(void* ctx, int ok, const char* id, const
 
 void CompanionServer::errorThunk(void* ctx, const char* reason) {
     auto* self = static_cast<CompanionServer*>(ctx);
-    emit self->error(QString::fromUtf8(reason));
+    if (!self) return;
+    emit self->error(reason ? QString::fromUtf8(reason) : QStringLiteral("sync error"));
 }
 
 }  // namespace xn

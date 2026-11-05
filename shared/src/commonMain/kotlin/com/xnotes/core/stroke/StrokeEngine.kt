@@ -594,6 +594,7 @@ object StrokeEngine {
             return StrokeGeometry(
                 floatArrayOf(sx[0].toFloat(), sy[0].toFloat()),
                 floatArrayOf(h.toFloat()),
+                pressures = floatArrayOf(sp[0].toFloat()),
             )
         }
 
@@ -676,7 +677,8 @@ object StrokeEngine {
             if (tf != null) h *= tf[i]
             writePoint(centerline, halfWidths, leftRail, rightRail, i, sx[i], sy[i], tx[i], ty[i], h)
         }
-        return StrokeGeometry(centerline, halfWidths, leftRail, rightRail)
+        val pressures = FloatArray(n) { sp[it].toFloat() }
+        return StrokeGeometry(centerline, halfWidths, leftRail, rightRail, pressures)
     }
 
     /**

@@ -163,6 +163,31 @@ sealed interface SyncMsg {
         val last: Boolean,
     ) : SyncMsg
 
+    /**
+     * One chunk of a recording's encoded bytes, keyed by [audioId]. Chunks precede
+     * the `add_audio` op on the wire; the op applies once all bytes are in.
+     */
+    data class AudioChunk(
+        override val seq: Int,
+        val file: String,
+        val audioId: String,
+        val total: Long,
+        val offset: Long,
+        val data: String,
+        val last: Boolean,
+    ) : SyncMsg
+
+    /** One chunk of a recording's waveform peaks for [audioId] (same framing as audio bytes). */
+    data class AudioPeaks(
+        override val seq: Int,
+        val file: String,
+        val audioId: String,
+        val total: Long,
+        val offset: Long,
+        val data: String,
+        val last: Boolean,
+    ) : SyncMsg
+
     data class Op(
         override val seq: Int,
         val file: String,

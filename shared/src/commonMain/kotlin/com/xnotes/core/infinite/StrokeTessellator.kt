@@ -1,10 +1,12 @@
 package com.xnotes.core.infinite
 
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.stroke.PencilStyle
 import com.xnotes.core.stroke.RibbonPoints
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.hypot
+import kotlin.math.pow
 
 /**
  * A triangle mesh in content space. Positions are doubles because the canvas is unbounded: a float
@@ -256,4 +258,76 @@ object StrokeTessellator {
     private fun estimateVertices(n: Int): Int = 2 * n + 2 * (MIN_CIRCLE_SEGMENTS + 2) + 16
 
     private fun estimateIndices(n: Int): Int = 6 * maxOf(0, n - 1) + 6 * (MIN_CIRCLE_SEGMENTS + 2) + 48
+
+    // --- pencil graphite: pressure→density/shade maps shared with the paged
+    // renderers, so every side shades the same graphite for the same hand ---
+
+    /**
+     * Graphite DENSITY for smoothed stylus pressure [p] in `[0, 1]`, drawn
+     * with [style]: the fraction of pixels that carry opaque graphite. Never
+     * 1: paper always shows through somewhere, like real graphite.
+     */
+    fun pencilDensity(p: Double, style: PencilStyle): Double =
+        pencilDensityFor(pencilEffectivePressure(p, style.pressure), style.density)
+
+    /** Effective pressure: sensitivity gain applied, NaN-proofed, clamped.
+     *  A zero (or negative) gain means "no response": pressure always reads
+     *  maximum, so the stroke keeps its darkest shade and density everywhere. */
+    fun pencilEffectivePressure(p: Double, gain: Double): Double {
+        if (gain <= 0.0) return 1.0
+        val c = if (p.isNaN()) 0.0 else p.coerceIn(0.0, 1.0)
+        return (c * gain).coerceIn(0.0, 1.0)
+    }
+
+    /** Density map over effective pressure, scaled and capped below solid. */
+    fun pencilDensityFor(pe: Double, scale: Double): Double =
+        ((PENCIL_DENSITY_BASE + PENCIL_DENSITY_SPAN * pe.pow(PENCIL_DENSITY_GAMMA)) * scale)
+            .coerceIn(0.0, PENCIL_DENSITY_MAX)
+
+    /** Density map intercept: graphite density at zero pressure. */
+    const val PENCIL_DENSITY_BASE = 0.55
+
+    /** Density map slope: additional density at full pressure. */
+    const val PENCIL_DENSITY_SPAN = 0.33
+
+    /** Density map gamma: lifts mid pressure toward solid. */
+    const val PENCIL_DENSITY_GAMMA = 0.7
+
+    /** Hard ceiling: graphite is never fully solid, always noise. */
+    const val PENCIL_DENSITY_MAX = 0.97
+
+    /**
+     * Grain SHADE for smoothed stylus pressure [p], drawn with [style]: light
+     * pressure leaves light-grey grains, hard pressure dark graphite ones — a
+     * gradient mapping over pressure, never translucency.
+     */
+    fun pencilShade(p: Double, style: PencilStyle): Double =
+        pencilShadeFor(pencilEffectivePressure(p, style.pressure), style.shadeResponse)
+
+    /** Shade map over effective pressure with an explicit response. */
+    fun pencilShadeFor(pe: Double, response: Double): Double =
+        (PENCIL_SHADE_BASE + (PENCIL_SHADE_SPAN * pe.pow(PENCIL_SHADE_GAMMA)) * response)
+            .coerceIn(0.0, 1.0)
+
+    /** Shade map intercept: grain colour mix at zero pressure. */
+    const val PENCIL_SHADE_BASE = 0.45
+
+    /** Shade map slope: additional mix at full pressure. */
+    const val PENCIL_SHADE_SPAN = 0.55
+
+    /** Shade map gamma: lifts mid pressure toward full ink. */
+    const val PENCIL_SHADE_GAMMA = 0.7
+
+    /** Pressure bands: graphite quantizes effective pressure into these, so
+     *  every band fills from one pre-thresholded tile at one shade. */
+    const val PENCIL_BANDS = 12
+
+    fun pencilBandOf(p: Double, gain: Double): Int =
+        (pencilEffectivePressure(p, gain) * PENCIL_BANDS).toInt().coerceIn(0, PENCIL_BANDS - 1)
+
+    fun pencilBandDensity(band: Int, scale: Double): Double =
+        pencilDensityFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, scale)
+
+    fun pencilBandShade(band: Int, response: Double): Double =
+        pencilShadeFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, response)
 }

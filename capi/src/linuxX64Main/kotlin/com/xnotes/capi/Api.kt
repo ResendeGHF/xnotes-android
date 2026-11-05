@@ -425,6 +425,8 @@ internal class CEditor(note: CNote, private val host: xn_host) {
     ) -> Unit)? = null
     private val scheduler = CScheduler(host)
     val history = History()
+    /** Text layout for constructed items (text/audio pills). */
+    val measurer = CTextMeasurer(host)
     private var palette: ChromePalette = ChromePalette.DARK
     private val surfaces = CSurfaceFactory(host)
     val state = CanvasState(note.document, surfaces, palette)
@@ -1373,6 +1375,10 @@ fun xnEditorPenStyle(editor: COpaquePointer?, toolId: String?, out: CPointer<xn_
     o.tip = c.taperMinFactor * 100.0
     o.dash = c.dashLength
     o.gap = c.dashGap
+    o.pencil_pressure = c.pencilPressure
+    o.pencil_density = c.pencilDensity
+    o.pencil_grain = c.pencilGrainSize
+    o.pencil_shade = c.pencilShadeResponse
     1
 }
 
@@ -1390,6 +1396,14 @@ fun xnEditorSetPenStyle(editor: COpaquePointer?, toolId: String?, style: CPointe
         taperMinFactor = if (tool == Tool.TAPER) s.tip.coerceIn(0.0, 100.0) / 100.0 else c.taperMinFactor,
         dashLength = if (tool == Tool.DASHED) s.dash.coerceIn(2.0, 40.0) else c.dashLength,
         dashGap = if (tool == Tool.DASHED) s.gap.coerceIn(2.0, 40.0) else c.dashGap,
+        pencilPressure = if (tool == Tool.PENCIL) s.pencil_pressure.coerceIn(
+            ToolConfig.PENCIL_PRESSURE_MIN, ToolConfig.PENCIL_PRESSURE_MAX) else c.pencilPressure,
+        pencilDensity = if (tool == Tool.PENCIL) s.pencil_density.coerceIn(
+            ToolConfig.PENCIL_DENSITY_MIN, ToolConfig.PENCIL_DENSITY_MAX) else c.pencilDensity,
+        pencilGrainSize = if (tool == Tool.PENCIL) s.pencil_grain.coerceIn(
+            ToolConfig.PENCIL_GRAIN_SIZE_MIN, ToolConfig.PENCIL_GRAIN_SIZE_MAX) else c.pencilGrainSize,
+        pencilShadeResponse = if (tool == Tool.PENCIL) s.pencil_shade.coerceIn(
+            ToolConfig.PENCIL_SHADE_RESPONSE_MIN, ToolConfig.PENCIL_SHADE_RESPONSE_MAX) else c.pencilShadeResponse,
     ))
 }
 
@@ -1781,6 +1795,30 @@ fun xnSyncPinCount(sync: COpaquePointer?): Int = guard(0) {
 @CName("xn_sync_pin_name")
 fun xnSyncPinName(sync: COpaquePointer?, index: Int): CPointer<ByteVar>? = guard(null) {
     sync!!.sync().engine.pins().getOrNull(index)?.let { strdup(it.name) }
+}
+
+/**
+ * Pencil grain tile for `density_key` (0..20): writes 256x256 ARGB px
+ * (0xFFFFFFFF graphite, 0x00000000 paper) into `out`, or reports the count
+ * through `inout_len` when `out` is null. Same fixed-seed shared field as
+ * every renderer, so the tooth matches Android's exactly.
+ */
+@CName("xn_pencil_tile")
+fun xnPencilTile(densityKey: Int, out: CPointer<UIntVar>?, inoutLen: CPointer<IntVar>?): Int = guard(0) {
+    val mask = com.xnotes.core.stroke.PencilField.stippleMask(densityKey / 20.0)
+    require(mask.size == 256 * 256) { "bad tile" }
+    if (out == null || inoutLen == null) {
+        inoutLen?.set(0, mask.size)
+        return@guard 0
+    }
+    val want = inoutLen[0]
+    if (want < mask.size) {
+        inoutLen[0] = mask.size
+        return@guard 0
+    }
+    for (i in mask.indices) out[i] = if (mask[i]) 0xFFFFFFFFu else 0u
+    inoutLen[0] = mask.size
+    1
 }
 
 @CName("xn_sync_pair_begin")

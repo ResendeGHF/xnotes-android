@@ -3,6 +3,7 @@ package com.xnotes.core.tools
 /** The tool set (spec 04 §1). */
 enum class Tool(val id: String) {
     PEN("pen"),
+    PENCIL("pencil"),
     DASHED("dashed"),
     CALLIGRAPHY("calligraphy"),
     SPEED("speed"),
@@ -25,7 +26,7 @@ enum class Tool(val id: String) {
     INSERT_SPACE("insert_space");
 
     /** Tools that produce ink via the stroke engine. */
-    val isStroke: Boolean get() = this == PEN || this == DASHED || this == CALLIGRAPHY ||
+    val isStroke: Boolean get() = this == PEN || this == PENCIL || this == DASHED || this == CALLIGRAPHY ||
         this == SPEED || this == TAPER || this == HIGHLIGHTER
 
     /**
@@ -48,6 +49,6 @@ enum class Tool(val id: String) {
         val DEFAULT = PAN
 
         /** Quick-tool-wheel order (spec 06 §11 / 10 §7). */
-        val wheelOrder = listOf(PEN, DASHED, CALLIGRAPHY, SPEED, TAPER, HIGHLIGHTER, ERASER, SELECT, LASSO, INSERT_SPACE, SCREENSHOT, SHAPE, TEXT, MARKUP, PAN)
+        val wheelOrder = listOf(PEN, PENCIL, DASHED, CALLIGRAPHY, SPEED, TAPER, HIGHLIGHTER, ERASER, SELECT, LASSO, INSERT_SPACE, SCREENSHOT, SHAPE, TEXT, MARKUP, PAN)
     }
 }

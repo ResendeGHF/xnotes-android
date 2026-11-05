@@ -71,6 +71,7 @@ const ToolEntry kTools[] = {
 /* Kinds of pen (the Android stroke tools), drawn by the pen button. */
 const ToolEntry kPens[] = {
     {"pen", "Pen", "", "ic_stroke_regular"},
+    {"pencil", "Pencil", "", "ic_stroke_pencil"},
     {"dashed", "Dashed", "", "ic_stroke_dashed"},
     {"calligraphy", "Calligraphy", "", "ic_stroke_calligraphy"},
     {"speed", "Speed", "", "ic_stroke_speed"},
@@ -213,6 +214,13 @@ MainWindow::MainWindow() {
 }
 
 MainWindow::~MainWindow() {
+    // Unbind before the editor is torn down: the sync bridge must never hold
+    // a destroyed editor (a late live frame would then use-after-free it).
+    if (!boundFileId_.isEmpty() && canvas_->editor()) {
+        companion_->closeFile(boundFileId_);
+        companion_->unbindEditor(canvas_->editor());
+        boundFileId_.clear();
+    }
     pages_->setDocument(nullptr, nullptr);
     canvas_->setNote(nullptr);
     if (note_) xn_note_close(note_);

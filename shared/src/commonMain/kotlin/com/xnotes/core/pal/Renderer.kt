@@ -175,6 +175,52 @@ interface Renderer {
         for (i in from until end) if (radii[i] > 0f) fillCircle(pt(i), radii[i].toDouble(), color)
     }
 
+    /**
+     * Fill one graphite band of a pencil run as the union of its ribbon
+     * pieces (discs + bridging quads), tinted by [shade] (1 = full ink, lower
+     * mixes toward white) and stippled from the shared grain field at
+     * [density]. [overwrite]: draw replacing instead of compositing, so bands
+     * crossing at a fold never darken. [endJoin]: the run's last station turns
+     * hard, so it gets its own join disc. [ox]/[oy] shift the sampled grain
+     * into page space without moving anything. [grainSize] scales the tile.
+     * Backends without stipple tiles fold [density]/[shade] into the fill
+     * alpha (a print-safe average of the same tooth). The default fills piece
+     * by piece (a flat fallback).
+     */
+    fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float = 1f,
+        capStart: Boolean = true,
+        capEnd: Boolean = true,
+        overwrite: Boolean = false,
+        endJoin: Boolean = false,
+        ox: Double = 0.0,
+        oy: Double = 0.0,
+        density: Double = 1.0,
+        shade: Double = 1.0,
+        grainSize: Double = 1.0,
+    ) {
+        if (count <= 0) return
+        fun pt(i: Int) = Pt(centers[2 * i].toDouble(), centers[2 * i + 1].toDouble())
+        fun r(i: Int) = radii[i].toDouble() * radiusScale
+        val end = from + count
+        if (count == 1) {
+            if ((capStart || capEnd) && r(from) > 0.0) fillCircle(pt(from), r(from), color)
+            return
+        }
+        for (i in from until end - 1) {
+            if (r(i) <= 0.0 && r(i + 1) <= 0.0) continue
+            val q = Geometry.ribbonQuad(pt(i), r(i), pt(i + 1), r(i + 1))
+            if (q.size >= 3) fillPolygon(q, color, FillRule.NONZERO)
+        }
+        if (capStart && r(from) > 0.0) fillCircle(pt(from), r(from), color)
+        if (capEnd && r(end - 1) > 0.0) fillCircle(pt(end - 1), r(end - 1), color)
+    }
+
     // --- outlines (cosmetic for chrome, page-space for shapes) ---
     fun strokeRect(rect: Rect, pen: Pen)
     fun strokePolyline(points: List<Pt>, pen: Pen)
@@ -317,3 +363,6 @@ private const val PATH_FALLBACK_TOLERANCE = 0.1
 /** Packed interleaved x,y → [Pt] list, for the default (non-hot) packed-primitive fallbacks. */
 private fun unpackPts(pts: FloatArray): List<Pt> =
     List(pts.size / 2) { Pt(pts[2 * it].toDouble(), pts[2 * it + 1].toDouble()) }
+
+/** Turn angle past which a ribbon run earns its own join disc. Mirrors the paged renderers. */
+const val RIBBON_JOIN_DISC_ANGLE = 0.18

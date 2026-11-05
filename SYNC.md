@@ -100,10 +100,15 @@ never the name.
   committed batch). Companion caches `(id -> version, bytes)`.
 - Fetch: `C -> S fetch {id, offset?, length?}` / `S -> C file {id, version,
   total, offset, data(base64), last?}`. Chunked (256 KiB) so big PDFs stream.
-- Images ride the same chunking as their own message: `image_data {file,
+ - Images ride the same chunking as their own message: `image_data {file,
   image_id, total, offset, data(base64), last?}` (256 KiB), sent before the
   `add_image` op that keys off `image_id`. Receivers hold the op until the
   last chunk lands (bounded), then materialize the file and place the item.
+- Audio rides two chunk streams: `audio_data {file, audio_id, total, offset,
+  data(base64), last?}` for the encoded recording and `audio_peaks` with the
+  same shape for its waveform bins. Either may arrive first; the op applies
+  when the bytes are complete, patching in late peaks. Empty (zero-byte)
+  bodies are legal and apply at once.
 - Changes ops cannot carry (a joined PDF, a cover page) go as a whole-file
   `file` push from the side that made them: current bytes (live document
   when open), head bumped once, index delta alongside. The far side replaces
@@ -180,7 +185,9 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   (same points, new style) are detected via full-config compare and replay
   as erase+add, so they propagate despite identical fingerprints.
 - `erase_strokes {page, ids:[fingerprint...]}`: exact fingerprint match applies;
-  no match = no-op (never an error).
+  no match = no-op (never an error). Strokes recorded during audio carry a
+  `sync:{rid, ms}` moment each; the mark rides the wire but never enters the
+  fingerprint, so old peers match the same ink.
 - `add_page {index, width, height}`: insert a blank page at `index` (page px
   sizes from the sender's page); out-of-range clamps. `remove_page {index}`:
   remove the page at `index`; no-op when it would empty the note or is out of
@@ -191,10 +198,34 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   strip `a` to `b`. Both sides re-execute the same deterministic cut
   (same base version ⇒ same result); no-op when the page or room is gone.
 - `add_image {page, image_id, width, height, rect:[x,y,w,h], orientation,
-  angle, flip_x?, flip_y?, part?}`: place an image on `page`. The bytes travel
-  first as `image_data` chunks (below); the op applies once they are in, and
-  waits for them when they are still in flight. Eraser-protected images are
-  never erased; select-delete of any non-stroke item is not synced in v1.
+  angle, flip_x?, flip_y?, part?, uid?}`: place an image on `page` (upserted
+  by `uid`, falling back to `image_id` from old peers). The bytes travel first
+  as `image_data` chunks (below); the op applies once they are in, and waits
+  for them when they are still in flight. `remove_image {page, ids:[uid...]}`
+  takes images off. Moves and restyles re-send the same `image_id` with the
+  new geometry (an upsert), so no new wire type is needed.
+- `add_text {page, text:{uid, x, y, width, height, text, color, point_size,
+  face, bold?, italic?, underline?, strike?, align?, math?, link?}}`: place or
+  update a text box (upserted by stable `uid`). `remove_text {page, ids:[uid...]}`
+  takes boxes off. Colors are `#rrggbb` or `#rrggbbaa`.
+- `add_table {page, table:{uid, x, y, w, h, cols:[...], rows:[...],
+  stroke_color, stroke_width, cells:[[text...]], link?}}`: place or update a
+  table (upserted by stable `uid`). `remove_table {page, ids:[uid...]}` takes
+  tables off. Cell edits send the whole grid; the receiver replaces it.
+- `add_audio {page, audio:{audio_id, uid, page, x, y, w, h, name, rid, ext,
+  duration_ms}}`: place an audio pill (upserted by stable `uid`, falling back
+  to `audio_id` from old peers). The encoded bytes travel first as
+  `audio_data` chunks and the waveform as `audio_peaks` chunks (below); the op
+  applies once the bytes are in (peaks may arrive later and patch the pill).
+  `remove_audio {page, ids:[uid...]}` takes pills off. Each side plays its own
+  copy: playback position is never synced, so replays stay user-independent.
+- Item identity: text/table/image/audio carry a stable `uid`, assigned at
+  creation and persisted in the file. Items that predate uids derive one
+  deterministically from kind, page, index and content (`legacy-` + 16 hex),
+  so every peer that reads the same bytes derives the same id and a
+  remove-by-uid converges. Unknown op names are skipped *without* failing the
+  batch, but a peer that cannot apply a known op must refetch the file (see
+  `resync` below) rather than ack-and-diverge.
 - `add_markup {page, markup:{id, type, color, intensity, quads:[[l,t,r,b,q]...],
   text, note?, link?, created, modified}}`: mark PDF text (`type` is
   `highlight|underline|strikeout|squiggly|note_link`; `color` is `#rrggbb`,
@@ -214,14 +245,23 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
 - Selection move/resize/rotate/restyle/delete and area-erase splits replay as
   plain `erase_strokes` + `add_stroke` in one batch (pre-change fingerprints,
   post-change strokes), so every peer converges with no new wire type.
-  Strokes only; non-stroke items are untouched by selection sync.
+  Strokes only; text/table/image/audio selections replay as remove + add of
+  their uid-keyed snapshots through the ops above.
   Unknown op names are skipped with a log.
 - Undo/redo propagate as inverse committed ops (no new wire type): strokes
   replay as erase+add replacements (fingerprint+config diff), markups as
-  remove+add, pages as add/remove; text/table/image/shape undos fall back to
-  a debounced full-file push. Remote applies bypass undo, so this is the
-  only path by which an undo converges. Guest cache tabs show
+  remove+add, pages as add/remove, text/table/image/audio as remove+add of
+  their uid-keyed snapshots (the undo diff upserts changed items and removes
+  missing ones). Anything without a wire form (shapes, tape, labels, sticky
+  notes, groups, page order) still converges via debounced full-file push on
+  the host side. Remote applies bypass undo, so this is the only path by
+  which an undo converges. Guest cache tabs show
   `External - {inherited name}`, never empty.
+- Forward compatibility: unknown op *names* decode to no-ops and never break
+  their batch (known siblings still apply). A peer that cannot apply a known
+  op (e.g. a pill whose model it lacks) must refetch the file instead of
+  acking and diverging: the next commit's base then misses and the host
+  answers `resync`, which reloads the whole file.
 
 Undo of a remote op is local-only (undo removes what *you* committed; a
 companion undo sends a compensating op, e.g. `erase_strokes` for your stroke).

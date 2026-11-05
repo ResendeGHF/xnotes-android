@@ -48,6 +48,67 @@ data class WireStroke(
     val pressure: Boolean,
     val samples: List<WireSample>,
     val style: WireStrokeStyle? = null,
+    /** Recording moment the stroke was added in, for replay fade/seek. Null when none. */
+    val sync: WireSyncMark? = null,
+)
+
+/** A recording moment: the recording's id and ms into it. Rides strokes. */
+data class WireSyncMark(val rid: Int, val ms: Int)
+
+/** A text box as it crosses the wire. `uid` is its stable id (see SYNC.md). */
+data class WireText(
+    val uid: String,
+    val x: Double,
+    val y: Double,
+    val width: Double,
+    val height: Double,
+    val text: String,
+    /** `#rrggbb` or `#rrggbbaa`. */
+    val color: String,
+    val pointSize: Double,
+    val face: String,
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    val underline: Boolean = false,
+    val strike: Boolean = false,
+    val align: String = "left",
+    val math: Boolean = false,
+    val link: String? = null,
+)
+
+/** A table as it crosses the wire. `uid` is its stable id (see SYNC.md). */
+data class WireTable(
+    val uid: String,
+    val x: Double,
+    val y: Double,
+    val w: Double,
+    val h: Double,
+    val cols: List<Double>,
+    val rows: List<Double>,
+    /** `#rrggbb` or `#rrggbbaa`. */
+    val strokeColor: String,
+    val strokeWidth: Double,
+    val cells: List<List<String>> = emptyList(),
+    val link: String? = null,
+)
+
+/**
+ * An audio pill as it crosses the wire. The bytes travel separately in
+ * `audio_data` chunks keyed by [audioId]; the op applies once they are
+ * complete. `uid` is its stable id (see SYNC.md); `rid` its recording id.
+ */
+data class WireAudio(
+    val audioId: String,
+    val uid: String,
+    val page: Int,
+    val x: Double,
+    val y: Double,
+    val w: Double,
+    val h: Double,
+    val name: String,
+    val rid: Int,
+    val ext: String,
+    val durationMs: Int,
 )
 
 /**
@@ -68,6 +129,8 @@ data class WireImage(
     val flipY: Boolean,
     /** Part fractions [l, t, r, b], or null for the whole image. */
     val part: List<Double>?,
+    /** Stable id for moves/removes; empty from old peers (then [imageId] is used). */
+    val uid: String = "",
 )
 
 /** One box of a text markup, in points as displayed. */
@@ -135,6 +198,20 @@ sealed interface SyncOp {
     data class CloseRoom(val page: Int, val sideways: Boolean, val a: Double, val b: Double) : SyncOp
     /** Place an image on [page]; its bytes arrive in `image_data` chunks keyed by id. */
     data class AddImage(val page: Int, val image: WireImage) : SyncOp
+    /** Take image pills off [page] by image id (or uid). */
+    data class RemoveImage(val page: Int, val ids: List<String>) : SyncOp
+    /** Place a text box on [page] (full snapshot, upserted by uid). */
+    data class AddText(val page: Int, val text: WireText) : SyncOp
+    /** Take text boxes off [page] by uid. */
+    data class RemoveText(val page: Int, val ids: List<String>) : SyncOp
+    /** Place a table on [page] (full snapshot, upserted by uid). */
+    data class AddTable(val page: Int, val table: WireTable) : SyncOp
+    /** Take tables off [page] by uid. */
+    data class RemoveTable(val page: Int, val ids: List<String>) : SyncOp
+    /** Place an audio pill on [page]; its bytes arrive in `audio_data` chunks keyed by id. */
+    data class AddAudio(val page: Int, val audio: WireAudio) : SyncOp
+    /** Take audio pills off [page] by audio id (or uid). */
+    data class RemoveAudio(val page: Int, val ids: List<String>) : SyncOp
     data class Unknown(val name: String) : SyncOp
 }
 
@@ -221,6 +298,7 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "shift" -> shift = doubleOr(p, 0.0)
             "live_id" -> liveId = stringOr(p, "")
             "image_id" -> imageId = stringOr(p, "")
+            "audio_id" -> imageId = stringOr(p, "")
             "dir_id" -> dirId = stringOrNull(p)
             "name" -> name = stringOr(p, "")
             "kind" -> kind = intOr(p, 0)
@@ -242,6 +320,8 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "fetch" -> SyncMsg.Fetch(seq, id, offset, length)
         "file" -> SyncMsg.FileChunk(seq, id, version, total, offset, data, last)
         "image_data" -> SyncMsg.ImageChunk(seq, id, imageId, total, offset, data, last)
+        "audio_data" -> SyncMsg.AudioChunk(seq, id, imageId, total, offset, data, last)
+        "audio_peaks" -> SyncMsg.AudioPeaks(seq, id, imageId, total, offset, data, last)
         "op" -> SyncMsg.Op(seq, id, baseVersion, version, dedupe, ops ?: emptyList())
         "op_ack" -> SyncMsg.OpAck(seq, replyTo, id, version)
         "resync" -> SyncMsg.Resync(seq, id, version)
@@ -353,6 +433,30 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.name("seq").value(msg.seq)
             w.name("file").value(msg.file)
             w.name("image_id").value(msg.imageId)
+            w.name("total").value(msg.total.toDouble())
+            w.name("offset").value(msg.offset.toDouble())
+            w.name("data").value(msg.data)
+            w.name("last").value(msg.last)
+            w.endObject()
+        }
+        is SyncMsg.AudioChunk -> {
+            w.beginObject()
+            w.name("t").value("audio_data")
+            w.name("seq").value(msg.seq)
+            w.name("file").value(msg.file)
+            w.name("audio_id").value(msg.audioId)
+            w.name("total").value(msg.total.toDouble())
+            w.name("offset").value(msg.offset.toDouble())
+            w.name("data").value(msg.data)
+            w.name("last").value(msg.last)
+            w.endObject()
+        }
+        is SyncMsg.AudioPeaks -> {
+            w.beginObject()
+            w.name("t").value("audio_peaks")
+            w.name("seq").value(msg.seq)
+            w.name("file").value(msg.file)
+            w.name("audio_id").value(msg.audioId)
             w.name("total").value(msg.total.toDouble())
             w.name("offset").value(msg.offset.toDouble())
             w.name("data").value(msg.data)
@@ -526,6 +630,12 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             }
             w.endArray()
             op.stroke.style?.let { writeStrokeStyle(w, it) }
+            op.stroke.sync?.let {
+                w.name("sync").beginObject()
+                w.name("rid").value(it.rid)
+                w.name("ms").value(it.ms.toDouble())
+                w.endObject()
+            }
             w.endObject()
             w.endObject()
         }
@@ -657,6 +767,117 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
                 for (v in p) w.value(v)
                 w.endArray()
             }
+            if (op.image.uid.isNotEmpty()) w.name("uid").value(op.image.uid)
+            w.endObject()
+        }
+        is SyncOp.RemoveImage -> {
+            w.beginObject()
+            w.name("op").value("remove_image")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
+            w.endObject()
+        }
+        is SyncOp.AddText -> {
+            w.beginObject()
+            w.name("op").value("add_text")
+            w.name("page").value(op.page)
+            w.name("text").beginObject()
+            w.name("uid").value(op.text.uid)
+            w.name("x").value(op.text.x)
+            w.name("y").value(op.text.y)
+            w.name("width").value(op.text.width)
+            w.name("height").value(op.text.height)
+            w.name("text").value(op.text.text)
+            w.name("color").value(op.text.color)
+            w.name("point_size").value(op.text.pointSize)
+            w.name("face").value(op.text.face)
+            if (op.text.bold) w.name("bold").value(true)
+            if (op.text.italic) w.name("italic").value(true)
+            if (op.text.underline) w.name("underline").value(true)
+            if (op.text.strike) w.name("strike").value(true)
+            w.name("align").value(op.text.align)
+            if (op.text.math) w.name("math").value(true)
+            op.text.link?.let { w.name("link").value(it) }
+            w.endObject()
+            w.endObject()
+        }
+        is SyncOp.RemoveText -> {
+            w.beginObject()
+            w.name("op").value("remove_text")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
+            w.endObject()
+        }
+        is SyncOp.AddTable -> {
+            w.beginObject()
+            w.name("op").value("add_table")
+            w.name("page").value(op.page)
+            w.name("table").beginObject()
+            w.name("uid").value(op.table.uid)
+            w.name("x").value(op.table.x)
+            w.name("y").value(op.table.y)
+            w.name("w").value(op.table.w)
+            w.name("h").value(op.table.h)
+            w.name("cols").beginArray()
+            for (v in op.table.cols) w.value(v)
+            w.endArray()
+            w.name("rows").beginArray()
+            for (v in op.table.rows) w.value(v)
+            w.endArray()
+            w.name("stroke_color").value(op.table.strokeColor)
+            w.name("stroke_width").value(op.table.strokeWidth)
+            if (op.table.cells.isNotEmpty()) {
+                w.name("cells").beginArray()
+                for (row in op.table.cells) {
+                    w.beginArray()
+                    for (c in row) w.value(c)
+                    w.endArray()
+                }
+                w.endArray()
+            }
+            op.table.link?.let { w.name("link").value(it) }
+            w.endObject()
+            w.endObject()
+        }
+        is SyncOp.RemoveTable -> {
+            w.beginObject()
+            w.name("op").value("remove_table")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
+            w.endObject()
+        }
+        is SyncOp.AddAudio -> {
+            w.beginObject()
+            w.name("op").value("add_audio")
+            w.name("page").value(op.page)
+            w.name("audio").beginObject()
+            w.name("audio_id").value(op.audio.audioId)
+            w.name("uid").value(op.audio.uid)
+            w.name("page").value(op.audio.page)
+            w.name("x").value(op.audio.x)
+            w.name("y").value(op.audio.y)
+            w.name("w").value(op.audio.w)
+            w.name("h").value(op.audio.h)
+            w.name("name").value(op.audio.name)
+            w.name("rid").value(op.audio.rid)
+            w.name("ext").value(op.audio.ext)
+            w.name("duration_ms").value(op.audio.durationMs)
+            w.endObject()
+            w.endObject()
+        }
+        is SyncOp.RemoveAudio -> {
+            w.beginObject()
+            w.name("op").value("remove_audio")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
             w.endObject()
         }
         is SyncOp.Unknown -> {
@@ -875,6 +1096,176 @@ private fun markupOr(p: JsonPull): WireMarkup? {    if (p.peek() != JsonPull.Tok
     return WireMarkup(id, type, color, intensity, quads, text, note, created, modified, link)
 }
 
+/** A `sync` object inside a stroke: the recording moment, or null when malformed. */
+private fun syncOr(p: JsonPull): WireSyncMark? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var rid = -1
+    var ms = 0
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "rid" -> rid = intOr(p, -1)
+            "ms" -> ms = longOr(p, 0L).toInt()
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    return if (rid < 0) null else WireSyncMark(rid, ms)
+}
+
+/** A `text` object inside an add_text op, or null when malformed. */
+private fun textOr(p: JsonPull): WireText? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var uid = ""
+    var x = 0.0
+    var y = 0.0
+    var width = 0.0
+    var height = 0.0
+    var text = ""
+    var color = ""
+    var pointSize = 13.0
+    var face = ""
+    var bold = false
+    var italic = false
+    var underline = false
+    var strike = false
+    var align = "left"
+    var math = false
+    var link: String? = null
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "uid" -> uid = stringOr(p, "")
+            "x" -> x = doubleOr(p, 0.0)
+            "y" -> y = doubleOr(p, 0.0)
+            "width" -> width = doubleOr(p, 0.0)
+            "height" -> height = doubleOr(p, 0.0)
+            "text" -> text = stringOr(p, "")
+            "color" -> color = stringOr(p, "")
+            "point_size" -> pointSize = doubleOr(p, 13.0)
+            "face" -> face = stringOr(p, "")
+            "bold" -> bold = boolOr(p, false)
+            "italic" -> italic = boolOr(p, false)
+            "underline" -> underline = boolOr(p, false)
+            "strike" -> strike = boolOr(p, false)
+            "align" -> align = stringOr(p, "left")
+            "math" -> math = boolOr(p, false)
+            "link" -> link = stringOrNull(p)
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (uid.isEmpty()) return null
+    return WireText(uid, x, y, width, height, text, color, pointSize, face, bold, italic, underline, strike, align, math, link)
+}
+
+/** A `table` object inside an add_table op, or null when malformed. */
+private fun tableOr(p: JsonPull): WireTable? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var uid = ""
+    var x = 0.0
+    var y = 0.0
+    var w = 0.0
+    var h = 0.0
+    var cols: List<Double> = emptyList()
+    var rows: List<Double> = emptyList()
+    var strokeColor = ""
+    var strokeWidth = 2.0
+    var cells: List<List<String>> = emptyList()
+    var link: String? = null
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "uid" -> uid = stringOr(p, "")
+            "x" -> x = doubleOr(p, 0.0)
+            "y" -> y = doubleOr(p, 0.0)
+            "w" -> w = doubleOr(p, 0.0)
+            "h" -> h = doubleOr(p, 0.0)
+            "cols" -> cols = numberListOr(p) ?: emptyList()
+            "rows" -> rows = numberListOr(p) ?: emptyList()
+            "stroke_color" -> strokeColor = stringOr(p, "")
+            "stroke_width" -> strokeWidth = doubleOr(p, 2.0)
+            "cells" -> cells = stringsGridOrNull(p) ?: emptyList()
+            "link" -> link = stringOrNull(p)
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (uid.isEmpty() || cols.isEmpty() || rows.isEmpty()) return null
+    return WireTable(uid, x, y, w, h, cols, rows, strokeColor, strokeWidth, cells, link)
+}
+
+/** An `audio` object inside an add_audio op, or null when malformed. */
+private fun audioOr(p: JsonPull): WireAudio? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var audioId = ""
+    var uid = ""
+    var page = 0
+    var x = 0.0
+    var y = 0.0
+    var w = 0.0
+    var h = 0.0
+    var name = ""
+    var rid = 0
+    var ext = ""
+    var durationMs = 0
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "audio_id" -> audioId = stringOr(p, "")
+            "uid" -> uid = stringOr(p, "")
+            "page" -> page = intOr(p, 0)
+            "x" -> x = doubleOr(p, 0.0)
+            "y" -> y = doubleOr(p, 0.0)
+            "w" -> w = doubleOr(p, 0.0)
+            "h" -> h = doubleOr(p, 0.0)
+            "name" -> name = stringOr(p, "")
+            "rid" -> rid = intOr(p, 0)
+            "ext" -> ext = stringOr(p, "")
+            "duration_ms" -> durationMs = intOr(p, 0)
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (audioId.isEmpty()) return null
+    return WireAudio(audioId, uid.ifEmpty { audioId }, page, x, y, w, h, name, rid, ext, durationMs)
+}
+
+/** A grid of strings (table cells), or null when not an array. */
+private fun stringsGridOrNull(p: JsonPull): List<List<String>>? {
+    if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+        p.skipValue()
+        return null
+    }
+    val out = ArrayList<List<String>>()
+    p.beginArray()
+    while (p.hasNext()) {
+        if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
+            p.skipValue()
+            continue
+        }
+        val row = ArrayList<String>()
+        p.beginArray()
+        while (p.hasNext()) stringOrNull(p)?.let { row += it }
+        p.endArray()
+        out += row
+    }
+    p.endArray()
+    return out
+}
+
 /** An `entries` array inside a page_style op. */
 private fun entriesOr(p: JsonPull): ArrayList<PageStyleEntry>? {
     if (p.peek() != JsonPull.Token.BEGIN_ARRAY) {
@@ -1083,6 +1474,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var pressure = false
         var samples: List<WireSample>? = null
         var strokeStyle: WireStrokeStyle? = null
+        var strokeSync: WireSyncMark? = null
         var ids: List<String>? = null
         var index = 0
         var sideways = false
@@ -1098,6 +1490,9 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var flipY = false
         var part: List<Double>? = null
         var markup: WireMarkup? = null
+        var text: WireText? = null
+        var table: WireTable? = null
+        var audio: WireAudio? = null
         var entries: ArrayList<PageStyleEntry>? = null
         var docStyle: WirePageStyle? = null
         var docMargins: WireMargins? = null
@@ -1122,6 +1517,9 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                 "flip_y" -> flipY = boolOr(p, false)
                 "part" -> part = numberListOr(p)
                 "markup" -> markup = markupOr(p)
+                "text" -> text = textOr(p)
+                "table" -> table = tableOr(p)
+                "audio" -> audio = audioOr(p)
                 "entries" -> entries = entriesOr(p)
                 "doc_style" -> docStyle = if (p.peek() == JsonPull.Token.BEGIN_OBJECT) styleBodyOr(p) else {
                     p.skipValue()
@@ -1138,6 +1536,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                             "pressure" -> pressure = boolOr(p, false)
                             "samples" -> samples = sampleListOr(p)
                             "style" -> strokeStyle = styleOr(p)
+                            "sync" -> strokeSync = syncOr(p)
                             else -> p.skipValue()
                         }
                     }
@@ -1158,7 +1557,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         }
         p.endObject()
         out += when (name) {
-            "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList(), strokeStyle))
+            "add_stroke" -> SyncOp.AddStroke(page, WireStroke(tool, width, color, pressure, samples ?: emptyList(), strokeStyle, strokeSync))
             "erase_strokes" -> SyncOp.EraseStrokes(page, ids ?: emptyList())
             "add_markup" -> markup?.let { SyncOp.AddMarkup(page, it) } ?: SyncOp.Unknown("add_markup")
             "remove_markup" -> SyncOp.RemoveMarkup(page, ids ?: emptyList())
@@ -1180,6 +1579,13 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                     ),
                 )
             }
+            "remove_image" -> SyncOp.RemoveImage(page, ids ?: emptyList())
+            "add_text" -> text?.let { SyncOp.AddText(page, it) } ?: SyncOp.Unknown("add_text")
+            "remove_text" -> SyncOp.RemoveText(page, ids ?: emptyList())
+            "add_table" -> table?.let { SyncOp.AddTable(page, it) } ?: SyncOp.Unknown("add_table")
+            "remove_table" -> SyncOp.RemoveTable(page, ids ?: emptyList())
+            "add_audio" -> audio?.let { SyncOp.AddAudio(page, it) } ?: SyncOp.Unknown("add_audio")
+            "remove_audio" -> SyncOp.RemoveAudio(page, ids ?: emptyList())
             else -> SyncOp.Unknown(name ?: "")
         }
     }

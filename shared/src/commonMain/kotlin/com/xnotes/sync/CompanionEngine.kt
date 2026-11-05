@@ -318,6 +318,34 @@ class CompanionEngine(
         }
     }
 
+    /** Chunks a recording's encoded bytes; the `add_audio` op follows on the same stream. */
+    fun sendAudioData(fileId: String, audioId: String, bytes: ByteArray) {
+        sendChunks(fileId, audioId, bytes, peaks = false)
+    }
+
+    /** Chunks a recording's waveform bins for [audioId]; the `add_audio` op follows. */
+    fun sendAudioPeaks(fileId: String, audioId: String, bytes: ByteArray) {
+        sendChunks(fileId, audioId, bytes, peaks = true)
+    }
+
+    private fun sendChunks(fileId: String, audioId: String, bytes: ByteArray, peaks: Boolean) {
+        if (bytes.isEmpty()) {
+            val msg = if (peaks) SyncMsg.AudioPeaks(nextSeq(), fileId, audioId, 0L, 0L, "", last = true)
+            else SyncMsg.AudioChunk(nextSeq(), fileId, audioId, 0L, 0L, "", last = true)
+            send(msg)
+            return
+        }
+        var off = 0
+        while (off < bytes.size) {
+            val n = minOf(IMAGE_CHUNK_BYTES, bytes.size - off)
+            val data = base64Of(bytes.copyOfRange(off, off + n))
+            val msg = if (peaks) SyncMsg.AudioPeaks(nextSeq(), fileId, audioId, bytes.size.toLong(), off.toLong(), data, last = off + n >= bytes.size)
+            else SyncMsg.AudioChunk(nextSeq(), fileId, audioId, bytes.size.toLong(), off.toLong(), data, last = off + n >= bytes.size)
+            send(msg)
+            off += n
+        }
+    }
+
     private class ImageAsm(val file: String, val total: Long, val buf: ByteArray, var filled: Long = 0)
     private data class PendingImage(val file: String, val op: SyncOp.AddImage)
     private data class ImageBytes(val file: String, val bytes: ByteArray)
@@ -325,6 +353,16 @@ class CompanionEngine(
     private val pendingImages = HashMap<String, ArrayList<PendingImage>>()
     private val imageBytes = HashMap<String, ImageBytes>()
     private val imageOrder = ArrayDeque<String>()
+    private class AudioAsm(val file: String, val total: Long, val buf: ByteArray, var filled: Long = 0)
+    private data class PendingAudio(val file: String, val op: SyncOp.AddAudio)
+    private data class AudioBytes(val file: String, val bytes: ByteArray)
+    private data class AudioPeaks(val file: String, val bytes: ByteArray)
+    private val audioAsm = HashMap<String, AudioAsm>()
+    private val audioPeaksAsm = HashMap<String, AudioAsm>()
+    private val pendingAudios = HashMap<String, ArrayList<PendingAudio>>()
+    private val audioBytes = HashMap<String, AudioBytes>()
+    private val audioPeaks = HashMap<String, AudioPeaks>()
+    private val audioOrder = ArrayDeque<String>()
 
     private fun rememberImageBytes(imageId: String, file: String, bytes: ByteArray) {
         withLock(lock) {
@@ -361,6 +399,8 @@ class CompanionEngine(
             is SyncMsg.Live -> onLive(msg)
             is SyncMsg.RoomLive -> onRoomLive(msg)
             is SyncMsg.ImageChunk -> onImageChunk(msg)
+        is SyncMsg.AudioChunk -> onAudioChunk(msg.file, msg.audioId, msg.total, msg.offset, msg.data, msg.last, peaks = false)
+        is SyncMsg.AudioPeaks -> onAudioChunk(msg.file, msg.audioId, msg.total, msg.offset, msg.data, msg.last, peaks = true)
             is SyncMsg.Presence -> withLock(lock) { hostPresence[msg.file] = msg.page }
             is SyncMsg.IndexSubscribe -> Unit // we send it; the host answers an index
             is SyncMsg.HelloAck -> Unit // the host never sends one; we answer hellos
@@ -693,6 +733,13 @@ class CompanionEngine(
                 is SyncOp.OpenRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, true, op.at, op.at + op.size)
                 is SyncOp.CloseRoom -> host.applyRemoteRoomEdit(m.file, op.page, op.sideways, false, op.a, op.b)
                 is SyncOp.AddImage -> onRemoteImage(m.file, op)
+                is SyncOp.RemoveImage -> host.applyRemoteImageRemove(m.file, op.page, op.ids)
+                is SyncOp.AddText -> host.applyRemoteText(m.file, op.page, op.text)
+                is SyncOp.RemoveText -> host.applyRemoteTextRemove(m.file, op.page, op.ids)
+                is SyncOp.AddTable -> host.applyRemoteTable(m.file, op.page, op.table)
+                is SyncOp.RemoveTable -> host.applyRemoteTableRemove(m.file, op.page, op.ids)
+                is SyncOp.AddAudio -> onRemoteAudio(m.file, op)
+                is SyncOp.RemoveAudio -> host.applyRemoteAudioRemove(m.file, op.page, op.ids)
                 is SyncOp.Unknown -> Unit
             }
         }
@@ -724,6 +771,126 @@ class CompanionEngine(
             host.previewRemoteRoom(m.file, m.page, m.sideways, m.split, m.resume, m.shift)
         }
         host.onLiveDirty()
+    }
+
+    private fun onAudioChunk(
+        file: String,
+        audioId: String,
+        total: Long,
+        offset: Long,
+        data: String,
+        last: Boolean,
+        peaks: Boolean,
+    ) {
+        // Bytes precede their op on the same stream; a mismatch drops the transfer.
+        // Audio recordings are small next to images; cap them lower.
+        if (total < 0 || total > AUDIO_MAX_BYTES || offset < 0 || offset > total) {
+            withLock(lock) { dropAudioLocked(audioId) }
+            return
+        }
+        if (total == 0L) {
+            if (!last) {
+                withLock(lock) { dropAudioLocked(audioId) }
+                return
+            }
+            if (peaks) {
+                rememberAudioPeaks(audioId, file, ByteArray(0))
+                flushAudioPeaks(audioId)
+            } else {
+                rememberAudioBytes(audioId, file, ByteArray(0))
+                flushAudio(audioId)
+            }
+            return
+        }
+        val asm = withLock(lock) {
+            val map = if (peaks) audioPeaksAsm else audioAsm
+            map.getOrPut(audioId) { AudioAsm(file, total, ByteArray(total.toInt())) }
+        }
+        if (asm.total != total || asm.file != file) {
+            withLock(lock) { dropAudioLocked(audioId) }
+            return
+        }
+        val bytes = bytesOfBase64(data) ?: run {
+            withLock(lock) { dropAudioLocked(audioId) }
+            return
+        }
+        if (offset != asm.filled || asm.filled + bytes.size > asm.total) {
+            withLock(lock) { dropAudioLocked(audioId) }
+            return
+        }
+        bytes.copyInto(asm.buf, asm.filled.toInt())
+        asm.filled += bytes.size
+        if (!last && asm.filled < asm.total) return
+        if (asm.filled != asm.total) {
+            withLock(lock) { dropAudioLocked(audioId) }
+            return
+        }
+        val dataBytes = asm.buf.copyOf(asm.filled.toInt())
+        withLock(lock) {
+            if (peaks) audioPeaksAsm.remove(audioId) else audioAsm.remove(audioId)
+        }
+        if (peaks) {
+            rememberAudioPeaks(audioId, file, dataBytes)
+            flushAudioPeaks(audioId)
+        } else {
+            rememberAudioBytes(audioId, file, dataBytes)
+            flushAudio(audioId)
+        }
+    }
+
+    private fun dropAudioLocked(audioId: String) {
+        audioAsm.remove(audioId)
+        audioPeaksAsm.remove(audioId)
+        pendingAudios.remove(audioId)
+    }
+
+    private fun rememberAudioBytes(audioId: String, file: String, bytes: ByteArray) {
+        withLock(lock) {
+            audioBytes[audioId] = AudioBytes(file, bytes)
+            audioOrder.remove(audioId)
+            audioOrder.addLast(audioId)
+            while (audioOrder.size > AUDIO_KEPT || audioBytes.values.sumOf { it.bytes.size.toLong() } > AUDIO_KEPT_BYTES) {
+                val oldest = audioOrder.removeFirstOrNull() ?: break
+                if (audioBytes.size <= 1) break
+                audioBytes.remove(oldest)
+                audioPeaks.remove(oldest)
+            }
+        }
+    }
+
+    private fun rememberAudioPeaks(audioId: String, file: String, peaks: ByteArray) {
+        withLock(lock) { audioPeaks[audioId] = AudioPeaks(file, peaks) }
+        flushAudioPeaks(audioId)
+    }
+
+    /** An `add_audio` op: apply once both bytes and peaks are in (peaks may be empty). */
+    private fun onRemoteAudio(file: String, op: SyncOp.AddAudio) {
+        val ready = withLock(lock) { audioBytes[op.audio.audioId]?.takeIf { it.file == file } }
+        if (ready != null) {
+            val peaks = withLock(lock) { audioPeaks[op.audio.audioId]?.takeIf { it.file == file }?.bytes } ?: ByteArray(0)
+            host.applyRemoteAudio(file, op.page, op.audio, ready.bytes, peaks)
+            return
+        }
+        withLock(lock) {
+            val pend = pendingAudios.getOrPut(op.audio.audioId) { ArrayList() }
+            pend += PendingAudio(file, op)
+        }
+    }
+
+    private fun flushAudio(audioId: String) {
+        val pend = withLock(lock) { pendingAudios.remove(audioId) } ?: return
+        val ready = withLock(lock) { audioBytes[audioId] } ?: return
+        val peaks = withLock(lock) { audioPeaks[audioId]?.takeIf { it.file == ready.file }?.bytes } ?: ByteArray(0)
+        for (p in pend) host.applyRemoteAudio(p.file, p.op.page, p.op.audio, ready.bytes, peaks)
+    }
+
+    private fun flushAudioPeaks(audioId: String) {
+        // Peaks arriving after the bytes complete a held op.
+        val pend = withLock(lock) { pendingAudios[audioId] } ?: return
+        val ready = withLock(lock) { audioBytes[audioId] } ?: return
+        val peaks = withLock(lock) { audioPeaks[audioId]?.takeIf { it.file == ready.file }?.bytes } ?: return
+        withLock(lock) { pendingAudios.remove(audioId) }
+        for (p in pend) host.applyRemoteAudio(p.file, p.op.page, p.op.audio, ready.bytes, peaks)
     }
 
     private fun onImageChunk(m: SyncMsg.ImageChunk) {
@@ -816,6 +983,13 @@ class CompanionEngine(
 
         /** Image ops held for bytes still in flight, across all files. */
         const val IMAGE_PENDING_MAX = 16
+
+        /** Recordings are smaller than images; cap their transfers lower. */
+        const val AUDIO_MAX_BYTES = 64L * 1024 * 1024
+
+        /** Completed recordings remembered, for ops that arrive after their bytes. */
+        const val AUDIO_KEPT = 8
+        const val AUDIO_KEPT_BYTES = 64L * 1024 * 1024
 
         /** Heartbeat every 20 s; silence over 60 s drops the connection. */
         const val HEARTBEAT_MS = 20_000L

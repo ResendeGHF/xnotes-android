@@ -78,6 +78,17 @@ typedef struct xn_renderer_vt {
      * writing; filling it as one path keeps shared edges from seaming.
      */
     void (*fill_disk_ribbon)(void* r, const float* centers, const float* radii, int from, int count, xn_rgba c);
+    /*
+     * Graphite band of a pencil run: the union of the ribbon pieces from `from` for `count`
+     * points, stippled from the shared grain field at `density` and tinted by `shade`
+     * (1 = full ink, lower mixes toward white), with the field shifted by (`ox`, `oy`) in
+     * content px and tiles spanning `grain_size` multiples of the base span. `overwrite`
+     * replaces instead of compositing; `end_join` adds a join disc at the run's last station;
+     * `cap_start`/`cap_end` round the run's own ends.
+     */
+    void (*fill_ribbon_union)(void* r, const float* centers, const float* radii, int from, int count,
+                              xn_rgba c, int overwrite, int end_join, int cap_start, int cap_end,
+                              double ox, double oy, double density, double shade, double grain_size);
 
     void (*stroke_polyline)(void* r, const double* xy, int n, int closed, const xn_pen* pen);
     void (*stroke_rect)(void* r, double x, double y, double w, double h, const xn_pen* pen);
@@ -97,6 +108,12 @@ typedef struct xn_renderer_vt {
     void (*draw_text_run)(void* r, const uint16_t* text, int len, double x, double baseline,
                           const xn_font* font, xn_rgba c);
 } xn_renderer_vt;
+
+/* Pencil grain tile: 256x256 pre-thresholded mask for `density_key` (0..20, same scale as the
+ * shared field): writes 0xFFFFFFFF where graphite sits, 0x00000000 elsewhere. `out` must hold
+ * 65536 uint32_t (or be NULL to query); `*inout_len` is set to the count written (65536).
+ * Returns 1 on success. Bits are identical on every platform (fixed-seed shared field). */
+int xn_pencil_tile(int density_key, uint32_t* out, int* inout_len);
 
 /* --- host services ------------------------------------------------------------------------- */
 
@@ -487,6 +504,10 @@ typedef struct xn_pen_style {
     double speed;       /* speed pen: 0..100, how much speed thins the line */
     double tip;         /* taper pen: 0..100, the tip's width in percent of the full width */
     double dash, gap;   /* dashed pen: dash and gap lengths, 2..40 page pixels */
+    double pencil_pressure; /* pencil: pressure sensitivity 0..2 (0 = always full) */
+    double pencil_density;  /* pencil: graphite density 0.2..1.3 */
+    double pencil_grain;    /* pencil: grain size 0.1..4 */
+    double pencil_shade;    /* pencil: shade response 0..1.5 */
 } xn_pen_style;
 /* A stroke tool's style; 0 for a tool that is not one. */
 int xn_editor_pen_style(const xn_editor* editor, const char* tool_id, xn_pen_style* out);

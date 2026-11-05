@@ -102,6 +102,10 @@ open class RemoteLiveStrokes(private val state: CanvasState) {
                 dashGap = st.dashG ?: base.dashGap,
                 highlighterAlpha = st.hlAlpha ?: base.highlighterAlpha,
                 highlighterInverse = st.hlInv ?: base.highlighterInverse,
+                pencilPressure = st.pencilP ?: base.pencilPressure,
+                pencilDensity = st.pencilD ?: base.pencilDensity,
+                pencilGrainSize = st.pencilG ?: base.pencilGrainSize,
+                pencilShadeResponse = st.pencilS ?: base.pencilShadeResponse,
             )
             val n = run.points.size
             val xs = DoubleArray(n) { run.points[it].x }

@@ -8,8 +8,19 @@ import com.xnotes.canvas.RoomEdit
 import com.xnotes.canvas.StrokeReplacement
 import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.model.AudioData
+import com.xnotes.core.model.AudioItem
+import com.xnotes.core.geometry.Pt
+import com.xnotes.core.model.CanvasItem
+import com.xnotes.core.pal.FontFace
+import com.xnotes.core.pal.HAlign
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.TableItem
+import com.xnotes.core.model.TextItem
+import com.xnotes.sync.WireAudio
+import com.xnotes.sync.WireTable
+import com.xnotes.sync.WireText
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.PageMargins
 import com.xnotes.core.model.PageStyle
@@ -84,6 +95,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     /** Received image files by sync file id, so unshare/close can drop them. */
     private val imageFiles = HashMap<String, ArrayList<File>>()
+    private val audioFiles = HashMap<String, ArrayList<File>>()
     private val imageDir: File = fileOf(fileOf(pinsDir), "sync-images").also {
         // Stale from a previous run: nothing is bound this early, so nothing can reference them.
         runCatching {
@@ -112,6 +124,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     fun unbindEditor(editor: CEditor) {
         val fileId = reverse.remove(editor) ?: return
+        editor.editor.history.onPush = null
+        editor.editor.onHistoryStep = null
+        historyBefore.remove(editor)
         editor.editor.onPageInserted = null
         editor.editor.onPageRemoved = null
         editor.editor.onImageInserted = null
@@ -123,6 +138,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         editor.controller.onStrokesReplaced = null
         editor.controller.onMarkupsErased = null
         dropImageFiles(fileId)
+        dropAudioFiles(fileId)
         bindings.remove(fileId)
         active.remove(editor)
         if (activeRoom?.fileId == fileId) activeRoom = null
@@ -147,9 +163,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         c.onRoomCommitted = { edit -> onRoomCommitted(editor, edit) }
         c.onRoomPreviewDone = { onRoomPreviewDone(editor) }
         // Explicit local page edits submit matching ops; remote ones never fire these.
+        editor.editor.history.onPush = { cmd -> onHistoryPushed(editor, cmd) }
         editor.editor.onPageInserted = { index, w, h -> onPageInserted(editor, index, w, h) }
         editor.editor.onPageRemoved = { index -> onPageRemoved(editor, index) }
-        editor.editor.onImageInserted = { page, item -> onImageInserted(editor, page, item) }
         editor.editor.onMarkupsAdded = { page, markups -> onLocalMarkupsAdded(editor, page, markups) }
         editor.editor.onPageStyleChanged = { entries, docStyle, docMargins -> onLocalPageStyle(editor, entries, docStyle, docMargins) }
         // Undo/redo converges via the same op paths (no new wire type): snapshot
@@ -163,6 +179,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val pages: List<String>,
         val items: List<List<String>>,
         val markups: List<List<String>>,
+        val content: List<List<String>>,
     )
 
     private fun snapshotOf(editor: CEditor): HistorySnapshot {
@@ -175,7 +192,19 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                 }
             },
             markups = doc.pages.map { pg -> pg.markups.map { it.id } },
+            content = doc.pages.map { pg -> pg.items.mapNotNull { contentKey(it) } },
         )
+    }
+
+    /** Stable snapshot string for a non-stroke item: uid + full wire form. */
+    private fun contentKey(item: CanvasItem): String? = when (item) {
+        is TextItem -> "t|" + item.uid + "|" + wireTextOf(item).toString()
+        is TableItem -> "b|" + item.uid + "|" + wireTableOf(item).toString()
+        is ImageItem -> if (item.uid.isEmpty()) null else "i|" + item.uid + "|" +
+            listOf(item.rect, item.orientation, item.angle, item.flip, item.part).joinToString("|")
+        is AudioItem -> if (item.uid.isEmpty()) null else "a|" + item.uid + "|" +
+            listOf(item.rect, item.name, item.rid, item.audio.durationMs, item.audio.ext).joinToString("|")
+        else -> null
     }
 
     fun armHistory(editor: CEditor) {
@@ -237,7 +266,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                     val byKey = HashMap<String, Stroke>()
                     for (st in afterStrokes) {
                         val k = com.xnotes.sync.SyncFingerprint.of(st.tool.id, st.config.baseWidth, hexColor(st.config.rgba), wireSamplesOf(st)) + "|" + st.config.hashCode()
-                        if (k in newKeys) byKey.putIfAbsent(k, st)
+                        if (k in newKeys && !byKey.containsKey(k)) byKey[k] = st
                     }
                     for (k in newKeys) {
                         byKey[k]?.let { ops += SyncOp.AddStroke(pi, wireOf(it)) }
@@ -251,6 +280,61 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                 if (removedIds.isNotEmpty()) ops += SyncOp.RemoveMarkup(pi, removedIds)
                 val added = doc.pages[pi].markups.filter { it.id !in bm }
                 for (m in added) ops += SyncOp.AddMarkup(pi, m.toWireMarkup())
+            }
+            // Content items (text/table/image/audio): uid-keyed diff; edits and
+            // moves upsert the current snapshot, deletes remove by uid.
+            val bc = before.content.getOrNull(pi) ?: emptyList()
+            val ac = doc.pages[pi].items.mapNotNull { contentKey(it) }
+            if (bc != ac) {
+                val bUids = bc.map { it.substringAfter("|").substringBefore("|") }.toSet()
+                val aUids = ac.map { it.substringAfter("|").substringBefore("|") }.toSet()
+                for (key in bc) {
+                    val uid = key.substringAfter("|").substringBefore("|")
+                    if (uid !in aUids) {
+                        when (key[0]) {
+                            't' -> ops += SyncOp.RemoveText(pi, listOf(uid))
+                            'b' -> ops += SyncOp.RemoveTable(pi, listOf(uid))
+                            'i' -> ops += SyncOp.RemoveImage(pi, listOf(uid))
+                            'a' -> ops += SyncOp.RemoveAudio(pi, listOf(uid))
+                        }
+                    }
+                }
+                val bMap = bc.associateBy { it.substringAfter("|").substringBefore("|") }
+                for (key in ac) {
+                    val uid = key.substringAfter("|").substringBefore("|")
+                    if (bMap[uid] != key) {
+                        val item = doc.pages[pi].items.firstOrNull {
+                            (it as? TextItem)?.uid == uid || (it as? TableItem)?.uid == uid ||
+                                (it as? ImageItem)?.uid == uid || (it as? AudioItem)?.uid == uid
+                        } ?: continue
+                        when (item) {
+                            is TextItem -> ops += SyncOp.AddText(pi, wireTextOf(item))
+                            is TableItem -> ops += SyncOp.AddTable(pi, wireTableOf(item))
+                            is ImageItem -> {
+                                val (imageId, bytes) = readImageBytes(item) ?: continue
+                                engine.sendImageData(fileId, imageId, bytes)
+                                ops += SyncOp.AddImage(
+                                    pi,
+                                    WireImage(
+                                        imageId, item.image.width, item.image.height,
+                                        item.rect.x, item.rect.y, item.rect.w, item.rect.h,
+                                        item.orientation, item.angle, item.flip.x, item.flip.y,
+                                        item.part?.let { listOf(it.x, it.y, it.right, it.bottom) },
+                                        uid = item.uid,
+                                    ),
+                                )
+                            }
+                            is AudioItem -> {
+                                val bytes = readAudioBytes(item) ?: continue
+                                val audioId = "aud-" + item.uid
+                                engine.sendAudioData(fileId, audioId, bytes)
+                                engine.sendAudioPeaks(fileId, audioId, item.audio.peaks)
+                                ops += SyncOp.AddAudio(pi, wireAudioOf(item, pi, audioId))
+                            }
+                            else -> Unit
+                        }
+                    }
+                }
             }
         }
         if (ops.isNotEmpty()) {
@@ -312,9 +396,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val base = headOf(fileId) ?: return
         if (a != null && a.fileId == fileId) {
             engine.finishStroke(fileId, page, a.id, a.tool, a.width, a.color, a.style)
-            engine.submitOp(fileId, base, a.id, listOf(SyncOp.AddStroke(page, wireOf(stroke))))
+            submit(editor, fileId, base, a.id, listOf(SyncOp.AddStroke(page, wireOf(stroke))))
         } else {
-            engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddStroke(page, wireOf(stroke))))
+            submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddStroke(page, wireOf(stroke))))
         }
         historyBefore[editor] = snapshotOf(editor)
     }
@@ -324,7 +408,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val base = headOf(fileId) ?: return
         val ids = strokes.map { SyncFingerprint.of(it.tool.id, it.config.baseWidth, hexColor(it.config.rgba), wireSamplesOf(it)) }
         if (ids.isEmpty()) return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.EraseStrokes(page, ids)))
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.EraseStrokes(page, ids)))
     }
 
     private fun onStrokesReplaced(editor: CEditor, changes: List<StrokeReplacement>) {
@@ -341,14 +425,14 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             for (s in c.added) ops += SyncOp.AddStroke(c.addPage, wireOf(s))
         }
         if (ops.isEmpty()) return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
     }
 
     private fun onMarkupsRemoved(editor: CEditor, page: Int, ids: List<String>) {
         if (ids.isEmpty()) return
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemoveMarkup(page, ids)))
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemoveMarkup(page, ids)))
     }
 
     private fun onNoteLinkTap(editor: CEditor, targetId: String) {
@@ -367,7 +451,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         // honors explicit invert flags (nulls keep its own).
         val docStyle = ce.state.document.style.toWirePageStyle()
             .copy(invertColors = ce.viewInvert, invertImages = ce.viewInvertImages)
-        engine.submitOp(
+        submit(editor, 
             fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
             listOf(SyncOp.PageStyle(emptyList(), docStyle, null)),
         )
@@ -384,7 +468,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         }
         for ((page, m) in added) ops += SyncOp.AddMarkup(page, m.toWireMarkup())
         if (ops.isEmpty()) return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
     }
 
     private fun onLocalMarkupsAdded(editor: CEditor, page: Int, markups: List<TextMarkup>) {
@@ -400,7 +484,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         if (entries.isEmpty() && docStyle == null && docMargins == null) return
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
-        engine.submitOp(
+        submit(editor, 
             fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}",
             listOf(
                 SyncOp.PageStyle(
@@ -417,13 +501,13 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     private fun onPageInserted(editor: CEditor, index: Int, w: Double, h: Double) {
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddPage(index, w, h)))
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.AddPage(index, w, h)))
     }
 
     private fun onPageRemoved(editor: CEditor, index: Int) {
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
-        engine.submitOp(fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemovePage(index)))
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", listOf(SyncOp.RemovePage(index)))
     }
 
     private fun onRoomPreview(editor: CEditor, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
@@ -446,7 +530,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         engine.finishRoom(fileId, edit.page, id, edit.sideways, split, resume, shift)
         val op = if (edit.open) SyncOp.OpenRoom(edit.page, edit.sideways, edit.a, edit.b - edit.a)
         else SyncOp.CloseRoom(edit.page, edit.sideways, edit.a, edit.b)
-        engine.submitOp(fileId, base, id, listOf(op))
+        submit(editor, fileId, base, id, listOf(op))
     }
 
     private fun onRoomPreviewDone(editor: CEditor) {
@@ -456,33 +540,151 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         engine.finishRoom(r.fileId, r.page, r.id, false, 0.0, 0.0, 0.0)
     }
 
-    private fun onImageInserted(editor: CEditor, page: Int, item: ImageItem) {
+    private fun wireTextOf(t: TextItem): WireText = WireText(
+        uid = t.uid,
+        x = t.pos.x, y = t.pos.y, width = t.width, height = t.height,
+        text = t.text, color = hexColor(t.rgba), pointSize = t.pointSize,
+        face = t.face.id, bold = t.bold, italic = t.italic,
+        underline = t.underline, strike = t.strike,
+        align = t.align.name.lowercase(), math = t.math, link = t.link,
+    )
+
+    private fun wireTableOf(t: TableItem): WireTable = WireTable(
+        uid = t.uid, x = t.rect.x, y = t.rect.y, w = t.rect.w, h = t.rect.h,
+        cols = t.colFractions.toList(), rows = t.rowFractions.toList(),
+        strokeColor = hexColor(t.strokeRgba), strokeWidth = t.strokeWidth,
+        cells = t.cellGrid(), link = t.link,
+    )
+
+    private fun wireAudioOf(a: AudioItem, page: Int, audioId: String): WireAudio = WireAudio(
+        audioId = audioId, uid = a.uid, page = page,
+        x = a.rect.x, y = a.rect.y, w = a.rect.w, h = a.rect.h,
+        name = a.name, rid = a.rid, ext = a.audio.ext, durationMs = a.audio.durationMs,
+    )
+
+    /** Submit [ops] and re-arm the undo/redo snapshot: every local commit path funnels here. */
+    private fun submit(editor: CEditor, fileId: String, base: Long, dedupe: String, ops: List<SyncOp>) {
+        engine.submitOp(fileId, base, dedupe, ops)
+        historyBefore[editor] = snapshotOf(editor)
+    }
+
+    private fun submitContentOps(editor: CEditor, ops: List<SyncOp>) {
+        if (ops.isEmpty()) return
         val fileId = reverse[editor] ?: return
         val base = headOf(fileId) ?: return
+        submit(editor, fileId, base, "l${dedupeCounter++}-${Random.nextInt().toString(16)}", ops)
+    }
+
+    /**
+     * Non-stroke local edits (text/table/image/audio create, move, restyle,
+     * delete) have no dedicated controller hook; translate the history
+     * command instead. Strokes are skipped (dedicated hooks own them).
+     * Erases become removes by uid; everything else upserts the current
+     * snapshot (same uid replaces in place on every peer).
+     */
+    private fun onHistoryPushed(editor: CEditor, cmd: com.xnotes.core.history.Command) {
+        val fileId = reverse[editor] ?: return
+        val doc = editor.state.document
+        val touched = try {
+            cmd.touched { item ->
+                doc.pages.firstOrNull { p -> p.items.any { it === item } }
+            }
+        } catch (_: Exception) { null } ?: return
+        // Items a dedicated hook just fanned out are skipped exactly once here
+        // (their later moves/deletes arrive fresh).
+        val items = touched.mapNotNull { (page, item) ->
+            if (item is Stroke) null
+            else {
+                val pi = doc.pages.indexOf(page)
+                if (pi < 0) null else pi to item
+            }
+        }
+        if (items.isEmpty()) return
+        val isErase = cmd is com.xnotes.core.history.EraseItems
+        val ops = ArrayList<SyncOp>()
+        for ((page, item) in items) {
+            when (item) {
+                is TextItem -> if (isErase) {
+                    if (item.uid.isNotEmpty()) ops += SyncOp.RemoveText(page, listOf(item.uid))
+                } else {
+                    if (item.uid.isEmpty()) item.uid = newUid()
+                    ops += SyncOp.AddText(page, wireTextOf(item))
+                }
+                is TableItem -> if (isErase) {
+                    if (item.uid.isNotEmpty()) ops += SyncOp.RemoveTable(page, listOf(item.uid))
+                } else {
+                    if (item.uid.isEmpty()) item.uid = newUid()
+                    ops += SyncOp.AddTable(page, wireTableOf(item))
+                }
+                is ImageItem -> {
+                    val key = item.uid.ifEmpty { null } ?: continue
+                    if (isErase) ops += SyncOp.RemoveImage(page, listOf(key))
+                    else {
+                        val (audioId, bytes) = readImageBytes(item) ?: continue
+                        engine.sendImageData(fileId, audioId, bytes)
+                        ops += SyncOp.AddImage(
+                            page,
+                            WireImage(
+                                audioId, item.image.width, item.image.height,
+                                item.rect.x, item.rect.y, item.rect.w, item.rect.h,
+                                item.orientation, item.angle, item.flip.x, item.flip.y,
+                                item.part?.let { listOf(it.x, it.y, it.right, it.bottom) },
+                                uid = key,
+                            ),
+                        )
+                    }
+                }
+                is AudioItem -> {
+                    val key = item.uid.ifEmpty { null } ?: continue
+                    if (isErase) ops += SyncOp.RemoveAudio(page, listOf(key))
+                    else {
+                        val bytes = readAudioBytes(item) ?: continue
+                        val audioId = "a${dedupeCounter++}-${Random.nextInt().toString(16)}"
+                        engine.sendAudioData(fileId, audioId, bytes)
+                        engine.sendAudioPeaks(fileId, audioId, item.audio.peaks)
+                        ops += SyncOp.AddAudio(page, wireAudioOf(item, page, audioId).copy(uid = key))
+                    }
+                }
+                else -> Unit
+            }
+        }
+        submitContentOps(editor, ops)
+    }
+
+    private fun readImageBytes(item: ImageItem): Pair<String, ByteArray>? {
+        if (item.uid.isEmpty()) return null
         val bytes = runCatching {
             okio.FileSystem.SYSTEM.read(item.image.file.asPath()) { readByteArray() }
-        }.getOrNull() ?: return
-        val imageId = "i${dedupeCounter++}-${Random.nextInt().toString(16)}"
-        engine.sendImageData(fileId, imageId, bytes)
-        val part = item.part?.let { listOf(it.x, it.y, it.right, it.bottom) }
-        engine.submitOp(
-            fileId, base, imageId,
-            listOf(
-                SyncOp.AddImage(
-                    page,
-                    WireImage(
-                        imageId, item.image.width, item.image.height,
-                        item.rect.x, item.rect.y, item.rect.w, item.rect.h,
-                        item.orientation, item.angle, item.flip.x, item.flip.y, part,
-                    ),
-                ),
-            ),
-        )
+        }.getOrNull() ?: return null
+        return "img-" + item.uid to bytes
     }
+
+    private fun readAudioBytes(item: AudioItem): ByteArray? {
+        if (item.uid.isEmpty()) return null
+        return runCatching {
+            okio.FileSystem.SYSTEM.read(item.audio.file.asPath()) { readByteArray() }
+        }.getOrNull()
+    }
+
+    @OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+    private fun newUid(): String = kotlin.uuid.Uuid.random().toString()
+
+    private fun snapshotText(t: TextItem): String =
+        listOf(t.uid, t.pos.x, t.pos.y, t.width, t.height, t.text, t.rgba, t.pointSize, t.face, t.bold, t.italic, t.underline, t.strike, t.align, t.math, t.link).joinToString("|")
+
+    private fun snapshotTable(t: TableItem): String =
+        (listOf(t.uid, t.rect, t.strokeRgba, t.strokeWidth, t.link) + t.colFractions + t.rowFractions + t.cellGrid().flatten()).joinToString("|")
 
     /** Drop received image files of [fileId] (unshare/close); the model owns applied ones. */
     private fun dropImageFiles(fileId: String) {
         val files = imageFiles.remove(fileId) ?: return
+        val fs = okio.FileSystem.SYSTEM
+        for (f in files) runCatching { fs.delete(f.asPath()) }
+    }
+
+    /** Drop received audio files of [fileId] (unshare/close); the model owns applied ones. */
+    private fun dropAudioFiles(fileId: String) {
+        val files = audioFiles.remove(fileId) ?: return
         val fs = okio.FileSystem.SYSTEM
         for (f in files) runCatching { fs.delete(f.asPath()) }
     }
@@ -529,6 +731,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             activeRoom?.takeIf { r -> r.fileId == id }?.let { activeRoom = null }
         }
         dropImageFiles(id)
+        dropAudioFiles(id)
         memScoped {
             host.sync_file_gone?.invoke(host.ctx, id.cstr.ptr)
         }
@@ -722,6 +925,164 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         ce.requestRender()
     }
 
+    private fun findByUid(pg: Page, uid: String): CanvasItem? {
+        if (uid.isEmpty()) return null
+        for (it in pg.items) {
+            val u = (it as? TextItem)?.uid ?: (it as? TableItem)?.uid
+                ?: (it as? ImageItem)?.uid ?: (it as? AudioItem)?.uid ?: continue
+            if (u == uid) return it
+        }
+        return null
+    }
+
+    override fun applyRemoteText(fileId: String, page: Int, text: WireText) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        val existing = findByUid(pg, text.uid) as? TextItem
+        if (existing != null) {
+            existing.pos = Pt(text.x, text.y)
+            existing.width = text.width
+            existing.height = text.height
+            existing.text = text.text
+            existing.rgba = RemoteLiveStrokes.parseColor(text.color) ?: existing.rgba
+            existing.pointSize = text.pointSize
+            existing.face = FontFace.fromId(text.face)
+            existing.bold = text.bold
+            existing.italic = text.italic
+            existing.underline = text.underline
+            existing.strike = text.strike
+            existing.align = HAlign.entries.firstOrNull { it.name.lowercase() == text.align } ?: HAlign.LEFT
+            existing.math = text.math
+            existing.link = text.link
+        } else {
+            pg.items.add(
+                TextItem(
+                    pos = Pt(text.x, text.y), width = text.width, height = text.height,
+                    text = text.text, rgba = RemoteLiveStrokes.parseColor(text.color) ?: Rgba(20, 20, 20, 255),
+                    pointSize = text.pointSize, face = FontFace.fromId(text.face),
+                    measurer = ce.measurer, bold = text.bold, italic = text.italic,
+                    underline = text.underline, strike = text.strike,
+                    align = HAlign.entries.firstOrNull { it.name.lowercase() == text.align } ?: HAlign.LEFT,
+                    math = text.math, uid = text.uid, link = text.link,
+                ),
+            )
+        }
+        doc.dirty = true
+        ce.state.invalidatePage(pg)
+        ce.requestRender()
+    }
+
+    override fun applyRemoteTextRemove(fileId: String, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (pg.items.removeAll { (it as? TextItem)?.uid in ids }) {
+            doc.dirty = true
+            ce.state.invalidatePage(pg)
+            ce.requestRender()
+        }
+    }
+
+    override fun applyRemoteTable(fileId: String, page: Int, table: WireTable) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        val existing = findByUid(pg, table.uid) as? TableItem
+        if (existing != null) {
+            existing.rect = Rect(table.x, table.y, table.w, table.h)
+            existing.colFractions.clear()
+            existing.colFractions.addAll(table.cols)
+            existing.rowFractions.clear()
+            existing.rowFractions.addAll(table.rows)
+            existing.strokeRgba = RemoteLiveStrokes.parseColor(table.strokeColor) ?: existing.strokeRgba
+            existing.strokeWidth = table.strokeWidth
+            existing.setCells(table.cells)
+            existing.link = table.link
+        } else {
+            pg.items.add(
+                TableItem(
+                    Rect(table.x, table.y, table.w, table.h),
+                    table.cols.toMutableList(), table.rows.toMutableList(),
+                    RemoteLiveStrokes.parseColor(table.strokeColor) ?: Rgba(20, 20, 20, 255),
+                    table.strokeWidth, table.cells.map { it.toMutableList() }.toMutableList(),
+                ).also { it.uid = table.uid; it.link = table.link },
+            )
+        }
+        doc.dirty = true
+        ce.state.invalidatePage(pg)
+        ce.requestRender()
+    }
+
+    override fun applyRemoteTableRemove(fileId: String, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (pg.items.removeAll { (it as? TableItem)?.uid in ids }) {
+            doc.dirty = true
+            ce.state.invalidatePage(pg)
+            ce.requestRender()
+        }
+    }
+
+    override fun applyRemoteAudio(fileId: String, page: Int, audio: WireAudio, bytes: ByteArray, peaks: ByteArray) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        val safeId = audio.audioId.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(64).ifEmpty { "aud" }
+        val safeFile = fileId.filter { it.isLetterOrDigit() }.take(24) + fileId.hashCode().toString(16)
+        val dest = fileOf(fileOf(audioDir(), safeFile), "$safeId.${audioExt(audio.ext)}")
+        runCatching {
+            val fs = okio.FileSystem.SYSTEM
+            fs.createDirectories(fileOf(audioDir(), safeFile).asPath())
+            fs.write(dest.asPath()) { write(bytes) }
+        }.getOrNull() ?: return
+        audioFiles.getOrPut(fileId) { ArrayList() } += dest
+        val native = AudioItem(
+            AudioData(dest, audio.ext, audio.durationMs, peaks),
+            Rect(audio.x, audio.y, audio.w, audio.h),
+            audio.name.ifEmpty { "audio" }, audio.rid, ce.measurer,
+        ).also { it.uid = audio.uid.ifEmpty { audio.audioId } }
+        // Same audio re-sent (a move): replace in place so z-order holds.
+        val at = pg.items.indexOfFirst { (it as? AudioItem)?.uid == native.uid && native.uid.isNotEmpty() }
+        if (at >= 0) pg.items[at] = native else pg.items.add(native)
+        doc.dirty = true
+        ce.state.invalidatePage(pg)
+        ce.requestRender()
+    }
+
+    override fun applyRemoteAudioRemove(fileId: String, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (pg.items.removeAll { (it as? AudioItem)?.uid in ids }) {
+            doc.dirty = true
+            ce.state.invalidatePage(pg)
+            ce.requestRender()
+        }
+    }
+
+    override fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (pg.items.removeAll { (it as? ImageItem)?.uid in ids }) {
+            doc.dirty = true
+            ce.state.invalidatePage(pg)
+            ce.requestRender()
+        }
+    }
+
+    /** Audio/image bytes root (mirrors the image dir; temp files owned by the bridge). */
+    private fun audioDir(): File = imageDir
+
+    private fun audioExt(ext: String): String =
+        ext.lowercase().takeIf { it.matches(Regex("[a-z0-9]{1,5}")) } ?: "m4a"
+
     override fun previewRemoteRoom(fileId: String, page: Int, sideways: Boolean, split: Double, resume: Double, shift: Double) {
         val ce = bindings[fileId] ?: return
         if (ce.controller.roomGestureActive) return // a local drag owns the preview
@@ -794,6 +1155,10 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             dashGap = st.dashG ?: base.dashGap,
             highlighterAlpha = st.hlAlpha ?: base.highlighterAlpha,
             highlighterInverse = st.hlInv ?: base.highlighterInverse,
+            pencilPressure = st.pencilP ?: base.pencilPressure,
+            pencilDensity = st.pencilD ?: base.pencilDensity,
+            pencilGrainSize = st.pencilG ?: base.pencilGrainSize,
+            pencilShadeResponse = st.pencilS ?: base.pencilShadeResponse,
         )
         val stroke = Stroke(tool, cfg, emptyList(), 1.0, false, 1.0)
         val n = w.samples.size

@@ -20,6 +20,9 @@ interface CanvasItem {
     /** Whether the item exposes resize handles (images, text boxes, shapes do). */
     val resizable: Boolean
 
+    /** False for text, which a mirror would turn backwards, so a selection holding any is not mirrored. */
+    val mirrorable: Boolean get() = true
+
     /**
      * Pinned in place: it cannot be selected, moved or erased until it is unlocked. A held finger
      * over a locked item offers to unlock it rather than picking it up, which is the only way back.
@@ -28,6 +31,24 @@ interface CanvasItem {
      * the selection being cleared, the document being closed and the file being reopened.
      */
     var locked: Boolean
+
+    /** An optional hyperlink (https/http/mailto); tapping the item with the pan tool opens it. None by default. */
+    var link: String?
+        get() = null
+        set(_) {}
+
+    /** The group it is in, an id shared by its fellow members on its page or canvas, or null for none. */
+    var group: Int?
+        get() = null
+        set(_) {}
+
+    /** The moment of a recording this item was added at, or null. Kinds that never sync keep the default. */
+    var sync: SyncMark?
+        get() = null
+        set(_) {}
+
+    /** Whether exports draw it: PDFs, page images and captures. Recordings and tape never print. */
+    val exported: Boolean get() = true
 
     /** Draw the item; [r] is already translated to the page origin and scaled. */
     fun paint(r: Renderer)

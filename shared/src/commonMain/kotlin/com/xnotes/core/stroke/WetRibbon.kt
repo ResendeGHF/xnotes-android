@@ -138,6 +138,7 @@ class WetRibbon(
     override fun cx(i: Int): Double = centerline[2 * i].toDouble()
     override fun cy(i: Int): Double = centerline[2 * i + 1].toDouble()
     override fun hw(i: Int): Double = halfWidths[i].toDouble()
+    override fun pw(i: Int): Double = if (i < pointCount) sp[i] else 1.0
 
     /** The packed centres, over-allocated: read `2 * pointCount` floats. */
     fun centerlineArray(): FloatArray = centerline

@@ -31,6 +31,13 @@ class SyncEngineTest {
         val roomPreviews = ArrayList<RoomPreviewRec>()
         val roomPreviewClears = ArrayList<String>()
         val images = ArrayList<ImageRec>()
+        val texts = ArrayList<Pair<String, WireText>>()
+        val textRemoves = ArrayList<Pair<String, List<String>>>()
+        val tables = ArrayList<Pair<String, WireTable>>()
+        val tableRemoves = ArrayList<Pair<String, List<String>>>()
+        val audios = ArrayList<Triple<String, WireAudio, ByteArray>>()
+        val audioRemoves = ArrayList<Pair<String, List<String>>>()
+        val imageRemoves = ArrayList<Pair<String, List<String>>>()
         var resynced: Pair<String, Long>? = null
         data class ImageRec(val file: String, val page: Int, val image: WireImage, val bytes: ByteArray)
 
@@ -100,6 +107,34 @@ class SyncEngineTest {
 
         override fun applyRemoteImage(fileId: String, page: Int, image: WireImage, bytes: ByteArray) {
             images += ImageRec(fileId, page, image, bytes)
+        }
+
+        override fun applyRemoteText(fileId: String, page: Int, text: WireText) {
+            texts += fileId to text
+        }
+
+        override fun applyRemoteTextRemove(fileId: String, page: Int, ids: List<String>) {
+            textRemoves += fileId to ids
+        }
+
+        override fun applyRemoteTable(fileId: String, page: Int, table: WireTable) {
+            tables += fileId to table
+        }
+
+        override fun applyRemoteTableRemove(fileId: String, page: Int, ids: List<String>) {
+            tableRemoves += fileId to ids
+        }
+
+        override fun applyRemoteAudio(fileId: String, page: Int, audio: WireAudio, bytes: ByteArray, peaks: ByteArray) {
+            audios += Triple(fileId, audio, bytes)
+        }
+
+        override fun applyRemoteAudioRemove(fileId: String, page: Int, ids: List<String>) {
+            audioRemoves += fileId to ids
+        }
+
+        override fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>) {
+            imageRemoves += fileId to ids
         }
 
         val markups = ArrayList<MarkupRec>()
@@ -555,6 +590,87 @@ class SyncEngineTest {
             overlay.draw(r2)
         }
         assertTrue("run must be gone after commit, got ${r2.ops}", r2.ops.none { it == "strokePolyline" || it == "fillPath" || it == "strokePath" } && r2.ribbonRuns.isEmpty())
+    }
+
+    @Test fun strokeStyleCarriesPencilKnobs() {
+        val before = WireStroke(
+            "pencil", 2.5, "#0a141e", false, listOf(WireSample(1.0, 2.0, 0.5)),
+            WireStrokeStyle(pencilP = 1.2, pencilD = 0.8, pencilG = 2.0, pencilS = 1.1, taper = true, taperMin = 0.5),
+        )
+        val enc = SyncFrames.encode(SyncMsg.Op(1, "u1", 0L, 1L, "d1", listOf(SyncOp.AddStroke(0, before))))
+        val back = ((SyncFrames.Decoder().feed(enc).single() as SyncMsg.Op).ops.single() as SyncOp.AddStroke).stroke
+        assertEquals("pencil", back.tool)
+        assertEquals(1.2, back.style?.pencilP)
+        assertEquals(0.8, back.style?.pencilD)
+        assertEquals(2.0, back.style?.pencilG)
+        assertEquals(1.1, back.style?.pencilS)
+        assertEquals(true, back.style?.taper)
+        // Old peers ignore unknown keys: a legacy frame without style still parses.
+        val legacyJson = """{"t":"op","seq":2,"file":"u1","base_version":0,"version":1,"dedupe":"d2","ops":[{"op":"add_stroke","page":0,"stroke":{"tool":"pen","width":3.0,"color":"#00e676","pressure":true,"samples":[[1.0,2.0,0.5]]}}]}"""
+        val legacyBytes = legacyJson.encodeToByteArray()
+        val legacyFrame = ByteArray(4 + legacyBytes.size).also {
+            val n = legacyBytes.size
+            it[0] = (n ushr 24).toByte()
+            it[1] = (n ushr 16).toByte()
+            it[2] = (n ushr 8).toByte()
+            it[3] = n.toByte()
+            legacyBytes.copyInto(it, 4)
+        }
+        val legacy = SyncFrames.Decoder().feed(legacyFrame).single()
+        val legacyStroke = ((legacy as SyncMsg.Op).ops.single() as SyncOp.AddStroke).stroke
+        assertEquals(null, legacyStroke.style)
+    }
+
+    @Test fun pencilFieldIsDeterministic() {
+        val a = com.xnotes.core.stroke.PencilField.stippleMask(0.5)
+        val b = com.xnotes.core.stroke.PencilField.stippleMask(0.5)
+        assertTrue(a.contentEquals(b))
+        assertEquals(256 * 256, a.size)
+        assertTrue(a.any { it } && a.any { !it })
+        // Denser graphite keeps every grain of a lighter one (nesting, no reshuffle).
+        val light = com.xnotes.core.stroke.PencilField.stippleMask(0.2)
+        val heavy = com.xnotes.core.stroke.PencilField.stippleMask(0.9)
+        for (i in light.indices) if (light[i]) assertTrue(heavy[i])
+    }
+
+    @Test fun contentOpsRoundTrip() {
+        val ops = listOf(
+            SyncOp.AddText(0, WireText("u1", 10.0, 20.0, 100.0, 30.0, "hi", "#ff0000", 14.0, "sans", bold = true, align = "center", link = "L")),
+            SyncOp.RemoveText(0, listOf("u1")),
+            SyncOp.AddTable(1, WireTable("t1", 0.0, 0.0, 200.0, 100.0, listOf(0.5, 0.5), listOf(1.0), "#000000", 2.0, listOf(listOf("a", "b")))),
+            SyncOp.RemoveTable(1, listOf("t1")),
+            SyncOp.AddAudio(2, WireAudio("a1", "u2", 2, 5.0, 5.0, 120.0, 40.0, "rec", 7, "m4a", 3000)),
+            SyncOp.RemoveAudio(2, listOf("a1")),
+            SyncOp.RemoveImage(0, listOf("img-9")),
+        )
+        val back = ((SyncFrames.Decoder().feed(SyncFrames.encode(SyncMsg.Op(1, "f", 0L, 1L, "d", ops))).single() as SyncMsg.Op).ops)
+        assertEquals(ops, back)
+    }
+
+    @Test fun contentOpsRouteToHost() {
+        val (e, h) = engine()
+        e.onConnected()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        assertEquals(7L, e.fileVersion("u1"))
+        val text = WireText("t1", 10.0, 20.0, 100.0, 30.0, "hi", "#ff0000", 14.0, "mono", bold = true, align = "center", link = "L")
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(2, "u1", 7L, 8L, "d1", listOf(SyncOp.AddText(0, text)))))
+        assertEquals("t1", h.texts.single().second.uid)
+        assertEquals(true, h.texts.single().second.bold)
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(3, "u1", 8L, 9L, "d2", listOf(SyncOp.RemoveText(0, listOf("t1"))))))
+        assertEquals(listOf("t1"), h.textRemoves.single().second)
+        val table = WireTable("tb1", 0.0, 0.0, 200.0, 100.0, listOf(0.5, 0.5), listOf(1.0), "#000000", 2.0, listOf(listOf("a", "b")))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(4, "u1", 9L, 10L, "d3", listOf(SyncOp.AddTable(0, table)))))
+        assertEquals("tb1", h.tables.single().second.uid)
+        val audBytes = ByteArray(16) { it.toByte() }
+        e.bytesReceived(SyncFrames.encode(SyncMsg.AudioChunk(90, "u1", "a1", audBytes.size.toLong(), 0, base64Of(audBytes), last = true)))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.AudioPeaks(91, "u1", "a1", 4L, 0, base64Of(ByteArray(4) { 9 }), last = true)))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 10L, 11L, "d4", listOf(SyncOp.AddAudio(1, WireAudio("a1", "au1", 1, 5.0, 5.0, 120.0, 40.0, "n", 3, "m4a", 1000))))))
+        assertEquals("au1", h.audios.single().second.uid)
+        // Unknown ops never break the batch: known siblings still apply.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(6, "u1", 11L, 12L, "d5",
+            listOf(SyncOp.Unknown("future_op"), SyncOp.RemoveImage(0, listOf("img-9"))))))
+        assertEquals(listOf("img-9"), h.imageRemoves.single().second)
+        assertEquals(12L, e.fileVersion("u1"))
     }
 
     @Test fun liveFrameUpdatesOverlayOld() {

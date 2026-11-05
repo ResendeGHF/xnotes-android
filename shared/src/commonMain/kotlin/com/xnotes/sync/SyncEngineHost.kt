@@ -94,4 +94,29 @@ interface SyncEngineHost {
      * refetch. The engine already queued the fetch.
      */
     fun applyResync(fileId: String, version: Long)
+
+    /** Upsert a committed remote text box on [page] (matched by uid). Bypasses undo. */
+    fun applyRemoteText(fileId: String, page: Int, text: WireText)
+
+    /** Take remote text boxes off [page] by uid. Bypasses undo. */
+    fun applyRemoteTextRemove(fileId: String, page: Int, ids: List<String>)
+
+    /** Upsert a committed remote table on [page] (matched by uid). Bypasses undo. */
+    fun applyRemoteTable(fileId: String, page: Int, table: WireTable)
+
+    /** Take remote tables off [page] by uid. Bypasses undo. */
+    fun applyRemoteTableRemove(fileId: String, page: Int, ids: List<String>)
+
+    /**
+     * Place a committed remote audio pill on [page]: [bytes] are the encoded
+     * audio, [peaks] its waveform bins. Applies to the open document,
+     * bypassing undo; each side plays its own copy.
+     */
+    fun applyRemoteAudio(fileId: String, page: Int, audio: WireAudio, bytes: ByteArray, peaks: ByteArray)
+
+    /** Take remote audio pills off [page] by audio id or uid. Bypasses undo. */
+    fun applyRemoteAudioRemove(fileId: String, page: Int, ids: List<String>)
+
+    /** Take remote image pills off [page] by image id or uid. Bypasses undo. */
+    fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>)
 }

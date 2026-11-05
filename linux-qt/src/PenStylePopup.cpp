@@ -25,6 +25,12 @@ PenStylePopup::PenStylePopup(const QByteArray& tool, const xn_pen_style& style, 
     if (tool == "calligraphy") addSlider(QStringLiteral("Nib contrast (thick to thin)"), 1, 5, &style_.multiplier, QStringLiteral("×"));
     if (tool == "speed") addSlider(QStringLiteral("Speed taper"), 0, 100, &style_.speed, QStringLiteral("%"));
     if (tool == "taper") addSlider(QStringLiteral("Tip width"), 0, 100, &style_.tip, QStringLiteral("%"));
+    if (tool == "pencil") {
+        addSlider(QStringLiteral("Pressure response"), 0.0, 2.0, &style_.pencil_pressure, QStringLiteral(""));
+        addSlider(QStringLiteral("Graphite density"), 0.2, 1.3, &style_.pencil_density, QStringLiteral(""));
+        addSlider(QStringLiteral("Grain size"), 0.1, 4.0, &style_.pencil_grain, QStringLiteral(""));
+        addSlider(QStringLiteral("Shade response"), 0.0, 1.5, &style_.pencil_shade, QStringLiteral(""));
+    }
     if (tool == "dashed") {
         addSlider(QStringLiteral("Dash"), 2, 40, &style_.dash, QStringLiteral(" px"));
         addSlider(QStringLiteral("Gap"), 2, 40, &style_.gap, QStringLiteral(" px"));

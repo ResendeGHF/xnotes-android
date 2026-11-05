@@ -155,6 +155,37 @@ internal class CRenderer(private val vt: xn_renderer_vt, internal val r: COpaque
         }
     }
 
+    override fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float,
+        capStart: Boolean,
+        capEnd: Boolean,
+        overwrite: Boolean,
+        endJoin: Boolean,
+        ox: Double,
+        oy: Double,
+        density: Double,
+        shade: Double,
+        grainSize: Double,
+    ) {
+        if (count <= 0) return
+        // Radius scale is baked by the caller on desktop (widths are final here).
+        centers.usePinned { c ->
+            radii.usePinned { rd ->
+                vt.fill_ribbon_union!!.invoke(
+                    r, c.addressOf(0), rd.addressOf(0), from, count, color.packed(),
+                    if (overwrite) 1 else 0, if (endJoin) 1 else 0,
+                    if (capStart) 1 else 0, if (capEnd) 1 else 0,
+                    ox, oy, density, shade, grainSize,
+                )
+            }
+        }
+    }
+
     override fun strokeRect(rect: Rect, pen: Pen) = memScoped {
         vt.stroke_rect!!.invoke(r, rect.x, rect.y, rect.w, rect.h, cPen(pen))
     }
