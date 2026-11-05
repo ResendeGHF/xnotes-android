@@ -483,6 +483,13 @@ class CompanionService : Service() {
 
     /** Start the Linux-companion half: dial the active (or remembered) device. */
     private fun startCompanionDial() {
+        // Refresh the remembered target: prefs are the source of truth and
+        // may have moved on (typed IP, forget purge) since the field was set.
+        // Without this the dial keeps using a stale address after DHCP moves
+        // the desktop or after forgetting (which clears the target).
+        val prefs = getSharedPreferences(PREFS, 0)
+        targetHost = prefs.getString(KEY_IP, "") ?: ""
+        targetPort = prefs.getString(KEY_PORT, "42317")?.toIntOrNull() ?: 42317
         dialActive()
         updateForeground()
     }

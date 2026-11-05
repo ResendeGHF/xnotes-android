@@ -14,13 +14,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -214,6 +214,35 @@ fun PolicyPane(editor: Editor, onBack: (() -> Unit)? = null) {
             )
         }
         Spacer(Modifier.height(4.dp))
+        // Share-all is always the first action: grants the whole tree to the
+        // picked companion in one tap. Disabled until a device is picked and
+        // the folder walk finishes, so it never grants a partial tree.
+        val deviceFp = fp
+        var sharingAll by remember(deviceFp) { mutableStateOf(false) }
+        Button(
+            onClick = {
+                val target = deviceFp ?: return@Button
+                sharingAll = true
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        val uris = snapshot.entries.map { it.uri }
+                        for (uri in uris) {
+                            grants.setGranted(target, uri, true)
+                        }
+                        CompanionService.refreshPolicy(context)
+                    }
+                    val ids = withContext(Dispatchers.IO) { store.grantIds(target) }
+                    shared.clear()
+                    shared.addAll(ids)
+                    sharingAll = false
+                }
+            },
+            enabled = deviceFp != null && !scanning && !sharingAll,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (sharingAll) "Sharing…" else "Share all files with this companion")
+        }
+        Spacer(Modifier.height(4.dp))
         Text(
             stringResource(com.xnotes.R.string.policy_help, shared.size),
             color = palette.textDim.toComposeColor(),
@@ -258,36 +287,6 @@ fun PolicyPane(editor: Editor, onBack: (() -> Unit)? = null) {
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(4.dp))
-        // One tap to share the whole tree with the picked companion.
-        val deviceFp = fp
-        if (deviceFp != null && !scanning && snapshot.entries.isNotEmpty()) {
-            val allUris = remember(snapshot) { snapshot.entries.map { it.uri } }
-            val allShared = allUris.isNotEmpty() && allUris.all { it in shared }
-            var sharingAll by remember(deviceFp) { mutableStateOf(false) }
-            if (!allShared) {
-                TextButton(
-                    onClick = {
-                        sharingAll = true
-                        scope.launch {
-                            withContext(Dispatchers.IO) {
-                                for (uri in allUris) {
-                                    grants.setGranted(deviceFp, uri, true)
-                                }
-                                CompanionService.refreshPolicy(context)
-                            }
-                            val ids = withContext(Dispatchers.IO) { store.grantIds(deviceFp) }
-                            shared.clear()
-                            shared.addAll(ids)
-                            sharingAll = false
-                        }
-                    },
-                    enabled = !sharingAll,
-                ) {
-                    Text(if (sharingAll) "Sharing…" else "Share all files with this companion")
-                }
-                Spacer(Modifier.height(2.dp))
-            }
-        }
         if (shown.isEmpty() && !scanning) {
             Text(
                 stringResource(if (snapshot.entries.isEmpty()) com.xnotes.R.string.policy_empty else com.xnotes.R.string.policy_no_match),
