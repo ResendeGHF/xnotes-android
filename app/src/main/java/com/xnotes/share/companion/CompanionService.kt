@@ -1286,28 +1286,6 @@ class CompanionService : Service() {
             }
         }
 
-        /**
-         * Follow a note link from a shared document: open when the target is
-         * shared, otherwise ask its host for permission (the answer opens it).
-         */
-        fun followSharedLink(context: Context, engine: GuestEngine, targetId: String) {
-            val svc = runningService ?: return
-            svc.main.post {
-                if (engine.remoteIndex().any { it.id == targetId }) {
-                    engine.fetch(targetId, openNow = true)
-                } else if (engine.isConnected()) {
-                    postStatusStatic("Asking the owner for access…")
-                    engine.requestLinkAccess(targetId)
-                } else {
-                    postStatusStatic("Not connected.")
-                }
-            }
-        }
-
-        private fun postStatusStatic(s: String) {
-            runningService?.postStatus(s)
-        }
-
         /** Cached bytes of a peer file, for the save-a-copy flow. */
         fun readGuestBytes(hostFp: String, remoteId: String): ByteArray? {
             val svc = runningService ?: return null
