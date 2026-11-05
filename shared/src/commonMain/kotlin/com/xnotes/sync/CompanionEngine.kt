@@ -76,6 +76,7 @@ class CompanionEngine(
         val buf = ByteArray(total.toInt().coerceAtLeast(0))
         var filled = 0L
         var complete = false
+        var lastRxMs = 0L
     }
 
     // --- transport ---
@@ -107,6 +108,11 @@ class CompanionEngine(
             if (displayCode != null && now - codeAtMs >= CODE_TTL_MS) {
                 displayCode = null
                 pendingPair = null
+            }
+            for ((id, asm) in assemblers) {
+                if (!asm.complete && asm.filled < asm.total && now - asm.lastRxMs >= FETCH_STALL_MS) {
+                    send(SyncMsg.Fetch(nextSeq(), id, asm.filled, 0L))
+                }
             }
         }
     }
@@ -506,21 +512,19 @@ class CompanionEngine(
 
     private fun onFileChunk(m: SyncMsg.FileChunk) {
         val asm = withLock(lock) {
-            assemblers.getOrPut(m.id) { FileAssembler(m.version, m.total) }
+            assemblers.getOrPut(m.id) { FileAssembler(m.version, m.total).also { it.lastRxMs = nowMs() } }
         }
         if (asm.version != m.version || asm.total != m.total) {
-            withLock(lock) { assemblers[m.id] = FileAssembler(m.version, m.total) }
+            withLock(lock) { assemblers[m.id] = FileAssembler(m.version, m.total).also { it.lastRxMs = nowMs() } }
             return requestOpen(m.id)
         }
         val bytes = bytesOfBase64(m.data) ?: return
         if (m.offset != asm.filled || asm.filled + bytes.size > asm.total) return
         bytes.copyInto(asm.buf, asm.filled.toInt())
         asm.filled += bytes.size
+        asm.lastRxMs = nowMs()
         val done = m.last || asm.filled >= asm.total
-        if (!done) {
-            if (asm.filled < asm.total) send(SyncMsg.Fetch(nextSeq(), m.id, asm.filled, 0L))
-            return
-        }
+        if (!done) return // the host streams the remainder; tick() refetches on stall
         asm.complete = true
         val data = asm.buf.copyOf(asm.filled.toInt())
         withLock(lock) {
@@ -998,6 +1002,14 @@ class CompanionEngine(
         /** Heartbeat every 20 s; silence over 60 s drops the connection. */
         const val HEARTBEAT_MS = 20_000L
         const val TIMEOUT_MS = 60_000L
+        /**
+         * A fetch whose chunks stopped arriving is re-requested from the
+         * filled offset. The host streams the whole remainder per request,
+         * so a follow-up fetch is only ever needed when the stream stalls
+         * (never per chunk: that re-streamed the remainder every time and
+         * transferred O(n²) for an n-chunk file).
+         */
+        const val FETCH_STALL_MS = 3000L
 
         /** A displayed pairing code lives 5 min and takes 3 attempts. */
         const val CODE_TTL_MS = 5 * 60_000L

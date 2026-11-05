@@ -47,6 +47,31 @@ class FetchWireCompatTest {
         override fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>) = Unit
     }
 
+    @Test fun noEagerRefetchPerChunk() {
+        val d = File(System.getProperty("java.io.tmpdir"), "sync-wirecompat2-${System.nanoTime()}").apply { mkdirs() }
+        val h = H()
+        val e = CompanionEngine(h, fileOf(d.path), "linux-test", "bb".repeat(32))
+        e.onConnected()
+        e.requestOpen("f")
+        assertEquals(1, h.out.size)
+        // Two-chunk file sent as two frames: the second chunk must NOT trigger
+        // another Fetch (the host already streams the remainder).
+        val half = ByteArray(300 * 1024) { (it % 251).toByte() }
+        val enc = okio.ByteString.of(*half).base64()
+        val c1 = """{"t":"file","seq":1,"id":"f","version":7,"total":614400,"offset":0,"data":"$enc","last":false}"""
+        val c2 = """{"t":"file","seq":2,"id":"f","version":7,"total":614400,"offset":307200,"data":"$enc","last":true}"""
+        e.bytesReceived(framed(c1))
+        assertEquals("no follow-up fetch after a non-final chunk", 1, h.out.size)
+        e.bytesReceived(framed(c2))
+        assertTrue("f" in h.ready)
+        assertEquals(614400, e.fileBytes("f")!!.size)
+    }
+
+    private fun framed(json: String): ByteArray {
+        val body = json.toByteArray(Charsets.UTF_8)
+        return java.nio.ByteBuffer.allocate(4 + body.size).order(java.nio.ByteOrder.BIG_ENDIAN).putInt(body.size).put(body).array()
+    }
+
     @Test fun androidFileChunkReassembles() {
         val d = File(System.getProperty("java.io.tmpdir"), "sync-wirecompat-${System.nanoTime()}").apply { mkdirs() }
         val h = H()

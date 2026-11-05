@@ -115,6 +115,11 @@ void BrowsePage::setDir(const QString& path) {
 
 void BrowsePage::rebuild() {
     clearLayout(grid_);
+    // Reset stretches from the previous build (row/col counts change), then
+    // re-anchor them: a trailing stretch row/column absorbs the viewport
+    // surplus so tiles keep their content size instead of spreading out.
+    for (int r = 0; r < grid_->rowCount(); ++r) grid_->setRowStretch(r, 0);
+    for (int c = 0; c < grid_->columnCount(); ++c) grid_->setColumnStretch(c, 0);
     crumb_->setText(dir_);
     QDir d(dir_);
     const auto entries = d.entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
@@ -145,6 +150,8 @@ void BrowsePage::rebuild() {
             ++row;
         }
     }
+    grid_->setRowStretch(row + (col > 0 ? 1 : 0), 1);
+    grid_->setColumnStretch(kCols, 1);
 }
 
 }  // namespace xn
