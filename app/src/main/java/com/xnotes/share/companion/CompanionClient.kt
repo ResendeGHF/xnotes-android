@@ -128,6 +128,36 @@ class CompanionClient(
         }
     }
 
+    /** Dial, connected, then TLS-handshake. Retries once unbound when a forced
+     *  Wi-Fi bind hits an unreachable route: the bound Network object may be
+     *  stale (roam/reconnect) while the default route already recovered. */
+    private fun dialSocket(ctx: javax.net.ssl.SSLContext): SSLSocket {
+        var last: Exception? = null
+        val passes = if (socketBinder != null) listOf(true, false) else listOf(false)
+        for (bound in passes) {
+            val raw = ctx.socketFactory.createSocket()
+            try {
+                raw.tcpNoDelay = true
+                if (bound) runCatching { socketBinder?.invoke(raw) }
+                raw.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                val sock = raw as SSLSocket
+                sock.tcpNoDelay = true
+                sock.startHandshake()
+                return sock
+            } catch (e: Exception) {
+                runCatching { raw.close() }
+                val msg = e.message ?: ""
+                val staleBind = bound && socketBinder != null &&
+                    (e is java.net.NoRouteToHostException ||
+                        msg.contains("route", ignoreCase = true) ||
+                        msg.contains("unreachable", ignoreCase = true))
+                if (!staleBind) throw e
+                last = e
+            }
+        }
+        throw last!!
+    }
+
     /**
      * One connect + serve cycle. Returns true when a connection lived (even
      * briefly); false when the dial/handshake itself failed.
@@ -143,15 +173,8 @@ class CompanionClient(
         }
         val sock: SSLSocket
         try {
-            val raw = ctx.socketFactory.createSocket()
-            raw.tcpNoDelay = true
-            runCatching { socketBinder?.invoke(raw) }
-            raw.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
-            sock = raw as SSLSocket
-            sock.tcpNoDelay = true
-            sock.startHandshake()
+            sock = dialSocket(ctx)
         } catch (e: Exception) {
-            runCatching { /* raw socket closed by factory on failure paths */ }
             val why = e.message ?: e.javaClass.simpleName
             val hint = if (!isLoopbackHost(host) &&
                 (why.contains("route", ignoreCase = true) ||

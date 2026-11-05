@@ -334,8 +334,13 @@ class CompanionService : Service() {
     private fun bindWifi(sock: java.net.Socket) {
         try {
             val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            // Default route already goes out Wi-Fi: binding would only risk a
+            // stale Network object, so leave the socket alone.
+            val active = runCatching { cm.activeNetwork }.getOrNull()
+            val activeCaps = active?.let { runCatching { cm.getNetworkCapabilities(it) }.getOrNull() }
+            if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) return
             for (net in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(net) ?: continue
+                val caps = runCatching { cm.getNetworkCapabilities(net) }.getOrNull() ?: continue
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
                     net.bindSocket(sock)
                     return
