@@ -16,6 +16,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +45,7 @@ import com.xnotes.share.ShareBackendImpl
 import com.xnotes.share.db.DeviceEntity
 import com.xnotes.share.db.DeviceGrants
 import com.xnotes.share.db.ShareStore
+import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.Dispatchers
@@ -62,7 +65,7 @@ import java.util.Date
  * state; persistence and companion notification happen off the main thread.
  */
 @Composable
-fun PolicyPane(editor: Editor) {
+fun PolicyPane(editor: Editor, onBack: (() -> Unit)? = null) {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val store = remember { ShareStore.of(context.applicationContext) }
@@ -194,11 +197,22 @@ fun PolicyPane(editor: Editor) {
     }
 
     Column(Modifier.fillMaxSize()) {
-        Text(
-            "Shared files",
-            color = palette.text.toComposeColor(),
-            fontSize = 20.sp,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        XnotesIcons.prev,
+                        contentDescription = "Back to Companion",
+                        tint = palette.text.toComposeColor(),
+                    )
+                }
+            }
+            Text(
+                "Shared files",
+                color = palette.text.toComposeColor(),
+                fontSize = 20.sp,
+            )
+        }
         Spacer(Modifier.height(4.dp))
         Text(
             stringResource(com.xnotes.R.string.policy_help, shared.size),

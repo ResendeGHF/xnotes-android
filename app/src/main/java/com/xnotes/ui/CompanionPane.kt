@@ -49,7 +49,7 @@ import java.util.Date
  * stay remembered but disconnected until picked.
  */
 @Composable
-fun CompanionPane() {
+fun CompanionPane(editor: Editor) {
     val palette = LocalPalette.current
     val context = LocalContext.current
     val status by CompanionService.companionStatus.collectAsState()
@@ -84,6 +84,12 @@ fun CompanionPane() {
     var editTarget by remember { mutableStateOf<DeviceEntity?>(null) }
     var editHost by remember { mutableStateOf("") }
     var editPort by remember { mutableStateOf("") }
+    var showPolicy by remember { mutableStateOf(false) }
+
+    if (showPolicy) {
+        PolicyPane(editor, onBack = { showPolicy = false })
+        return
+    }
 
     fun saveTarget(): Pair<String, Int>? {
         val port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
@@ -228,6 +234,10 @@ fun CompanionPane() {
             OutlinedButton(onClick = { CompanionService.disconnect() }, enabled = companionOn) { Text("Disconnect") }
             Spacer(Modifier.width(12.dp))
             Text(status.text, color = palette.textDim.toComposeColor(), fontSize = 12.sp)
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = { showPolicy = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("Shared files — choose what the companion may see")
         }
         if (codeNeeded && companionOn) {
             Spacer(Modifier.height(12.dp))
