@@ -1489,7 +1489,7 @@ internal fun DropdownMenu(
 ) {
     val palette = LocalPalette.current
     androidx.compose.material3.DropdownMenu(
-        expanded = expanded,
+        expanded = expanded && Eyedropper.target == null,
         onDismissRequest = onDismissRequest,
         modifier = modifier,
         offset = LocalMenuOffset.current,
@@ -1524,6 +1524,7 @@ internal fun AlertDialog(
     shape: Shape = MaterialTheme.shapes.large,
     containerColor: Color = LocalPalette.current.menuBg.toComposeColor(),
 ) {
+    if (Eyedropper.target != null) return
     androidx.compose.material3.AlertDialog(
         onDismissRequest = onDismissRequest,
         confirmButton = confirmButton,

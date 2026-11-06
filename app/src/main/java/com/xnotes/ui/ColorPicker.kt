@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.xnotes.R
 import com.xnotes.core.model.Rgba
+import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.ColorMath
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.icons.XnotesIcons
@@ -135,17 +136,13 @@ internal fun ColorPickerPopup(
                 TabChip(stringResource(R.string.swatches), tab == 0) { tab = 0 }
                 TabChip(stringResource(R.string.spectrum), tab == 1) { tab = 1 }
                 Spacer(Modifier.weight(1f))
-                // Close the picker and pick the colour off the screen instead; it lands like a pick here.
                 Icon(
                     XnotesIcons.eyedropper,
                     contentDescription = stringResource(R.string.eyedropper),
                     tint = palette.text.toComposeColor(),
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .clickable {
-                            Eyedropper.target = onPick
-                            onDismiss()
-                        }
+                        .clickable { Eyedropper.target = { commit(it) } }
                         .padding(4.dp)
                         .size(20.dp),
                 )
