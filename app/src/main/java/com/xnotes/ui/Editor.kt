@@ -10122,15 +10122,17 @@ class Editor(
         if (controller.isEditingLabel) controller.commitTextEdit() // and so is a label being typed
         val command = history.nextUndo
         val pagesBefore = state.document.pages.toList()
-        // Snapshot per-page items/markups for sync diff (undo itself never fires sync hooks).
-        val itemsBefore = pagesBefore.map { it.items.toList() }
-        val markupsBefore = pagesBefore.map { it.markups.toList() }
+        // The snapshots + fan-out below exist only for a listening peer (companion sync);
+        // without one they are pure main-thread cost, so undo stays O(touched).
+        val syncing = isUndoSyncListening()
+        val itemsBefore = if (syncing) pagesBefore.map { it.items.toList() } else emptyList()
+        val markupsBefore = if (syncing) pagesBefore.map { it.markups.toList() } else emptyList()
         val viewed = viewedPage()
         val was = touchedRegions(command)
         history.undo()
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
-        emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
+        if (syncing) emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
     }
 
     fun redo() {
@@ -10138,15 +10140,27 @@ class Editor(
         if (controller.isEditingLabel) controller.commitTextEdit()
         val command = history.nextRedo
         val pagesBefore = state.document.pages.toList()
-        val itemsBefore = pagesBefore.map { it.items.toList() }
-        val markupsBefore = pagesBefore.map { it.markups.toList() }
+        // As in undo: no listening peer, no snapshots and no fan-out.
+        val syncing = isUndoSyncListening()
+        val itemsBefore = if (syncing) pagesBefore.map { it.items.toList() } else emptyList()
+        val markupsBefore = if (syncing) pagesBefore.map { it.markups.toList() } else emptyList()
         val viewed = viewedPage()
         val was = touchedRegions(command)
         history.redo()
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
-        emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
+        if (syncing) emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
     }
+
+    /**
+     * Whether an undo/redo must fan out to a peer: true while a companion-sync session
+     * holds any of the undo hooks. All of them are attached and cleared together by the
+     * share layer, so a recording (or any offline editing) never pays the diff.
+     */
+    private fun isUndoSyncListening(): Boolean =
+        controller.onStrokesReplaced != null || onHistoryStepSync != null ||
+            onMarkupsChanged != null || onFileContentReplaced != null ||
+            onPageInserted != null || onPageRemoved != null
 
     /**
      * Propagate an undo/redo to peers in real time via the existing op paths
@@ -10161,6 +10175,7 @@ class Editor(
         pagesBefore: List<Page>,
         command: com.xnotes.core.history.Command?,
     ) {
+        if (!isUndoSyncListening()) return // no peer: the diff below is pure cost
         val pagesNow = state.document.pages
         // Page add/remove (by identity): undo of AddPage/DeletePage, MovePages.
         if (pagesNow.size != pagesBefore.size || pagesNow != pagesBefore) {
