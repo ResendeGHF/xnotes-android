@@ -55,5 +55,13 @@ class JsonStore(private val file: File) {
         /** Page counts and PDF flags the explorer read from notes, under the private config directory. */
         fun docMeta(context: Context): JsonStore =
             JsonStore(File(File(context.filesDir, "config"), "doc_meta.json"))
+
+        /** Folder item counts, by folder identity and mtime, under the private config directory. */
+        fun folderCounts(context: Context): JsonStore =
+            JsonStore(File(File(context.filesDir, "config"), "folder_counts.json"))
+
+        /** Last-seen folder listings (names + free metadata), under the private config directory. */
+        fun folderListings(context: Context): JsonStore =
+            JsonStore(File(File(context.filesDir, "config"), "folder_listings.json"))
     }
 }

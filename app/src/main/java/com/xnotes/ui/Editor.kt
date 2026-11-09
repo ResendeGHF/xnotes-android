@@ -329,6 +329,9 @@ private const val RECENT_MAX = 40
 /** Recents resolved concurrently per chunk: bounds parallel SAF queries like the meta badges. */
 private const val RECENT_BATCH = 16
 
+/** Tiles warmed from disk per folder visit: bounds parallel disk reads like the meta badges. */
+private const val PREFETCH_TILES = 48
+
 /** How long the view must sit still before a PDF text selection's menu shows again. */
 private const val PDF_TEXT_MENU_SETTLE_MS = 250L
 
@@ -772,6 +775,10 @@ class Editor(
     private val docMeta = com.xnotes.platform.DocMetaStore(com.xnotes.platform.JsonStore.docMeta(appContext))
     /** Which documents carry which colour (learned while browsing + on every colour edit), for the instant colour filter. */
     private val colorIndex = ColorIndex(com.xnotes.platform.JsonStore.colorIndex(appContext))
+    /** Folder item counts, persisted so rows show them on the first paint after a restart. */
+    private val folderCountStore = com.xnotes.platform.FolderCountStore(com.xnotes.platform.JsonStore.folderCounts(appContext))
+    /** Last-seen folder listings, persisted so folders paint instantly on a cold start. */
+    private val folderListings = FolderListings(com.xnotes.platform.JsonStore.folderListings(appContext))
     /** Explorer thumbnails: parsed and painted concurrently (every task owns its surfaces and
      *  layout pass), at background priority. Bounded so a folder of many notes fills in fast
      *  without starving the UI, render or SAF-provider threads. */
@@ -5591,6 +5598,38 @@ class Editor(
 
     private enum class TileKind { READER, CANVAS, NOTE }
 
+    /**
+     * Disk-cached tiles for [entries] into memory in one batch, so the grid paints
+     * them instead of staggering per-tile settles and renders. Disk hits only —
+     * never renders or opens documents: misses stay on the tiles' own on-demand
+     * path, and sealed notes (never stored on disk) just miss here. Best-effort
+     * and epoch-guarded; bound the caller, cancelled with its scope.
+     */
+    suspend fun prefetchTiles(entries: List<BrowseEntry>, whole: Boolean) {
+        val generation = thumbnailGeneration
+        val epoch = tileEpoch
+        if (!isCurrentThumbnail(generation)) return
+        val mine = entries.asSequence()
+            .filter { !it.isDir && !com.xnotes.core.util.ReaderKind.isReadable(it.name) }
+            .filter { synchronized(noteThumbs) { noteThumbs.get(if (whole) pageThumbKey(it.documentUri) else it.documentUri) == null } }
+            .take(PREFETCH_TILES)
+            .toList()
+        if (mine.isEmpty()) return
+        coroutineScope {
+            mine.map { e ->
+                async(thumbPool) {
+                    ensureActive()
+                    if (!tileAlive(epoch, generation)) return@async
+                    val key = if (whole) pageThumbKey(e.documentUri) else e.documentUri
+                    thumbCache.load(key, generation)?.let { bmp ->
+                        ensureActive()
+                        publishThumbnail(key, bmp, generation, epoch)
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
     /** A read-only PDF's first page (memory-cached only); the entry point filters other reader kinds. */
     private suspend fun readerTile(uri: String, epoch: Long, generation: Long): ImageBitmap? =
         withContext(thumbPool) {
@@ -5805,6 +5844,8 @@ class Editor(
         sidecarFileCache.clear()
         rootNameCache.clear()
         colorIndex.clear()
+        folderCountStore.clear()
+        folderListings.clear()
         reloadTemplateLibrary()
     }
 
@@ -6033,6 +6074,8 @@ class Editor(
         createdStore.clear() // and every tracked creation time — the keys only meant anything for that folder
         docMeta.clear()
         colorIndex.clear()
+        folderCountStore.clear()
+        folderListings.clear()
         synchronized(noteThumbs) { noteThumbs.evictAll() }
         thumbCache.prune(emptySet()) // every cached tile belonged to the released folder
     }
@@ -7083,6 +7126,8 @@ class Editor(
             val created = kotlinx.coroutines.withContext(Dispatchers.IO) { scanAndImportPdfs(root) }
             if (created > 0) {
                 browseCache.clear()
+                folderCountStore.clear()
+                folderListings.clear()
                 relistTree()
             }
             created
@@ -7262,6 +7307,8 @@ class Editor(
             docMeta.rekeyTree(from, to)
             colorIndex.moved(from, to, parentDocIdOf(newUri))
             rekeyTabUi(from, to)
+            // Rows/counts keyed by the old ids are stale, and the new parents changed shape.
+            dropListingCaches(from.substringBefore('|'), from.substringAfter('|'), to.substringAfter('|'))
             knownStamps.remove(oldUri)?.let { knownStamps[newUri] = it }
             invalidateThumb(oldUri)
             runCatching { noteLinkIndex.remap(oldUri, newUri, newName) }
@@ -7326,6 +7373,24 @@ class Editor(
     }.getOrDefault(false)
 
     /**
+     * Drop cached listings and counts touched by a structural change of [docIds] (deleted
+     * or moved items/folders): snapshots of the subtrees themselves, which no longer exist
+     * there, and of their parents, whose rows/counts changed. The next listing rewrites them.
+     */
+    private fun dropListingCaches(auth: String?, vararg docIds: String) {
+        for (id in docIds) {
+            val prefix = "$auth|$id"
+            folderListings.dropMatching { com.xnotes.core.util.DocKeys.within(it, prefix) }
+            folderCountStore.removeMatching { com.xnotes.core.util.DocKeys.within(it, prefix) }
+            val parent = id.substringBeforeLast('/', "")
+            if (parent.isNotEmpty() && parent != id) {
+                folderListings.dropParent("$auth|$parent")
+                folderCountStore.remove("$auth|$parent")
+            }
+        }
+    }
+
+    /**
      * Erase every trace of a just-deleted document — or, when it's a folder, everything beneath
      * it: discard the open note if it was the deleted file, drop matching recents, and discard
      * their cached thumbnails and remembered views. Matching is by document identity (authority +
@@ -7353,6 +7418,7 @@ class Editor(
         createdStore.removeMatching { it == keyPrefix || it.startsWith("$keyPrefix/") }
         docMeta.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         colorIndex.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        dropListingCaches(auth, delId)
         tabZoomLocked.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         tabSidebarVisible.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         tabSidePanelTab.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
@@ -8481,7 +8547,8 @@ class Editor(
         applyHomePreferences(preferences.copy(hideDotItems = hide))
         browseCache.clear()
         sidecarFileCache.clear()
-        folderCounts.clear()
+        folderCountStore.clear()
+        folderListings.clear()
         treeVersion++
     }
 
@@ -8531,12 +8598,17 @@ class Editor(
         val now = System.currentTimeMillis()
         val coveringVault = vaultCovering(treeUri, parentDocId)
         val parentSealed = coveringVault != null
+        // Vault roots among the children (checked once, reused below): locked folders show,
+        // but their names must never reach plaintext disk.
+        val vaultRoots = HashSet<String>()
         if (!parentSealed) {
             createdStore.stampMissing(
                 out.filterNot { e ->
-                    e.isDir && runCatching {
+                    val sealed = e.isDir && runCatching {
                         isVaultRoot(treeUri, android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(e.documentUri)))
                     }.getOrDefault(false)
+                    if (sealed) vaultRoots.add(e.documentUri)
+                    sealed
                 }.associate { documentKey(it.documentUri) to (com.xnotes.core.util.DocKeys.inferCreated(now, it.modified) ?: now) },
             )
         }
@@ -8548,6 +8620,23 @@ class Editor(
         // their row, all with zero extra IO (the sidecar was just read).
         colorIndex.noteFolder(tree.authority ?: "", parentDocId, result, { e -> documentKey(e.documentUri) }, coveringVault)
         browseCache["$treeUri|$parentDocId"] = result
+        // Remember the listing's free metadata so the folder paints instantly on a cold
+        // start; the live query above rewrites it on every visit. Sealed parents and
+        // vault roots are never stored.
+        if (!parentSealed) {
+            val auth = tree.authority ?: ""
+            folderListings.note(
+                "$auth|$parentDocId",
+                result.filterNot { it.documentUri in vaultRoots }.mapNotNull { e ->
+                    runCatching {
+                        FolderListings.Row(
+                            e.name, browseDocId(e.documentUri), e.isDir, e.size, e.modified, e.created,
+                            e.color?.let { Rgba.toHex(it) },
+                        )
+                    }.getOrNull()
+                },
+            )
+        }
         return result
     }
 
@@ -8996,11 +9085,10 @@ class Editor(
         return runCatching { appContext.contentResolver.openInputStream(u)?.use { viaStream(it) } }.getOrNull()
     }
 
-    private val folderCounts = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Int>>()
-
     /** How many notes, canvases and folders [folder] holds, as the explorer would list them. IO, cached by the folder's mtime. */
     fun folderItemCount(treeUri: String, folder: BrowseEntry): Int {
-        folderCounts[folder.documentUri]?.takeIf { it.first == folder.modified && folder.modified > 0 }?.let { return it.second }
+        val key = documentKey(folder.documentUri)
+        if (folder.modified > 0) folderCountStore.get(key, folder.modified)?.let { return it }
         val tree = android.net.Uri.parse(treeUri)
         val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, browseDocId(folder.documentUri))
         var n = 0
@@ -9017,12 +9105,39 @@ class Editor(
                 }
             }
         }
-        folderCounts[folder.documentUri] = folder.modified to n
+        if (folder.modified > 0) folderCountStore.put(key, folder.modified, n)
         return n
     }
 
+    /** Counts for [folders] as known right now (memory + disk, no IO), to seed rows before the recount. */
+    fun cachedFolderCounts(folders: List<BrowseEntry>): Map<String, Int> {
+        if (folders.isEmpty()) return emptyMap()
+        val out = HashMap<String, Int>(folders.size)
+        for (f in folders) {
+            if (f.modified <= 0) continue
+            folderCountStore.get(documentKey(f.documentUri), f.modified)?.let { out[f.documentUri] = it }
+        }
+        return out
+    }
+
     /** Last-listed children for a folder, to seed the explorer instantly before the refresh. */
-    fun cachedChildren(treeUri: String, parentDocId: String): List<BrowseEntry>? = browseCache["$treeUri|$parentDocId"]
+    fun cachedChildren(treeUri: String, parentDocId: String): List<BrowseEntry>? {
+        browseCache["$treeUri|$parentDocId"]?.let { return it }
+        // Cold start: the last listing from disk paints instantly; the live query corrects it in place.
+        val tree = runCatching { android.net.Uri.parse(treeUri) }.getOrNull() ?: return null
+        val auth = tree.authority ?: return null
+        val rows = folderListings.get("$auth|$parentDocId")?.takeIf { it.isNotEmpty() } ?: return null
+        return rows.mapNotNull { r ->
+            runCatching {
+                val docUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, r.childDocId).toString()
+                BrowseEntry(
+                    name = r.name, documentUri = docUri, isDir = r.isDir,
+                    size = r.size, modified = r.modified, created = r.created,
+                    parentDocId = parentDocId, color = r.colorHex?.let { Rgba.fromHex(it) },
+                )
+            }.getOrNull()
+        }.takeIf { it.isNotEmpty() }
+    }
 
     /**
      * Recursively finds notes at or below [startDocId] in tree [treeUri] whose name (sans `.xnote`)

@@ -1333,6 +1333,13 @@ private fun ExplorerSection(
             ensureActive()
         }
     }
+    // Warm memory tiles from disk in one batch once the listing lands, so the grid
+    // paints cached tiles instead of staggering per-tile loads and renders.
+    LaunchedEffect(source, view.thumb) {
+        if (vaultLocked) return@LaunchedEffect // sealed tiles never reach disk
+        val pool = source?.takeIf { it.isNotEmpty() } ?: return@LaunchedEffect
+        editor.prefetchTiles(pool, view.thumb == ThumbShape.PAGE)
+    }
     val kindOf: (BrowseEntry) -> EntryKind = { entryKind(it, editor.cachedMeta(it)) }
     val withCreated: (BrowseEntry) -> BrowseEntry = { e -> editor.createdOf(e).let { if (it == e.created) e else e.copy(created = it) } }
     val arrange: (List<BrowseEntry>) -> List<BrowseEntry> = remember(view.sortKey, view.descending, view.folders, kindFilter, metaTick) {
@@ -1369,16 +1376,25 @@ private fun ExplorerSection(
         )
     }
     val metas = remember(arranged, metaTick) { arranged.orEmpty().filter { !it.isDir }.associate { it.documentUri to editor.cachedMeta(it) } }
-    val counts by produceState(emptyMap<String, Int>(), root, arranged, prefs.showFolderCounts) {
-        val folders = arranged.orEmpty().filter { it.isDir }
-        value = if (!prefs.showFolderCounts || folders.isEmpty()) emptyMap()
-        else withContext(Dispatchers.IO) {
+    val foldersForCounts = remember(arranged) { arranged.orEmpty().filter { it.isDir } }
+    val counts by produceState(editor.cachedFolderCounts(foldersForCounts), root, arranged, prefs.showFolderCounts) {
+        if (!prefs.showFolderCounts) {
+            if (value.isNotEmpty()) value = emptyMap()
+            return@produceState
+        }
+        val folders = foldersForCounts
+        if (folders.isEmpty()) {
+            if (value.isNotEmpty()) value = emptyMap()
+            return@produceState
+        }
+        val fresh = withContext(Dispatchers.IO) {
             folders.chunked(COUNT_BATCH).flatMap { chunk ->
                 coroutineScope {
                     chunk.map { f -> async { f.documentUri to editor.folderItemCount(root, f) } }.awaitAll()
                 }
             }.toMap()
         }
+        if (fresh != value) value = fresh
     }
 
     // Drag-to-move state. While a selection is being dragged onto a folder, [dragPos] is the finger
