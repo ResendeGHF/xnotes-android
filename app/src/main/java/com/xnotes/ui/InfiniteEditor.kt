@@ -2083,6 +2083,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         // Wet runs are rebuilt every sample, so they take the Lod budget too: zoomed out, the
         // settled discs shrink to a few segments instead of dozens.
         val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
+        val meshStartNs = System.nanoTime()
         val settled = ribbon.settledCount
         if (settled - wetMeshed >= runPoints) {
             val from = (wetMeshed - 1).coerceAtLeast(0)
@@ -2100,7 +2101,51 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val parts = if (tail == null) emptyList() else listOf(if (invertInk) tail.inverted() else tail)
         if (!frontDecided) decideFrontInk(stroke, parts)
         wetTail = parts
-        if (frontInk) pad.setTail(parts) else scene.setWetTail(parts, bounds)
+        // Pixels-only lookahead past the nib: the predicted segment rides the real tail and
+        // is corrected by the next sample, so it can never corrupt the stroke.
+        val predicted = predictedTailPart(stroke, ribbon, wetTol)
+        val tailed = if (predicted == null) parts else parts + predicted
+        val tailedBounds = if (predicted == null) bounds else bounds.outset(predictLeadContent())
+        if (frontInk) pad.setTail(tailed) else scene.setWetTail(tailed, tailedBounds)
+        scene.noteWetMesh((System.nanoTime() - meshStartNs) / 1_000_000.0)
+    }
+
+    /** Content units the prediction may reach: a fixed on-screen distance whatever the zoom. */
+    private fun predictLeadContent(): Double {
+        val z = viewport.zoom
+        return if (!z.isFinite() || z <= 0.0) 0.0
+        else com.xnotes.canvas.StrokePredictor.MAX_LEAD_SCREEN_PX / z
+    }
+
+    /**
+     * A one-segment mesh from the nib toward where it is heading, for plain opaque
+     * ink only: pencil tone, dash rhythm and neon blooms cannot be faked for a frame
+     * without showing, so those tools keep the un-predicted tail.
+     */
+    private fun predictedTailPart(
+        stroke: Stroke,
+        ribbon: com.xnotes.core.stroke.RibbonPoints,
+        tolerance: Double,
+    ): com.xnotes.core.infinite.MeshPart? {
+        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
+        if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
+        val n = ribbon.pointCount
+        if (n < 2) return null
+        val lead = predictLeadContent()
+        if (lead <= 0.0) return null
+        val head = com.xnotes.canvas.StrokePredictor.predict(
+            stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
+            stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
+            lead,
+        ) ?: return null
+        val hw = ribbon.hw(n - 1)
+        if (!hw.isFinite() || hw <= 0.0) return null
+        val builder = com.xnotes.core.infinite.MeshBuilder()
+        builder.polylineRibbon(listOf(Pt(stroke.xAt(n - 1), stroke.yAt(n - 1)), head), hw, false, tolerance)
+        val mesh = builder.build()
+        if (mesh.isEmpty) return null
+        val part = com.xnotes.core.infinite.MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
+        return if (invertInk) part.inverted() else part
     }
 
     /**

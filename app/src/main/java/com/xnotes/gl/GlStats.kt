@@ -66,4 +66,10 @@ data class GlStats(
     val commitMs: Double = 0.0,
     val liftMs: Double = 0.0,
     val wetMs: Double = 0.0,
+    /** Last wet mesh+upload cost in ms, measured wherever the tessellation ran. */
+    val wetMeshMs: Double = 0.0,
+    /** Frames that reused the visible set instead of re-culling, cumulative. */
+    val cullSkipped: Int = 0,
+    /** Last minimap redraw cost in ms. */
+    val minimapMs: Double = 0.0,
 )

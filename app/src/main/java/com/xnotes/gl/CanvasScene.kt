@@ -142,7 +142,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
      * be on screen while a stroke is being drawn.
      */
     private val wetStore = GeometryStore()
-    private var wetParts: List<Part> = emptyList()
+    private var wetParts = ArrayList<Part>()
     private val tailStore = GeometryStore()
     private var tailParts: List<Part> = emptyList()
     private var wetBounds = Rect(0.0, 0.0, 0.0, 0.0)
@@ -192,8 +192,44 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     /** Bumped by any change to the records, so the cached halo layer knows it is stale. */
     private var revision = 0
 
+    /** Viewport and revision the visible set was last collected for; a match reuses it. */
+    private var lastCullView: Rect? = null
+    private var lastCullRevision = -1
+
+    /** Frames that reused the visible set, for the debug HUD. */
+    private var cullSkippedTotal = 0
+
+    /** Last wet mesh+upload cost in ms, published by whoever produced the tessellation. */
+    @Volatile
+    var notedWetMeshMs = 0.0
+        private set
+
+    /** Last minimap redraw cost in ms. */
+    @Volatile
+    var lastMinimapMs = 0.0
+        private set
+
     /** What the cached halo layer was built for; a mismatch means rebuild it. */
-    private var haloKey: String? = null
+    private var lastHaloRevision = -1
+    private var lastHaloZoom = Double.NaN
+    private var lastHaloScrollX = Double.NaN
+    private var lastHaloScrollY = Double.NaN
+    private var lastHaloW = -1
+    private var lastHaloH = -1
+
+    /** Glowing records for the cached halo layer, rebuilt when the revision moves. */
+    private var lastGlowing: List<Record> = emptyList()
+    private var lastGlowRevision = -1
+
+    /** What the throttled minimap was last drawn for; a match skips redrawing it. */
+    private var lastMinimapNs = 0L
+    private var lastMinimapRevision = -1
+    private var lastMinimapZoom = Double.NaN
+    private var lastMinimapScrollX = Double.NaN
+    private var lastMinimapScrollY = Double.NaN
+    private var lastMinimapW = -1
+    private var lastMinimapH = -1
+    private var lastMinimapBounds: Rect? = null
 
     /** The same for the dragged selection's halos, plus the point in the drag they were built at. */
     private var liftHaloKey: String? = null
@@ -224,11 +260,18 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     var onOutOfMemory: ((Boolean) -> Unit)? = null
     private var reportedOutOfMemory = false
 
+    /** Publish a wet mesh+upload cost measured wherever the tessellation ran. */
+    fun noteWetMesh(ms: Double) {
+        notedWetMeshMs = ms
+    }
+
     private var contextGen = -1
 
     /** Reused per frame so drawing allocates nothing. */
     private val visible = ArrayList<Record>()
     private val deferred = ArrayList<Deferred>()
+    private val stickyDeferred = ArrayList<Deferred>()
+    private val pencilParts = ArrayList<Triple<GeometryStore, Part, Rect>>()
 
     /** Items currently drawn, for the debug readout. */
     val itemCount: Int get() = records.size
@@ -268,6 +311,9 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         textureBytes = textures.residentBytes,
         texturesPending = textures.pendingCount,
         lastTessellateMs = lastTessellateMs,
+        wetMeshMs = notedWetMeshMs,
+        cullSkipped = cullSkippedTotal,
+        minimapMs = lastMinimapMs,
         cullMs = lastCullMs,
         commitMs = lastCommitMs,
         liftMs = lastLiftMs,
@@ -455,11 +501,20 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         GLES30.glEnable(GLES30.GL_BLEND)
         GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
 
-        collectVisible(frame)
-        lastVisibleItems = visible.size
+        // The visible set only depends on the viewport and the records: when neither
+        // moved, reusing it skips a full chunk walk, sort and dedupe every static frame.
+        val view = viewRect(frame)
+        if (view == lastCullView && revision == lastCullRevision) {
+            cullSkippedTotal++
+        } else {
+            collectVisible(view)
+            lastCullView = view
+            lastCullRevision = revision
+            lastVisibleItems = visible.size
+            lastCullMs = (System.nanoTime() - frameStartNs) / 1_000_000.0
+        }
         lastDrawCalls = 0
         val cullDone = System.nanoTime()
-        lastCullMs = (cullDone - frameStartNs) / 1_000_000.0
 
         // Halos of everything already committed go into a layer that is rebuilt only when the view
         // or the content moves. Re-blurring each of them every frame made the cost of neon scale
@@ -471,7 +526,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         // everything else first, then the notes (with their own ink) over it.
         val fade = fade
         deferred.clear()
-        val stickyDeferred = ArrayList<Deferred>()
+        stickyDeferred.clear()
         drawCommittedBatch(program, frame, camChunkX, camChunkY, fade, stickyOnly = false, deferred)
         // A sticky's paper covers the plain highlighters beneath it, like a tape does.
         for (record in visible) {
@@ -501,7 +556,29 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val liftDone = System.nanoTime()
         lastLiftMs = (liftDone - commitDone) / 1_000_000.0
         drawWet(program, frame, camChunkX, camChunkY)
-        if (frame.minimapVisible) drawMinimap(frame)
+        if (frame.minimapVisible) {
+            // The minimap walks every record, so on a dense note it is a second cull per
+            // frame. Redraw it at most a few times a second while nothing it shows changed.
+            val nowNs = System.nanoTime()
+            if (nowNs - lastMinimapNs >= MINIMAP_REDRAW_NS ||
+                revision != lastMinimapRevision || frame.zoom != lastMinimapZoom ||
+                frame.scrollX != lastMinimapScrollX || frame.scrollY != lastMinimapScrollY ||
+                frame.widthPx != lastMinimapW || frame.heightPx != lastMinimapH ||
+                frame.contentBounds != lastMinimapBounds
+            ) {
+                val miniStart = System.nanoTime()
+                drawMinimap(frame)
+                lastMinimapMs = (System.nanoTime() - miniStart) / 1_000_000.0
+                lastMinimapNs = nowNs
+                lastMinimapRevision = revision
+                lastMinimapZoom = frame.zoom
+                lastMinimapScrollX = frame.scrollX
+                lastMinimapScrollY = frame.scrollY
+                lastMinimapW = frame.widthPx
+                lastMinimapH = frame.heightPx
+                lastMinimapBounds = frame.contentBounds
+            }
+        }
         lastWetMs = (System.nanoTime() - liftDone) / 1_000_000.0
         lastCommitMs = (commitDone - cullDone) / 1_000_000.0
 
@@ -871,7 +948,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             runCount = 0
         }
         // Pencil runs defer their covers to the shared union below.
-        val pencilParts = ArrayList<Triple<GeometryStore, Part, Rect>>()
+        pencilParts.clear()
         for (part in parts) {
             if (part.pass == InkPass.OPAQUE) {
                 if (runStart >= 0 && part.slice.indexOffset == runStart + runCount) {
@@ -1035,15 +1112,26 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     ) {
         val shader = glowShader ?: return
         if (!glowTarget.ready) return
-        val glowing = visible.filter { record -> record.parts.any { it.pass == InkPass.GLOW } }
-        if (glowing.isEmpty()) {
-            haloKey = null
-            return
+        // The glowing set only depends on the records and the revision; the halo pixels
+        // additionally on the view. Compare fields directly: the old string key allocated
+        // every frame to learn the same thing.
+        if (revision != lastGlowRevision) {
+            lastGlowing = visible.filter { record -> record.parts.any { it.pass == InkPass.GLOW } }
+            lastGlowRevision = revision
         }
-        val key = "$revision|${frame.zoom}|${frame.scrollX}|${frame.scrollY}|${frame.widthPx}x${frame.heightPx}"
-        if (key != haloKey) {
+        val glowing = lastGlowing
+        if (glowing.isEmpty()) return
+        if (revision != lastHaloRevision || frame.zoom != lastHaloZoom ||
+            frame.scrollX != lastHaloScrollX || frame.scrollY != lastHaloScrollY ||
+            frame.widthPx != lastHaloW || frame.heightPx != lastHaloH
+        ) {
             buildHaloLayer(program, glowing, frame, camChunkX, camChunkY)
-            haloKey = key
+            lastHaloRevision = revision
+            lastHaloZoom = frame.zoom
+            lastHaloScrollX = frame.scrollX
+            lastHaloScrollY = frame.scrollY
+            lastHaloW = frame.widthPx
+            lastHaloH = frame.heightPx
             rebind(program, frame, camChunkX, camChunkY)
             store.bindForDraw(contextGen)
             store.bindAttributes(program)
@@ -1569,7 +1657,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                 // Appended, never rewritten: this run is ink that can no longer change.
                 wetBounds = edit.bounds
                 if (edit.parts.isEmpty()) return
-                wetParts = wetParts + build(edit.parts, wetStore)
+                wetParts.addAll(build(edit.parts, wetStore))
             }
             WetKind.TAIL -> {
                 // Its own buffer, cleared whole, so the churn under the nib cannot fragment the
@@ -1664,7 +1752,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
     private fun clearWetBuffer() {
         wetStore.clear()
-        wetParts = emptyList()
+        wetParts.clear()
         tailStore.clear()
         tailParts = emptyList()
     }
@@ -1706,9 +1794,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
     // --- culling ---
 
-    private fun collectVisible(frame: FrameState) {
+    private fun collectVisible(view: Rect) {
         visible.clear()
-        val view = viewRect(frame)
         for (record in oversized) if (record.bounds.intersects(view)) visible.add(record)
         val x0 = chunkOf(view.left)
         val y0 = chunkOf(view.top)
@@ -1802,6 +1889,9 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
         /** Smallest a minimap marker is drawn, so one thin stroke is still visible. */
         private const val MINIMAP_DOT_PX = 1.5
+
+        /** Slowest the minimap redraws while nothing it shows changed. */
+        private const val MINIMAP_REDRAW_NS = 120_000_000L
 
         /**
          * Device pixels a drag may slide its halo layer before it is blurred again. The layer only

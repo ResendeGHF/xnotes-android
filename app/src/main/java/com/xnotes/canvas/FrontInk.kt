@@ -165,7 +165,45 @@ class FrontInk(
         val tailFrom = (meshed - 1).coerceAtLeast(0)
         val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, arc)
         tailPart = tail
-        pad.setTail(if (tail == null) emptyList() else listOf(if (invert) tail.inverted() else tail))
+        val tailParts = if (tail == null) emptyList() else listOf(if (invert) tail.inverted() else tail)
+        // Pixels-only lookahead past the nib, corrected by the next sample; plain opaque
+        // ink only, so dash rhythm is never faked (the pad only hosts opaque runs anyway).
+        val predicted = predictedTailPart(stroke, ribbon, pageIndex)
+        pad.setTail(if (predicted == null) tailParts else tailParts + predicted)
+    }
+
+    /**
+     * A one-segment mesh from the nib toward where it is heading. Never enters the
+     * stroke: the next sample's tail replaces it, so a wrong guess lasts one frame.
+     */
+    private fun predictedTailPart(stroke: Stroke, ribbon: com.xnotes.core.stroke.RibbonPoints, pageIndex: Int): MeshPart? {
+        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
+        val n = ribbon.pointCount
+        if (n < 2) return null
+        val zoom = state.zoom
+        val lead = if (!zoom.isFinite() || zoom <= 0.0) 0.0
+        else StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
+        if (lead <= 0.0) return null
+        val head = StrokePredictor.predict(
+            stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
+            stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
+            lead,
+        ) ?: return null
+        val hw = ribbon.hw(n - 1)
+        if (!hw.isFinite() || hw <= 0.0) return null
+        val page = state.document.pages.getOrNull(pageIndex)
+        val invert = page?.resolvedInvertColors(state.document) == true
+        // The pad paint path re-derives res from the view each present (see GlWetPad); the
+        // ribbon tolerance here matches the settled runs meshed just above.
+        val builder = com.xnotes.core.infinite.MeshBuilder()
+        builder.polylineRibbon(
+            listOf(Pt(stroke.xAt(n - 1), stroke.yAt(n - 1)), head),
+            hw, false, com.xnotes.core.infinite.StrokeTessellator.DEFAULT_TOLERANCE,
+        )
+        val mesh = builder.build()
+        if (mesh.isEmpty) return null
+        val part = MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
+        return if (invert) part.inverted() else part
     }
 
     /** lightness-invert a meshed run for color inversion (alpha untouched, glow with it). */
