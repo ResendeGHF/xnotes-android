@@ -2118,13 +2118,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val tailedBounds = if (predicted == null) bounds else bounds.outset(predictLeadContent())
         if (frontInk) pad.setTail(tailed) else scene.setWetTail(tailed, tailedBounds)
         scene.noteWetMesh((System.nanoTime() - meshStartNs) / 1_000_000.0)
-        // A prediction with no follow-up samples is stale ink: retract it so a held
-        // pen never keeps showing a tip the commit would take away.
+        // A prediction with no follow-up samples is stale ink: shrink it back onto
+        // the nib a step at a time so a held pen never keeps showing a tip the
+        // commit would take away. Any new sample re-arms with the full lead.
         mainHandler.removeCallbacks(dropPrediction)
         if (predicted != null) {
             predictArmGen = predictGen
             predictStroke = stroke
-            mainHandler.postDelayed(dropPrediction, PREDICT_HOLD_MS)
+            predictLeadLeft = predictLeadContent()
+            mainHandler.postDelayed(dropPrediction, PREDICT_TICK_MS)
         }
     }
 
@@ -2149,22 +2151,41 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     ): com.xnotes.core.infinite.MeshPart? {
         if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
         if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
+        return predictedTailPart(stroke, ribbon, tolerance, predictLeadContent())
+    }
+
+    /**
+     * A one-segment mesh from the nib toward where it is heading, capped at
+     * [maxLead] content units, for plain opaque ink only: pencil tone, dash
+     * rhythm and neon blooms cannot be faked for a frame without showing, so
+     * those tools keep the un-predicted tail. The lead shrinks with
+     * deceleration and with turning, so a stopping or turning pen converges
+     * onto its real position instead of overshooting into ink that vanishes
+     * on commit.
+     */
+    private fun predictedTailPart(
+        stroke: Stroke,
+        ribbon: com.xnotes.core.stroke.RibbonPoints,
+        tolerance: Double,
+        maxLead: Double,
+    ): com.xnotes.core.infinite.MeshPart? {
+        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
+        if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
         val n = ribbon.pointCount
         if (n < 2) return null
-        val lead = predictLeadContent()
-        if (lead <= 0.0) return null
+        if (maxLead <= 0.0) return null
         val head = if (n >= 3) {
             com.xnotes.canvas.StrokePredictor.predict(
                 stroke.xAt(n - 3), stroke.yAt(n - 3), stroke.tAt(n - 3),
                 stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
                 stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                lead,
+                maxLead,
             )
         } else {
             com.xnotes.canvas.StrokePredictor.predict(
                 stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
                 stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                lead,
+                maxLead,
             )
         } ?: return null
         val hw = ribbon.hw(n - 1)
@@ -2178,18 +2199,40 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     /**
-     * Retract a stale prediction: with no new samples the tail is re-meshed plain
-     * so a pen held still never keeps showing ink past its nib, which would snap
-     * back on commit. Armed only while a prediction is on screen; any new sample,
-     * stroke change or commit disarms it.
+     * Shrink a stale prediction back onto the nib a step at a time, so a held
+     * pen shows its tip visibly settle instead of keeping ink that would snap
+     * back on commit. Armed only while a prediction is on screen; any new
+     * sample, stroke change or commit disarms it.
      */
     private var predictGen = 0
     private var predictArmGen = -1
     private var predictStroke: Stroke? = null
-    private val dropPrediction = Runnable {
+    private var predictLeadLeft = 0.0
+    private val dropPrediction: Runnable = Runnable {
         val stroke = predictStroke
         if (stroke == null || predictArmGen != predictGen || wetOwner !== stroke) return@Runnable
-        refreshWetTail(stroke)
+        predictLeadLeft *= PREDICT_DECAY
+        if (predictLeadLeft < com.xnotes.canvas.StrokePredictor.MIN_LEAD_UNITS || !republishPredictedTail(stroke, predictLeadLeft)) {
+            refreshWetTail(stroke)
+        } else {
+            mainHandler.postDelayed(dropPrediction, PREDICT_TICK_MS)
+        }
+    }
+
+    /** Re-mesh the live tail with a shrunken prediction cap and present it; false when there is nothing to show. */
+    private fun republishPredictedTail(stroke: Stroke, maxLead: Double): Boolean {
+        val ribbon = stroke.wetRibbon ?: return false
+        if (wetOwner !== stroke || maxLead <= 0.0) return false
+        val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
+        val tailFrom = (wetMeshed - 1).coerceAtLeast(0)
+        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, wetArc, wetTol) ?: return false
+        val parts = listOf(if (invertInk) tail.inverted() else tail)
+        wetTail = parts
+        val predicted = predictedTailPart(stroke, ribbon, wetTol, maxLead) ?: return false
+        val tailedBounds = stroke.paintBounds().outset(maxLead)
+        if (frontInk) pad.setTail(parts + predicted) else scene.setWetTail(parts + predicted, tailedBounds)
+        requestRender()
+        return true
     }
 
     /** Re-mesh the live tail without prediction and present it. */
@@ -3638,8 +3681,11 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
          */
         const val WHOLE_MESH_MIN_NS = 8_000_000L
 
-        /** How long a prediction may sit on screen with no new samples before it is retracted. */
-        const val PREDICT_HOLD_MS = 60L
+        /** How often a stale prediction shrinks back onto the nib while the pen holds still. */
+        const val PREDICT_TICK_MS = 32L
+
+        /** Each hold tick keeps this fraction of the prediction's reach. */
+        const val PREDICT_DECAY = 0.5
 
         /** Strokes re-meshed per frame by the settle refinement, to never stall a frame. */
         const val LOD_REFINE_BATCH = 12

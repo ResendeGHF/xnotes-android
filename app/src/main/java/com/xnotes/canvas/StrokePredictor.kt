@@ -8,11 +8,14 @@ import com.xnotes.core.geometry.Pt
  *
  * The predicted point is pixels only: it is meshed as an extra tail segment and
  * never enters the stroke's samples, so the next real sample corrects it and a
- * commit can never contain ink the hand did not draw. The flip side is the
- * commit boundary: whatever is still predicted when the pen lifts disappears
- * with it, so the lead shrinks with deceleration and a stale prediction is
- * retracted outright — a stopping pen must converge onto the real nib before
- * the stroke ends, or the tip visibly snaps back on pen-up.
+ * commit can never contain ink the hand did not draw. The flip side of that
+ * contract is the commit boundary: whatever is still shown when the pen lifts
+ * vanishes with it. So the lead shrinks with deceleration and with turning —
+ * a stopping pen converges onto its real position, and a pen whipping around
+ * a corner does not fire a spike off in the old direction — and a prediction
+ * left showing with no follow-up samples is retracted outright (see the
+ * publishers' hold timers). Either would otherwise paint ink that vanishes
+ * on commit.
  */
 object StrokePredictor {
 
@@ -20,7 +23,7 @@ object StrokePredictor {
     const val LEAD_MS = 8.0
 
     /** The prediction never reaches further than this on screen, whatever the zoom. */
-    const val MAX_LEAD_SCREEN_PX = 12.0
+    const val MAX_LEAD_SCREEN_PX = 8.0
 
     /** Above this implied speed the samples disagree (a teleport or a glitch): hold still. */
     const val MAX_SPEED_UNITS_PER_MS = 20.0
