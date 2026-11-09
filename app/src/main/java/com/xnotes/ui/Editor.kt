@@ -650,18 +650,70 @@ class Editor(
     /** Canvas views use a centre + zoom waypoint, which survives a pane-size change. */
     private val tabCanvasViews = HashMap<String, com.xnotes.core.infinite.Waypoint>()
 
+    /**
+     * Per-tab chrome: zoom lock + side panel (open + tab). A single editor swaps
+     * documents when tabs change, so these must live beside the tab — otherwise
+     * toggling them in one note leaks into every other. In-memory only.
+     */
+    private val tabZoomLocked = HashMap<String, Boolean>()
+    private val tabSidebarVisible = HashMap<String, Boolean>()
+    private val tabSidePanelTab = HashMap<String, SidePanelTab>()
+
+    /** Remember this tab's chrome under its document, so leaving never leaks it into the next tab. */
+    private fun saveTabUiState() {
+        val uri = openDocumentUri ?: return
+        val key = documentKey(uri)
+        tabZoomLocked[key] = zoomLocked
+        tabSidebarVisible[key] = sidebarVisible
+        tabSidePanelTab[key] = sidePanelTab
+    }
+
+    /** Restore the chrome saved for [uri], or the defaults for a tab with nothing saved yet. */
+    private fun restoreTabUiState(uri: String?) {
+        if (uri == null) {
+            zoomLocked = false
+            state.zoomLocked = false
+            sidebarVisible = false
+            sidePanelTab = SidePanelTab.PAGES
+            return
+        }
+        val key = documentKey(uri)
+        val locked = tabZoomLocked[key] ?: false
+        zoomLocked = locked
+        state.zoomLocked = locked
+        sidebarVisible = tabSidebarVisible[key] ?: false
+        sidePanelTab = tabSidePanelTab[key] ?: SidePanelTab.PAGES
+    }
+
+    /** Carry per-tab chrome across a rename or move that changed the document id. */
+    private fun rekeyTabUi(from: String, to: String) {
+        fun <T> rekey(map: HashMap<String, T>) {
+            val moves = map.keys.mapNotNull { k -> com.xnotes.core.util.DocKeys.moved(k, from, to)?.let { k to it } }
+            for ((old, new) in moves) map.remove(old)?.let { map[new] = it }
+        }
+        rekey(tabZoomLocked)
+        rekey(tabSidebarVisible)
+        rekey(tabSidePanelTab)
+    }
+
     fun forgetInactiveDocument(uri: String) {
         inactiveDocuments.remove(uri)
         inactiveCanvases.remove(uri)
         val key = documentKey(uri)
         tabViews.remove(key)
         tabCanvasViews.remove(key)
+        tabZoomLocked.remove(key)
+        tabSidebarVisible.remove(key)
+        tabSidePanelTab.remove(key)
     }
     fun clearInactiveDocuments() {
         inactiveDocuments.clear()
         inactiveCanvases.clear()
         tabViews.clear()
         tabCanvasViews.clear()
+        tabZoomLocked.clear()
+        tabSidebarVisible.clear()
+        tabSidePanelTab.clear()
     }
 
     private fun rememberCanvasView() {
@@ -679,8 +731,9 @@ class Editor(
     }
 
     /** Finish the canvas's edits before switching the pane to a paged note. */
-    private fun leaveCanvasForPagedNote() {
-        if (!canvasOpen) return
+    private fun leaveCanvasForPagedNote(): Boolean {
+        if (!canvasOpen) return false
+        saveTabUiState() // the canvas tab's chrome, before the pane stops showing it
         infinite.commitText()
         flushCanvasAutosave()
         rememberInactiveCanvas()
@@ -690,6 +743,7 @@ class Editor(
         infinite.interaction.resetGestureState()
         canvasAutosaveUri = null
         canvasOpen = false
+        return true
     }
 
     private fun rememberInactiveDocument() {
@@ -1527,6 +1581,7 @@ class Editor(
         fromSession: Boolean = false,
         vaultId: String? = null,
     ) {
+        saveTabUiState() // the outgoing tab's chrome (paged or canvas), before the swap
         if (canvasOpen) {
             infinite.commitText()
             flushCanvasAutosave()
@@ -1569,6 +1624,9 @@ class Editor(
         canvasAutosaveUri?.let { rememberStamp(it) }
         canvasOpen = true
         noteOpen = true
+        // A session restore keeps the launch chrome (the persisted sidebar state) and seeds
+        // this tab with it; any other open restores the tab's own chrome, or the defaults.
+        if (fromSession) saveTabUiState() else restoreTabUiState(uri)
         canvas.recoverRecordings(fromSession)
     }
 
@@ -4384,6 +4442,7 @@ class Editor(
             state.relayout()
             if (state.viewportW > 0) state.establishInitialView()
             maybeBindAutosave(state.document.path) // resume autosave if the restored note is in the folder
+            saveTabUiState() // seed this tab with the restored chrome (session zoom lock + launch sidebar)
             refreshContent()
             view.requestRender()
             recoverRecordings(fromSession = true)
@@ -5075,9 +5134,9 @@ class Editor(
                     inactiveDocuments[uri] = cached
                     return
                 }
-                leaveCanvasForPagedNote()
+                val wasCanvas = leaveCanvasForPagedNote()
                 openVaultId = vaultId
-                replaceDocument(cached)
+                replaceDocument(cached, saveTabUi = !wasCanvas)
                 maybeBindAutosave(uri)
                 noteOpen = true
                 rememberOpened(uri, name)
@@ -5113,8 +5172,8 @@ class Editor(
             doc.displayName = name
             doc.dirty = false
             openVaultId = vaultId
-            leaveCanvasForPagedNote()
-            replaceDocument(doc)
+            val wasCanvas = leaveCanvasForPagedNote()
+            replaceDocument(doc, saveTabUi = !wasCanvas)
             state.openFileBytes = fileBytes
             state.lastSaveBytes = fileBytes // the on-disk size, until the first autosave rewrites it
             maybeBindAutosave(uri) // resume autosaving if this note lives in the granted folder
@@ -7202,6 +7261,7 @@ class Editor(
             viewStates.rekeyTree(from, to)
             docMeta.rekeyTree(from, to)
             colorIndex.moved(from, to, parentDocIdOf(newUri))
+            rekeyTabUi(from, to)
             knownStamps.remove(oldUri)?.let { knownStamps[newUri] = it }
             invalidateThumb(oldUri)
             runCatching { noteLinkIndex.remap(oldUri, newUri, newName) }
@@ -7293,6 +7353,9 @@ class Editor(
         createdStore.removeMatching { it == keyPrefix || it.startsWith("$keyPrefix/") }
         docMeta.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         colorIndex.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        tabZoomLocked.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        tabSidebarVisible.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        tabSidePanelTab.keys.removeAll { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         if (folderViews.keys.any { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }) {
             folderViews = folderViews.filterKeys { !com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
             settings = settings.copy(folderViews = folderViews)
@@ -7713,10 +7776,12 @@ class Editor(
 
     /** Point the open note at the copy it just forked into, and say so. Main thread. */
     private fun adoptNoteFork(fork: Fork) {
+        saveTabUiState() // the pre-fork tab keeps its chrome
         state.document.path = fork.uri
         openVaultId = vaultOf(fork.uri)
         state.document.displayName = fork.name
         autosaveUri = fork.uri
+        saveTabUiState() // the fork starts with the chrome it was looking at
         refreshContent()
         message = appContext.getString(R.string.note_forked, com.xnotes.core.util.DocumentKind.stripSuffix(fork.name))
     }
@@ -7724,11 +7789,13 @@ class Editor(
     /** The canvas sibling of [adoptNoteFork]. Main thread. */
     private fun adoptCanvasFork(fork: Fork) {
         val canvas = infiniteOrNull ?: return
+        saveTabUiState() // the pre-fork tab keeps its chrome
         canvas.document.path = fork.uri
         openVaultId = vaultOf(fork.uri)
         canvas.imageDir = openVaultId?.let { vaultWorkFor(it) } ?: imageDir
         canvas.document.displayName = fork.name
         canvasAutosaveUri = fork.uri
+        saveTabUiState() // the fork starts with the chrome it was looking at
         refreshContent()
         message = appContext.getString(R.string.canvas_forked, com.xnotes.core.util.DocumentKind.stripSuffix(fork.name))
     }
@@ -9779,10 +9846,16 @@ class Editor(
         }
     }
 
-    private fun replaceDocument(doc: Document) {
+    /**
+     * Swap the paged document. [saveTabUi] is false when the caller just left a canvas
+     * tab (its chrome is already saved): the stale paged buffer underneath must not
+     * overwrite that tab's entry.
+     */
+    private fun replaceDocument(doc: Document, saveTabUi: Boolean = true) {
         AudioRecording.stopFor(this) // closing the note places its recording
         AudioPlayback.closeFor(this)
         saveViewState() // remember the outgoing folder note's view before switching away
+        if (saveTabUi) saveTabUiState() // this tab's chrome, so the next tab starts with its own
         flowText.endSession() // flushes the typing burst so the autosave below carries it
         flushAutosave() // save the outgoing note if it was autosaving to the folder
         if (state.document.path != doc.path) rememberInactiveDocument()
@@ -9803,6 +9876,7 @@ class Editor(
         state.invalidateAllCaches()
         state.relayout()
         installInitialView(doc.path) // this note's remembered view, or fit width — never the last note's
+        restoreTabUiState(doc.path) // and this tab's chrome — never the last tab's
         refreshContent()
         view.requestRender()
         recoverRecordings(fromSession = false)
@@ -12978,6 +13052,7 @@ class Editor(
         AudioRecording.stopFor(this) // closing the note places its recording
         AudioPlayback.closeFor(this)
         saveViewState()
+        saveTabUiState() // the outgoing tab keeps its chrome; the blank note starts with the defaults
         flushAutosave()
         val wasSealed = openVaultId != null
         autosaveUri = null
@@ -12996,6 +13071,7 @@ class Editor(
         state.invalidateAllCaches()
         state.relayout()
         installInitialView(null) // a fresh in-memory note: fit width
+        restoreTabUiState(null) // and default chrome — never the last tab's
         refreshContent()
         view.requestRender()
         noteOpen = true // push the editor on top of backstage
@@ -13094,6 +13170,7 @@ class Editor(
     fun goHome(onLeft: (() -> Unit)? = null) {
         cancelOpenInProgress()
         if (!noteOpen) { onLeft?.invoke(); return }
+        saveTabUiState() // the tab keeps its chrome for when it is reopened
         val sealed = openVaultId != null
         vaultPrompt = null
         penMenu.close()
