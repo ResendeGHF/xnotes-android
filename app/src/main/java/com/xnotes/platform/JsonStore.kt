@@ -44,6 +44,10 @@ class JsonStore(private val file: File) {
         fun createdTimes(context: Context): JsonStore =
             JsonStore(File(File(context.filesDir, "config"), "created_times.json"))
 
+        /** Which documents carry which colour, learned while browsing; powers the instant colour filter. */
+        fun colorIndex(context: Context): JsonStore =
+            JsonStore(File(File(context.filesDir, "config"), "color_index.json"))
+
         /** Where playback stood in each recording, under the private config directory. */
         fun audioPositions(context: Context): JsonStore =
             JsonStore(File(File(context.filesDir, "config"), "audio_positions.json"))

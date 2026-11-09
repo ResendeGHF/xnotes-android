@@ -716,6 +716,8 @@ class Editor(
     /** App-tracked creation times for explorer ordering (SAF exposes only last-modified). */
     private val createdStore = com.xnotes.platform.CreationTimeStore(com.xnotes.platform.JsonStore.createdTimes(appContext))
     private val docMeta = com.xnotes.platform.DocMetaStore(com.xnotes.platform.JsonStore.docMeta(appContext))
+    /** Which documents carry which colour (learned while browsing + on every colour edit), for the instant colour filter. */
+    private val colorIndex = ColorIndex(com.xnotes.platform.JsonStore.colorIndex(appContext))
     /** Explorer thumbnails: parsed and painted concurrently (every task owns its surfaces and
      *  layout pass), at background priority. Bounded so a folder of many notes fills in fast
      *  without starving the UI, render or SAF-provider threads. */
@@ -5309,7 +5311,7 @@ class Editor(
      * (the system "Open…" picker) maps to one key. Shared by the per-note view state ([viewKey])
      * and the creation-time store. Falls back to the raw string for non-document URIs.
      */
-    private fun documentKey(uri: String): String = runCatching {
+    internal fun documentKey(uri: String): String = runCatching {
         val u = android.net.Uri.parse(uri)
         "${u.authority}|${android.provider.DocumentsContract.getDocumentId(u)}"
     }.getOrDefault(uri)
@@ -5743,6 +5745,7 @@ class Editor(
         browseCache.clear()
         sidecarFileCache.clear()
         rootNameCache.clear()
+        colorIndex.clear()
         reloadTemplateLibrary()
     }
 
@@ -5970,6 +5973,7 @@ class Editor(
         viewStates.clear() // forget every remembered per-note view for the released folder
         createdStore.clear() // and every tracked creation time — the keys only meant anything for that folder
         docMeta.clear()
+        colorIndex.clear()
         synchronized(noteThumbs) { noteThumbs.evictAll() }
         thumbCache.prune(emptySet()) // every cached tile belonged to the released folder
     }
@@ -6117,6 +6121,7 @@ class Editor(
             com.xnotes.crypto.VaultSession.lock(folderId)
             com.xnotes.crypto.VaultCrypto.secureDeleteTree(vaultWorkFor(folderId))
             purgeVaultDiskRows(folderId)
+            colorIndex.dropVault(folderId)
             for (ed in panes) {
                 // A session snapshot holds the note's plaintext. Overwrite it rather than merely
                 // unlinking it, then drop decoded thumbnails that the explorer could still show.
@@ -7196,6 +7201,7 @@ class Editor(
             createdStore.rekeyTree(from, to)
             viewStates.rekeyTree(from, to)
             docMeta.rekeyTree(from, to)
+            colorIndex.moved(from, to, parentDocIdOf(newUri))
             knownStamps.remove(oldUri)?.let { knownStamps[newUri] = it }
             invalidateThumb(oldUri)
             runCatching { noteLinkIndex.remap(oldUri, newUri, newName) }
@@ -7286,6 +7292,7 @@ class Editor(
         // matched the same way as the view state, and drop its cached tile.
         createdStore.removeMatching { it == keyPrefix || it.startsWith("$keyPrefix/") }
         docMeta.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
+        colorIndex.removeMatching { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
         if (folderViews.keys.any { com.xnotes.core.util.DocKeys.within(it, keyPrefix) }) {
             folderViews = folderViews.filterKeys { !com.xnotes.core.util.DocKeys.within(it, keyPrefix) }
             settings = settings.copy(folderViews = folderViews)
@@ -8455,7 +8462,8 @@ class Editor(
         // now and its modified time: nothing was created after its last edit, and a fresh item gets now.
         // Vault contents are never stamped: created_times.json would leak their document ids.
         val now = System.currentTimeMillis()
-        val parentSealed = vaultCovering(treeUri, parentDocId) != null
+        val coveringVault = vaultCovering(treeUri, parentDocId)
+        val parentSealed = coveringVault != null
         if (!parentSealed) {
             createdStore.stampMissing(
                 out.filterNot { e ->
@@ -8469,6 +8477,9 @@ class Editor(
             it.copy(created = createdStore.get(documentKey(it.documentUri)) ?: now, color = colors[it.name])
         }
         val result = withCreated.sortedWith(explorerComparator(explorerView.sortKey, explorerView.descending) { it.created })
+        // Feed the colour index: every coloured entry is learned, uncoloured ones drop
+        // their row, all with zero extra IO (the sidecar was just read).
+        colorIndex.noteFolder(tree.authority ?: "", parentDocId, result, { e -> documentKey(e.documentUri) }, coveringVault)
         browseCache["$treeUri|$parentDocId"] = result
         return result
     }
@@ -8579,15 +8590,20 @@ class Editor(
         setItemColors(treeUri, parentDocId, mapOf(itemName to color))
 
     /** Applies [changes] (item name to colour, null clears it) to [parentDocId]'s sidecar in one read and one write. IO. */
-    fun setItemColors(treeUri: String, parentDocId: String, changes: Map<String, Rgba?>): Boolean = runCatching {
-        if (changes.isEmpty()) return@runCatching true
-        val tree = android.net.Uri.parse(treeUri)
-        val sidecarId = sidecarDir(tree, parentDocId, create = changes.values.any { it != null })
-            ?: return@runCatching true // nothing stored, nothing to clear
-        val map = readSidecarColors(tree, sidecarId).toMutableMap()
-        for ((name, c) in changes) if (c == null) map.remove(name) else map[name] = c
-        writeSidecarColors(tree, sidecarId, map)
-    }.getOrDefault(false)
+    fun setItemColors(treeUri: String, parentDocId: String, changes: Map<String, Rgba?>): Boolean {
+        val ok = runCatching {
+            if (changes.isEmpty()) return@runCatching true
+            val tree = android.net.Uri.parse(treeUri)
+            val sidecarId = sidecarDir(tree, parentDocId, create = changes.values.any { it != null })
+                ?: return@runCatching true // nothing stored, nothing to clear
+            val map = readSidecarColors(tree, sidecarId).toMutableMap()
+            for ((name, c) in changes) if (c == null) map.remove(name) else map[name] = c
+            writeSidecarColors(tree, sidecarId, map)
+        }.getOrDefault(false)
+        // Re-list so the colour index (and the explorer cache) see the edit at once.
+        if (ok) runCatching { browseChildren(treeUri, parentDocId) }
+        return ok
+    }
 
     /** Doc id of [parentDocId]'s hidden sidecar dir, made on demand when [create]; null when absent or on failure. */
     private fun sidecarDir(tree: android.net.Uri, parentDocId: String, create: Boolean): String? {
@@ -8783,11 +8799,35 @@ class Editor(
         }.getOrDefault(false)
     }
 
-    /** Every folder and note in the tree carrying [color], in the explorer's sort order. One query per folder; IO. */
+    /**
+     * Every folder and note in the tree carrying [color], in the explorer's sort order. IO.
+     *
+     * Instant on a warm index: the parents holding this colour are known from memory
+     * (learned while browsing, topped up on every colour edit), so only those folders
+     * are re-listed — one bulk query each — to verify the hits are still there. A cold
+     * index (first run, new root) falls back to one full walk that warms it.
+     */
     fun findByColor(treeUri: String, color: Rgba): List<BrowseEntry> {
+        val hex = Rgba.toHex(color)
+        val tree = runCatching { android.net.Uri.parse(treeUri) }.getOrNull() ?: return emptyList()
+        val auth = tree.authority ?: return emptyList()
+        val rootId = runCatching { browseRootDocId(treeUri) }.getOrNull() ?: return emptyList()
+        val warm = colorIndex.isWarmed(auth)
+        val parents = colorIndex.parentsWith(auth, hex)
+        if (warm && parents.isEmpty()) return emptyList()
+        if (warm) {
+            val out = ArrayList<BrowseEntry>()
+            for (parent in parents) {
+                for (e in runCatching { browseChildren(treeUri, parent) }.getOrDefault(emptyList())) {
+                    if (e.color == color) out.add(e)
+                }
+            }
+            return out.sortedWith(explorerComparator(explorerView.sortKey, explorerView.descending) { it.created })
+        }
+        // Cold: one full walk that also warms the index through browseChildren.
         val out = ArrayList<BrowseEntry>()
         val seen = HashSet<String>()
-        val stack = ArrayDeque<String>().apply { addLast(browseRootDocId(treeUri)) }
+        val stack = ArrayDeque<String>().apply { addLast(rootId) }
         while (stack.isNotEmpty()) {
             val docId = stack.removeLast()
             if (!seen.add(docId)) continue // guard against any cyclic SAF links
@@ -8796,18 +8836,58 @@ class Editor(
                 if (e.isDir) stack.addLast(browseDocId(e.documentUri))
             }
         }
+        colorIndex.markWarmed(auth)
         return out.sortedWith(explorerComparator(explorerView.sortKey, explorerView.descending) { it.created })
     }
 
+    /**
+     * Learn every coloured document under the current root in the background (one
+     * bulk query per folder, lowest priority), so the first colour tap is instant.
+     * Single-flight: overlapping calls collapse into the running pass.
+     */
+    fun warmColorIndex() {
+        if (colorPrewarmJob?.isActive == true) return
+        colorPrewarmJob = autosaveScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val root = browseRoot ?: return@runCatching
+                    val tree = android.net.Uri.parse(root)
+                    val auth = tree.authority ?: return@runCatching
+                    if (colorIndex.isWarmed(auth)) return@runCatching
+                    val seen = HashSet<String>()
+                    val stack = ArrayDeque<String>().apply { addLast(browseRootDocId(root)) }
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_LOWEST)
+                    while (stack.isNotEmpty()) {
+                        if (!isActive) return@runCatching
+                        val docId = stack.removeLast()
+                        if (!seen.add(docId)) continue
+                        for (e in browseChildren(root, docId)) {
+                            if (!isActive) return@runCatching
+                            if (e.isDir) stack.addLast(browseDocId(e.documentUri))
+                        }
+                    }
+                    colorIndex.markWarmed(auth)
+                }
+            }
+        }
+    }
+
+    private var colorPrewarmJob: kotlinx.coroutines.Job? = null
+
     /** Carries a colour across a rename: moves key [oldName] -> [newName] in [parentDocId]'s sidecar. */
-    fun moveItemColor(treeUri: String, parentDocId: String, oldName: String, newName: String): Boolean = runCatching {
-        val tree = android.net.Uri.parse(treeUri)
-        val sidecarId = findChildDocId(tree, parentDocId, SIDECAR_DIR, dir = true) ?: return@runCatching true
-        val map = readSidecarColors(tree, sidecarId).toMutableMap()
-        val c = map.remove(oldName) ?: return@runCatching true
-        map[newName] = c
-        writeSidecarColors(tree, sidecarId, map)
-    }.getOrDefault(false)
+    fun moveItemColor(treeUri: String, parentDocId: String, oldName: String, newName: String): Boolean {
+        val ok = runCatching {
+            val tree = android.net.Uri.parse(treeUri)
+            val sidecarId = findChildDocId(tree, parentDocId, SIDECAR_DIR, dir = true) ?: return@runCatching true
+            val map = readSidecarColors(tree, sidecarId).toMutableMap()
+            val c = map.remove(oldName) ?: return@runCatching true
+            map[newName] = c
+            writeSidecarColors(tree, sidecarId, map)
+        }.getOrDefault(false)
+        // Re-list so the renamed entry keeps its colour in the index.
+        if (ok) runCatching { browseChildren(treeUri, parentDocId) }
+        return ok
+    }
 
     /** The page count and PDF flag [entry]'s tile shows, if they're known for the file as it is now. Instant. */
     fun cachedMeta(entry: BrowseEntry): com.xnotes.platform.DocMetaStore.Meta? =
@@ -8995,6 +9075,8 @@ class Editor(
                 // The open note stops writing to where it was; what's keyed by its identity follows it in.
                 detachIfOpen(e.documentUri)
                 onDocumentMoved(e.documentUri, moved.toString())
+                // Trashed items live under the hidden sidecar: never colour-filterable.
+                colorIndex.drop(documentKey(moved.toString()))
                 dropPinsWithin(moved.toString())
                 dropRecentsWithin(moved.toString())
                 TrashItem(wrapperId, e.copy(documentUri = moved.toString(), parentDocId = wrapperId), path, now)
@@ -9193,6 +9275,7 @@ class Editor(
             }
         }
         prewarmLinkGraph()
+        warmColorIndex()
     }
 
     private var linkPrewarmJob: kotlinx.coroutines.Job? = null
