@@ -253,6 +253,8 @@ typedef struct xn_host {
     /* A fetched file's bytes are complete (open it) or it left the set. */
     void (*sync_file_changed)(void* ctx, const char* file_id);
     void (*sync_file_gone)(void* ctx, const char* file_id);
+    /* A file's small entries arrived ahead of its bytes: open the skeleton now. */
+    void (*sync_file_head_ready)(void* ctx, const char* file_id);
     /* The open document must drop its state and refetch (host moved the head). */
     void (*sync_resync)(void* ctx, const char* file_id, long long version);
     /* A live frame changed the overlay: repaint. */
@@ -295,6 +297,10 @@ int xn_sync_file_count(const xn_sync* sync);
 int xn_sync_file_info(const xn_sync* sync, int index, char** id, char** path, int* kind, long long* version, long long* size);
 char* xn_sync_file_path(xn_sync* sync, const char* id);
 void xn_sync_open(xn_sync* sync, const char* id);
+/* A fetched head's entries as an openable skeleton file, or NULL when none waits. */
+char* xn_sync_file_head_path(xn_sync* sync, const char* id);
+/* Fill a skeleton-open note with its fetched bytes in place; 1 when completed. */
+int xn_sync_transplant(xn_sync* sync, const char* id, const char* work_dir);
 void xn_sync_resubscribe(xn_sync* sync);
 void xn_sync_close_file(xn_sync* sync, const char* id);
 void xn_sync_presence(xn_sync* sync, const char* id, int page);
@@ -318,6 +324,10 @@ void xn_free_string(char* s);
  * sets *error to a message (free with xn_free_string).
  */
 xn_note* xn_note_open(const char* path, const char* work_dir, const xn_host* host, char** error);
+
+/* Open a skeleton bundle (see xn_sync_file_head_path): missing assets decode as empty
+ * placeholders, so every item slot stays stable and xn_sync_transplant fills them later. */
+xn_note* xn_note_open_head(const char* path, const char* work_dir, const xn_host* host, char** error);
 
 /* A new note of `pages` blank A4 pages. */
 xn_note* xn_note_new(int pages);
@@ -661,6 +671,20 @@ typedef struct xn_page_style {
 void xn_editor_page_style(const xn_editor* editor, int all_pages, xn_page_style* out);
 /* Replace it; the canvas redraws, the note is marked changed (a style is not an undo step). */
 void xn_editor_set_page_style(xn_editor* editor, int all_pages, const xn_page_style* style);
+/* Register a plain-JSON template; returns its content-hash key (free with xn_free_string). */
+char* xn_template_add_json(const char* text);
+/* Register a packaged template (a .xtemplate zip path); returns its content-hash key. */
+char* xn_template_add_package(const char* path);
+/*
+ * Every template on offer, as JSON [{"key","name","kind","source"}] (free with xn_free_string):
+ * the library's bundled ones, plus note's own embedded copies when note is given (else just the
+ * library). kind is "page" or "cover"; source is "library" or "note".
+ */
+char* xn_templates_list(const xn_note* note);
+/* The override template key at all_pages' scope ("" = inherit). Free with xn_free_string. */
+char* xn_editor_page_template(const xn_editor* editor, int all_pages);
+/* Switch all_pages' scope to template key (NULL/empty = inherit), embedding it when needed. */
+void xn_editor_set_page_template(xn_editor* editor, int all_pages, const char* key);
 /* Note-level color-inversion view override (mirrored with the host over page_style). */
 int xn_editor_view_invert(const xn_editor* editor);
 /* Set it; images = -1 keeps, else 0/1. Fires the sync submit; remote applies bypass it. */

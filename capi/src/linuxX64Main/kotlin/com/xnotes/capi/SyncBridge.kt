@@ -16,6 +16,16 @@ import com.xnotes.core.pal.FontFace
 import com.xnotes.core.pal.HAlign
 import com.xnotes.core.model.ImageData
 import com.xnotes.core.model.ImageItem
+import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.ShapeLabel
+import com.xnotes.core.model.TextStyle
+import com.xnotes.core.model.FunctionSpec
+import com.xnotes.core.shapes.FreePath
+import com.xnotes.core.shapes.Head
+import com.xnotes.core.shapes.ShapeKind
+import com.xnotes.sync.WireShape
+import com.xnotes.sync.bytesOfBase64
+import com.xnotes.sync.toWireShape
 import com.xnotes.core.model.TableItem
 import com.xnotes.core.model.TextItem
 import com.xnotes.sync.WireAudio
@@ -28,9 +38,11 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.platform.File
+import com.xnotes.core.platform.asFile
 import com.xnotes.core.platform.asPath
 import com.xnotes.core.platform.fileOf
 import com.xnotes.core.platform.pathString
+import com.xnotes.core.platform.asInputStream
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 import com.xnotes.core.tools.ToolDefaults
@@ -96,6 +108,94 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
     /** Received image files by sync file id, so unshare/close can drop them. */
     private val imageFiles = HashMap<String, ArrayList<File>>()
     private val audioFiles = HashMap<String, ArrayList<File>>()
+
+    /**
+     * The last (id, version) handed to Qt as a temp note file. Reopening the same bytes
+     * rewrote a full temp copy every time (a 100 MB PDF note paid a full write + read per
+     * open); the path is reused while the version — and the file behind it — is unchanged.
+     */
+    private var lastNotePathId: String? = null
+    private var lastNotePathVersion = -1L
+    private var lastNotePath: String? = null
+
+    /** Temp path holding the cached bytes of [id] at [version], reused when still current. */
+    fun cachedNotePath(id: String, version: Long, bytes: ByteArray): String {
+        lastNotePath
+            ?.takeIf { lastNotePathId == id && lastNotePathVersion == version }
+            ?.let { path ->
+                if (runCatching { okio.FileSystem.SYSTEM.exists(fileOf(path).asPath()) }.getOrDefault(false)) return path
+            }
+        lastNotePath?.let { old ->
+            runCatching { okio.FileSystem.SYSTEM.delete(fileOf(old).asPath()) }
+        }
+        val tmp = com.xnotes.core.platform.createTempFile("sync", ".xnote", okio.FileSystem.SYSTEM_TEMPORARY_DIRECTORY.asFile())
+        okio.FileSystem.SYSTEM.write(tmp.asPath()) { write(bytes) }
+        lastNotePathId = id
+        lastNotePathVersion = version
+        lastNotePath = tmp.pathString
+        return tmp.pathString
+    }
+
+    /** Temp skeleton note files handed to Qt, at most one pending; replaced on every head. */
+    private var lastHeadPath: String? = null
+
+    /**
+     * Files opened from a skeleton head, by sync id: their images/audio/pdf are still
+     * streaming in. A full fetch completes them in place (no reopen).
+     */
+    private val skeletonVersions = HashMap<String, Long>()
+
+    /**
+     * The head's entries as an openable skeleton bundle, or null when no head is
+     * waiting for [id]. The bytes go to a temp file the Qt side opens with
+     * placeholders; every item slot stays stable so the full fetch fills in place.
+     */
+    fun cachedHeadPath(id: String): String? {
+        val version = engine.fileVersion(id) ?: return null
+        val head = engine.takeFileHead(id, version) ?: return null
+        val packages = HashMap<String, ByteArray>()
+        for ((k, v) in head.packages) {
+            runCatching { packages[k] = com.xnotes.sync.bytesOfBase64(v) ?: error("bad package") }
+        }
+        val codec = codecFor(null)
+        val bytes = codec.skeletonBytes(
+            head.manifest.encodeToByteArray(),
+            head.flow?.encodeToByteArray(),
+            head.markups?.encodeToByteArray(),
+            head.templates,
+            packages,
+        )
+        lastHeadPath?.let { old ->
+            runCatching { okio.FileSystem.SYSTEM.delete(fileOf(old).asPath()) }
+        }
+        val tmp = com.xnotes.core.platform.createTempFile("synch", ".xnote", okio.FileSystem.SYSTEM_TEMPORARY_DIRECTORY.asFile())
+        okio.FileSystem.SYSTEM.write(tmp.asPath()) { write(bytes) }
+        lastHeadPath = tmp.pathString
+        skeletonVersions[id] = version
+        return tmp.pathString
+    }
+
+    /**
+     * Fill a skeleton-open document with its full bytes: pdf, images, audio and
+     * missing packages swap in; items, history and the view survive. True when
+     * a skeleton was completed (the caller repaints and reloads the outline).
+     */
+    fun transplantFull(id: String, workDir: File?): Boolean {
+        val ce = bindings[id] ?: return false
+        if (!skeletonVersions.containsKey(id)) return false
+        val bytes = engine.fileBytes(id) ?: return false
+        val dir = workDir ?: return false
+        val full = try {
+            codecFor(null).read(okio.Buffer().write(bytes).asInputStream(), dir, dir)
+        } catch (_: Exception) {
+            return false
+        }
+        codecFor(null).absorbAssets(ce.state.document, full)
+        skeletonVersions.remove(id)
+        ce.state.invalidateAllCaches()
+        ce.requestRender()
+        return true
+    }
     private val imageDir: File = fileOf(fileOf(pinsDir), "sync-images").also {
         // Stale from a previous run: nothing is bound this early, so nothing can reference them.
         runCatching {
@@ -118,7 +218,8 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         val overlay = RemoteLiveStrokes(editor.state)
         overlay.showingFile = fileId
         editor.controller.remoteLive = overlay
-        engine.liveOverlay = overlay
+        engine.setLiveOverlay(fileId, overlay)
+        engine.noteOpened(fileId, engine.fileVersion(fileId) ?: -1L)
         attach(editor)
     }
 
@@ -142,7 +243,10 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         bindings.remove(fileId)
         active.remove(editor)
         if (activeRoom?.fileId == fileId) activeRoom = null
-        if (editor.controller.remoteLive === engine.liveOverlay) editor.controller.remoteLive = null
+        engine.noteClosed(fileId)
+        engine.clearLiveOverlay(fileId)
+        skeletonVersions.remove(fileId)
+        if (editor.controller.remoteLive?.showingFile == fileId) editor.controller.remoteLive = null
     }
 
     fun fileFor(editor: CEditor): String? = reverse[editor]
@@ -204,6 +308,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             listOf(item.rect, item.orientation, item.angle, item.flip, item.part).joinToString("|")
         is AudioItem -> if (item.uid.isEmpty()) null else "a|" + item.uid + "|" +
             listOf(item.rect, item.name, item.rid, item.audio.durationMs, item.audio.ext).joinToString("|")
+        is ShapeItem -> if (item.uid.isEmpty()) null else "s|" + item.uid + "|" + item.toWireShape().toString()
         else -> null
     }
 
@@ -296,6 +401,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                             'b' -> ops += SyncOp.RemoveTable(pi, listOf(uid))
                             'i' -> ops += SyncOp.RemoveImage(pi, listOf(uid))
                             'a' -> ops += SyncOp.RemoveAudio(pi, listOf(uid))
+                            's' -> ops += SyncOp.RemoveShape(pi, listOf(uid))
                         }
                     }
                 }
@@ -305,11 +411,13 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                     if (bMap[uid] != key) {
                         val item = doc.pages[pi].items.firstOrNull {
                             (it as? TextItem)?.uid == uid || (it as? TableItem)?.uid == uid ||
-                                (it as? ImageItem)?.uid == uid || (it as? AudioItem)?.uid == uid
+                                (it as? ImageItem)?.uid == uid || (it as? AudioItem)?.uid == uid ||
+                                (it as? ShapeItem)?.uid == uid
                         } ?: continue
                         when (item) {
                             is TextItem -> ops += SyncOp.AddText(pi, wireTextOf(item))
                             is TableItem -> ops += SyncOp.AddTable(pi, wireTableOf(item))
+                            is ShapeItem -> ops += SyncOp.AddShape(pi, item.toWireShape())
                             is ImageItem -> {
                                 val (imageId, bytes) = readImageBytes(item) ?: continue
                                 engine.sendImageData(fileId, imageId, bytes)
@@ -331,6 +439,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                                 engine.sendAudioPeaks(fileId, audioId, item.audio.peaks)
                                 ops += SyncOp.AddAudio(pi, wireAudioOf(item, pi, audioId))
                             }
+                            is ShapeItem -> ops += SyncOp.AddShape(pi, item.toWireShape())
                             else -> Unit
                         }
                     }
@@ -344,7 +453,7 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
 
     // --- local gestures out ---
 
-    private fun headOf(fileId: String): Long? = engine.headVersion(fileId)
+    private fun headOf(fileId: String): Long? = engine.openVersion(fileId) ?: engine.headVersion(fileId)
 
     private fun styleOf(tool: Tool, cfg: ToolConfig): com.xnotes.sync.WireStrokeStyle {
         return com.xnotes.sync.WireStrokeStyle(
@@ -648,6 +757,16 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
                 else -> Unit
             }
         }
+        // Shapes have no dedicated hook on this side: every local shape commit funnels here.
+        for ((page, item) in items) {
+            if (item !is ShapeItem) continue
+            if (isErase) {
+                if (item.uid.isNotEmpty()) ops += SyncOp.RemoveShape(page, listOf(item.uid))
+            } else {
+                if (item.uid.isEmpty()) item.uid = newUid()
+                ops += SyncOp.AddShape(page, item.toWireShape())
+            }
+        }
         submitContentOps(editor, ops)
     }
 
@@ -722,6 +841,12 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         }
     }
 
+    override fun onFileHeadReady(id: String) {
+        memScoped {
+            host.sync_file_head_ready?.invoke(host.ctx, id.cstr.ptr)
+        }
+    }
+
     override fun onFileGone(id: String) {
         bindings.remove(id)?.let {
             reverse.remove(it)
@@ -730,6 +855,9 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             it.editor.onImageInserted = null
             activeRoom?.takeIf { r -> r.fileId == id }?.let { activeRoom = null }
         }
+        engine.noteClosed(id)
+        engine.clearLiveOverlay(id)
+        skeletonVersions.remove(id)
         dropImageFiles(id)
         dropAudioFiles(id)
         memScoped {
@@ -929,7 +1057,8 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
         if (uid.isEmpty()) return null
         for (it in pg.items) {
             val u = (it as? TextItem)?.uid ?: (it as? TableItem)?.uid
-                ?: (it as? ImageItem)?.uid ?: (it as? AudioItem)?.uid ?: continue
+                ?: (it as? ImageItem)?.uid ?: (it as? AudioItem)?.uid
+                ?: (it as? ShapeItem)?.uid ?: continue
             if (u == uid) return it
         }
         return null
@@ -1025,6 +1154,75 @@ internal class SyncBridge(private val host: xn_host, pinsDir: String, deviceName
             ce.state.invalidatePage(pg)
             ce.requestRender()
         }
+    }
+
+    override fun applyRemoteShape(fileId: String, page: Int, shape: WireShape) {
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: run {
+            // The host moved on (pages added): refetch the whole file.
+            engine.requestOpen(fileId)
+            return
+        }
+        val native = shapeToNative(shape, ce) ?: return
+        val existing = findByUid(pg, shape.uid) as? ShapeItem
+        if (existing != null) {
+            val i = pg.items.indexOf(existing)
+            if (i >= 0) pg.items[i] = native
+        } else {
+            pg.items.add(native)
+        }
+        doc.dirty = true
+        ce.state.appendToCache(pg, native)
+        ce.requestRender()
+    }
+
+    override fun applyRemoteShapeRemove(fileId: String, page: Int, ids: List<String>) {
+        if (ids.isEmpty()) return
+        val ce = bindings[fileId] ?: return
+        val doc = ce.state.document
+        val pg = doc.pages.getOrNull(page) ?: return
+        if (pg.items.removeAll { (it as? ShapeItem)?.uid in ids }) {
+            doc.dirty = true
+            ce.state.invalidatePage(pg)
+            ce.requestRender()
+        }
+    }
+
+    private fun shapeToNative(shape: WireShape, ce: CEditor): ShapeItem? {
+        val kind = ShapeKind.fromIdOrNull(shape.kind) ?: return null
+        val stroke = RemoteLiveStrokes.parseColor(shape.strokeColor) ?: return null
+        val item = ShapeItem(
+            shape = kind,
+            start = Pt(shape.start.getOrElse(0) { 0.0 }, shape.start.getOrElse(1) { 0.0 }),
+            end = Pt(shape.end.getOrElse(0) { 0.0 }, shape.end.getOrElse(1) { 0.0 }),
+            strokeRgba = stroke,
+            strokeWidth = shape.strokeWidth,
+            fillRgba = shape.fillColor?.let { RemoteLiveStrokes.parseColor(it) },
+            neon = shape.neon,
+            neonStrength = shape.neonStrength,
+            dashed = shape.dashed,
+            dashLength = shape.dashLength,
+            dashGap = shape.dashGap,
+        )
+        item.uid = shape.uid
+        item.rotation = shape.rotation
+        item.flip = Flip.fromId(shape.flip)
+        if (shape.adj.isNotEmpty()) item.adj = shape.adj.toDoubleArray()
+        if (shape.n > 0) item.n = shape.n
+        item.headStart = Head.fromId(shape.headStart)
+        item.headEnd = Head.fromId(shape.headEnd)
+        shape.path?.let { item.path = FreePath.fromSvg(it) }
+        shape.function?.let { f ->
+            if (!item.setFunction(FunctionSpec(f.expr, f.from, f.to, f.yMin, f.yMax))) return null
+        }
+        shape.label?.let { l ->
+            val rgba = RemoteLiveStrokes.parseColor(l.color) ?: stroke
+            item.label = ShapeLabel(l.text, TextStyle(rgba, l.pointSize, FontFace.fromId(l.face)), ce.measurer)
+            item.labelAt = l.at.coerceIn(0.0, 1.0)
+        }
+        item.locked = shape.locked
+        return item
     }
 
     override fun applyRemoteAudio(fileId: String, page: Int, audio: WireAudio, bytes: ByteArray, peaks: ByteArray) {

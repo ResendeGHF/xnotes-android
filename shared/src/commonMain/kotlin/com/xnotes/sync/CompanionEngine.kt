@@ -35,8 +35,24 @@ class CompanionEngine(
      */
     private val fileCacheDir: File? = null,
 ) {
-    /** The far side's live runs, painted by the canvas overlay (wired by the host). */
-    var liveOverlay: RemoteLiveStrokes? = null
+    /**
+     * The far side's live runs, painted by the canvas overlay (wired by the host).
+     * One overlay per open file, so background tabs keep their live ink while the
+     * foreground tab paints its own; the host routes repaints.
+     */
+    private val liveOverlays = HashMap<String, RemoteLiveStrokes>()
+
+    /** Wire [overlay] (cleared) to live runs of [fileId]. */
+    fun setLiveOverlay(fileId: String, overlay: RemoteLiveStrokes) {
+        withLock(lock) { liveOverlays[fileId] = overlay }
+    }
+
+    /** Drop the live overlay (and its runs) for [fileId]. */
+    fun clearLiveOverlay(fileId: String) {
+        withLock(lock) { liveOverlays.remove(fileId)?.clear() }
+    }
+
+    private fun overlayFor(fileId: String): RemoteLiveStrokes? = withLock(lock) { liveOverlays[fileId] }
 
     private val lock = Lock()
     private val decoder = SyncFrames.Decoder()
@@ -57,6 +73,13 @@ class CompanionEngine(
 
     /** Shared files, by id. */
     private val index = LinkedHashMap<String, SyncFileEntry>()
+
+    /**
+     * [files] sorted by path, cached: the Qt home lists every row through
+     * `file_info`, and re-sorting the whole index per row is O(n² log n).
+     * Cleared wherever [index] mutates (only [onIndex]).
+     */
+    private var filesCache: List<SyncFileEntry>? = null
     private val versions = HashMap<String, Long>()
     private val fileCache = LinkedHashMap<String, CachedFile>()
     private val assemblers = HashMap<String, FileAssembler>()
@@ -114,6 +137,17 @@ class CompanionEngine(
                     send(SyncMsg.Fetch(nextSeq(), id, asm.filled, 0L))
                 }
             }
+            // A catch-up the host never answers (old host without FetchOps): fall back whole.
+            for ((id, c) in catchups.toMap()) {
+                if (now - c.lastRxMs >= FETCH_OPS_STALL_MS) {
+                    catchups.remove(id)
+                    fileCache.remove(id)
+                    assemblers.remove(id)
+                    overlayFor(id)?.clearFile(id)
+                    host.applyResync(id, versions[id] ?: 0L)
+                    send(SyncMsg.Fetch(nextSeq(), id, 0L, 0L))
+                }
+            }
         }
     }
 
@@ -161,8 +195,8 @@ class CompanionEngine(
 
     /** The socket dropped: forget live runs and half-fetched chunks. */
     fun onDisconnected() {
-        liveOverlay?.clear()
         withLock(lock) {
+            liveOverlays.values.forEach { it.clear() }
             assemblers.clear()
             imageAsm.clear()
             pendingImages.clear()
@@ -189,10 +223,15 @@ class CompanionEngine(
     // --- files ---
 
     /** Current shared-file list, sorted by path. */
-    fun files(): List<SyncFileEntry> = withLock(lock) { index.values.sortedBy { it.path } }
+    fun files(): List<SyncFileEntry> = withLock(lock) {
+        filesCache ?: index.values.sortedBy { it.path }.also { filesCache = it }
+    }
 
     /** The head version known for [id], or null. */
     fun headVersion(id: String): Long? = withLock(lock) { versions[id] }
+
+    /** The version the open document for [id] was read at, or null when not open. */
+    fun openVersion(id: String): Long? = withLock(lock) { openVersions[id] }
 
     fun fileVersion(id: String): Long? = withLock(lock) { versions[id] }
 
@@ -200,13 +239,64 @@ class CompanionEngine(
         fileCache[id]?.also { it.lastUsedMs = nowMs() }?.bytes
     }
 
+    /** Take (and drop) the head parts for [id] at [version], or null. */
+    fun takeFileHead(id: String, version: Long): HeadParts? = withLock(lock) {
+        fileHeads[id]?.takeIf { it.version == version }.also { fileHeads.remove(id) }
+    }
+
     /** Ask the host for a fresh full index (manual refresh button). */
     fun resubscribe() {
         send(SyncMsg.IndexSubscribe(nextSeq()))
     }
 
-    /** Open [id]: fetch when uncached, else hand over at once. */
-    fun requestOpen(id: String) {        val cached = withLock(lock) { fileCache[id] }
+    /**
+     * The version the open document for [fileId] was read at (set by [noteOpened],
+     * cleared by [noteClosed] and resyncs). Ops apply only when their base matches
+     * it; anything else means we missed edits and refetch instead of mis-applying.
+     */
+    private val openVersions = HashMap<String, Long>()
+
+    /** A stale cache catching up through ops: buffered until the head lands. */
+    private class Catchup(val since: Long, val target: Long, var nextBase: Long, var lastRxMs: Long) {
+        val buffered = ArrayList<SyncMsg.Op>()
+    }
+
+    private val catchups = HashMap<String, Catchup>()
+
+    /** A head (small entries) ahead of its chunks, waiting for an open. */
+    class HeadParts(
+        val version: Long,
+        val total: Long,
+        val manifest: String,
+        val flow: String?,
+        val markups: String?,
+        val templates: Map<String, String>,
+        val packages: Map<String, String>,
+    )
+
+    private val fileHeads = HashMap<String, HeadParts>()
+
+    /** How long a catch-up may go quiet before falling back to a full fetch. */
+    private val FETCH_OPS_STALL_MS = 10_000L
+
+    /** The host opened [fileId]'s document at [version] (bind time). */
+    fun noteOpened(fileId: String, version: Long) {
+        withLock(lock) { openVersions[fileId] = version }
+        flushCatchup(fileId)
+    }
+
+    /** The host closed [fileId]'s document; its ops stop gating on a doc version. */
+    fun noteClosed(fileId: String) {
+        withLock(lock) { openVersions.remove(fileId) }
+    }
+
+    /**
+     * Open [id]: hand over at once when cached current, else open the stale bytes
+     * at once and catch up with just the edits ([SyncMsg.FetchOps]) instead of
+     * refetching the whole file. Uncached files still fetch whole.
+     */
+    fun requestOpen(id: String) {
+        val cached = withLock(lock) { fileCache[id] }
         val version = withLock(lock) { versions[id] }
         if (cached != null && version != null && cached.version == version) {
             host.onFileReady(id)
@@ -220,6 +310,25 @@ class CompanionEngine(
                 return
             }
         }
+        if (cached != null && version != null && cached.version < version) {
+            host.onFileReady(id)
+            withLock(lock) { catchups[id] = Catchup(cached.version, version, cached.version, nowMs()) }
+            send(SyncMsg.FetchOps(nextSeq(), id, cached.version))
+            return
+        }
+        send(SyncMsg.Fetch(nextSeq(), id, 0L, 0L))
+    }
+
+    /** Drop the catch-up for [id] and fetch it whole (gap unbridgeable). */
+    private fun fullFetch(id: String) {
+        withLock(lock) {
+            catchups.remove(id)
+            fileCache.remove(id)
+            assemblers.remove(id)
+            fileHeads.remove(id)
+        }
+        overlayFor(id)?.clearFile(id)
+        host.applyResync(id, withLock(lock) { versions[id] } ?: 0L)
         send(SyncMsg.Fetch(nextSeq(), id, 0L, 0L))
     }
 
@@ -403,6 +512,9 @@ class CompanionEngine(
             is SyncMsg.PairResult -> onPairResult(msg)
             is SyncMsg.Index -> onIndex(msg)
             is SyncMsg.FileChunk -> onFileChunk(msg)
+            is SyncMsg.FileHead -> onFileHead(msg)
+            is SyncMsg.FetchOps -> Unit // host-side; the guest sends it, never receives it
+            is SyncMsg.FetchOps -> Unit // host-side; we send it
             is SyncMsg.Op -> onOp(msg)
             is SyncMsg.OpAck -> onOpAck(msg)
             is SyncMsg.Resync -> onResync(msg)
@@ -481,6 +593,7 @@ class CompanionEngine(
         // authority, so an index head is always at least what ops gave us, and
         // advancing it makes a later open refetch instead of serving stale bytes.
         val gone = withLock(lock) {
+            filesCache = null
             val seen = HashSet<String>()
             for (f in m.files) {
                 seen += f.id
@@ -502,6 +615,9 @@ class CompanionEngine(
                         fileCache.remove(id)
                         dropDisk(id)
                         hostPresence.remove(id)
+                        openVersions.remove(id)
+                        catchups.remove(id)
+                        fileHeads.remove(id)
                     }
                 }
             }
@@ -534,7 +650,8 @@ class CompanionEngine(
             evictLocked()
         }
         persistFile(m.id, m.version, data)
-        liveOverlay?.clearFile(m.id)
+        overlayFor(m.id)?.clearFile(m.id)
+        withLock(lock) { fileHeads.remove(m.id) }
         host.onFileReady(m.id)
     }
 
@@ -725,8 +842,44 @@ class CompanionEngine(
         val key = if (echo) m.dedupe.dropLast(FAN_SUFFIX.length) else m.dedupe
         val fresh = markDedupe(m.file, key)
         withLock(lock) { versions[m.file] = m.version }
-        liveOverlay?.finish(key)
-        if (!fresh) return
+        overlayFor(m.file)?.finish(key)
+        if (!fresh) {
+            // Our own echo: the doc already has these bytes, just move its head.
+            withLock(lock) { if (openVersions.containsKey(m.file)) openVersions[m.file] = m.version }
+            return
+        }
+        // A stale cache catching up: buffer in order until the head lands, then replay.
+        // Nothing applies live mid-catch-up, so there is exactly one replay point.
+        val catchup = withLock(lock) { catchups[m.file] }
+        if (catchup != null) {
+            if (m.baseVersion != catchup.nextBase) {
+                fullFetch(m.file)
+                return
+            }
+            catchup.buffered += m
+            catchup.nextBase = m.version
+            catchup.lastRxMs = nowMs()
+            if (m.version >= catchup.target) {
+                withLock(lock) { catchups.remove(m.file) }
+                for (buffered in catchup.buffered) applyOp(buffered)
+                withLock(lock) { if (openVersions.containsKey(m.file)) openVersions[m.file] = m.version }
+            }
+            return
+        }
+        // Steady state: an op whose base is not the open doc's version means edits
+        // slipped past us; drop the doc and refetch instead of mis-applying.
+        val open = withLock(lock) { openVersions[m.file] }
+        if (open != null) {
+            if (m.baseVersion != open) {
+                fullFetch(m.file)
+                return
+            }
+            withLock(lock) { openVersions[m.file] = m.version }
+        }
+        applyOp(m)
+    }
+
+    private fun applyOp(m: SyncMsg.Op) {
         // A room commit supersedes its live preview even when the done frame was lost.
         if (m.ops.any { it is SyncOp.OpenRoom || it is SyncOp.CloseRoom }) host.clearRemoteRoomPreview(m.file)
         for (op in m.ops) {
@@ -748,9 +901,39 @@ class CompanionEngine(
                 is SyncOp.RemoveTable -> host.applyRemoteTableRemove(m.file, op.page, op.ids)
                 is SyncOp.AddAudio -> onRemoteAudio(m.file, op)
                 is SyncOp.RemoveAudio -> host.applyRemoteAudioRemove(m.file, op.page, op.ids)
+                is SyncOp.AddShape -> {
+                    // A snap replaces its live run: drop the pre-snap ink the moment the shape lands.
+                    if (op.shape.liveId.isNotEmpty()) overlayFor(m.file)?.finish(op.shape.liveId)
+                    host.applyRemoteShape(m.file, op.page, op.shape)
+                }
+                is SyncOp.RemoveShape -> host.applyRemoteShapeRemove(m.file, op.page, op.ids)
                 is SyncOp.Unknown -> Unit
             }
         }
+    }
+
+    /** Replay buffered catch-up ops into a newly bound doc, in order. */
+    private fun flushCatchup(fileId: String) {
+        val catchup = withLock(lock) { catchups[fileId] } ?: return
+        val open = withLock(lock) { openVersions[fileId] } ?: return
+        if (catchup.buffered.isEmpty() || open != catchup.since) return
+        val buffered = withLock(lock) {
+            catchups[fileId]?.buffered?.toList() ?: emptyList()
+        }
+        var version = open
+        for (m in buffered) {
+            if (m.baseVersion != version) {
+                fullFetch(fileId)
+                return
+            }
+            version = m.version
+        }
+        withLock(lock) {
+            val c = catchups[fileId] ?: return
+            repeat(buffered.size) { if (c.buffered.isNotEmpty()) c.buffered.removeAt(0) }
+            openVersions[fileId] = version
+        }
+        for (m in buffered) applyOp(m)
     }
 
     private fun onOpAck(m: SyncMsg.OpAck) {
@@ -762,15 +945,26 @@ class CompanionEngine(
             versions[m.file] = m.version
             fileCache.remove(m.file)
             assemblers.remove(m.file)
+            openVersions.remove(m.file)
+            catchups.remove(m.file)
+            fileHeads.remove(m.file)
         }
-        liveOverlay?.clearFile(m.file)
+        overlayFor(m.file)?.clearFile(m.file)
         host.applyResync(m.file, m.version)
         send(SyncMsg.Fetch(nextSeq(), m.file, 0L, 0L))
     }
 
+    private fun onFileHead(m: SyncMsg.FileHead) {
+        withLock(lock) { versions[m.id] = m.version }
+        val have = withLock(lock) { fileCache[m.id] }
+        if (have != null && have.version == m.version) return
+        withLock(lock) { fileHeads[m.id] = HeadParts(m.version, m.total, m.manifest, m.flow, m.markups, m.templates, m.packages) }
+        host.onFileHeadReady(m.id)
+    }
+
     private fun onLive(m: SyncMsg.Live) {
         if (m.samples.isEmpty() && !m.done) return
-        liveOverlay?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done, m.style)
+        overlayFor(m.file)?.update(m.file, m.page, m.strokeId, m.tool, m.width, m.color, m.samples, m.done, m.style)
         host.onLiveDirty()
     }    private fun onRoomLive(m: SyncMsg.RoomLive) {
         if (m.done) {

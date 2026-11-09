@@ -3,6 +3,7 @@ package com.xnotes.format
 import com.xnotes.core.FakeImageCodec
 import com.xnotes.core.FakeTextMeasurer
 import com.xnotes.core.geometry.Affine
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.infinite.CanvasBackground
@@ -306,8 +307,47 @@ class CanvasCodecTest {
         )
     }
 
-    @Test fun polygonVerticesRoundTripInContentSpace() {
+    @Test fun aFillRoundTripsUnderAKindOlderReadersSkip() {
         val doc = InfiniteDocument()
+        val outer = listOf(Pt(-5000.0, 10.0), Pt(-4800.0, 10.0), Pt(-4800.0, 110.0), Pt(-5000.0, 110.0))
+        val hole = listOf(Pt(-4950.0, 40.0), Pt(-4900.0, 40.0), Pt(-4900.0, 80.0), Pt(-4950.0, 80.0))
+        val fill = ShapeItem.fill(listOf(outer, hole), Rgba(30, 140, 220, 255))
+        doc.add(fill)
+        val manifest = manifestText(doc)
+        assertTrue(manifest.contains("\"kind\":\"fill\""))
+        assertFalse("no point list for an older reader", manifest.contains("\"points\""))
+        val back = roundTrip(doc).items.single() as ShapeItem
+        assertEquals(ShapeKind.FILL, back.shape)
+        assertEquals(Rgba(30, 140, 220, 255), back.fillRgba)
+        val want = fill.paths().flatMap { it.contours }.flatMap { FreePath.vertices(it) }
+        val got = back.paths().flatMap { it.contours }.flatMap { FreePath.vertices(it) }
+        assertEquals(want.size, got.size)
+        for ((w, g) in want.zip(got)) assertEquals(0.0, w.distanceTo(g), 1e-3)
+        assertFalse("the hole stays open", back.contains(Pt(-4925.0, 60.0)))
+    }
+
+    @Test fun aFlippedShapeRoundTripsAndOlderReadersKeepItsOutline() {
+        val doc = InfiniteDocument()
+        val s = ShapeItem(ShapeKind.RIGHT_TRIANGLE, Pt(10.0, 20.0), Pt(110.0, 120.0), ink, 2.0).also { it.flip = Flip.X }
+        s.applyTransform(Affine.rotateAbout(s.box.center, 0.5))
+        doc.add(s)
+        doc.add(ShapeItem(ShapeKind.RECTANGLE, Pt(0.0, 0.0), Pt(10.0, 10.0), ink, 2.0))
+        val text = manifestText(doc)
+        assertTrue(text.contains("\"flip_geom\":\"right_triangle\""))
+        assertTrue(text.contains("\"flip\":\"x\""))
+        assertFalse("never under the key older readers rebuild unflipped", text.contains("\"geom\""))
+        val back = roundTrip(doc).items[0] as ShapeItem
+        assertEquals(ShapeKind.RIGHT_TRIANGLE, back.shape)
+        assertEquals(Flip.X, back.flip)
+        assertEquals(0.5, back.rotation, 1e-12)
+        assertEquals(Flip.NONE, (roundTrip(doc).items[1] as ShapeItem).flip)
+        // A reader from before flips skips both keys and keeps the stand-in, which faces the right way.
+        val old = readManifest(text.replace(Regex(",\"flip_geom\":\"[a-z0-9_]+\""), "").replace(Regex(",\"flip\":\"[a-z]+\""), "")).items[0] as ShapeItem
+        assertEquals(ShapeKind.POLYGON, old.shape)
+        assertSameCorners(s.vertexDots().map { it.at }, old.vertices()!!)
+    }
+
+    @Test fun polygonVerticesRoundTripInContentSpace() {        val doc = InfiniteDocument()
         val verts = listOf(Pt(10.0, 10.0), Pt(90.0, 20.0), Pt(50.0, 80.0))
         doc.add(ShapeItem.poly(ShapeKind.POLYGON, verts, Rgba(3, 3, 3, 255), 2.0, null, false, 0.6, false, 10.0, 8.0))
         val back = roundTrip(doc).items[0] as ShapeItem
@@ -765,8 +805,8 @@ class CanvasCodecTest {
     }
 
     @Test fun everyBasicKindRoundTripsBehindAStandIn() {
-        // Drawn text goes under a kind of its own, which older readers skip (its own test).
-        val kinds = ShapeKind.all.filter { !it.isLegacy && it != ShapeKind.GLYPHS }
+        // Drawn text and fills go under kinds of their own, which older readers skip (their own tests).
+        val kinds = ShapeKind.all.filter { !it.isLegacy && it != ShapeKind.GLYPHS && it != ShapeKind.FILL }
         val doc = InfiniteDocument()
         for (k in kinds) {
             val s = ShapeItem(k, Pt(0.0, 0.0), Pt(120.0, 80.0), ink, 2.0, n = if (k.nRange != null) 7 else k.defaultN)

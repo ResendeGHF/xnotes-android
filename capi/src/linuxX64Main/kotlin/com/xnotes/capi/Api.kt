@@ -39,14 +39,19 @@ import com.xnotes.core.tools.ToolConversions
 import com.xnotes.core.tools.ToolConfig
 import com.xnotes.core.model.PagePattern
 import com.xnotes.core.model.PageStyle
+import com.xnotes.core.model.PageTemplates
+import com.xnotes.core.platform.File
 import com.xnotes.capi.c.xn_text_field
 import com.xnotes.canvas.EditingField
 import com.xnotes.core.pal.FontFace
 import com.xnotes.core.platform.Lock
 import com.xnotes.core.platform.asFile
 import com.xnotes.core.platform.asPath
-import com.xnotes.core.platform.createTempFile
 import com.xnotes.core.platform.withLock
+import com.xnotes.core.template.LibraryTemplate
+import com.xnotes.core.template.TemplateKind
+import com.xnotes.core.template.TemplatePictures
+import com.xnotes.core.template.TemplateRenderer
 import kotlinx.cinterop.UShortVar
 import kotlinx.cinterop.memScoped
 import com.xnotes.core.tools.EraseMode
@@ -55,6 +60,7 @@ import kotlinx.cinterop.DoubleVar
 import kotlinx.cinterop.LongVar
 import kotlinx.cinterop.UByteVar
 import kotlinx.cinterop.UIntVar
+import okio.ByteString.Companion.toByteString
 import kotlinx.cinterop.IntVar
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.history.History
@@ -112,6 +118,7 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.set
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.value
+import kotlin.concurrent.Volatile
 import okio.FileSystem
 import okio.IOException
 import okio.Path.Companion.toPath
@@ -147,7 +154,7 @@ private object NoImageCodec : ImageCodec {
     override fun probeFile(path: String): ImageSize? = null
 }
 
-private fun codecFor(host: CPointer<xn_host>?): DocumentCodec {
+internal fun codecFor(host: CPointer<xn_host>?): DocumentCodec {
     if (host == null) return DocumentCodec(NoImageCodec, NoTextMeasurer)
     val h = host.pointed
     return DocumentCodec(CImageCodec(h), CTextMeasurer(h))
@@ -225,6 +232,18 @@ fun xnFreeString(s: CPointer<ByteVar>?) = free(s)
 
 @CName("xn_note_open")
 fun xnNoteOpen(path: String?, workDir: String?, host: CPointer<xn_host>?, error: CPointer<CPointerVar<ByteVar>>?): COpaquePointer? =
+    openNote(path, workDir, host, error, placeholders = false)
+
+/**
+ * Open a skeleton bundle (see `SyncBridge.cachedHeadPath`): same as [xnNoteOpen]
+ * but missing assets decode as empty placeholders, so every item slot stays
+ * stable and the full fetch fills them in place.
+ */
+@CName("xn_note_open_head")
+fun xnNoteOpenHead(path: String?, workDir: String?, host: CPointer<xn_host>?, error: CPointer<CPointerVar<ByteVar>>?): COpaquePointer? =
+    openNote(path, workDir, host, error, placeholders = true)
+
+private fun openNote(path: String?, workDir: String?, host: CPointer<xn_host>?, error: CPointer<CPointerVar<ByteVar>>?, placeholders: Boolean): COpaquePointer? =
     try {
         requireNotNull(path) { "path is null" }
         val dir = workDir?.let { fileOf(it) }
@@ -237,7 +256,7 @@ fun xnNoteOpen(path: String?, workDir: String?, host: CPointer<xn_host>?, error:
             StableRef.create(CCanvasNote(canvas)).asCPointer()
         } else {
             val doc = FileSystem.SYSTEM.source(path.toPath()).use { source ->
-                codecFor(host).read(source.asInputStream(), dir, dir)
+                codecFor(host).read(source.asInputStream(), dir, dir, placeholders = placeholders)
             }
             doc.path = path
             doc.displayName = path.substringAfterLast('/')
@@ -308,6 +327,8 @@ fun xnNotePaintPage(note: COpaquePointer?, page: Int, renderer: COpaquePointer?,
         val box = st.footprint(p)
         r.fillRect(box, st.effectivePageColor(p) ?: unpack(paper))
         paintPdfBackground(h, doc, p, r, pdfScale, box)  // the export host always draws exactly
+        CTemplateLibrary.imageProbe = CTemplateLibrary.probeVia(h)
+        st.templateRenderer = CTemplateLibrary.renderer
         st.paintRuling(p, r, box)
         for (item in p.items) item.paint(r)
     }
@@ -672,6 +693,8 @@ internal class CEditor(note: CNote, private val host: xn_host) {
         state.paintPageBackground = { page, renderer, res, region ->
             if (!paintPdfBackground(host, state.document, page, renderer, res, region)) withLock(standInLock) { standIns.add(page) }
             state.paintBakedMarkups(page, renderer)
+            CTemplateLibrary.imageProbe = CTemplateLibrary.probeVia(host)
+            state.templateRenderer = CTemplateLibrary.renderer
             state.paintRuling(page, renderer, region)
         }
         background?.let { bg ->
@@ -1266,6 +1289,158 @@ fun xnEditorSetPageStyle(editor: COpaquePointer?, allPages: Int, style: CPointer
         spacing = s.spacing.takeIf { it > 0.0 }?.coerceIn(PageStyle.MIN_SPACING, PageStyle.MAX_SPACING),
     )
     val e = editor!!.editor().editor
+    if (allPages != 0) e.setDocumentStyle(next) else e.setCurrentPageStyle(next)
+}
+
+// --- page templates (beyond the built-in rulings) ----------------------------------------------
+
+/** Content-hash keys, matching upstream: sha256 of the JSON text or package bytes, first 8 bytes hex. */
+private fun templateKeyOf(bytes: ByteArray): String =
+    bytes.toByteString().sha256().hex().take(16)
+
+/** A JSON string with [s] quoted (control characters escaped, UTF-8 passed through). */
+private fun jsonQuote(s: String): String = buildString {
+    append('"')
+    for (c in s) when (c) {
+        '"' -> append("\\\"")
+        '\\' -> append("\\\\")
+        '\n' -> append("\\n")
+        '\r' -> append("\\r")
+        '\t' -> append("\\t")
+        else -> if (c < ' ') {
+            append("\\u")
+            append(c.code.toString(16).padStart(4, '0'))
+        } else append(c)
+    }
+    append('"')
+}
+
+/**
+ * The companion's template library: bundled `.xtemplate` files the host feeds in
+ * ([xn_template_add_json]/[xn_template_add_package]), plus every note's own embedded copies at
+ * paint time. One process-wide instance: layouts and parsed templates are shared by every open
+ * note, and keys are content hashes so the same file is the same key on every device.
+ */
+internal object CTemplateLibrary {
+    private val lock = Lock()
+    private val entries = LinkedHashMap<String, LibraryTemplate>()
+
+    private fun cacheDir(name: String): File {
+        val dir = fileOf(FileSystem.SYSTEM_TEMPORARY_DIRECTORY.asFile(), name)
+        runCatching { FileSystem.SYSTEM.createDirectories(dir.asPath()) }
+        return dir
+    }
+
+    private val pictures = TemplatePictures(cacheDir("xnotes-template-pics")) { file ->
+        imageProbe?.invoke(file)
+    }
+
+    /**
+     * The render host's image probe, installed on every paint (there is a single render host,
+     * so last-write-wins is exact, and every probe behaves the same).
+     */
+    @Volatile
+    var imageProbe: ((File) -> ImageSize?)? = null
+
+    val renderer = TemplateRenderer(outliner = null, pictures = pictures)
+
+    internal fun libDir(): File = cacheDir("xnotes-template-lib")
+
+    fun add(key: String, entry: LibraryTemplate) = withLock(lock) {
+        entries[key] = entry
+        renderer.library = HashMap(entries)
+    }
+
+    fun entry(key: String): LibraryTemplate? = withLock(lock) { entries[key] }
+
+    fun probeVia(host: xn_host): (File) -> ImageSize? = { file ->
+        memScoped {
+            val w = alloc<IntVar>()
+            val h = alloc<IntVar>()
+            val probe = host.image_probe
+            if (probe == null || probe(host.ctx, file.pathString.cstr.ptr, w.ptr, h.ptr) == 0) null
+            else ImageSize(w.value, h.value).takeIf { it.width > 0 && it.height > 0 }
+        }
+    }
+
+    /** Carry library template [key] in [doc], so the note draws the same everywhere without it. */
+    fun embed(doc: Document, key: String) {
+        if (key == PageTemplates.NONE || PageTemplates.isBuiltIn(key)) return
+        if (doc.templates.containsKey(key) || doc.templatePackages.containsKey(key)) return
+        val e = entry(key) ?: return
+        val text = e.text
+        val pkg = e.packageFile
+        if (text != null) {
+            doc.templates = doc.templates + (key to text)
+        } else if (pkg != null) {
+            doc.templatePackages = doc.templatePackages + (key to pkg)
+        } else return
+        doc.dirty = true
+    }
+}
+
+/** Register a plain-JSON template; returns its content-hash key (frees with [xn_free_string]). */
+@CName("xn_template_add_json")
+fun xnTemplateAddJson(text: String?): CPointer<ByteVar>? = guard(null) {
+    val t = requireNotNull(text) { "text is null" }
+    com.xnotes.format.TemplateReader.read(t)
+    val key = templateKeyOf(t.encodeToByteArray())
+    CTemplateLibrary.add(key, LibraryTemplate(t, null))
+    strdup(key)
+}
+
+/** Register a packaged template ([path] to a `.xtemplate` zip); returns its content-hash key. */
+@CName("xn_template_add_package")
+fun xnTemplateAddPackage(path: String?): CPointer<ByteVar>? = guard(null) {
+    val src = fileOf(requireNotNull(path) { "path is null" })
+    val bytes = FileSystem.SYSTEM.read(src.asPath()) { readByteArray() }
+    val key = templateKeyOf(bytes)
+    val dest = fileOf(CTemplateLibrary.libDir(), "$key.xtemplate")
+    if (!FileSystem.SYSTEM.exists(dest.asPath())) FileSystem.SYSTEM.write(dest.asPath()) { write(bytes) }
+    CTemplateLibrary.add(key, LibraryTemplate(null, dest))
+    strdup(key)
+}
+
+/**
+ * Every template on offer, as JSON `[{"key","name","kind","source"}]` (malloc'd; [xn_free_string]
+ * frees): the library's bundled ones, plus [note]'s own embedded copies when given.
+ */
+@CName("xn_templates_list")
+fun xnTemplatesList(note: COpaquePointer?): CPointer<ByteVar>? = guard(null) {
+    val doc = runCatching { note!!.note().document }.getOrNull()
+    val out = StringBuilder().append('[')
+    CTemplateLibrary.renderer.entries(doc).forEachIndexed { i, e ->
+        if (i > 0) out.append(',')
+        out.append("{\"key\":").append(jsonQuote(e.key))
+            .append(",\"name\":").append(jsonQuote(e.name))
+            .append(",\"kind\":").append(jsonQuote(e.kind.name.lowercase()))
+            .append(",\"source\":").append(jsonQuote(e.source.name.lowercase()))
+            .append('}')
+    }
+    out.append(']')
+    strdup(out.toString())
+}
+
+/** The override template key at [all_pages]' scope (malloc'd, "" = inherit). */
+@CName("xn_editor_page_template")
+fun xnEditorPageTemplate(editor: COpaquePointer?, allPages: Int): CPointer<ByteVar>? = guard(null) {
+    editor!!.canvas(quiet = true)?.let { return@guard strdup("") }
+    val e = editor!!.editorQuiet().editor
+    val st = if (allPages != 0) e.documentStyle else e.currentPageStyle
+    strdup(st.template ?: "")
+}
+
+/** Switch [all_pages]' scope to template [key] (null/empty = inherit), embedding it when needed. */
+@CName("xn_editor_set_page_template")
+fun xnEditorSetPageTemplate(editor: COpaquePointer?, allPages: Int, key: String?) = guard(Unit) {
+    if (editor!!.canvas(quiet = true) != null) return@guard // canvases keep the pattern picker
+    val k = key?.takeIf { it.isNotEmpty() }
+    val e = editor!!.editor().editor
+    val doc = e.state.document
+    if (k != null) CTemplateLibrary.embed(doc, k)
+    val cur = if (allPages != 0) e.documentStyle else e.currentPageStyle
+    val inherited = if (allPages != 0) PageTemplates.NONE else (doc.style.template ?: PageTemplates.NONE)
+    val next = cur.withTemplate(k, inherited)
     if (allPages != 0) e.setDocumentStyle(next) else e.setCurrentPageStyle(next)
 }
 
@@ -1868,11 +2043,32 @@ fun xnSyncFileInfo(
 @CName("xn_sync_file_path")
 fun xnSyncFilePath(sync: COpaquePointer?, id: String?): CPointer<ByteVar>? = guard(null) {
     val bridge = sync!!.sync()
-    val bytes = bridge.engine.fileBytes(id ?: return@guard null) ?: return@guard null
-    // Cached bytes to a temp file the Qt side opens as a note.
-    val tmp = createTempFile("sync", ".xnote", okio.FileSystem.SYSTEM_TEMPORARY_DIRECTORY.asFile())
-    okio.FileSystem.SYSTEM.write(tmp.asPath()) { write(bytes) }
-    strdup(tmp.pathString)
+    val key = id ?: return@guard null
+    val bytes = bridge.engine.fileBytes(key) ?: return@guard null
+    val version = bridge.engine.fileVersion(key) ?: return@guard null
+    // Cached bytes to a temp file the Qt side opens as a note; the path is reused while the
+    // version is unchanged instead of rewriting the whole file on every open.
+    strdup(bridge.cachedNotePath(key, version, bytes))
+}
+
+/** A fetched head's entries as an openable skeleton file, or null when no head waits. */
+@CName("xn_sync_file_head_path")
+fun xnSyncFileHeadPath(sync: COpaquePointer?, id: String?): CPointer<ByteVar>? = guard(null) {
+    val bridge = sync!!.sync()
+    val path = bridge.cachedHeadPath(id ?: return@guard null) ?: return@guard null
+    strdup(path)
+}
+
+/**
+ * Fill a skeleton-open note with its fetched bytes in place (no reopen): pdf,
+ * images, audio and missing template packages swap in, history and view survive.
+ * Returns 1 when a skeleton was completed (repaint and reload the outline).
+ */
+@CName("xn_sync_transplant")
+fun xnSyncTransplant(sync: COpaquePointer?, id: String?, workDir: String?): Int = guard(0) {
+    val bridge = sync!!.sync()
+    val dir = workDir?.let { fileOf(it) }
+    if (bridge.transplantFull(id ?: return@guard 0, dir)) 1 else 0
 }
 
 @CName("xn_sync_open")

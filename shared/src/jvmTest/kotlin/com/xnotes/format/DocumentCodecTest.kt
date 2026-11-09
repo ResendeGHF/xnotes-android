@@ -89,6 +89,44 @@ class DocumentCodecTest {
         return out
     }
 
+    @Test fun skeletonKeepsSlotsAndAbsorbsAssets() {
+        val doc = Document(dpi = 150)
+        doc.pages += Page(1240.0, 1754.0)
+        val img = imageFile(ByteArray(64) { it.toByte() })
+        val item = com.xnotes.core.model.ImageItem(
+            com.xnotes.core.model.ImageData(img, 8, 8),
+            com.xnotes.core.geometry.Rect(10.0, 10.0, 80.0, 80.0), 0, 0.0, com.xnotes.core.geometry.Flip.NONE, null,
+        )
+        item.uid = "img-1"
+        doc.pages.single().items.add(item)
+        val out = ByteArrayOutputStream()
+        codec.write(doc, out)
+        val bundle = out.toByteArray()
+        // The head carries everything small; the image entry rides the chunks.
+        val skel = codec.skeletonBytes(manifestOf(bundle).encodeToByteArray())
+        val names = entryNames(skel)
+        assertTrue(names.contains("manifest.json"))
+        assertFalse(names.any { it.startsWith("assets/image-") })
+        val skelDir = Files.createTempDirectory("xnotes-skel").toFile()
+        val skelDoc = codec.read(ByteArrayInputStream(skel), skelDir, skelDir, placeholders = true)
+        assertEquals(1, skelDoc.pages.single().items.size)
+        val standIn = skelDoc.pages.single().items.single() as com.xnotes.core.model.ImageItem
+        assertEquals("img-1", standIn.uid)
+        assertEquals(0L, standIn.image.file.length())
+        assertTrue(skelDoc.missingAssets.isNotEmpty())
+        // Without placeholders the same bundle drops the item (old behavior).
+        val dropped = codec.read(ByteArrayInputStream(skel), skelDir, skelDir)
+        assertTrue(dropped.pages.single().items.isEmpty())
+        // The full fetch fills the stand-in; items, history and order survive.
+        val fullDir = Files.createTempDirectory("xnotes-full").toFile()
+        val full = codec.read(ByteArrayInputStream(bundle), fullDir, fullDir)
+        codec.absorbAssets(skelDoc, full)
+        assertTrue(skelDoc.missingAssets.isEmpty())
+        val filled = skelDoc.pages.single().items.single() as com.xnotes.core.model.ImageItem
+        assertEquals(img.readBytes().toList(), filled.image.file.readBytes().toList())
+        assertEquals("img-1", filled.uid)
+    }
+
     @Test fun markupsRideTheirOwnEntryJustBeforeTheManifest() {
         val doc = Document(dpi = 150)
         doc.pages += Page(1240.0, 1754.0)

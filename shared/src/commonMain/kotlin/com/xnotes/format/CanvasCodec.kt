@@ -15,8 +15,11 @@ import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Routing
+import com.xnotes.core.geometry.Flip
+import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.ShapeLabel
+import com.xnotes.core.model.SyncMark
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextStyle
@@ -265,11 +268,17 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         // A shape older readers cannot draw goes down as the polygon they can, its real geometry after.
         val standIn = s.legacyOutline()
         val drawn = standIn?.let { Rect.bounding(it) }
-        // Drawn text has no shape an older reader could stand in, so it goes under a kind they skip.
-        val glyphs = s.shape == ShapeKind.GLYPHS
+        // Drawn text and a dropped colour's area have no shape an older reader could stand in, so each goes under a kind they skip.
+        val ownKind = when (s.shape) {
+            ShapeKind.GLYPHS -> ShapeItem.GLYPHS_KIND
+            ShapeKind.FILL -> ShapeItem.FILL_KIND
+            else -> null
+        }
+        val own = ownKind != null
         j.beginObject()
-        j.name("kind").value(if (glyphs) ShapeItem.GLYPHS_KIND else ShapeItem.KIND)
+        j.name("kind").value(ownKind ?: ShapeItem.KIND)
         id?.let { j.name("id").value(it) }
+        if (s.uid.isNotEmpty()) j.name("uid").value(s.uid)
         j.name("shape").value(s.legacyId())
         j.name("start").beginArray().value(drawn?.left ?: s.start.x).value(drawn?.top ?: s.start.y).endArray()
         j.name("end").beginArray().value(drawn?.right ?: s.end.x).value(drawn?.bottom ?: s.end.y).endArray()
@@ -279,17 +288,20 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         j.name("fill_rgba")
         s.fillRgba?.let { writeRgba(j, it) } ?: j.nullValue()
         // Polygon/polyline carry their vertices (absolute content px); other kinds omit them.
-        (standIn ?: s.vertices()?.takeUnless { glyphs })?.let { verts ->
+        (standIn ?: s.vertices()?.takeUnless { own })?.let { verts ->
             j.name("points").beginArray()
             for (p in verts) j.beginArray().value(p.x).value(p.y).endArray()
             j.endArray()
         }
-        if (standIn != null || glyphs) {
-            if (!s.isFree) j.name("geom").value(s.shape.id)
+        if (standIn != null || own) {
+            // A mirrored shape names its kind under a key readers before flips skip, so they keep the stand-in.
+            if (!s.isFree || s.shape == ShapeKind.FUNCTION || s.shape == ShapeKind.SPLINE) j.name(if (s.flip == Flip.NONE) "geom" else "flip_geom").value(s.shape.id)
+            if (s.flip != Flip.NONE) j.name("flip").value(s.flip.id)
             val f = s.box
             j.name("rect").beginArray().value(f.x).value(f.y).value(f.w).value(f.h).endArray()
             if (s.rotation != 0.0) j.name("angle").value(s.rotation)
-            s.path?.takeIf { s.isFree && (glyphs || !FreePath.isVertexList(it)) }?.let { j.name("path").value(FreePath.toSvg(it)) }
+            // A spline's points are not the line its stand-in draws, so they are always written.
+            s.path?.takeIf { s.isFree && (own || s.shape == ShapeKind.SPLINE || !FreePath.isVertexList(it)) }?.let { j.name("path").value(FreePath.toSvg(it)) }
         }
         if (s.n != s.shape.defaultN) j.name("n").value(s.n)
         if (s.headStart != s.shape.defaultHeadStart) j.name("head_start").value(s.headStart.id)
@@ -319,7 +331,19 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             if (s.labelAt != 0.5) j.name("at").value(s.labelAt)
             j.endObject()
         }
+        s.function?.let {
+            j.name("function").value(it.expr)
+            j.name("function_from").value(it.from)
+            j.name("function_to").value(it.to)
+            if (it.yMin != null && it.yMax != null) {
+                j.name("function_ymin").value(it.yMin)
+                j.name("function_ymax").value(it.yMax)
+            }
+        }
+        s.sync?.let { j.name("rec").value(it.rid); j.name("rec_ms").value(it.ms) }
         if (s.locked) j.name("locked").value(true)
+        s.link?.let { j.name("link").value(it) }
+        s.group?.let { j.name("group").value(it) }
         j.endObject()
     }
 
@@ -631,6 +655,8 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var angle = 0.0
         var shape: String? = null
         var geom: String? = null
+        var flipGeom: String? = null
+        var flip: Flip = Flip.NONE
         var path: String? = null
         var adj: DoubleArray? = null
         var n = 0
@@ -648,6 +674,16 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var dashed = false
         var dashLength = 10.0
         var dashGap = 8.0
+        var function: String? = null
+        var functionFrom = 0.0
+        var functionTo = 0.0
+        var functionYMin: Double? = null
+        var functionYMax: Double? = null
+        var uid: String? = null
+        var link: String? = null
+        var group: Int? = null
+        var rec: Int? = null
+        var recMs = 0
     }
 
     /** Stroke config fields as written; null = absent, so defaults resolve exactly as before. */
@@ -691,6 +727,8 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "angle" -> s.angle = doubleOr(p, 0.0)
                 "shape" -> s.shape = stringOr(p, "")
                 "geom" -> s.geom = stringOrNull(p)
+                "flip_geom" -> s.flipGeom = stringOrNull(p)
+                "flip" -> s.flip = Flip.fromId(stringOrNull(p))
                 "path" -> s.path = stringOrNull(p)
                 "adj" -> s.adj = doublesOrNull(p)
                 "n" -> s.n = intOr(p, 0)
@@ -708,6 +746,21 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "dashed" -> s.dashed = boolOr(p, false)
                 "dash_length" -> s.dashLength = doubleOr(p, 10.0)
                 "dash_gap" -> s.dashGap = doubleOr(p, 8.0)
+                "uid" -> s.uid = stringOrNull(p)
+                "function" -> s.function = stringOrNull(p)
+                "function_from" -> s.functionFrom = doubleOr(p, 0.0)
+                "function_to" -> s.functionTo = doubleOr(p, 0.0)
+                "function_ymin" -> s.functionYMin = doubleOrNull(p)
+                "function_ymax" -> s.functionYMax = doubleOrNull(p)
+                "link" -> s.link = stringOrNull(p)
+                "group" -> s.group = intOrNull(p)
+                "rec" -> s.rec = intOrNull(p)
+                "rec_ms" -> s.recMs = intOr(p, 0)
+                "function" -> s.function = stringOrNull(p)
+                "function_from" -> s.functionFrom = doubleOr(p, 0.0)
+                "function_to" -> s.functionTo = doubleOr(p, 0.0)
+                "function_ymin" -> s.functionYMin = doubleOrNull(p)
+                "function_ymax" -> s.functionYMax = doubleOrNull(p)
                 "locked" -> s.locked = boolOr(p, false)
                 else -> p.skipValue()
             }
@@ -727,7 +780,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                     )
                 }
             }
-            ShapeItem.KIND, ShapeItem.GLYPHS_KIND -> {
+            ShapeItem.KIND, ShapeItem.GLYPHS_KIND, ShapeItem.FILL_KIND -> {
                 val c = s.connector
                 items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
             }
@@ -764,22 +817,28 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
     }
 
     private fun buildShape(s: ItemScratch): ShapeItem {
-        val shape = buildDrawnShape(s)
-        // The real geometry behind a stand-in polygon; or else an old file's baked turn.
+        val shape = buildDrawnShape(s)        // The real geometry behind a stand-in polygon; or else an old file's baked turn.
         val frame = s.rect
-        if (frame != null && (s.geom != null || s.angle != 0.0 || s.path != null)) {
-            shape.restoreFrame(ShapeKind.fromIdOrNull(s.geom), frame, s.angle, FreePath.fromSvg(s.path))
+        val geom = s.geom ?: s.flipGeom
+        if (frame != null && (geom != null || s.angle != 0.0 || s.path != null)) {
+            shape.restoreFrame(ShapeKind.fromIdOrNull(geom), frame, s.angle, FreePath.fromSvg(s.path))
         } else {
             shape.unbake()
         }
+        if (!shape.shape.isFree && !shape.shape.isEndpointShape) shape.flip = s.flip
         if (s.n > 0) shape.n = s.n
         s.adj?.let { shape.adj = it }
         s.headStart?.let { shape.headStart = Head.fromId(it) }
         s.headEnd?.let { shape.headEnd = Head.fromId(it) }
+        s.function?.let { shape.setFunction(FunctionSpec(it, s.functionFrom, s.functionTo, s.functionYMin, s.functionYMax)) }
+        shape.uid = s.uid ?: ""
         s.label?.takeIf { it.text.isNotEmpty() }?.let { l ->
             shape.label = ShapeLabel(l.text, TextStyle(l.rgba ?: shape.strokeRgba, l.pointSize, FontFace.fromId(l.fontFace)), textMeasurer)
             l.at?.takeIf { it.isFinite() }?.let { shape.labelAt = it.coerceIn(0.0, 1.0) }
         }
+        s.link?.let { shape.link = it }
+        s.group?.let { shape.group = it }
+        if (s.rec != null) shape.sync = SyncMark(s.rec ?: 0, s.recMs)
         return shape
     }
 
@@ -908,11 +967,12 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
     private fun buildDrawnShape(s: ItemScratch): ShapeItem {
         val kind = ShapeKind.fromId(s.shape)
         val strokeRgba = s.strokeRgba ?: DEFAULT_SHAPE_STROKE
+        val spec = s.function?.let { FunctionSpec(it, s.functionFrom, s.functionTo, s.functionYMin, s.functionYMax) }
         s.points?.let { verts ->
             return ShapeItem.poly(
                 kind, verts, strokeRgba, s.strokeWidth, s.fillRgba, s.neon, s.neonStrength,
                 s.dashed, s.dashLength, s.dashGap,
-            )
+            ).also { shape -> shape.function = spec }
         }
         return ShapeItem(
             shape = kind,
@@ -926,7 +986,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashed = s.dashed,
             dashLength = s.dashLength,
             dashGap = s.dashGap,
-        )
+        ).also { shape -> shape.function = spec }
     }
 
     private fun parseConfig(p: JsonPull): ConfigScratch? {

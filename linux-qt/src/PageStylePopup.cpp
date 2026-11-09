@@ -5,14 +5,20 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QColorDialog>
+#include <QComboBox>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QLabel>
 #include <QRadioButton>
 #include <QSlider>
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <cmath>
 
 namespace {
@@ -20,8 +26,8 @@ namespace {
 /* The Android app's paper presets: two darks, white, cream, light grey. */
 const xn_rgba kPapers[] = {0x161616FFu, 0x0D0D0DFFu, 0xFFFFFFFFu, 0xF7F3E9FFu, 0xE8E8E8FFu};
 
-/* The built-in ruling colour: grey at a quarter opacity (PageStyle.DEFAULT_PATTERN_COLOR). */
-constexpr xn_rgba kDefaultLineColor = 0x96969640u;
+/* The built-in ruling colour: grey at half opacity (PageStyle.DEFAULT_PATTERN_COLOR). */
+constexpr xn_rgba kDefaultLineColor = 0x96969680u;
 constexpr double kDefaultSpacing = 64.0;
 
 /* Button ids in the groups (QButtonGroup takes -1 to mean "pick one"). */
@@ -66,7 +72,7 @@ QLabel* caption(const QString& text, QWidget* parent) {
 
 }  // namespace
 
-PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) : QDialog(parent), editor_(editor) {
+PageStylePopup::PageStylePopup(xn_editor* editor, xn_note* note, bool canvas, QWidget* parent) : QDialog(parent), editor_(editor), note_(note) {
     setWindowTitle(canvas ? QStringLiteral("Canvas background") : QStringLiteral("Page background"));
     auto* col = new QVBoxLayout(this);
 
@@ -135,6 +141,63 @@ PageStylePopup::PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent) 
     connect(pattern_, &QButtonGroup::idClicked, this, [this](int id) {
         style_.pattern = id - kPatternIdBase;
         apply();
+    });
+
+    // Installed page templates (.xtemplate): the bundled set plus the note's own embedded
+    // ones. The pattern chips above stay for the built-ins; picking a key here writes the
+    // template override, and the rulings repaint through the same engine on every device.
+    template_ = new QComboBox(this);
+    QLabel* templateCaption = caption(QStringLiteral("Template"), this);
+    col->addWidget(templateCaption);
+    col->addWidget(template_);
+    {
+        template_->addItem(QStringLiteral("Default"), QString());
+        template_->addItem(QStringLiteral("None"), QStringLiteral("none"));
+        template_->addItem(QStringLiteral("Ruled"), QStringLiteral("lines"));
+        template_->addItem(QStringLiteral("Dotted"), QStringLiteral("dots"));
+        template_->addItem(QStringLiteral("Grid"), QStringLiteral("grid"));
+        struct Item {
+            QString name;
+            QString key;
+            QString source;
+        };
+        QList<Item> items;
+        if (char* list = xn_templates_list(note_)) {
+            const QJsonArray arr = QJsonDocument::fromJson(QByteArray(list)).array();
+            xn_free_string(list);
+            for (const QJsonValue& v : arr) {
+                const QJsonObject o = v.toObject();
+                const QString key = o.value(QStringLiteral("key")).toString();
+                // Built-ins are covered above; the core lists bundled and note templates here.
+                if (key == "lines" || key == "dots" || key == "grid") continue;
+                items.append({o.value(QStringLiteral("name")).toString(), key,
+                              o.value(QStringLiteral("source")).toString()});
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+            return a.name.compare(b.name, Qt::CaseInsensitive) < 0;
+        });
+        bool sep = false;
+        for (const Item& it : items) {
+            if (!sep) {
+                template_->insertSeparator(template_->count());
+                sep = true;
+            }
+            QString label = it.name;
+            if (it.source == "note") label += QStringLiteral(" (in note)");
+            template_->addItem(label, it.key);
+        }
+    }
+    template_->setVisible(!canvas);
+    templateCaption->setVisible(!canvas);
+    connect(template_, QOverload<int>::of(&QComboBox::activated), this, [this](int i) {
+        if (syncing_) return;
+        const QVariant data = template_->itemData(i);
+        if (!data.isValid() || data.isNull()) return;  // separators carry no key
+        const QString key = data.toString();
+        const QByteArray raw = key.toUtf8();
+        xn_editor_set_page_template(editor_, allPages_ ? 1 : 0, key.isEmpty() ? nullptr : raw.constData());
+        load();
     });
 
     spacingLabel_ = new QLabel(this);
@@ -242,6 +305,13 @@ void PageStylePopup::load() {
     opacity_->setValue(int(std::lround((line & 0xFF) / 2.55)));
     opacityLabel_->setText(QStringLiteral("Line opacity: %1%").arg(opacity_->value()));
     invert_->setChecked(xn_editor_view_invert(editor_) != 0);
+    if (template_) {
+        char* key = xn_editor_page_template(editor_, allPages_ ? 1 : 0);
+        const QString current = key ? QString::fromUtf8(key) : QString();
+        if (key) xn_free_string(key);
+        const int pick = template_->findData(current);
+        template_->setCurrentIndex(pick >= 0 ? pick : 0);
+    }
     syncing_ = false;
 }
 

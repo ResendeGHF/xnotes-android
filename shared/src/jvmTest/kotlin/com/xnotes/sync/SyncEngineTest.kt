@@ -18,6 +18,7 @@ class SyncEngineTest {
         var paired: String? = null
         var indexChanged = 0
         var fileReady: String? = null
+        var fileHeadReady: String? = null
         var fileGone: String? = null
         var error: String? = null
         var liveDirty = 0
@@ -38,6 +39,7 @@ class SyncEngineTest {
         val audios = ArrayList<Triple<String, WireAudio, ByteArray>>()
         val audioRemoves = ArrayList<Pair<String, List<String>>>()
         val imageRemoves = ArrayList<Pair<String, List<String>>>()
+        val shapeRemoves = ArrayList<Pair<String, List<String>>>()
         var resynced: Pair<String, Long>? = null
         data class ImageRec(val file: String, val page: Int, val image: WireImage, val bytes: ByteArray)
 
@@ -61,6 +63,9 @@ class SyncEngineTest {
             fileReady = id
         }
 
+        override fun onFileHeadReady(id: String) {
+            fileHeadReady = id
+        }
         override fun onFileGone(id: String) {
             fileGone = id
         }
@@ -137,6 +142,17 @@ class SyncEngineTest {
             imageRemoves += fileId to ids
         }
 
+        val shapes = ArrayList<ShapeRec>()
+        data class ShapeRec(val file: String, val page: Int, val shape: com.xnotes.sync.WireShape)
+
+        override fun applyRemoteShape(fileId: String, page: Int, shape: com.xnotes.sync.WireShape) {
+            shapes += ShapeRec(fileId, page, shape)
+        }
+
+        override fun applyRemoteShapeRemove(fileId: String, page: Int, ids: List<String>) {
+            shapeRemoves += fileId to ids
+        }
+
         val markups = ArrayList<MarkupRec>()
         data class MarkupRec(val file: String, val page: Int, val added: List<TextMarkup>, val removedIds: List<String>)
 
@@ -197,7 +213,7 @@ class SyncEngineTest {
         assertEquals("u1", h2.fileReady)
         assertTrue(h2.out.none { it is SyncMsg.Fetch })
         assertEquals("0123456789", e2.fileBytes("u1")!!.decodeToString())
-        // A newer advertised version refetches.
+        // A newer advertised version opens the stale bytes at once and catches up with just the edits.
         e2.bytesReceived(
             SyncFrames.encode(
                 SyncMsg.Index(2, -1, true, listOf(SyncFileEntry("u1", "notes/todo.xnote", 0, 42L, 10L))),
@@ -206,7 +222,10 @@ class SyncEngineTest {
         h2.out.clear()
         h2.fileReady = null
         e2.requestOpen("u1")
-        assertTrue(h2.lastSent() is SyncMsg.Fetch)
+        assertEquals("u1", h2.fileReady)
+        val catchup = h2.out.single()
+        assertTrue(catchup is SyncMsg.FetchOps)
+        assertEquals(41L, (catchup as SyncMsg.FetchOps).sinceVersion)
     }
 
     @Test fun fingerprintVector() {
@@ -553,7 +572,7 @@ class SyncEngineTest {
         state.relayout()
         val overlay = com.xnotes.canvas.RemoteLiveStrokes(state)
         overlay.showingFile = "u1"
-        e.liveOverlay = overlay
+        e.setLiveOverlay("u1", overlay)
         e.bytesReceived(
             SyncFrames.encode(
                 SyncMsg.Live(1, "u1", 0, "s-1", "pen", 3.0, "#00e676", listOf(WireSample(10.0, 20.0, 0.5)), done = false),
@@ -642,6 +661,14 @@ class SyncEngineTest {
             SyncOp.AddAudio(2, WireAudio("a1", "u2", 2, 5.0, 5.0, 120.0, 40.0, "rec", 7, "m4a", 3000)),
             SyncOp.RemoveAudio(2, listOf("a1")),
             SyncOp.RemoveImage(0, listOf("img-9")),
+            SyncOp.AddShape(
+                0, WireShape(
+                    "sh1", "rectangle", listOf(1.0, 2.0), listOf(30.0, 40.0),
+                    "#00e676", 3.0, "#ffffff", neon = true, rotation = 0.5, flip = "x",
+                    adj = listOf(0.25), headEnd = "open", liveId = "s-9", locked = true,
+                ),
+            ),
+            SyncOp.RemoveShape(0, listOf("sh1")),
         )
         val back = ((SyncFrames.Decoder().feed(SyncFrames.encode(SyncMsg.Op(1, "f", 0L, 1L, "d", ops))).single() as SyncMsg.Op).ops)
         assertEquals(ops, back)
@@ -673,10 +700,102 @@ class SyncEngineTest {
         assertEquals(12L, e.fileVersion("u1"))
     }
 
+    @Test fun shapeOpsRouteToHostAndSnapDropsItsLiveRun() {
+        val (e, h) = engine()
+        e.onConnected()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        val state = com.xnotes.canvas.CanvasState(
+            com.xnotes.core.model.Document.blank(1),
+            com.xnotes.core.FakeSurfaceFactory(),
+            com.xnotes.canvas.TestPalette(),
+        )
+        state.viewportW = 800
+        state.viewportH = 600
+        state.relayout()
+        val overlay = com.xnotes.canvas.RemoteLiveStrokes(state)
+        overlay.showingFile = "u1"
+        e.setLiveOverlay("u1", overlay)
+        // The pre-snap live ink is on screen...
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Live(2, "u1", 0, "s-9", "pen", 3.0, "#00e676", listOf(WireSample(10.0, 20.0, 0.5)), done = false)))
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Live(2, "u1", 0, "s-9", "pen", 3.0, "#00e676", listOf(WireSample(11.5, 21.0, 0.6)), done = false)))
+        val r = com.xnotes.core.FakeRenderer()
+        val o = state.origin()
+        r.withSave {
+            r.translate(o.x, o.y)
+            r.scale(state.zoom, state.zoom)
+            overlay.draw(r)
+        }
+        assertTrue("live run must paint", r.ribbonRuns.isNotEmpty() || r.ops.any { it == "strokePolyline" })
+        // ...then the snap lands as a shape carrying the live id: the run vanishes at once.
+        val shape = WireShape("sh1", "rectangle", listOf(1.0, 2.0), listOf(30.0, 40.0), "#00e676", 3.0, null, liveId = "s-9")
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(3, "u1", 7L, 8L, "d1", listOf(SyncOp.AddShape(0, shape)))))
+        assertEquals("sh1", h.shapes.single().shape.uid)
+        assertEquals("rectangle", h.shapes.single().shape.kind)
+        val r2 = com.xnotes.core.FakeRenderer()
+        r2.withSave {
+            r2.translate(o.x, o.y)
+            r2.scale(state.zoom, state.zoom)
+            overlay.draw(r2)
+        }
+        assertTrue("pre-snap ink must be gone", r2.ribbonRuns.isEmpty() && r2.ops.none { it == "strokePolyline" })
+        // A committed remove routes by uid too.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(4, "u1", 8L, 9L, "d2", listOf(SyncOp.RemoveShape(0, listOf("sh1"))))))
+        assertEquals(listOf("sh1"), h.shapeRemoves.single().second)
+    }
+
+    @Test fun staleOpenCatchesUpThroughOpsWithoutRefetch() {
+        val (e, h) = engine()
+        e.onConnected()
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(1, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 7L, 10L)))))
+        // Prime the cache at v7 with a full fetch.
+        e.requestOpen("u1")
+        e.bytesReceived(SyncFrames.encode(SyncMsg.FileChunk(2, "u1", 7L, 10L, 0L, base64Of("0123456789".toByteArray()), last = true)))
+        assertEquals("u1", h.fileReady)
+        h.fileReady = null
+        h.out.clear()
+        // The head moves to v9 while we look away: reopening hands over the stale
+        // bytes at once and asks for just the edits.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Index(3, -1, true, listOf(SyncFileEntry("u1", "n.xnote", 0, 9L, 10L)))))
+        e.requestOpen("u1")
+        assertEquals("u1", h.fileReady)
+        val asking = h.out.single() as SyncMsg.FetchOps
+        assertEquals(7L, asking.sinceVersion)
+        // The open binds at the stale version; the two missing ops buffer, then replay in order.
+        e.noteOpened("u1", 7L)
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(4, "u1", 7L, 8L, "d8", listOf(SyncOp.AddText(0, textOf("t8"))))))
+        assertTrue(h.texts.isEmpty())
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(5, "u1", 8L, 9L, "d9", listOf(SyncOp.AddText(0, textOf("t9"))))))
+        assertEquals(listOf("t8", "t9"), h.texts.map { it.second.uid })
+        assertEquals(9L, e.openVersion("u1"))
+        // Steady state keeps gating on the doc version: a skipped op resyncs.
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(6, "u1", 11L, 12L, "d12", listOf(SyncOp.AddText(0, textOf("t12"))))))
+        assertTrue(h.out.last() is SyncMsg.Fetch)
+        // ...while the chained op applies.
+        e.noteOpened("u1", 12L)
+        e.bytesReceived(SyncFrames.encode(SyncMsg.Op(7, "u1", 12L, 13L, "d13", listOf(SyncOp.AddText(0, textOf("t13"))))))
+        assertTrue(h.texts.any { it.second.uid == "t13" })
+    }
+
+    @Test fun fileHeadRoundTripsAndNotifies() {
+        val (e, h) = engine()
+        e.onConnected()
+        val head = SyncMsg.FileHead(9, "u1", 7L, 100L, "{}", "flow", null, mapOf("t" to "{}"), mapOf("p" to "aGk="))
+        val back = SyncFrames.Decoder().feed(SyncFrames.encode(head)).single() as SyncMsg.FileHead
+        assertEquals(head, back)
+        e.bytesReceived(SyncFrames.encode(head))
+        assertEquals("u1", h.fileHeadReady)
+        val kept = e.takeFileHead("u1", 7L)
+        assertEquals("{}", kept?.manifest)
+        assertEquals("flow", kept?.flow)
+        assertNull(e.takeFileHead("u1", 7L))
+    }
+
+    private fun textOf(uid: String) = WireText(uid, 10.0, 20.0, 100.0, 30.0, "hi", "#ff0000", 14.0, "sans")
+
     @Test fun liveFrameUpdatesOverlayOld() {
         val (e, h) = engine()
         var overlays = 0
-        e.liveOverlay = object : com.xnotes.canvas.RemoteLiveStrokes(
+        e.setLiveOverlay("u1", object : com.xnotes.canvas.RemoteLiveStrokes(
             com.xnotes.canvas.CanvasState(
                 com.xnotes.core.model.Document(),
                 com.xnotes.core.FakeSurfaceFactory(),
@@ -697,7 +816,7 @@ class SyncEngineTest {
                 overlays++
                 super.update(file, page, strokeId, tool, width, color, samples, done, style)
             }
-        }
+        })
         e.bytesReceived(
             SyncFrames.encode(
                 SyncMsg.Live(1, "u1", 0, "s-1", "pen", 3.0, "#00e676", listOf(WireSample(1.0, 1.0, 1.0)), done = false),

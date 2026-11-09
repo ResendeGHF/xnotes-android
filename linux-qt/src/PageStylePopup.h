@@ -1,5 +1,5 @@
-// "Page background": paper colour and ruling (lines, dots, grid) for all pages or the current one,
-// applied live (the Android Styles popup). A modeless dialog, so its colour pickers can open.
+// "Page background": paper colour, ruling (lines, dots, grid) and any installed page template
+// (.xtemplate) for all pages or the current one, applied live (the Android Styles popup).
 #pragma once
 
 #include "xnotes.h"
@@ -9,6 +9,7 @@
 class QAbstractButton;
 class QButtonGroup;
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QSlider;
 class QToolButton;
@@ -16,11 +17,12 @@ class QToolButton;
 class PageStylePopup : public QDialog {
     Q_OBJECT
 public:
-    /* canvas: an infinite canvas's background, one for the whole canvas. */
-    PageStylePopup(xn_editor* editor, bool canvas, QWidget* parent);
+    /* canvas: an infinite canvas's background, one for the whole canvas (patterns only). */
+    PageStylePopup(xn_editor* editor, xn_note* note, bool canvas, QWidget* parent);
 
 private:
     xn_editor* editor_;
+    xn_note* note_;
     bool allPages_ = true;
     bool syncing_ = false;
     xn_page_style style_{};
@@ -28,6 +30,7 @@ private:
     QButtonGroup* scope_;
     QButtonGroup* paper_;
     QButtonGroup* pattern_;
+    QComboBox* template_ = nullptr;
     QToolButton* customPaper_;
     QLabel* spacingLabel_;
     QSlider* spacing_;

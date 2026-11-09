@@ -133,6 +133,111 @@ data class WireImage(
     val uid: String = "",
 )
 
+/**
+ * A shape as it crosses the wire: the full snapshot, upserted by [uid] (an idempotent
+ * redelivery lands on the same item). [liveId] names the live run this shape snaps from,
+ * so the guest drops the pre-snap ink the moment the shape lands.
+ */
+data class WireShape(
+    val uid: String,
+    /** ShapeKind id ("rectangle", "flow_process", "solid_cube", "function", ...). */
+    val kind: String,
+    val start: List<Double>,
+    val end: List<Double>,
+    /** `#rrggbb` or `#rrggbbaa`. */
+    val strokeColor: String,
+    val strokeWidth: Double,
+    /** `#rrggbb` or `#rrggbbaa`; null = unfilled. */
+    val fillColor: String?,
+    val neon: Boolean = false,
+    val neonStrength: Double = 0.6,
+    val dashed: Boolean = false,
+    val dashLength: Double = 10.0,
+    val dashGap: Double = 8.0,
+    val rotation: Double = 0.0,
+    /** Flip id ("" = none). */
+    val flip: String = "",
+    val adj: List<Double> = emptyList(),
+    val n: Int = 0,
+    val headStart: String = "none",
+    val headEnd: String = "none",
+    /** Free outline as SVG path data (normalized to the box); null for box kinds. */
+    val path: String? = null,
+    val function: WireFunction? = null,
+    val label: WireShapeLabel? = null,
+    val locked: Boolean = false,
+    val liveId: String = "",
+)
+
+/** A plotted function for the wire. */
+data class WireFunction(
+    val expr: String,
+    val from: Double,
+    val to: Double,
+    val yMin: Double? = null,
+    val yMax: Double? = null,
+)
+
+/** A shape's typed label for the wire. */
+data class WireShapeLabel(
+    val text: String,
+    /** `#rrggbb` or `#rrggbbaa`. */
+    val color: String,
+    val pointSize: Double,
+    val face: String = "",
+    val at: Double = 0.5,
+)
+
+/** `#rrggbb`, locale-independent. */
+internal fun wireHex(c: com.xnotes.core.model.Rgba): String {
+    fun h(v: Int): String {
+        val d = "0123456789abcdef"
+        return "${d[(v shr 4) and 0xF]}${d[v and 0xF]}"
+    }
+    return "#${h(c.r)}${h(c.g)}${h(c.b)}"
+}
+
+/** `#rrggbbaa` (alpha = line opacity), locale-independent. */
+internal fun wireHexAlpha(c: com.xnotes.core.model.Rgba): String {
+    fun h(v: Int): String {
+        val d = "0123456789abcdef"
+        return "${d[(v shr 4) and 0xF]}${d[v and 0xF]}"
+    }
+    return "#${h(c.r)}${h(c.g)}${h(c.b)}${h(c.a)}"
+}
+
+/** A shape item as it crosses the wire (full snapshot, upserted by uid). */
+fun com.xnotes.core.model.ShapeItem.toWireShape(liveId: String = ""): WireShape =
+    WireShape(
+        uid = uid,
+        kind = shape.id,
+        start = listOf(start.x, start.y),
+        end = listOf(end.x, end.y),
+        strokeColor = wireHexAlpha(strokeRgba),
+        strokeWidth = strokeWidth,
+        fillColor = fillRgba?.let(::wireHexAlpha),
+        neon = neon,
+        neonStrength = neonStrength,
+        dashed = dashed,
+        dashLength = dashLength,
+        dashGap = dashGap,
+        rotation = rotation,
+        flip = flip.id,
+        adj = adj.toList(),
+        n = n,
+        headStart = headStart.id,
+        headEnd = headEnd.id,
+        path = path?.let(com.xnotes.core.shapes.FreePath::toSvg),
+        function = function?.let {
+            WireFunction(it.expr, it.from, it.to, it.yMin, it.yMax)
+        },
+        label = label?.takeIf { it.text.isNotEmpty() }?.let { l ->
+            WireShapeLabel(l.text, wireHexAlpha(l.style.rgba), l.style.pointSize, l.style.face.id, labelAt)
+        },
+        locked = locked,
+        liveId = liveId,
+    )
+
 /** One box of a text markup, in points as displayed. */
 data class WireQuad(val l: Double, val t: Double, val r: Double, val b: Double, val q: Int)
 
@@ -208,6 +313,10 @@ sealed interface SyncOp {
     data class AddTable(val page: Int, val table: WireTable) : SyncOp
     /** Take tables off [page] by uid. */
     data class RemoveTable(val page: Int, val ids: List<String>) : SyncOp
+    /** Place a shape on [page] (full snapshot, upserted by uid; drops [WireShape.liveId]'s live run). */
+    data class AddShape(val page: Int, val shape: WireShape) : SyncOp
+    /** Take shapes off [page] by uid. */
+    data class RemoveShape(val page: Int, val ids: List<String>) : SyncOp
     /** Place an audio pill on [page]; its bytes arrive in `audio_data` chunks keyed by id. */
     data class AddAudio(val page: Int, val audio: WireAudio) : SyncOp
     /** Take audio pills off [page] by audio id (or uid). */
@@ -259,6 +368,12 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
     var reason: String? = null
     var deviceName = ""
     var code = ""
+    var sinceVersion = 0L
+    var manifest = ""
+    var flow: String? = null
+    var markups: String? = null
+    var templates: Map<String, String>? = null
+    var packages: Map<String, String>? = null
     p.beginObject()
     while (p.hasNext()) {
         when (p.nextName()) {
@@ -307,6 +422,12 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
             "device_name" -> deviceName = stringOr(p, "")
             "device" -> deviceName = stringOr(p, "")
             "code" -> code = stringOr(p, "")
+            "since_version" -> sinceVersion = longOr(p, 0L)
+            "manifest" -> manifest = stringOr(p, "")
+            "flow" -> flow = stringOrNull(p)
+            "markups" -> markups = stringOrNull(p)
+            "templates" -> templates = stringMapOr(p)
+            "packages" -> packages = stringMapOr(p)
             else -> p.skipValue()
         }
     }
@@ -318,6 +439,8 @@ internal fun parseSyncBody(p: JsonPull): SyncMsg {
         "pair_result" -> SyncMsg.PairResult(seq, replyTo, ok, reason)
         "index" -> SyncMsg.Index(seq, replyTo, full, files ?: emptyList())
         "fetch" -> SyncMsg.Fetch(seq, id, offset, length)
+        "fetch_ops" -> SyncMsg.FetchOps(seq, id, sinceVersion)
+        "file_head" -> SyncMsg.FileHead(seq, id, version, total, manifest, flow, markups, templates ?: emptyMap(), packages ?: emptyMap())
         "file" -> SyncMsg.FileChunk(seq, id, version, total, offset, data, last)
         "image_data" -> SyncMsg.ImageChunk(seq, id, imageId, total, offset, data, last)
         "audio_data" -> SyncMsg.AudioChunk(seq, id, imageId, total, offset, data, last)
@@ -413,6 +536,40 @@ internal fun writeSyncBody(w: JsonWrite, msg: SyncMsg) {
             w.name("id").value(msg.id)
             w.name("offset").value(msg.offset.toDouble())
             w.name("length").value(msg.length.toDouble())
+            w.endObject()
+        }
+        is SyncMsg.FetchOps -> {
+            w.beginObject()
+            w.name("t").value("fetch_ops")
+            w.name("seq").value(msg.seq)
+            w.name("id").value(msg.id)
+            w.name("since_version").value(msg.sinceVersion.toDouble())
+            w.endObject()
+        }
+        is SyncMsg.FileHead -> {
+            w.beginObject()
+            w.name("t").value("file_head")
+            w.name("seq").value(msg.seq)
+            w.name("id").value(msg.id)
+            w.name("version").value(msg.version.toDouble())
+            w.name("total").value(msg.total.toDouble())
+            w.name("manifest").value(msg.manifest)
+            msg.flow?.let { w.name("flow").value(it) }
+            msg.markups?.let { w.name("markups").value(it) }
+            if (msg.templates.isNotEmpty()) {
+                w.name("templates").beginObject()
+                for ((k, v) in msg.templates) {
+                    w.name(k).value(v)
+                }
+                w.endObject()
+            }
+            if (msg.packages.isNotEmpty()) {
+                w.name("packages").beginObject()
+                for ((k, v) in msg.packages) {
+                    w.name(k).value(v)
+                }
+                w.endObject()
+            }
             w.endObject()
         }
         is SyncMsg.FileChunk -> {
@@ -852,6 +1009,76 @@ private fun writeOp(w: JsonWrite, op: SyncOp) {
             w.endArray()
             w.endObject()
         }
+        is SyncOp.AddShape -> {
+            w.beginObject()
+            w.name("op").value("add_shape")
+            w.name("page").value(op.page)
+            w.name("shape").beginObject()
+            w.name("uid").value(op.shape.uid)
+            w.name("kind").value(op.shape.kind)
+            w.name("start").beginArray()
+            w.value(op.shape.start.getOrElse(0) { 0.0 })
+            w.value(op.shape.start.getOrElse(1) { 0.0 })
+            w.endArray()
+            w.name("end").beginArray()
+            w.value(op.shape.end.getOrElse(0) { 0.0 })
+            w.value(op.shape.end.getOrElse(1) { 0.0 })
+            w.endArray()
+            w.name("stroke_color").value(op.shape.strokeColor)
+            w.name("stroke_width").value(op.shape.strokeWidth)
+            op.shape.fillColor?.let { w.name("fill_color").value(it) }
+            if (op.shape.neon) {
+                w.name("neon").value(true)
+                w.name("neon_strength").value(op.shape.neonStrength)
+            }
+            if (op.shape.dashed) {
+                w.name("dashed").value(true)
+                w.name("dash_length").value(op.shape.dashLength)
+                w.name("dash_gap").value(op.shape.dashGap)
+            }
+            if (op.shape.rotation != 0.0) w.name("rotation").value(op.shape.rotation)
+            if (op.shape.flip.isNotEmpty()) w.name("flip").value(op.shape.flip)
+            if (op.shape.adj.isNotEmpty()) {
+                w.name("adj").beginArray()
+                for (v in op.shape.adj) w.value(v)
+                w.endArray()
+            }
+            if (op.shape.n != 0) w.name("n").value(op.shape.n.toDouble())
+            if (op.shape.headStart != "none") w.name("head_start").value(op.shape.headStart)
+            if (op.shape.headEnd != "none") w.name("head_end").value(op.shape.headEnd)
+            op.shape.path?.let { w.name("path").value(it) }
+            op.shape.function?.let { f ->
+                w.name("function").beginObject()
+                w.name("expr").value(f.expr)
+                w.name("from").value(f.from)
+                w.name("to").value(f.to)
+                f.yMin?.let { w.name("ymin").value(it) }
+                f.yMax?.let { w.name("ymax").value(it) }
+                w.endObject()
+            }
+            op.shape.label?.let { l ->
+                w.name("label").beginObject()
+                w.name("text").value(l.text)
+                w.name("color").value(l.color)
+                w.name("point_size").value(l.pointSize)
+                if (l.face.isNotEmpty()) w.name("face").value(l.face)
+                if (l.at != 0.5) w.name("at").value(l.at)
+                w.endObject()
+            }
+            if (op.shape.locked) w.name("locked").value(true)
+            if (op.shape.liveId.isNotEmpty()) w.name("live_id").value(op.shape.liveId)
+            w.endObject()
+            w.endObject()
+        }
+        is SyncOp.RemoveShape -> {
+            w.beginObject()
+            w.name("op").value("remove_shape")
+            w.name("page").value(op.page)
+            w.name("ids").beginArray()
+            for (id in op.ids) w.value(id)
+            w.endArray()
+            w.endObject()
+        }
         is SyncOp.AddAudio -> {
             w.beginObject()
             w.name("op").value("add_audio")
@@ -1204,6 +1431,123 @@ private fun tableOr(p: JsonPull): WireTable? {
     return WireTable(uid, x, y, w, h, cols, rows, strokeColor, strokeWidth, cells, link)
 }
 
+/** A `shape` object inside an add_shape op, or null when malformed. */
+private fun shapeOr(p: JsonPull): WireShape? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    var uid = ""
+    var kind = ""
+    var start: List<Double> = emptyList()
+    var end: List<Double> = emptyList()
+    var strokeColor = ""
+    var strokeWidth = 3.0
+    var fillColor: String? = null
+    var neon = false
+    var neonStrength = 0.6
+    var dashed = false
+    var dashLength = 10.0
+    var dashGap = 8.0
+    var rotation = 0.0
+    var flip = ""
+    var adj: List<Double> = emptyList()
+    var n = 0
+    var headStart = "none"
+    var headEnd = "none"
+    var path: String? = null
+    var function: WireFunction? = null
+    var label: WireShapeLabel? = null
+    var locked = false
+    var liveId = ""
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "uid" -> uid = stringOr(p, "")
+            "kind" -> kind = stringOr(p, "")
+            "start" -> start = numberListOr(p) ?: emptyList()
+            "end" -> end = numberListOr(p) ?: emptyList()
+            "stroke_color" -> strokeColor = stringOr(p, "")
+            "stroke_width" -> strokeWidth = doubleOr(p, 3.0)
+            "fill_color" -> fillColor = stringOrNull(p)
+            "neon" -> neon = boolOr(p, false)
+            "neon_strength" -> neonStrength = doubleOr(p, 0.6)
+            "dashed" -> dashed = boolOr(p, false)
+            "dash_length" -> dashLength = doubleOr(p, 10.0)
+            "dash_gap" -> dashGap = doubleOr(p, 8.0)
+            "rotation" -> rotation = doubleOr(p, 0.0)
+            "flip" -> flip = stringOr(p, "")
+            "adj" -> adj = numberListOr(p) ?: emptyList()
+            "n" -> n = intOr(p, 0)
+            "head_start" -> headStart = stringOr(p, "none")
+            "head_end" -> headEnd = stringOr(p, "none")
+            "path" -> path = stringOrNull(p)
+            "function" -> function = if (p.peek() == JsonPull.Token.BEGIN_OBJECT) functionOr(p) else {
+                p.skipValue()
+                null
+            }
+            "label" -> label = if (p.peek() == JsonPull.Token.BEGIN_OBJECT) shapeLabelOr(p) else {
+                p.skipValue()
+                null
+            }
+            "locked" -> locked = boolOr(p, false)
+            "live_id" -> liveId = stringOr(p, "")
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (uid.isEmpty() || kind.isEmpty() || strokeColor.isEmpty()) return null
+    return WireShape(
+        uid, kind, start, end, strokeColor, strokeWidth, fillColor, neon, neonStrength,
+        dashed, dashLength, dashGap, rotation, flip, adj, n, headStart, headEnd,
+        path, function, label, locked, liveId,
+    )
+}
+
+private fun functionOr(p: JsonPull): WireFunction? {
+    var expr = ""
+    var from = 0.0
+    var to = 0.0
+    var yMin: Double? = null
+    var yMax: Double? = null
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "expr" -> expr = stringOr(p, "")
+            "from" -> from = doubleOr(p, 0.0)
+            "to" -> to = doubleOr(p, 0.0)
+            "ymin" -> yMin = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            "ymax" -> yMax = if (p.peek() == JsonPull.Token.NUMBER) p.nextDouble() else { p.skipValue(); null }
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (expr.isEmpty()) return null
+    return WireFunction(expr, from, to, yMin, yMax)
+}
+
+private fun shapeLabelOr(p: JsonPull): WireShapeLabel? {
+    var text = ""
+    var color = ""
+    var pointSize = 0.0
+    var face = ""
+    var at = 0.5
+    p.beginObject()
+    while (p.hasNext()) {
+        when (p.nextName()) {
+            "text" -> text = stringOr(p, "")
+            "color" -> color = stringOr(p, "")
+            "point_size" -> pointSize = doubleOr(p, 0.0)
+            "face" -> face = stringOr(p, "")
+            "at" -> at = doubleOr(p, 0.5)
+            else -> p.skipValue()
+        }
+    }
+    p.endObject()
+    if (text.isEmpty() || color.isEmpty()) return null
+    return WireShapeLabel(text, color, pointSize, face, at)
+}
+
 /** An `audio` object inside an add_audio op, or null when malformed. */
 private fun audioOr(p: JsonPull): WireAudio? {
     if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
@@ -1263,6 +1607,22 @@ private fun stringsGridOrNull(p: JsonPull): List<List<String>>? {
         out += row
     }
     p.endArray()
+    return out
+}
+
+/** A string→string object, or null when absent. */
+private fun stringMapOr(p: JsonPull): Map<String, String>? {
+    if (p.peek() != JsonPull.Token.BEGIN_OBJECT) {
+        p.skipValue()
+        return null
+    }
+    val out = LinkedHashMap<String, String>()
+    p.beginObject()
+    while (p.hasNext()) {
+        val k = p.nextName()
+        stringOrNull(p)?.let { out[k] = it }
+    }
+    p.endObject()
     return out
 }
 
@@ -1493,6 +1853,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
         var text: WireText? = null
         var table: WireTable? = null
         var audio: WireAudio? = null
+        var shape: WireShape? = null
         var entries: ArrayList<PageStyleEntry>? = null
         var docStyle: WirePageStyle? = null
         var docMargins: WireMargins? = null
@@ -1520,6 +1881,7 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
                 "text" -> text = textOr(p)
                 "table" -> table = tableOr(p)
                 "audio" -> audio = audioOr(p)
+                "shape" -> shape = shapeOr(p)
                 "entries" -> entries = entriesOr(p)
                 "doc_style" -> docStyle = if (p.peek() == JsonPull.Token.BEGIN_OBJECT) styleBodyOr(p) else {
                     p.skipValue()
@@ -1586,6 +1948,8 @@ private fun opListOr(p: JsonPull): List<SyncOp>? {
             "remove_table" -> SyncOp.RemoveTable(page, ids ?: emptyList())
             "add_audio" -> audio?.let { SyncOp.AddAudio(page, it) } ?: SyncOp.Unknown("add_audio")
             "remove_audio" -> SyncOp.RemoveAudio(page, ids ?: emptyList())
+            "add_shape" -> shape?.let { SyncOp.AddShape(page, it) } ?: SyncOp.Unknown("add_shape")
+            "remove_shape" -> SyncOp.RemoveShape(page, ids ?: emptyList())
             else -> SyncOp.Unknown(name ?: "")
         }
     }
@@ -1675,7 +2039,7 @@ fun WireMargins.toPageMargins(): com.xnotes.core.model.PageMargins =
     com.xnotes.core.model.PageMargins(left = l, top = t, right = r, bottom = b)
 
 /** Bytes of a base64 chunk, or null when malformed. */
-internal fun bytesOfBase64(s: String): ByteArray? = try {
+fun bytesOfBase64(s: String): ByteArray? = try {
     s.decodeBase64()?.toByteArray()
 } catch (_: Exception) {
     null

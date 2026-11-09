@@ -21,6 +21,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QDockWidget>
+#include <QFile>
 #include <QGridLayout>
 #include <QInputDialog>
 #include <QPushButton>
@@ -33,6 +34,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QMenu>
+#include <QStandardPaths>
 #include <QToolButton>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -45,6 +47,8 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
+
+#include <mutex>
 
 namespace {
 
@@ -128,20 +132,57 @@ QString takeError(char* error) {
     return message;
 }
 
+/*
+ * The page templates every device knows: the bundled `.xtemplate` files shipped as resources
+ * (:/templates), registered with the core once per process. Plain JSON goes straight in;
+ * packages (zips with pictures) are copied into the cache once per API version — the core keys
+ * everything by content hash, so the same file is the same template on every device. Notes that
+ * carry their own embedded copies need nothing here; the core resolves those first.
+ */
+void loadBundledTemplates() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
+                                  QStringLiteral("/templates-%1/").arg(XN_API_VERSION);
+        QDir().mkpath(cacheBase);
+        const QStringList roots{QStringLiteral(":/templates"), QStringLiteral(":/templates/examples")};
+        for (const QString& root : roots) {
+            const QDir dir(root);
+            for (const QString& name : dir.entryList({QStringLiteral("*.xtemplate")}, QDir::Files)) {
+                QFile f(dir.filePath(name));
+                if (!f.open(QIODevice::ReadOnly)) continue;
+                const QByteArray bytes = f.readAll();
+                if (bytes.size() >= 2 && bytes[0] == 'P' && bytes[1] == 'K') {
+                    const QString kept = cacheBase + QString::fromUtf8(name);
+                    if (!QFile::exists(kept)) {
+                        QFile out(kept);
+                        if (out.open(QIODevice::WriteOnly)) out.write(bytes);
+                    }
+                    if (char* key = xn_template_add_package(kept.toUtf8().constData())) xn_free_string(key);
+                } else if (!bytes.isEmpty()) {
+                    if (char* key = xn_template_add_json(bytes.constData())) xn_free_string(key);
+                }
+            }
+        }
+    });
+}
+
 }  // namespace
 
 MainWindow::MainWindow() {
-    // The canvas with scroll bars beside and under it (device pixels, as the core counts).
-    auto* central = new QWidget(this);
-    auto* grid = new QGridLayout(central);
-    grid->setContentsMargins(0, 0, 0, 0);
-    grid->setSpacing(0);
-    canvas_ = new CanvasWidget(central);
-    vbar_ = new QScrollBar(Qt::Vertical, central);
-    hbar_ = new QScrollBar(Qt::Horizontal, central);
-    grid->addWidget(canvas_, 0, 0);
-    grid->addWidget(vbar_, 0, 1);
-    grid->addWidget(hbar_, 1, 0);
+    loadBundledTemplates();
+    // One tab per open note, each with its own canvas (editor, undo, scroll)
+    // beside and under it (device pixels, as the core counts).
+    tabs_ = new QTabWidget(this);
+    tabs_->setTabsClosable(true);
+    tabs_->setMovable(true);
+    tabs_->setTabBarAutoHide(true);
+    connect(tabs_, &QTabWidget::tabCloseRequested, this, [this](int i) { closeTab(i); });
+    connect(tabs_, &QTabWidget::currentChanged, this, [this](int i) { activateTab(i); });
+    // Built before the toolbars exist, so keep the switch silent until below.
+    tabs_->blockSignals(true);
+    addTab();
+    tabs_->blockSignals(false);
     // Sidebar navigation: Home, Browse, Shared. The canvas is page 0.
     // The sidebar only lives on the browser pages; the editor is chromeless
     // apart from its own toolbar (Back returns home).
@@ -159,7 +200,7 @@ MainWindow::MainWindow() {
     connect(navShared_, &QAction::triggered, this, [this] { showPage(3); });
 
     stack_ = new QStackedWidget(this);
-    stack_->addWidget(central);
+    stack_->addWidget(tabs_);
     home_ = new xn::HomeScreen(stack_);
     stack_->addWidget(home_);
     browse_ = new xn::BrowsePage(stack_);
@@ -173,12 +214,6 @@ MainWindow::MainWindow() {
     row->addWidget(nav);
     row->addWidget(stack_, 1);
     setCentralWidget(middle);
-    auto scrolled = [this] {
-        if (syncingBars_ || !canvas_->editor()) return;
-        xn_editor_scroll_to(canvas_->editor(), hbar_->value(), vbar_->value());
-    };
-    connect(vbar_, &QScrollBar::valueChanged, this, scrolled);
-    connect(hbar_, &QScrollBar::valueChanged, this, scrolled);
     // Page thumbnails on the left (the Android side panel), shown with notes, not canvases.
     pages_ = new PagesPanel(this);
     pagesDock_ = new QDockWidget(QStringLiteral("Pages"), this);
@@ -188,27 +223,20 @@ MainWindow::MainWindow() {
     pagesDock_->setWidget(pages_);
     addDockWidget(Qt::LeftDockWidgetArea, pagesDock_);
     buildUi();
-    connect(canvas_, &CanvasWidget::contentChanged, pages_, &PagesPanel::contentChanged);
-    connect(canvas_, &CanvasWidget::viewChanged, pages_, &PagesPanel::viewChanged);
-    connect(canvas_, &CanvasWidget::contentChanged, this, &MainWindow::refresh);
-    connect(canvas_, &CanvasWidget::viewChanged, this, &MainWindow::refreshView);
-    connect(canvas_, &CanvasWidget::notice, this, [this](int code) {
-        statusBar()->showMessage(code == XN_NOTICE_KEEP_ONE_PAGE ? QStringLiteral("The note must keep at least one page")
-                                 : code == XN_NOTICE_PAGE_ALREADY_EMPTY ? QStringLiteral("Page is already empty")
-                                                                        : QString(), 4000);
-    });
+    activateTab(0);
     // Input and speed, for checking a tablet: whether Qt reports it as a pen with pressure.
     inputLabel_ = new QLabel(this);
     statusBar()->addPermanentWidget(inputLabel_);
     auto* stats = new QTimer(this);
     connect(stats, &QTimer::timeout, this, [this] {
-        const QString input = canvas_->lastInput();
-        const double interval = canvas_->frameIntervalMs();
-        const int b = canvas_->penButtons();
+        auto* canvas = activeCanvas();
+        const QString input = canvas ? canvas->lastInput() : QString();
+        const double interval = canvas ? canvas->frameIntervalMs() : 0;
+        const int b = canvas ? canvas->penButtons() : 0;
         const QString buttons = b == 0 ? QString() : b == 1 ? QStringLiteral("pen button 1   ") : b == 2 ? QStringLiteral("pen button 2   ") : QStringLiteral("pen buttons 1+2   ");
-        inputLabel_->setText(buttons + (input.isEmpty() ? QString() : QStringLiteral("input: %1, pressure %2   ").arg(input).arg(canvas_->lastPressure(), 0, 'f', 2)) +
-                             QStringLiteral("%1: frame %2 ms").arg(canvas_->render() == CanvasWidget::Render::Gl ? QStringLiteral("GPU") : QStringLiteral("CPU"))
-                                 .arg(canvas_->lastFrameMs(), 0, 'f', 1) +
+        inputLabel_->setText(buttons + (input.isEmpty() || !canvas ? QString() : QStringLiteral("input: %1, pressure %2   ").arg(input).arg(canvas->lastPressure(), 0, 'f', 2)) +
+                             QStringLiteral("%1: frame %2 ms").arg(canvas && canvas->render() == CanvasWidget::Render::Gl ? QStringLiteral("GPU") : QStringLiteral("CPU"))
+                                 .arg(canvas ? canvas->lastFrameMs() : 0, 0, 'f', 1) +
                              (interval > 0 ? QStringLiteral(", %1 fps").arg(int(std::lround(1000 / interval))) : QString()));
     });
     stats->start(250);
@@ -217,16 +245,246 @@ MainWindow::MainWindow() {
 }
 
 MainWindow::~MainWindow() {
-    // Unbind before the editor is torn down: the sync bridge must never hold
+    // Unbind before the editors are torn down: the sync bridge must never hold
     // a destroyed editor (a late live frame would then use-after-free it).
-    if (!boundFileId_.isEmpty() && canvas_->editor()) {
-        companion_->closeFile(boundFileId_);
-        companion_->unbindEditor(canvas_->editor());
-        boundFileId_.clear();
+    // closeEvent already confirmed; here everything just drops, tab by tab.
+    while (!tabs_.isEmpty()) {
+        Tab* tab = tabs_.first();
+        if (!tab->fileId.isEmpty() && tab->canvas->editor()) {
+            companion_->closeFile(tab->fileId);
+            companion_->unbindEditor(tab->canvas->editor());
+        }
+        tab->canvas->setNote(nullptr);
+        if (tab->note) xn_note_close(tab->note);
+        tabs_.removeFirst();
+        delete tab;
     }
     pages_->setDocument(nullptr, nullptr);
-    canvas_->setNote(nullptr);
-    if (note_) xn_note_close(note_);
+}
+
+MainWindow::Tab* MainWindow::activeTab() const {
+    const int i = tabs_ ? tabs_->currentIndex() : -1;
+    return (i >= 0 && i < tabs_.size()) ? tabs_.at(i) : nullptr;
+}
+
+CanvasWidget* MainWindow::activeCanvas() const {
+    Tab* tab = activeTab();
+    return tab ? tab->canvas : nullptr;
+}
+
+xn_note* MainWindow::activeNote() const {
+    Tab* tab = activeTab();
+    return tab ? tab->note : nullptr;
+}
+
+MainWindow::Tab* MainWindow::tabForFile(const QString& id) const {
+    if (id.isEmpty()) return nullptr;
+    for (Tab* tab : std::as_const(tabs_)) {
+        if (tab->fileId == id) return tab;
+    }
+    return nullptr;
+}
+
+MainWindow::Tab* MainWindow::tabForPath(const QString& path) const {
+    if (path.isEmpty()) return nullptr;
+    const QString abs = QFileInfo(path).absoluteFilePath();
+    for (Tab* tab : std::as_const(tabs_)) {
+        if (!tab->path.isEmpty() && QFileInfo(tab->path).absoluteFilePath() == abs) return tab;
+    }
+    return nullptr;
+}
+
+MainWindow::Tab* MainWindow::addTab() {
+    auto* tab = new Tab();
+    auto* page = new QWidget(tabs_);
+    auto* grid = new QGridLayout(page);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(0);
+    tab->canvas = new CanvasWidget(page);
+    tab->vbar = new QScrollBar(Qt::Vertical, page);
+    tab->hbar = new QScrollBar(Qt::Horizontal, page);
+    grid->addWidget(tab->canvas, 0, 0);
+    grid->addWidget(tab->vbar, 0, 1);
+    grid->addWidget(tab->hbar, 1, 0);
+    tab->page = page;
+    auto scrolled = [this, tab] {
+        if (syncingBars_ || tab != activeTab() || !tab->canvas->editor()) return;
+        xn_editor_scroll_to(tab->canvas->editor(), tab->hbar->value(), tab->vbar->value());
+    };
+    connect(tab->vbar, &QScrollBar::valueChanged, this, scrolled);
+    connect(tab->hbar, &QScrollBar::valueChanged, this, scrolled);
+    connect(tab->canvas, &CanvasWidget::contentChanged, this, [this, tab] {
+        if (tab != activeTab()) return;
+        pages_->contentChanged();
+        refresh();
+    });
+    connect(tab->canvas, &CanvasWidget::viewChanged, this, [this, tab] {
+        if (tab != activeTab()) return;
+        pages_->viewChanged();
+        refreshView();
+    });
+    connect(tab->canvas, &CanvasWidget::notice, this, [this, tab](int code) {
+        if (tab != activeTab()) return;
+        statusBar()->showMessage(code == XN_NOTICE_KEEP_ONE_PAGE ? QStringLiteral("The note must keep at least one page")
+                                 : code == XN_NOTICE_PAGE_ALREADY_EMPTY ? QStringLiteral("Page is already empty")
+                                                                        : QString(), 4000);
+    });
+    tabs_.append(tab);
+    tabs_->addTab(page, QString());
+    refreshTabTitle(tab);
+    return tab;
+}
+
+void MainWindow::closeTab(int index) {
+    if (index < 0 || index >= tabs_.size()) return;
+    Tab* tab = tabs_.at(index);
+    if (tab->note && xn_note_is_dirty(tab->note)) {
+        // The tab keeps unsaved work: confirm on its own behalf.
+        const QString name = !tab->title.isEmpty() ? tab->title : tr("Untitled");
+        const auto answer = QMessageBox::question(this, tr("Unsaved changes"),
+                                                  tr("Save changes to %1?").arg(name),
+                                                  QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+        if (answer == QMessageBox::Cancel) return;
+        if (answer == QMessageBox::Save) {
+            activateTab(index);
+            if (!save(false)) return;
+        }
+    }
+    if (!tab->fileId.isEmpty() && tab->canvas->editor()) {
+        companion_->closeFile(tab->fileId);
+        companion_->unbindEditor(tab->canvas->editor());
+    }
+    tab->canvas->setNote(nullptr);
+    if (tab->note) xn_note_close(tab->note);
+    const bool wasActive = tab == activeTab();
+    tabs_.removeAt(index);
+    tabs_->removeTab(index);
+    delete tab;
+    if (!wasActive) return;
+    if (tabs_.isEmpty()) {
+        // Never leave the editor area without a canvas: the call sites below
+        // assume one exists (only its editor may be null).
+        addTab();
+        activateTab(0);
+    } else {
+        activateTab(qMin(index, static_cast<int>(tabs_.size()) - 1));
+    }
+}
+
+void MainWindow::activateTab(int index) {
+    if (index < 0 || index >= tabs_.size()) return;
+    Tab* coming = tabs_.at(index);
+    if (Tab* going = activeTab()) {
+        if (going != coming && !going->fileId.isEmpty()) {
+            // Background tabs stay bound (their ops keep applying); they just
+            // stop reporting a viewed page.
+            companion_->presence(going->fileId, -1);
+            going->lastPresencePage = -2;
+        }
+    }
+    tabs_->setCurrentIndex(index);
+    // Mirrors of the focused tab: everything below reads these.
+    canvas_ = coming->canvas;
+    note_ = coming->note;
+    path_ = coming->path;
+    boundFileId_ = coming->fileId;
+    lastPresencePage_ = coming->lastPresencePage;
+    vbar_ = coming->vbar;
+    hbar_ = coming->hbar;
+    if (pageStyle_) pageStyle_->close();
+    applyKind();
+    canvas_->setDark(dark_);
+    pages_->setPaper(paper());
+    pages_->setDocument(note_, canvas_->editor());
+    if (QAction* tool = tools_->checkedAction()) canvas_->setTool(tool->data().toByteArray().constData());
+    applyToolSettings();
+    syncWidth();
+    refresh();
+    refreshView();
+    showPage(0);
+    syncPresenceFor(coming);
+}
+
+void MainWindow::installTab(Tab* tab, xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path) {
+    if (!tab) {
+        if (note) xn_note_close(note);
+        return;
+    }
+    // Focus first so every readout below (and the mirrors) follows this tab.
+    if (tab != activeTab()) activateTab(tabs_->indexOf(tab->page));
+    if (tab->canvas->editor()) {
+        if (!tab->fileId.isEmpty()) companion_->closeFile(tab->fileId);
+        companion_->unbindEditor(tab->canvas->editor());
+        if (boundFileId_ == tab->fileId) boundFileId_.clear();
+        tab->fileId.clear();
+        lastPresencePage_ = -2;
+    }
+    suggestedName_.clear();
+    if (pageStyle_) pageStyle_->close();  // it edits the editor going away
+    pages_->setDocument(nullptr, nullptr);
+    tab->canvas->setNote(nullptr);
+    if (tab->note) xn_note_close(tab->note);
+    tab->note = note;
+    tab->workDir = std::move(workDir);
+    tab->path = path;
+    tab->title.clear();
+    tab->lastPresencePage = -2;
+    tab->skeleton = false;
+    installing_ = true;
+    tab->canvas->setNote(note);
+    installing_ = false;
+    applyKind();
+    tab->canvas->setDark(dark_);
+    pages_->setPaper(paper());
+    pages_->setDocument(note, tab->canvas->editor());
+    if (QAction* tool = tools_->checkedAction()) tab->canvas->setTool(tool->data().toByteArray().constData());
+    if (!path.isEmpty() && !QDir(path).absolutePath().startsWith(QDir::tempPath() + QLatin1Char('/')))
+        xn::Recents::touchLocal(path);
+    if (colorAction_->data().isValid()) setInk(colorAction_->data().value<QColor>());
+    applyToolSettings();
+    syncWidth();
+    refreshTabTitle(tab);
+    // Mirrors of the focused tab.
+    note_ = note;
+    path_ = path;
+    refresh();
+    refreshView();
+    showPage(0);
+}
+
+void MainWindow::refreshTabTitle(Tab* tab) {
+    if (!tab) return;
+    // The base name is fixed at open time (a shared-index scan per keystroke
+    // would stall typing); here only the cheap dirty/skeleton marks change.
+    if (tab->title.isEmpty()) {
+        if (!tab->fileId.isEmpty()) {
+            tab->title = syncFilePath(tab->fileId).section(QLatin1Char('/'), -1);
+            if (tab->title.isEmpty()) tab->title = tab->fileId;
+        } else if (!tab->path.isEmpty()) {
+            tab->title = QFileInfo(tab->path).fileName();
+        }
+        if (tab->title.isEmpty()) tab->title = tr(tab->note && xn_note_is_canvas(tab->note) ? "New canvas" : "New note");
+    }
+    QString name = tab->title;
+    if (tab->skeleton) name += QStringLiteral(" …");
+    else if (tab->note && xn_note_is_dirty(tab->note)) name = QStringLiteral("• ") + name;
+    const int i = tabs_->indexOf(tab->page);
+    if (i < 0) return;
+    tabs_->setTabText(i, name);
+    const QString tip = !tab->fileId.isEmpty() ? tab->fileId : tab->path;
+    if (!tip.isEmpty()) tabs_->setTabToolTip(i, tip);
+}
+
+void MainWindow::syncPresenceFor(Tab* tab) {
+    if (!tab || tab->fileId.isEmpty() || !tab->canvas->editor()) return;
+    const int page = xn_editor_current_page(tab->canvas->editor());
+    if (page == tab->lastPresencePage) return;
+    tab->lastPresencePage = page;
+    companion_->presence(tab->fileId, page);
+    if (tab == activeTab()) {
+        boundFileId_ = tab->fileId;
+        lastPresencePage_ = page;
+    }
 }
 
 void MainWindow::buildUi() {
@@ -253,8 +511,8 @@ void MainWindow::buildUi() {
     create->setToolTip(QStringLiteral("New"));
     create->setPopupMode(QToolButton::InstantPopup);
     auto* createMenu = new QMenu(create);
-    createMenu->addAction(xnIcon(QStringLiteral("file")), QStringLiteral("Note"), QKeySequence::New, this, [this] { if (confirmDiscard()) newNote(); });
-    createMenu->addAction(xnIcon(QStringLiteral("canvas")), QStringLiteral("Canvas"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), this, [this] { if (confirmDiscard()) newCanvas(); });
+    createMenu->addAction(xnIcon(QStringLiteral("file")), QStringLiteral("Note"), QKeySequence::New, this, [this] { newNote(); });
+    createMenu->addAction(xnIcon(QStringLiteral("canvas")), QStringLiteral("Canvas"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), this, [this] { newCanvas(); });
     create->setMenu(createMenu);
     bar->addWidget(create);
     bar->addAction(QStringLiteral("Open…"), QKeySequence::Open, this, &MainWindow::chooseOpen);
@@ -297,7 +555,7 @@ void MainWindow::buildUi() {
     bar->addAction(QStringLiteral("Background…"), this, [this] {
         if (!canvas_->editor()) return;
         if (!pageStyle_) {
-            pageStyle_ = new PageStylePopup(canvas_->editor(), xn_note_is_canvas(note_) != 0, this);
+            pageStyle_ = new PageStylePopup(canvas_->editor(), note_, xn_note_is_canvas(note_) != 0, this);
             pageStyle_->setAttribute(Qt::WA_DeleteOnClose);
         }
         pageStyle_->show();
@@ -761,9 +1019,11 @@ void MainWindow::editMarkupNote(xn_editor* e, const QString& current) {
 
 /* A fresh file name in the note's work folder, which lives as long as the note. */
 QString MainWindow::workFile(const QString& suffix) {
-    if (!workDir_ || !workDir_->isValid()) workDir_ = std::make_unique<QTemporaryDir>();
-    if (!workDir_->isValid()) return {};
-    return workDir_->filePath(QStringLiteral("inserted-%1.%2").arg(QUuid::createUuid().toString(QUuid::Id128), suffix));
+    Tab* tab = activeTab();
+    if (!tab) return {};
+    if (!tab->workDir || !tab->workDir->isValid()) tab->workDir = std::make_unique<QTemporaryDir>();
+    if (!tab->workDir->isValid()) return {};
+    return tab->workDir->filePath(QStringLiteral("inserted-%1.%2").arg(QUuid::createUuid().toString(QUuid::Id128), suffix));
 }
 
 void MainWindow::chooseImage() {
@@ -849,37 +1109,6 @@ void MainWindow::showContextMenu(QPointF at, bool onLocked) {
     menu.exec(canvas_->mapToGlobal(at.toPoint()));
 }
 
-void MainWindow::install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path) {
-    if (!boundFileId_.isEmpty() && canvas_->editor()) {
-        companion_->closeFile(boundFileId_);
-        companion_->unbindEditor(canvas_->editor());
-        boundFileId_.clear();
-    }
-    suggestedName_.clear();
-    if (pageStyle_) pageStyle_->close();  // it edits the editor going away
-    pages_->setDocument(nullptr, nullptr);
-    canvas_->setNote(nullptr);
-    if (note_) xn_note_close(note_);
-    note_ = note;
-    workDir_ = std::move(workDir);
-    path_ = path;
-    installing_ = true;
-    canvas_->setNote(note_);
-    installing_ = false;
-    applyKind();
-    canvas_->setDark(dark_);
-    pages_->setPaper(paper());
-    pages_->setDocument(note_, canvas_->editor());
-    if (QAction* tool = tools_->checkedAction()) canvas_->setTool(tool->data().toByteArray().constData());
-    if (!path.isEmpty() && !QDir(path).absolutePath().startsWith(QDir::tempPath() + QLatin1Char('/')))
-        xn::Recents::touchLocal(path);
-    if (colorAction_->data().isValid()) setInk(colorAction_->data().value<QColor>());
-    applyToolSettings();
-    syncWidth();
-    refresh();
-    refreshView();
-    showPage(0);
-}
 
 /* Sidebar navigation: Home, Browse, Shared files, or the open note's canvas. */
 void MainWindow::showPage(int index) {
@@ -904,7 +1133,7 @@ void MainWindow::showPage(int index) {
 
 void MainWindow::setupCompanion() {
     companion_ = new xn::CompanionServer(this);
-    connect(browse_, &xn::BrowsePage::newNote, this, [this] { if (confirmDiscard()) newNote(); });
+    connect(browse_, &xn::BrowsePage::newNote, this, [this] { newNote(); });
     connect(browse_, &xn::BrowsePage::openLocal, this, [this](const QString& path) { open(path); });
     connect(shared_, &xn::SharedPage::openShared, this, [this](const QString& id) { openSharedFile(id); });
     connect(shared_, &xn::SharedPage::refreshRequested, this, [this] {
@@ -962,17 +1191,18 @@ void MainWindow::setupCompanion() {
     });
     connect(companion_, &xn::CompanionServer::indexChanged, this, &MainWindow::refreshHomeFiles);
     connect(companion_, &xn::CompanionServer::fileReady, this, &MainWindow::openSharedReady);
+    connect(companion_, &xn::CompanionServer::fileHeadReady, this, &MainWindow::openSharedHeadReady);
     connect(companion_, &xn::CompanionServer::fileGone, this, [this](const QString& id) {
-        if (boundFileId_ == id) {
-            boundFileId_.clear();
-            showHome();
-            statusBar()->showMessage(QStringLiteral("The host unshared the open file"), 4000);
-        }
+        if (Tab* tab = tabForFile(id)) closeTab(tabs_->indexOf(tab->page));
+        if (boundFileId_ == id) boundFileId_.clear();
         xn::Recents::forgetShared(id);
         refreshHomeFiles();
+        statusBar()->showMessage(QStringLiteral("The host unshared a shared file"), 4000);
     });
     connect(companion_, &xn::CompanionServer::resync, this, [this](const QString& id, long long) { reopenSharedFile(id); });
-    connect(companion_, &xn::CompanionServer::paint, this, [this] { canvas_->update(); });
+    connect(companion_, &xn::CompanionServer::paint, this, [this] {
+        for (Tab* tab : std::as_const(tabs_)) tab->canvas->update();
+    });
     connect(companion_, &xn::CompanionServer::deleteAnswered, this, [this](bool ok, const QString& reason) {
         statusBar()->showMessage(ok ? QStringLiteral("Deleted on the host") : QStringLiteral("Host declined: %1").arg(reason), 4000);
     });
@@ -1080,15 +1310,76 @@ void MainWindow::approvePairing(const QString& device, const QString& fp) {
 }
 
 void MainWindow::openSharedFile(const QString& id) {
-    if (!confirmDiscard()) return;
-    pendingOpenId_ = id;
+    if (Tab* tab = tabForFile(id)) {
+        activateTab(tabs_->indexOf(tab->page));
+        return;
+    }
+    pendingIds_ += id;
     statusBar()->showMessage(QStringLiteral("Fetching…"), 2000);
     companion_->openFile(id);
 }
 
+void MainWindow::openSharedHeadReady(const QString& id) {
+    Tab* tab = tabForFile(id);
+    if (tab && tab->note && !tab->skeleton) {
+        activateTab(tabs_->indexOf(tab->page));
+        return;
+    }
+    if (!tab && !pendingIds_.contains(id)) return;
+    char* path = xn_sync_file_head_path(companion_->sync(), QFile::encodeName(id).constData());
+    if (!path) return;  // The full fetch will open it instead.
+    if (!tab) tab = addTab();
+    pendingIds_.remove(id);
+    const QString local = QString::fromUtf8(path);
+    xn_free_string(path);
+    auto workDir = std::make_unique<QTemporaryDir>();
+    if (!workDir->isValid()) return;
+    char* error = nullptr;
+    const QByteArray file = QFile::encodeName(local);
+    const QByteArray dir = QFile::encodeName(workDir->path());
+    xn_note* note = xn_note_open_head(file.constData(), dir.constData(), tab->canvas->host(), &error);
+    if (!note) {
+        statusBar()->showMessage(QStringLiteral("Could not open shared file: %1").arg(takeError(error)), 4000);
+        return;
+    }
+    installTab(tab, note, std::move(workDir), local);
+    tab->fileId = id;
+    tab->skeleton = true;
+    refreshTabTitle(tab);
+    xn::Recents::touchShared(id, syncFilePath(id));
+    if (tab->canvas->editor()) {
+        companion_->bindEditor(tab->canvas->editor(), id);
+        tab->lastPresencePage = -2;
+        boundFileId_ = id;
+        lastPresencePage_ = -2;
+        syncPresence();
+    }
+    statusBar()->showMessage(QStringLiteral("Loading full file in background…"), 2000);
+}
+
 void MainWindow::openSharedReady(const QString& id) {
-    if (id != pendingOpenId_) return;
-    pendingOpenId_.clear();
+    if (Tab* tab = tabForFile(id)) {
+        if (tab->note && tab->skeleton) {
+            // The full bytes landed on an open skeleton: fill it in place.
+            activateTab(tabs_->indexOf(tab->page));
+            const QByteArray dir = QFile::encodeName(tab->workDir ? tab->workDir->path() : QString());
+            if (xn_sync_transplant(companion_->sync(), QFile::encodeName(id).constData(), dir.constData())) {
+                tab->skeleton = false;
+                refreshTabTitle(tab);
+                pages_->setDocument(tab->note, tab->canvas->editor());
+                tab->canvas->update();
+                statusBar()->showMessage(QStringLiteral("Shared file complete"), 2000);
+                return;
+            }
+            // Transplant refused (head moved on): fall through and reopen whole.
+        } else if (tab->note) {
+            activateTab(tabs_->indexOf(tab->page));
+            return;
+        }
+    } else if (!pendingIds_.contains(id)) {
+        return;
+    }
+    pendingIds_.remove(id);
     char* path = xn_sync_file_path(companion_->sync(), QFile::encodeName(id).constData());
     if (!path) {
         statusBar()->showMessage(QStringLiteral("Fetch failed"), 4000);
@@ -1096,12 +1387,33 @@ void MainWindow::openSharedReady(const QString& id) {
     }
     const QString local = QString::fromUtf8(path);
     xn_free_string(path);
-    if (!open(local)) return;
+    Tab* tab = tabForFile(id);
+    if (!tab) tab = addTab();
+    auto workDir = std::make_unique<QTemporaryDir>();
+    if (!workDir->isValid()) {
+        statusBar()->showMessage(QStringLiteral("Could not create a temporary folder"), 4000);
+        return;
+    }
+    char* error = nullptr;
+    const QByteArray file = QFile::encodeName(local);
+    const QByteArray dir = QFile::encodeName(workDir->path());
+    xn_note* note = xn_note_open(file.constData(), dir.constData(), tab->canvas->host(), &error);
+    if (!note) {
+        statusBar()->showMessage(QStringLiteral("Could not open shared file: %1").arg(takeError(error)), 4000);
+        return;
+    }
+    installTab(tab, note, std::move(workDir), local);
+    tab->fileId = id;
+    tab->skeleton = false;
+    refreshTabTitle(tab);
     xn::Recents::touchShared(id, syncFilePath(id));
-    companion_->bindEditor(canvas_->editor(), id);
-    boundFileId_ = id;
-    lastPresencePage_ = -2;
-    syncPresence();
+    if (tab->canvas->editor()) {
+        companion_->bindEditor(tab->canvas->editor(), id);
+        tab->lastPresencePage = -2;
+        boundFileId_ = id;
+        lastPresencePage_ = -2;
+        syncPresence();
+    }
 }
 
 void MainWindow::linkFromSelection() {
@@ -1140,14 +1452,21 @@ void MainWindow::linkFromSelection() {
     if (!target.isEmpty()) xn_editor_pdf_link(e, target.toUtf8().constData());
 }
 
-void MainWindow::reopenSharedFile(const QString& id) {    if (boundFileId_ != id) return;
-    if (canvas_->editor()) companion_->unbindEditor(canvas_->editor());
-    boundFileId_.clear();
+void MainWindow::reopenSharedFile(const QString& id) {
+    Tab* tab = tabForFile(id);
+    if (!tab) {
+        pendingIds_ += id;
+        return;  // The engine already queued the fetch on resync.
+    }
+    if (tab->canvas->editor()) companion_->unbindEditor(tab->canvas->editor());
+    if (tab->fileId == boundFileId_) boundFileId_.clear();
     statusBar()->showMessage(QStringLiteral("Reloading the shared file…"), 2000);
-    install(nullptr, std::make_unique<QTemporaryDir>(), QString());
-    showHome();
-    pendingOpenId_ = id;
-    // The engine already queued the fetch on resync.
+    installTab(tab, nullptr, std::make_unique<QTemporaryDir>(), QString());
+    tab->fileId = id;
+    tab->skeleton = false;
+    refreshTabTitle(tab);
+    pendingIds_ += id;
+    // The engine already queued the fetch on resync; openSharedReady reopens in place.
 }
 
 void MainWindow::syncPresence() {
@@ -1158,9 +1477,15 @@ void MainWindow::syncPresence() {
     companion_->presence(boundFileId_, page);
 }
 
-void MainWindow::newNote() { install(xn_note_new(1), std::make_unique<QTemporaryDir>(), QString()); }
+void MainWindow::newNote() {
+    Tab* tab = addTab();
+    installTab(tab, xn_note_new(1), std::make_unique<QTemporaryDir>(), QString());
+}
 
-void MainWindow::newCanvas() { install(xn_canvas_new(), std::make_unique<QTemporaryDir>(), QString()); }
+void MainWindow::newCanvas() {
+    Tab* tab = addTab();
+    installTab(tab, xn_canvas_new(), std::make_unique<QTemporaryDir>(), QString());
+}
 
 /* An infinite canvas has no pages, text boxes or PDF export: their controls step aside. */
 void MainWindow::applyKind() {
@@ -1182,6 +1507,10 @@ void MainWindow::applyKind() {
 }
 
 bool MainWindow::open(const QString& path) {
+    if (Tab* tab = tabForPath(path)) {
+        activateTab(tabs_->indexOf(tab->page));
+        return true;
+    }
     auto workDir = std::make_unique<QTemporaryDir>();
     if (!workDir->isValid()) {
         QMessageBox::warning(this, QStringLiteral("Open"), QStringLiteral("Could not create a temporary folder"));
@@ -1201,12 +1530,14 @@ bool MainWindow::open(const QString& path) {
     char* error = nullptr;
     const QByteArray file = QFile::encodeName(QFileInfo(path).absoluteFilePath());
     const QByteArray dir = QFile::encodeName(workDir->path());
-    xn_note* note = xn_note_open(file.constData(), dir.constData(), canvas_->host(), &error);
+    Tab* tab = addTab();
+    xn_note* note = xn_note_open(file.constData(), dir.constData(), tab->canvas->host(), &error);
     if (!note) {
         QMessageBox::warning(this, QStringLiteral("Open"), QStringLiteral("Could not open %1:\n%2").arg(path, takeError(error)));
+        closeTab(tabs_->indexOf(tab->page));
         return false;
     }
-    install(note, std::move(workDir), QFileInfo(path).absoluteFilePath());
+    installTab(tab, note, std::move(workDir), QFileInfo(path).absoluteFilePath());
     return true;
 }
 
@@ -1251,19 +1582,20 @@ bool MainWindow::importPdf(const QString& path, std::unique_ptr<QTemporaryDir> w
         return false;
     }
     char* error = nullptr;
-    xn_note* note = xn_note_import_pdf(QFile::encodeName(copy).constData(), canvas_->host(), &error);
+    Tab* tab = addTab();
+    xn_note* note = xn_note_import_pdf(QFile::encodeName(copy).constData(), tab->canvas->host(), &error);
     if (!note) {
         QMessageBox::warning(this, QStringLiteral("Open"), QStringLiteral("Could not open PDF %1:\n%2").arg(path, takeError(error)));
+        closeTab(tabs_->indexOf(tab->page));
         return false;
     }
-    install(note, std::move(workDir), QString());
+    installTab(tab, note, std::move(workDir), QString());
     suggestedName_ = QFileInfo(path).absolutePath() + QLatin1Char('/') + QFileInfo(path).completeBaseName() + QStringLiteral(".xnote");
     refresh();
     return true;
 }
 
 void MainWindow::chooseOpen() {
-    if (!confirmDiscard()) return;
     const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Open"), QFileInfo(path_).absolutePath(),
                                                       QStringLiteral("Notes, canvases and PDFs (*.xnote *.xcanvas *.pdf);;Notes (*.xnote);;Canvases (*.xcanvas);;PDFs (*.pdf)"));
     if (!path.isEmpty()) open(path);
@@ -1323,7 +1655,16 @@ bool MainWindow::confirmDiscard() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
-    if (confirmDiscard()) e->accept(); else e->ignore();
+    for (Tab* tab : std::as_const(tabs_)) {
+        if (tab->note && xn_note_is_dirty(tab->note)) {
+            activateTab(tabs_->indexOf(tab->page));
+            if (!confirmDiscard()) {
+                e->ignore();
+                return;
+            }
+        }
+    }
+    e->accept();
 }
 
 void MainWindow::chooseColor() {
@@ -1346,6 +1687,7 @@ void MainWindow::refresh() {
     const QString name = !path_.isEmpty() ? QFileInfo(path_).fileName() : canvas ? QStringLiteral("New canvas") : QStringLiteral("New note");
     const bool dirty = note_ && xn_note_is_dirty(note_);
     setWindowTitle((dirty ? QStringLiteral("• ") : QString()) + name + QStringLiteral(" — xnotes"));
+    refreshTabTitle(activeTab());
     refreshView();
 }
 

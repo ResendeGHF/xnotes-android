@@ -26,6 +26,9 @@ interface SyncEngineHost {
     /** [id] left the shared set: close it with a notice. */
     fun onFileGone(id: String)
 
+    /** A file's small entries arrived ahead of its bytes: open the skeleton now. */
+    fun onFileHeadReady(id: String)
+
     /** The host answered a delete request. */
     fun onDeleteResult(ok: Boolean, reason: String?)
 
@@ -119,4 +122,10 @@ interface SyncEngineHost {
 
     /** Take remote image pills off [page] by image id or uid. Bypasses undo. */
     fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>)
+
+    /** Upsert a committed remote shape on [page] (matched by uid; drops [WireShape.liveId]'s live run). Bypasses undo. */
+    fun applyRemoteShape(fileId: String, page: Int, shape: WireShape)
+
+    /** Take remote shapes off [page] by uid. Bypasses undo. */
+    fun applyRemoteShapeRemove(fileId: String, page: Int, ids: List<String>)
 }

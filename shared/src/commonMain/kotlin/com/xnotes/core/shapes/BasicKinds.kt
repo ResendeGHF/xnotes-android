@@ -1,9 +1,10 @@
 package com.xnotes.core.shapes
 
-import com.xnotes.core.geometry.toDegrees
-import com.xnotes.core.geometry.toRadians
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.geometry.toDegrees
+import com.xnotes.core.geometry.toRadians
 import com.xnotes.core.pal.FillRule
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
@@ -25,6 +26,7 @@ import kotlin.math.tan
 internal class RoundedRectKind(id: String, private val capsule: Boolean) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = if (capsule) 2.0 else 1.5
+    override val flips get() = Flip.NONE
     // Squared up a capsule is a circle, so its perfect form is its chip's pill.
     override fun perfectAspect(n: Int) = if (capsule) iconAspect else 1.0
     override val defaultAdj = if (capsule) doubleArrayOf() else doubleArrayOf(1.0 / 6.0)
@@ -69,7 +71,6 @@ internal class RoundedRectKind(id: String, private val capsule: Boolean) : Shape
 internal class RightTriangleKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = 1.2
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = null
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val corners = listOf(Pt(box.left, box.top), Pt(box.right, box.bottom), Pt(box.left, box.bottom))
         val text = Rect(box.x, box.y + box.h / 2.0, box.w / 2.0, box.h / 2.0)
@@ -81,6 +82,7 @@ internal class RightTriangleKind(id: String) : ShapeKind(id) {
 internal class DiamondKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = 1.3
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val corners = listOf(Pt(box.centerX, box.top), Pt(box.right, box.centerY), Pt(box.centerX, box.bottom), Pt(box.left, box.centerY))
         val text = Rect(box.x + box.w / 4.0, box.y + box.h / 4.0, box.w / 2.0, box.h / 2.0)
@@ -99,7 +101,8 @@ internal class ParallelogramKind(id: String) : ShapeKind(id) {
             drag = { to, box, _, _ -> doubleArrayOf(if (box.w > 0.0) ((to.x - box.left) / box.w).coerceIn(0.0, 0.9) else 0.25) },
         ),
     )
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = null
+    // Upside down it leans the other way too, which a drag to the left already gives.
+    override val dragFlips get() = Flip.X
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val s = box.w * adjOf(p.adj, 0).coerceIn(0.0, 0.9)
         val corners = listOf(Pt(box.left + s, box.top), Pt(box.right, box.top), Pt(box.right - s, box.bottom), Pt(box.left, box.bottom))
@@ -119,6 +122,7 @@ internal class TrapezoidKind(id: String) : ShapeKind(id) {
             drag = { to, box, _, _ -> doubleArrayOf(if (box.w > 0.0) ((to.x - box.left) / box.w).coerceIn(0.0, 0.5) else 0.25) },
         ),
     )
+    override val flips get() = Flip.Y
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val i = box.w * adjOf(p.adj, 0).coerceIn(0.0, 0.5)
         val corners = listOf(Pt(box.left + i, box.top), Pt(box.right - i, box.top), Pt(box.right, box.bottom), Pt(box.left, box.bottom))
@@ -132,6 +136,9 @@ internal class RegularPolygonKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
     override val defaultN get() = 5
     override val nRange = 3..24
+    // An odd count stands on a side with a point up, and keeps standing so however it is dragged.
+    override val flips get() = Flip.Y
+    override val dragFlips get() = Flip.NONE
     override fun perfectAspect(n: Int) = aspectOf(regularUnit(n.coerceIn(3, 24)))
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val n = p.n.coerceIn(3, 24)
@@ -150,6 +157,8 @@ internal class StarKind(id: String) : ShapeKind(id) {
     override val defaultN get() = 5
     override val nRange = 3..24
     override val countKind get() = CountKind.POINTS
+    override val flips get() = Flip.Y
+    override val dragFlips get() = Flip.NONE
     override val defaultAdj = doubleArrayOf(-1.0)
     override val knobs = listOf(
         KnobDef(
@@ -197,6 +206,7 @@ internal class StarKind(id: String) : ShapeKind(id) {
 /** A plus sign: the knob sets how thick its arms are, as a share of the shorter side. */
 internal class CrossKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
+    override val flips get() = Flip.NONE
     override val defaultAdj = doubleArrayOf(1.0 / 3.0)
     override val knobs = listOf(
         KnobDef(
@@ -233,6 +243,8 @@ internal class CrossKind(id: String) : ShapeKind(id) {
 /** A heart of six curves, its dip and tip on the box's middle line. */
 internal class HeartKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
+    override val flips get() = Flip.Y
+    override val dragFlips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         fun at(x: Double, y: Double) = Pt(box.left + x * box.w, box.top + y * box.h)
         val contour = VectorContour(
@@ -262,6 +274,8 @@ internal class HeartKind(id: String) : ShapeKind(id) {
 internal class CloudKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = 1.5
+    // Its bumps are uneven but face no way, so a drag leaves it as its chip.
+    override val dragFlips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         // Uneven steps round the oval, so the bumps read as a cloud rather than a gear.
         val turns = doubleArrayOf(0.0, 0.11, 0.24, 0.36, 0.47, 0.6, 0.71, 0.83, 0.93)
@@ -284,6 +298,7 @@ internal class CloudKind(id: String) : ShapeKind(id) {
 /** A donut: the knob sets the ring's thickness as a share of the radius. */
 internal class RingKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
+    override val flips get() = Flip.NONE
     override val defaultAdj = doubleArrayOf(0.25)
     override val knobs = listOf(
         KnobDef(
@@ -331,8 +346,6 @@ internal class SliceKind(id: String, private val pie: Boolean) : ShapeKind(id) {
         },
     )
 
-    override fun mirroredAdj(adj: DoubleArray) = doubleArrayOf(norm(180.0 - adjOf(adj, 1)), norm(180.0 - adjOf(adj, 0)))
-
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val a0 = adjOf(p.adj, 0)
         val a1 = adjOf(p.adj, 1)
@@ -374,6 +387,47 @@ internal class SliceKind(id: String, private val pie: Boolean) : ShapeKind(id) {
         val r = deg % 360.0
         return if (r < 0.0) r + 360.0 else r
     }
+}
+
+/**
+ * A smooth curve through its control points (uniform Catmull-Rom, as the fork drew it). The points
+ * are stored as a polyline in [ShapeParams.path], so they are the vertex dots a drag moves; an edge
+ * dot sits on the curve itself and adds a point there.
+ */
+internal class SplineKind(id: String) : ShapeKind(id) {
+    override val isClosed get() = false
+    override val isFree get() = true
+    // The curve swings past its points between them.
+    override val staysInBox get() = false
+    override val iconAspect get() = 1.5
+    override val flips get() = Flip.NONE
+
+    override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
+        val points = FreePath.place(p.path ?: DEFAULT, box).firstOrNull()?.let(FreePath::vertices).orEmpty()
+        val curve = if (points.size >= 2) listOf(catmullRom(points)) else emptyList()
+        return ShapeGeometry(listOf(ShapePath(curve, PathRole.STROKE_ONLY)), points, points.map { ConnectionPoint(it, emptyList()) }, ShapeKind.inset(box))
+    }
+
+    companion object {
+        /** Fewer points and the curve is a straight line, which a line already is. */
+        const val MIN_POINTS = 3
+
+        /** A new curve's points, normalized to its box: nearly straight bottom-left to top-right, with a slight wave. */
+        val DEFAULT = listOf(FreePath.lines(listOf(Pt(0.0, 1.0), Pt(0.3, 0.6), Pt(0.7, 0.4), Pt(1.0, 0.0)), closed = false))
+    }
+}
+
+/** The uniform Catmull-Rom spline through [c] as the cubic Beziers that trace it exactly. */
+internal fun catmullRom(c: List<Pt>): VectorContour {
+    val segs = ArrayList<VectorSeg>(c.size - 1)
+    for (i in 0 until c.size - 1) {
+        val p0 = c[max(i - 1, 0)]
+        val p1 = c[i]
+        val p2 = c[i + 1]
+        val p3 = c[min(i + 2, c.size - 1)]
+        segs.add(VectorSeg.Cubic(p1 + (p2 - p0) * (1.0 / 6.0), p2 - (p3 - p1) * (1.0 / 6.0), p2))
+    }
+    return VectorContour(c.first(), segs, false)
 }
 
 /** A point on the unit circle at angle [a], at radius [r]. */

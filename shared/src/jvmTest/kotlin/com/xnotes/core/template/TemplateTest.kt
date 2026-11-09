@@ -8,6 +8,7 @@ import com.xnotes.core.model.paintPagePattern
 import com.xnotes.format.TemplateFormatException
 import com.xnotes.format.TemplateReader
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -333,6 +334,74 @@ class TemplateTest {
             maxPrims = 500,
         )
         assertEquals(500, out.primCount)
+    }
+
+    // --- the packaged template surface: kind, image layers and where they paint ---
+
+    @Test
+    fun templateKindDefaultsToPageAndReadsCover() {
+        assertEquals(TemplateKind.PAGE, TemplateReader.read(tpl("")).kind)
+        assertEquals(
+            TemplateKind.COVER,
+            TemplateReader.read(tpl("", extra = """"kind": "cover",""")).kind,
+        )
+        assertEquals(
+            TemplateKind.PAGE,
+            TemplateReader.read(tpl("", extra = """"kind": "nope",""")).kind,
+        )
+    }
+
+    @Test
+    fun anImageIsALayerOfItsOwnInPaintOrder() {
+        val out = eval(
+            tpl(
+                """{ "type": "hline", "y": 10 }, { "type": "image", "src": "images/a.jpg", "opacity": 0.5 },
+                   { "type": "hline", "y": 20, "stroke": "accent" }, { "type": "hline", "y": 30 }""",
+            ),
+        )
+        assertEquals(3, out.layers.size)
+        assertEquals(ink, out.layers[0].color)
+        assertEquals(2, out.layers[0].prims.size)
+        val img = out.layers[1].image!!
+        assertEquals(128, out.layers[1].color.a)
+        assertEquals("images/a.jpg", img.src)
+        assertEquals(Rect(0.0, 0.0, 100.0, 100.0), img.box)
+        assertEquals(accent, out.layers[2].color)
+    }
+
+    @Test
+    fun anImageIsClippedToItsBoxAndTheClipInEffect() {
+        val out = eval(
+            tpl(
+                """{ "type": "group", "x": 10, "y": 10, "w": 50, "h": 50, "clip": true, "children": [
+                     { "type": "image", "src": "a.png", "x": 20, "y": 20, "w": 60, "h": 60, "fit": "cover", "position": "top left" } ] }""",
+            ),
+        )
+        val img = out.layers.single().image!!
+        assertEquals(Rect(30.0, 30.0, 60.0, 60.0), img.box)
+        assertEquals(Rect(30.0, 30.0, 30.0, 30.0), img.clip)
+        assertEquals(ImageFit.COVER, img.fit)
+        assertEquals(0.0, img.posX, 0.0)
+        assertEquals(0.0, img.posY, 0.0)
+    }
+
+    @Test
+    fun anImageWithABadSourceOrNoAreaDrawsNothing() {
+        val out = eval(
+            tpl(
+                """{ "type": "image", "src": "../a.png" }, { "type": "image", "src": "/a.png" }, { "type": "image" },
+                   { "type": "image", "src": "a.png", "w": 0 }, { "type": "image", "src": "a.png", "opacity": 0 }""",
+            ),
+        )
+        assertTrue(out.layers.isEmpty())
+    }
+
+    @Test
+    fun usesInkSeesThePatternColour() {
+        val plain = TemplateReader.read(tpl("""{ "type": "hline", "y": 10 }"""))
+        assertTrue(plain.usesInk)
+        val accent = TemplateReader.read(tpl("""{ "type": "hline", "y": 10, "stroke": "accent" }"""))
+        assertFalse(accent.usesInk)
     }
 
     // --- the bundled rulings match the painter they replace ---

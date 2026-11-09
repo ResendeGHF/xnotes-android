@@ -1,6 +1,7 @@
 package com.xnotes.core.shapes
 
 import com.xnotes.core.geometry.Affine
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.Rgba
@@ -122,16 +123,21 @@ class BasicKindsTest {
         for (p in before.map(flip::apply)) assertTrue("missing $p in $after", after.any { it.distanceTo(p) < 1e-6 })
     }
 
-    @Test fun aRightTriangleThatCannotMirrorBecomesFree() {
+    @Test fun aMirroredRightTriangleStaysOneFlipped() {
         val tri = ShapeItem(ShapeKind.RIGHT_TRIANGLE, box.topLeft, Pt(box.right, box.bottom), ink, 2.0)
-        tri.applyTransform(Affine.scaleAbout(box.center, -1.0, 1.0))
-        assertEquals(ShapeKind.POLYGON, tri.shape)
+        val before = tri.vertexDots().map { it.at }
+        val flip = Affine.scaleAbout(box.center, -1.0, 1.0)
+        tri.applyTransform(flip)
+        assertEquals(ShapeKind.RIGHT_TRIANGLE, tri.shape)
+        assertEquals(Flip.X, tri.flip)
+        val after = tri.vertexDots().map { it.at }
+        for (p in before.map(flip::apply)) assertTrue("missing $p in $after", after.any { it.distanceTo(p) < 1e-9 })
     }
 
-    @Test fun theBasicPageHasItsTwentyFourChipsInOrder() {
+    @Test fun theBasicPageHasItsTwentyFiveChipsInOrder() {
         val keys = ShapePresets.basic.presets.map { it.key }
-        assertEquals(24, keys.size)
-        assertEquals(listOf("line", "arrow", "rectangle", "rounded_rect", "square", "capsule"), keys.take(6))
+        assertEquals(25, keys.size)
+        assertEquals(listOf("line", "arrow", "spline", "rectangle", "rounded_rect", "square"), keys.take(6))
         assertEquals(listOf("heart", "cloud", "ring", "pie", "arc", ShapePresets.FREE_POLYGON), keys.takeLast(6))
         assertEquals(6, ShapePresets.byKey("hexagon")!!.n)
     }

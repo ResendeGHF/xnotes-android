@@ -1,5 +1,6 @@
 package com.xnotes.core.shapes
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.vector.VectorContour
@@ -52,6 +53,10 @@ internal interface Canonical {
     val knobs: List<KnobDef> get() = emptyList()
     val iconAspect: Double get() = 1.5
     val perfectAspect: Double get() = 1.0
+
+    /** The flips that change the drawing, in its own right-pointing frame. */
+    val flips: Flip get() = Flip.XY
+    val dragFlips: Flip get() = flips
     fun build(w: Double, h: Double, adj: (Int) -> Double): ShapeGeometry
 }
 
@@ -61,9 +66,11 @@ internal class OrientedKind(id: String, private val orient: Orient, private val 
     override val defaultAdj = drawing.defaultAdj
     override val iconAspect get() = if (orient == Orient.UP || orient == Orient.DOWN) 1.0 / drawing.iconAspect else drawing.iconAspect
     override fun perfectAspect(n: Int) = if (orient == Orient.UP || orient == Orient.DOWN) 1.0 / drawing.perfectAspect else drawing.perfectAspect
+    override val flips get() = laid(drawing.flips)
+    override val dragFlips get() = laid(drawing.dragFlips)
 
-    // A flip turns one direction into another kind, so the shape goes free instead.
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = null
+    /** A flip of the canonical drawing as it lands on the box: a turned one swaps its axes. */
+    private fun laid(f: Flip) = if (orient == Orient.UP || orient == Orient.DOWN) Flip.of(f.y, f.x) else f
 
     override val knobs: List<KnobDef> = drawing.knobs.map { k ->
         KnobDef(
@@ -101,14 +108,14 @@ internal class OrientedKind(id: String, private val orient: Orient, private val 
 internal class BoxedKind(
     id: String,
     private val drawing: Canonical,
-    private val mirror: ((DoubleArray) -> DoubleArray?)? = null,
     override val staysInBox: Boolean = true,
 ) : ShapeKind(id) {
     override val isClosed get() = drawing.closed
     override val defaultAdj = drawing.defaultAdj
     override val iconAspect get() = drawing.iconAspect
     override fun perfectAspect(n: Int) = drawing.perfectAspect
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = mirror?.invoke(adj)
+    override val flips get() = drawing.flips
+    override val dragFlips get() = drawing.dragFlips
     override val knobs: List<KnobDef> = drawing.knobs.map { k ->
         KnobDef(
             position = { box, adj, n -> k.position(Rect(0.0, 0.0, box.w, box.h), adj, n) + box.topLeft },
@@ -178,6 +185,7 @@ private fun thicknessKnob(
 /** One head on the right of a straight shaft. Notched: a V cut into the tail. */
 internal class SingleArrow(private val notched: Boolean = false) : Canonical {
     override val defaultAdj = DoubleArray(0)
+    override val flips get() = Flip.X
     override val knobs = listOf(spanKnob({ w, h -> head(w, h) }, { w -> 2.0 * w }))
 
     private fun head(w: Double, h: Double) = min(h / 2.0, w)
@@ -205,6 +213,7 @@ internal class SingleArrow(private val notched: Boolean = false) : Canonical {
 /** Heads at both ends of a straight shaft. */
 internal class DoubleArrow : Canonical {
     override val defaultAdj = DoubleArray(0)
+    override val flips get() = Flip.NONE
     override val iconAspect get() = 2.0
     // Squared up, the heads would meet with no shaft between them.
     override val perfectAspect get() = 2.0
@@ -235,6 +244,7 @@ internal class DoubleArrow : Canonical {
 internal class QuadArrow : Canonical {
     override val defaultAdj = doubleArrayOf(0.22)
     override val iconAspect get() = 1.0
+    override val flips get() = Flip.NONE
     override val knobs = listOf(
         // Halfway along the right head's top edge.
         thicknessKnob(0.22, RANGE, at = { w, h, t -> Pt(w - t / 2.0, h / 2.0 - t / 2.0) }) { to, _, h -> 2.0 * abs(to.y - h / 2.0) },
@@ -266,6 +276,7 @@ internal class QuadArrow : Canonical {
 /** A chevron (notched both ends) or a pentagon arrow (square tail), the knob setting how far the point reaches back. */
 internal class PointedBand(private val notchedTail: Boolean) : Canonical {
     override val defaultAdj = doubleArrayOf(0.5)
+    override val flips get() = Flip.X
     override val knobs = listOf(
         KnobDef(
             position = { b, adj, _ -> Pt(b.w - depth(b.w, b.h, adj.getOrNull(0) ?: 0.5), 0.0) },
@@ -480,6 +491,7 @@ internal class CircularArrow : Canonical {
 /** A right arrow whose tail is broken into two stripes. */
 internal class StripedArrow : Canonical {
     override val defaultAdj = DoubleArray(0)
+    override val flips get() = Flip.X
     override val knobs = listOf(spanKnob({ w, h -> head(w, h) }, { w -> 1.4 * w }))
 
     private fun head(w: Double, h: Double) = min(h / 2.0, w * 0.7)
@@ -514,8 +526,6 @@ private fun tailKnob() = KnobDef(
         )
     },
 )
-
-private fun mirrorTail(adj: DoubleArray) = doubleArrayOf(1.0 - (adj.getOrNull(0) ?: TAIL_ADJ[0]), adj.getOrNull(1) ?: TAIL_ADJ[1])
 
 /** A rectangle (rounded or not) with a wedge out of the side that faces its tip. */
 internal class BoxCallout(private val rounded: Boolean) : Canonical {
@@ -622,6 +632,8 @@ internal class LineCallout : Canonical {
 internal class Burst : Canonical {
     override val defaultAdj = DoubleArray(0)
     override val iconAspect get() = 1.2
+    // Its spikes are uneven but face no way, so a drag leaves it as its chip.
+    override val dragFlips get() = Flip.NONE
     override fun build(w: Double, h: Double, adj: (Int) -> Double): ShapeGeometry {
         val radii = doubleArrayOf(1.0, 0.55, 0.9, 0.5, 0.97, 0.58, 0.82, 0.5, 1.0, 0.6, 0.86, 0.48, 0.95, 0.56, 0.88, 0.52)
         val unit = radii.indices.map { i ->
@@ -647,7 +659,7 @@ internal object ArrowKinds {
     val DOWN: ShapeKind = OrientedKind("arrow_down", Orient.DOWN, single)
     val LEFT_RIGHT: ShapeKind = OrientedKind("arrow_left_right", Orient.RIGHT, double)
     val UP_DOWN: ShapeKind = OrientedKind("arrow_up_down", Orient.UP, double)
-    val QUAD: ShapeKind = BoxedKind("arrow_quad", QuadArrow(), mirror = { it })
+    val QUAD: ShapeKind = BoxedKind("arrow_quad", QuadArrow())
     val BENT: ShapeKind = BoxedKind("arrow_bent", BentArrow(up = false))
     val U_TURN: ShapeKind = BoxedKind("arrow_u_turn", UTurnArrow())
     val CHEVRON: ShapeKind = OrientedKind("arrow_chevron", Orient.RIGHT, PointedBand(notchedTail = true))
@@ -660,11 +672,11 @@ internal object ArrowKinds {
     val BENT_UP: ShapeKind = BoxedKind("arrow_bent_up", BentArrow(up = true))
     val LEFT_UP: ShapeKind = BoxedKind("arrow_left_up", LeftUpArrow())
 
-    val RECT_CALLOUT: ShapeKind = BoxedKind("callout_rect", BoxCallout(rounded = false), ::mirrorTail, staysInBox = false)
-    val ROUND_CALLOUT: ShapeKind = BoxedKind("callout_round", BoxCallout(rounded = true), ::mirrorTail, staysInBox = false)
-    val OVAL_CALLOUT: ShapeKind = BoxedKind("callout_oval", OvalCallout(), ::mirrorTail, staysInBox = false)
-    val THOUGHT: ShapeKind = BoxedKind("callout_thought", ThoughtCallout(), ::mirrorTail, staysInBox = false)
-    val LINE_CALLOUT: ShapeKind = BoxedKind("callout_line", LineCallout(), ::mirrorTail, staysInBox = false)
+    val RECT_CALLOUT: ShapeKind = BoxedKind("callout_rect", BoxCallout(rounded = false), staysInBox = false)
+    val ROUND_CALLOUT: ShapeKind = BoxedKind("callout_round", BoxCallout(rounded = true), staysInBox = false)
+    val OVAL_CALLOUT: ShapeKind = BoxedKind("callout_oval", OvalCallout(), staysInBox = false)
+    val THOUGHT: ShapeKind = BoxedKind("callout_thought", ThoughtCallout(), staysInBox = false)
+    val LINE_CALLOUT: ShapeKind = BoxedKind("callout_line", LineCallout(), staysInBox = false)
     val BURST: ShapeKind = BoxedKind("burst", Burst())
 
     val all: List<ShapeKind> = listOf(

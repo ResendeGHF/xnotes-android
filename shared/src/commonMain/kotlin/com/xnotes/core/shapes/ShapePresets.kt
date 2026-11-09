@@ -1,6 +1,8 @@
 package com.xnotes.core.shapes
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.model.FunctionSpec
 
 /** A chip in the shape picker: a kind, with its own point count, knob values and heads. */
 class ShapePreset(
@@ -12,6 +14,8 @@ class ShapePreset(
     val headEnd: Head = kind.defaultHeadEnd,
     /** For a free kind, the outline its chip shows, normalized to the icon's box. */
     val iconPath: List<com.xnotes.core.vector.VectorContour>? = null,
+    /** The flips a drag toward the left or upward gives what this chip draws. */
+    val dragFlips: Flip = kind.dragFlips,
 ) {
     /** True when the picker offers a minus/plus for this chip's point or side count. */
     val counted: Boolean get() = kind.nRange != null
@@ -23,7 +27,7 @@ class ShapePage(val key: String, val presets: List<ShapePreset>)
 /** The chips the shape picker offers, page by page. */
 object ShapePresets {
 
-    const val ROWS = 4
+    const val ROWS = 5
     const val COLUMNS = 6
 
     /** The key of the chip that places a polygon corner by corner rather than by dragging a box. */
@@ -34,6 +38,7 @@ object ShapePresets {
         listOf(
             ShapePreset("line", ShapeKind.LINE),
             ShapePreset("arrow", ShapeKind.ARROW),
+            ShapePreset("spline", ShapeKind.SPLINE),
             ShapePreset("rectangle", ShapeKind.RECTANGLE),
             ShapePreset("rounded_rect", ShapeKind.ROUNDED_RECT),
             ShapePreset("square", ShapeKind.SQUARE),
@@ -88,7 +93,8 @@ object ShapePresets {
             ShapePreset("flow_stored_data", FlowchartKinds.STORED_DATA),
             ShapePreset("flow_sort", FlowchartKinds.SORT),
             ShapePreset("flow_merge", FlowchartKinds.MERGE),
-            ShapePreset("flow_extract", ShapeKind.TRIANGLE),
+            // Upside down it would be Merge.
+            ShapePreset("flow_extract", ShapeKind.TRIANGLE, dragFlips = Flip.NONE),
             ShapePreset("flow_summing", FlowchartKinds.SUMMING),
             ShapePreset("flow_or", FlowchartKinds.OR),
         ),
@@ -149,7 +155,17 @@ object ShapePresets {
         ),
     )
 
-    val pages: List<ShapePage> = listOf(basic, flowchart, arrows, solidsMath)
+    /** What a function chip's key starts with; the rest is the expression it plots. */
+    const val FUNCTION_PREFIX = "fn:"
+
+    val functions = ShapePage(
+        "functions",
+        FunctionSpec.PRESETS.map { spec ->
+            ShapePreset(FUNCTION_PREFIX + spec.expr, ShapeKind.FUNCTION, iconPath = spec.normalizedRuns()?.map { FreePath.lines(it, false) })
+        },
+    )
+
+    val pages: List<ShapePage> = listOf(basic, flowchart, arrows, solidsMath, functions)
 
     val all: List<ShapePreset> = pages.flatMap { it.presets }
 
@@ -159,6 +175,11 @@ object ShapePresets {
 
     /** The chip a setting written before chips existed names by its bare kind. */
     fun forKind(kind: ShapeKind): ShapePreset = all.firstOrNull { it.kind == kind } ?: byKey.getValue("rectangle")
+
+    /** The pages left once the [hidden] chips and pages (by key) are taken out, each without its hidden chips. */
+    fun shown(hidden: Set<String>): List<ShapePage> =
+        if (hidden.isEmpty()) pages
+        else pages.filter { it.key !in hidden }.map { page -> ShapePage(page.key, page.presets.filter { it.key !in hidden }) }.filter { it.presets.isNotEmpty() }
 
     /** The page [preset] sits on. */
     fun pageOf(preset: ShapePreset): Int = pages.indexOfFirst { preset in it.presets }.coerceAtLeast(0)

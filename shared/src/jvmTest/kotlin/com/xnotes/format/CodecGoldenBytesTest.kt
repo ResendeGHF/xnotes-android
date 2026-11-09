@@ -130,11 +130,11 @@ class CodecGoldenBytesTest {
     }
 
     private companion object {
-        const val NOTE_BUNDLE = "e86fd4541befc5ae1772a89eaa8ec587a0aaaeff765dbbd4ffe8a33af2984727"
+        const val NOTE_BUNDLE = "812ab652386140a1192a3e3bd58523a7f7a38a3fcfd9242e78c3954e0ec9ad94"
         const val NOTE_ENTRIES =
-            "[(assets/image-000.png, af5f6f5c5967c377e49193eca1ee0b98300a171cd3165c9a2410e8fb7c028674), (assets/image-001.svg, a87cba1d08bc5397e7f459b9339b2427c42d824e223839840731f0a2cdd42f69), (manifest.json, ff665cf57308b2cd5d6baa12f5c8f9c0d663451b3fa017726b488e01895402fb)]"
-        const val CANVAS_BUNDLE = "36e7366ef8e32c411c3a70b6ca0ad644cd80a7df320b65bb9a4d22c5f27006e1"
+            "[(assets/image-000.png, af5f6f5c5967c377e49193eca1ee0b98300a171cd3165c9a2410e8fb7c028674), (assets/image-001.svg, a87cba1d08bc5397e7f459b9339b2427c42d824e223839840731f0a2cdd42f69), (manifest.json, 82024c1e27b493a1e909b522488a5d0eca33d99941872b3bfc0c945efaa75220)]"
+        const val CANVAS_BUNDLE = "58d15786c2b229de24f347228c17bc6e5217e6708ed85e6238c93848a9e410ed"
         const val CANVAS_ENTRIES =
-            "[(assets/image-000.png, 039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81), (manifest.json, 33abbc9199eb460cee30f613955cdb644c1c33deeae752253dfac8c83e1ee5a7)]"
+            "[(assets/image-000.png, 039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81), (manifest.json, 8083d4752bea61c445706e1b54926a422824734d08e699f431435ea3c138c9a0)]"
     }
 }

@@ -99,7 +99,20 @@ never the name.
 - `version`: host's per-file commit counter (integer, starts at 1, +1 per
   committed batch). Companion caches `(id -> version, bytes)`.
 - Fetch: `C -> S fetch {id, offset?, length?}` / `S -> C file {id, version,
-  total, offset, data(base64), last?}`. Chunked (256 KiB) so big PDFs stream.
+  total, offset, data(base64), last?}`. Chunked (1 MiB) so big PDFs stream.
+- Stale cache: when the guest holds an older version it opens those bytes at
+  once and asks only for the edits — `C -> S fetch_ops {id, since_version}`.
+  The host replays its op journal (each op with `base_version` chaining from
+  the last) and the guest applies them in order; anything the journal no
+  longer covers answers `resync` and the guest refetches whole. Every applied
+  op is gated on the open document's version, so a gap refetches instead of
+  mis-applying.
+- Big files open progressively: before the chunks, the host sends
+  `S -> C file_head {id, version, total, manifest, flow?, markups?,
+  templates?, packages?}` (manifest always; the rest best-effort and size
+  capped). The guest opens a skeleton document from it immediately — ink,
+  shapes and text are already complete — and the chunks fill images, audio
+  and the source PDF in place behind it, without reopening.
  - Images ride the same chunking as their own message: `image_data {file,
   image_id, total, offset, data(base64), last?}` (256 KiB), sent before the
   `add_image` op that keys off `image_id`. Receivers hold the op until the
@@ -219,13 +232,23 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
   applies once the bytes are in (peaks may arrive later and patch the pill).
   `remove_audio {page, ids:[uid...]}` takes pills off. Each side plays its own
   copy: playback position is never synced, so replays stay user-independent.
-- Item identity: text/table/image/audio carry a stable `uid`, assigned at
+- Item identity: text/table/image/audio/shape carry a stable `uid`, assigned at
   creation and persisted in the file. Items that predate uids derive one
   deterministically from kind, page, index and content (`legacy-` + 16 hex),
   so every peer that reads the same bytes derives the same id and a
   remove-by-uid converges. Unknown op names are skipped *without* failing the
   batch, but a peer that cannot apply a known op must refetch the file (see
   `resync` below) rather than ack-and-diverge.
+- `add_shape {page, shape:{uid, kind, start:[x,y], end:[x,y], stroke_color,
+  stroke_width, fill_color?, neon?, neon_strength?, dashed?, dash_length?,
+  dash_gap?, rotation?, flip?, adj?, n?, head_start?, head_end?, path?,
+  function?, label?, locked?, live_id?}}`: place or update a shape (upserted
+  by stable `uid`, covering every family: basic, flowchart, arrows, 3D/math,
+  functions, connectors, UML). `shape` is the `ShapeKind` id; `path` is SVG
+  for free outlines; `function:{expr, from, to, ymin?, ymax?}` plots graphs.
+  `remove_shape {page, ids:[uid...]}` takes shapes off. A snapped shape
+  carries the `live_id` of the run it replaces, so the guest drops the
+  pre-snap ink the moment the shape lands.
 - `add_markup {page, markup:{id, type, color, intensity, quads:[[l,t,r,b,q]...],
   text, note?, link?, created, modified}}`: mark PDF text (`type` is
   `highlight|underline|strikeout|squiggly|note_link`; `color` is `#rrggbb`,
@@ -245,14 +268,14 @@ Op set v1 (strokes/erases/pages; text/markup follow the same envelope):
 - Selection move/resize/rotate/restyle/delete and area-erase splits replay as
   plain `erase_strokes` + `add_stroke` in one batch (pre-change fingerprints,
   post-change strokes), so every peer converges with no new wire type.
-  Strokes only; text/table/image/audio selections replay as remove + add of
-  their uid-keyed snapshots through the ops above.
+  Strokes only; text/table/image/audio/shape selections replay as remove +
+  add of their uid-keyed snapshots through the ops above.
   Unknown op names are skipped with a log.
 - Undo/redo propagate as inverse committed ops (no new wire type): strokes
   replay as erase+add replacements (fingerprint+config diff), markups as
-  remove+add, pages as add/remove, text/table/image/audio as remove+add of
-  their uid-keyed snapshots (the undo diff upserts changed items and removes
-  missing ones). Anything without a wire form (shapes, tape, labels, sticky
+  remove+add, pages as add/remove, text/table/image/audio/shape as remove+add
+  of their uid-keyed snapshots (the undo diff upserts changed items and
+  removes missing ones). Anything without a wire form (tape, labels, sticky
   notes, groups, page order) still converges via debounced full-file push on
   the host side. Remote applies bypass undo, so this is the only path by
   which an undo converges. Guest cache tabs show
@@ -283,7 +306,9 @@ C <-> S  room_live {file, page, sideways, split, resume, shift, live_id, done}
   (same settle machinery, model untouched). `done:true` ends the run; the
   matching committed `add_stroke` (same id as dedupe) also drops it, and a
   room commit clears its preview — so a lost `done` frame can never leave a
-  stale duplicate beside the committed result.
+  stale duplicate beside the committed result. A snap-to-shape replaces the
+  run with an `add_shape` carrying its id as `live_id`, so the pre-snap ink
+  vanishes the moment the shape lands instead of lingering until reopen.
 
 - Only for the file(s) both sides have open. Frames for a closed file,
   a `stroke_id` never started, or a room drag while the local Insert space
@@ -315,14 +340,17 @@ C <-> S  room_live {file, page, sideways, split, resume, shift, live_id, done}
 ## What is deliberately v2
 
 View-only grants, kick/revoke mid-session, multi-companion fan-out beyond one,
-binary frames, mDNS discovery, online relay, text/markup ops, conflict-free
+binary frames, mDNS discovery, online relay, conflict-free
 undo across sides.
 
-v1 syncs strokes, erases, blank page add/remove, room open/close and image
-placement: local undo of a synced op does not propagate (re-sync by
-refetching), area-erase splits and sticky-note ink stay local, undo/redo of
-page commands is local, select-delete of non-stroke items is not mirrored,
-and pasted page content, cover flags and page reorder are not carried as ops
+v1 syncs strokes, erases, blank page add/remove, room open/close, image
+placement, text/tables/audio/markups/page styles and shapes (all families,
+live snap included); stale files catch up through the op journal instead of
+refetching, and big files open from a head skeleton that fills in behind.
+Local undo of a synced op propagates as inverse ops. Area-erase splits and
+sticky-note ink stay local, undo/redo of page commands is local,
+select-delete of non-stroke items is mirrored by uid, and pasted page
+content, cover flags and page reorder are not carried as ops
 (cover/PDF joins push whole-file bytes instead).
 
 ## Conformance

@@ -17,6 +17,7 @@ import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TextMarkup
 import com.xnotes.core.pdf.MarkupPainter
+import com.xnotes.core.template.TemplateRenderer
 import com.xnotes.core.model.insets
 import com.xnotes.core.model.paintMarginPattern
 import com.xnotes.core.model.paintPagePattern
@@ -736,9 +737,27 @@ class CanvasState(
         MarkupPainter.paint(r, page.markups, document.dpi / 72.0)
     }
 
-    fun paintRuling(page: Page, renderer: Renderer, region: Rect) {
-        // The built-in templates are the classic rulings; others are drawn by a template painter.
-        val pattern = PagePattern.fromId(effectiveTemplate(page))?.takeIf { it != PagePattern.NONE } ?: return
+    /**
+     * Paints non-built-in page templates (custom and bundled `.xtemplate`s). Set by the host with
+     * its template library and picture supply; null paints nothing extra (built-in rulings keep
+     * their own path below, so old notes draw exactly as before).
+     */
+    var templateRenderer: TemplateRenderer? = null
+
+    /**
+     * The page's ruling, for a [paintPageBackground] hook (page space, clipped to [region]). A ruling
+     * covers a blank note page whole; on an imported PDF page it rules the margins only, so the
+     * page itself is never drawn over. [minLine] is the thinnest line in content px, so thumbnails
+     * keep a custom template's ruling visible.
+     */
+    fun paintRuling(page: Page, renderer: Renderer, region: Rect, minLine: Double = 0.0) {
+        // The built-in templates are the classic rulings; any other key is a custom template.
+        val key = effectiveTemplate(page)
+        val pattern = PagePattern.fromId(key)?.takeIf { it != PagePattern.NONE }
+        if (pattern == null) {
+            if (key != PageTemplates.NONE) templateRenderer?.paint(renderer, document, page, footprint(page), region, minLine)
+            return
+        }
         val color = page.resolvedPatternColor(document)
         val spacing = page.resolvedSpacing(document) ?: PageStyle.DEFAULT_SPACING
         val cover = footprint(page)

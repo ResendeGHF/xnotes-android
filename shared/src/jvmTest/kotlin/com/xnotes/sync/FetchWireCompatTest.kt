@@ -21,6 +21,7 @@ class FetchWireCompatTest {
         override fun onPaired(deviceName: String) = Unit
         override fun onIndexChanged() = Unit
         override fun onFileReady(id: String) { ready += id }
+        override fun onFileHeadReady(id: String) = Unit
         override fun onFileGone(id: String) = Unit
         override fun onDeleteResult(ok: Boolean, reason: String?) = Unit
         override fun onCreateResult(ok: Boolean, id: String?, reason: String?) = Unit
@@ -45,6 +46,8 @@ class FetchWireCompatTest {
         override fun applyRemoteAudio(fileId: String, page: Int, audio: WireAudio, bytes: ByteArray, peaks: ByteArray) = Unit
         override fun applyRemoteAudioRemove(fileId: String, page: Int, ids: List<String>) = Unit
         override fun applyRemoteImageRemove(fileId: String, page: Int, ids: List<String>) = Unit
+        override fun applyRemoteShape(fileId: String, page: Int, shape: com.xnotes.sync.WireShape) = Unit
+        override fun applyRemoteShapeRemove(fileId: String, page: Int, ids: List<String>) = Unit
     }
 
     @Test fun noEagerRefetchPerChunk() {

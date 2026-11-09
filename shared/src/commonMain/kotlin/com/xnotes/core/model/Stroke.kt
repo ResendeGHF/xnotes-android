@@ -502,7 +502,12 @@ class Stroke(
         // Isolate the run so the replacing fills below only ever replace each
         // other, never the page: the layer composites once at full strength.
         r.saveLayerBlended(bounds().outset(2.0), 1.0, BlendMode.SRC_OVER)
-        val runEndJoin = capEnd && count >= 2 && ribbonTurnAt(ribbon, from + count - 1) > RIBBON_JOIN_DISC_ANGLE
+        // The run's last station only turns when a next station exists: at the stroke's end
+        // there is no outgoing segment (reading past it is out of bounds on committed
+        // geometry), and the cap circle covers the tip, so no join disc is needed there.
+        val endStation = from + count - 1
+        val runEndJoin = capEnd && count >= 2 && endStation + 1 < ribbon.pointCount &&
+            ribbonTurnAt(ribbon, endStation) > RIBBON_JOIN_DISC_ANGLE
         // This run's style: grain phase from the raw first sample plus the
         // four UI knobs. Stable for the stroke's whole life.
         val style = pencilStyle()

@@ -1,11 +1,13 @@
 package com.xnotes.core.shapes
 
 import com.xnotes.core.geometry.Affine
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -41,13 +43,22 @@ class FlowchartKindsTest {
         assertTrue("curved ones show none", FlowchartKinds.DELAY.build(box, ShapeParams()).corners.isEmpty())
     }
 
-    @Test fun aFlippedOneSidedSymbolBecomesFree() {
+    @Test fun aFlippedSymbolStaysItself() {
         val s = ShapeItem(FlowchartKinds.INTERNAL_STORAGE, box.topLeft, Pt(box.right, box.bottom), Rgba(0, 0, 0), 2.0)
         s.applyTransform(Affine.scaleAbout(box.center, -1.0, 1.0))
-        assertEquals(ShapeKind.POLYGON, s.shape)
+        assertEquals(FlowchartKinds.INTERNAL_STORAGE, s.shape)
+        assertEquals(Flip.X, s.flip)
         val sort = ShapeItem(FlowchartKinds.SORT, box.topLeft, Pt(box.right, box.bottom), Rgba(0, 0, 0), 2.0)
         sort.applyTransform(Affine.scaleAbout(box.center, -1.0, 1.0))
         assertEquals(FlowchartKinds.SORT, sort.shape)
+        assertEquals("a symmetric symbol needs no flip", Flip.NONE, sort.flip)
+    }
+
+    @Test fun aDragMirrorsASymbolButNeverTurnsItOver() {
+        for (k in FlowchartKinds.all) assertFalse("$k", k.dragFlips.y)
+        assertEquals(Flip.X, FlowchartKinds.DISPLAY.dragFlips)
+        assertEquals("Extract upside down would be Merge", Flip.NONE, ShapePresets.byKey("flow_extract")!!.dragFlips)
+        assertEquals(Flip.Y, ShapePresets.byKey("triangle")!!.dragFlips)
     }
 
     @Test fun theFlowchartPageHasTwentyFourChips() {

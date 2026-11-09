@@ -24,6 +24,7 @@ CompanionServer::CompanionServer(QObject* parent) : QObject(parent), deviceName_
     host_.sync_index_changed = indexChangedThunk;
     host_.sync_file_changed = fileChangedThunk;
     host_.sync_file_gone = fileGoneThunk;
+    host_.sync_file_head_ready = fileHeadReadyThunk;
     host_.sync_resync = resyncThunk;
     host_.sync_live_dirty = liveDirtyThunk;
     host_.sync_delete_result = deleteResultThunk;
@@ -352,6 +353,12 @@ void CompanionServer::fileGoneThunk(void* ctx, const char* id) {
     auto* self = static_cast<CompanionServer*>(ctx);
     if (!self || !id) return;
     emit self->fileGone(QString::fromUtf8(id));
+}
+
+void CompanionServer::fileHeadReadyThunk(void* ctx, const char* id) {
+    auto* self = static_cast<CompanionServer*>(ctx);
+    if (!self || !id) return;
+    emit self->fileHeadReady(QString::fromUtf8(id));
 }
 
 void CompanionServer::resyncThunk(void* ctx, const char* id, long long version) {

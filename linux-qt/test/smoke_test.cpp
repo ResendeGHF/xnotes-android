@@ -1321,7 +1321,7 @@ private slots:
         };
         QCOMPARE(rules(grab(canvas)), std::pair(0, 0));
 
-        PageStylePopup dialog(canvas.editor(), false, nullptr);
+        PageStylePopup dialog(canvas.editor(), nullptr, false, nullptr);
         auto button = [&](const QString& text) {
             for (QAbstractButton* b : dialog.findChildren<QAbstractButton*>())
                 if (b->text() == text) return b;
@@ -1450,7 +1450,7 @@ private slots:
         QVERIFY(inkPixels(grab(*canvas), canvas->rect()) > 300);
 
         // Its background, through the dialog: one for the whole canvas.
-        PageStylePopup dialog(canvas->editor(), true, nullptr);
+        PageStylePopup dialog(canvas->editor(), nullptr, true, nullptr);
         for (QAbstractButton* b : dialog.findChildren<QAbstractButton*>()) {
             if (b->text() == QStringLiteral("Current page")) QVERIFY(!b->isVisibleTo(&dialog));
             if (b->text() == QStringLiteral("Dotted")) b->click();

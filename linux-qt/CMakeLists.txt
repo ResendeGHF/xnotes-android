@@ -64,6 +64,13 @@ target_include_directories(xnotes_host PUBLIC src)
 # The icons, from linux-qt/icons/generate.py, as :/icons/<name>.svg.
 file(GLOB XNOTES_ICONS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS icons/svg/*.svg)
 qt_add_resources(xnotes_host "xnotes_icons" PREFIX "/icons" BASE icons/svg FILES ${XNOTES_ICONS})
+
+# The page templates, from the app's assets (the same files Android ships), as
+# :/templates/<name>.xtemplate and :/templates/examples/<name>.xtemplate. The host feeds them to
+# the core at startup, so every pattern paints without any files on disk.
+file(GLOB_RECURSE XNOTES_TEMPLATE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/assets/templates/*.xtemplate")
+qt_add_resources(xnotes_host "xnotes_templates" PREFIX "/templates"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/assets/templates" FILES ${XNOTES_TEMPLATE_FILES})
 target_link_libraries(xnotes_host PUBLIC Qt6::Widgets Qt6::Network Qt6::OpenGLWidgets Qt6::Pdf ZLIB::ZLIB xnotes_core)
 target_compile_options(xnotes_host PRIVATE -Wall -Wextra)
 

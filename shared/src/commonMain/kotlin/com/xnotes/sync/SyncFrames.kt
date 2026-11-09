@@ -40,11 +40,18 @@ object SyncFrames {
      */
     class Decoder {
         private var pending = ByteArray(0)
+        private var at = 0
 
         fun feed(bytes: ByteArray, from: Int = 0, to: Int = bytes.size): List<SyncMsg> {
+            if (at > 0) {
+                // A previous feed ended mid-message: drop the consumed prefix once here
+                // instead of copying it on every feed (a 1 MB chunk arriving in small
+                // socket reads would otherwise copy megabytes per segment).
+                pending = pending.copyOfRange(at, pending.size)
+                at = 0
+            }
             pending += bytes.sliceArray(from until to)
             val out = ArrayList<SyncMsg>()
-            var at = 0
             while (pending.size - at >= 4) {
                 val n = ((pending[at].toInt() and 0xFF) shl 24) or
                     ((pending[at + 1].toInt() and 0xFF) shl 16) or
@@ -55,7 +62,15 @@ object SyncFrames {
                 out += decode(pending.sliceArray(at + 4 until at + 4 + n))
                 at += 4 + n
             }
-            pending = if (at < pending.size) pending.sliceArray(at until pending.size) else ByteArray(0)
+            if (at >= pending.size) {
+                pending = ByteArray(0)
+                at = 0
+            } else if (at > 65536) {
+                // A large consumed prefix with a partial message behind it: compact now
+                // so the buffer does not grow without bound across feeds.
+                pending = pending.copyOfRange(at, pending.size)
+                at = 0
+            }
             return out
         }
     }
@@ -137,6 +152,35 @@ sealed interface SyncMsg {
         val id: String,
         val offset: Long,
         val length: Long,
+    ) : SyncMsg
+
+    /**
+     * Ask for just the edits since [sinceVersion]: the host replays the
+     * journaled ops (and any media chunks they reference) instead of the whole
+     * file, or answers `resync` when its journal no longer covers the gap.
+     */
+    data class FetchOps(
+        override val seq: Int,
+        val id: String,
+        val sinceVersion: Long,
+    ) : SyncMsg
+
+    /**
+     * A file's small entries ahead of its bytes: manifest (always), flow,
+     * markups, inline templates and template packages (each optional). The guest
+     * opens a skeleton document from these at once; the `file` chunks that
+     * follow fill in images, audio and the source PDF progressively.
+     */
+    data class FileHead(
+        override val seq: Int,
+        val id: String,
+        val version: Long,
+        val total: Long,
+        val manifest: String,
+        val flow: String?,
+        val markups: String?,
+        val templates: Map<String, String>,
+        val packages: Map<String, String>,
     ) : SyncMsg
 
     data class FileChunk(

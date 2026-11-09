@@ -1,26 +1,29 @@
 package com.xnotes.core.shapes
 
-import com.xnotes.core.geometry.toRadians
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.geometry.toDegrees
+import com.xnotes.core.geometry.toRadians
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 import kotlin.math.min
 import kotlin.math.sqrt
 
 // The Flowchart page's own symbols. Process, alternate process, decision, data, terminator,
-// connector and extract are chips of Basic kinds; these are the rest.
+// connector and extract are chips of Basic kinds; these are the rest. A drag may mirror a symbol
+// but never turns it over, which would make it another symbol (Merge is Extract upside down).
 
-/** A straight-edged symbol whose corners come from [corners]; asymmetric ones refuse a mirror. */
+/** A straight-edged symbol whose corners come from [corners]. */
 internal class FlowPolygonKind(
     id: String,
-    private val symmetric: Boolean,
+    override val flips: Flip,
     override val iconAspect: Double,
     private val text: (Rect) -> Rect,
     private val corners: (Rect) -> List<Pt>,
 ) : ShapeKind(id) {
     override val isClosed get() = true
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = if (symmetric) adj else null
+    override val dragFlips get() = flips.and(Flip.X)
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val c = corners(box)
         return ShapeGeometry(listOf(ShapePath.polygon(c)), c, polygonConnections(c), text(box))
@@ -31,6 +34,7 @@ internal class FlowPolygonKind(
 internal class PreparationKind(id: String) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = 1.5
+    override val flips get() = Flip.NONE
     override val defaultAdj = doubleArrayOf(0.2)
     override val knobs = listOf(
         KnobDef(
@@ -52,7 +56,7 @@ internal class PreparationKind(id: String) : ShapeKind(id) {
 /** An outline with stroked detail inside it: predefined process, internal storage, sort, summing junction, or. */
 internal class FlowDetailKind(
     id: String,
-    private val symmetric: Boolean,
+    override val flips: Flip,
     override val iconAspect: Double,
     private val text: (Rect) -> Rect,
     private val connections: (Rect) -> List<ConnectionPoint>,
@@ -60,7 +64,7 @@ internal class FlowDetailKind(
     private val detail: (Rect) -> List<VectorContour>,
 ) : ShapeKind(id) {
     override val isClosed get() = true
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = if (symmetric) adj else null
+    override val dragFlips get() = flips.and(Flip.X)
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry = ShapeGeometry(
         listOf(ShapePath(listOf(outline(box))), ShapePath(detail(box), PathRole.STROKE_ONLY)),
         emptyList(),
@@ -72,7 +76,7 @@ internal class FlowDetailKind(
 /** A curved symbol drawn by [contours] (the first is the outline, any more are detail strokes). */
 internal class FlowCurvedKind(
     id: String,
-    private val symmetric: Boolean,
+    override val flips: Flip,
     override val iconAspect: Double,
     private val text: (Rect) -> Rect,
     private val contours: (Rect) -> List<VectorContour>,
@@ -80,7 +84,7 @@ internal class FlowCurvedKind(
     private val stacked: Boolean = false,
 ) : ShapeKind(id) {
     override val isClosed get() = true
-    override fun mirroredAdj(adj: DoubleArray): DoubleArray? = if (symmetric) adj else null
+    override val dragFlips get() = flips.and(Flip.X)
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val main = contours(box)
         val paths = ArrayList<ShapePath>(3)
@@ -133,7 +137,7 @@ internal object FlowchartKinds {
     val PREPARATION: ShapeKind = PreparationKind("flow_preparation")
 
     val PREDEFINED: ShapeKind = FlowDetailKind(
-        "flow_predefined", symmetric = true, iconAspect = 1.5,
+        "flow_predefined", flips = Flip.NONE, iconAspect = 1.5,
         text = { b -> ShapeKind.inset(Rect(b.left + 0.1 * b.w, b.top, 0.8 * b.w, b.h)) },
         connections = ::boxConnections,
         outline = ::rectContour,
@@ -146,7 +150,7 @@ internal object FlowchartKinds {
     )
 
     val INTERNAL_STORAGE: ShapeKind = FlowDetailKind(
-        "flow_internal_storage", symmetric = false, iconAspect = 1.25,
+        "flow_internal_storage", flips = Flip.XY, iconAspect = 1.25,
         text = { b -> ShapeKind.inset(Rect(b.left + 0.15 * b.w, b.top + 0.15 * b.h, 0.85 * b.w, 0.85 * b.h)) },
         connections = ::boxConnections,
         outline = ::rectContour,
@@ -159,13 +163,13 @@ internal object FlowchartKinds {
     )
 
     val DOCUMENT: ShapeKind = FlowCurvedKind(
-        "flow_document", symmetric = false, iconAspect = 1.4,
+        "flow_document", flips = Flip.XY, iconAspect = 1.4,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top, b.w, 0.82 * b.h)) },
         contours = { b -> listOf(documentContour(b)) },
     )
 
     val MULTIDOCUMENT: ShapeKind = FlowCurvedKind(
-        "flow_multidocument", symmetric = false, iconAspect = 1.3,
+        "flow_multidocument", flips = Flip.XY, iconAspect = 1.3,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top + 0.2 * b.h, 0.8 * b.w, 0.65 * b.h)) },
         contours = { b ->
             val d = min(b.w, b.h) * 0.1
@@ -190,27 +194,27 @@ internal object FlowchartKinds {
     )
 
     val MANUAL_INPUT: ShapeKind = FlowPolygonKind(
-        "flow_manual_input", symmetric = false, iconAspect = 1.5,
+        "flow_manual_input", flips = Flip.XY, iconAspect = 1.5,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top + 0.25 * b.h, b.w, 0.75 * b.h)) },
     ) { b -> listOf(Pt(b.left, b.top + 0.25 * b.h), Pt(b.right, b.top), Pt(b.right, b.bottom), Pt(b.left, b.bottom)) }
 
     val MANUAL_OPERATION: ShapeKind = FlowPolygonKind(
-        "flow_manual_operation", symmetric = true, iconAspect = 1.5,
+        "flow_manual_operation", flips = Flip.Y, iconAspect = 1.5,
         text = { b -> ShapeKind.inset(Rect(b.left + 0.1 * b.w, b.top, 0.8 * b.w, b.h)) },
     ) { b -> listOf(b.topLeft, Pt(b.right, b.top), Pt(b.right - 0.2 * b.w, b.bottom), Pt(b.left + 0.2 * b.w, b.bottom)) }
 
     val OFF_PAGE: ShapeKind = FlowPolygonKind(
-        "flow_off_page", symmetric = true, iconAspect = 0.9,
+        "flow_off_page", flips = Flip.Y, iconAspect = 0.9,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top, b.w, 0.75 * b.h)) },
     ) { b -> listOf(b.topLeft, Pt(b.right, b.top), Pt(b.right, b.top + 0.75 * b.h), Pt(b.centerX, b.bottom), Pt(b.left, b.top + 0.75 * b.h)) }
 
     val MERGE: ShapeKind = FlowPolygonKind(
-        "flow_merge", symmetric = true, iconAspect = 1.15,
+        "flow_merge", flips = Flip.Y, iconAspect = 1.15,
         text = { b -> Rect(b.left + b.w / 4.0, b.top, b.w / 2.0, b.h / 2.0) },
     ) { b -> listOf(b.topLeft, Pt(b.right, b.top), Pt(b.centerX, b.bottom)) }
 
     val DATABASE: ShapeKind = FlowCurvedKind(
-        "flow_database", symmetric = true, iconAspect = 0.8,
+        "flow_database", flips = Flip.Y, iconAspect = 0.8,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top + cap(b), b.w, b.h - 1.5 * cap(b))) },
         contours = { b ->
             val c = cap(b)
@@ -233,7 +237,7 @@ internal object FlowchartKinds {
     )
 
     val DIRECT_ACCESS: ShapeKind = FlowCurvedKind(
-        "flow_direct_access", symmetric = false, iconAspect = 1.6,
+        "flow_direct_access", flips = Flip.X, iconAspect = 1.6,
         text = { b -> ShapeKind.inset(Rect(b.left + side(b) / 2.0, b.top, b.w - 1.5 * side(b), b.h)) },
         contours = { b ->
             val c = side(b)
@@ -256,7 +260,7 @@ internal object FlowchartKinds {
     )
 
     val DISPLAY: ShapeKind = FlowCurvedKind(
-        "flow_display", symmetric = false, iconAspect = 1.5,
+        "flow_display", flips = Flip.X, iconAspect = 1.5,
         text = { b -> ShapeKind.inset(Rect(b.left + 0.15 * b.w, b.top, 0.7 * b.w, b.h)) },
         contours = { b ->
             val r = 0.15 * b.w
@@ -273,7 +277,7 @@ internal object FlowchartKinds {
     )
 
     val DELAY: ShapeKind = FlowCurvedKind(
-        "flow_delay", symmetric = false, iconAspect = 1.3,
+        "flow_delay", flips = Flip.X, iconAspect = 1.3,
         text = { b -> ShapeKind.inset(Rect(b.left, b.top, b.w - delayRadius(b) / 2.0, b.h)) },
         contours = { b ->
             val r = delayRadius(b)
@@ -289,7 +293,7 @@ internal object FlowchartKinds {
     )
 
     val STORED_DATA: ShapeKind = FlowCurvedKind(
-        "flow_stored_data", symmetric = false, iconAspect = 1.5,
+        "flow_stored_data", flips = Flip.X, iconAspect = 1.5,
         text = { b -> ShapeKind.inset(Rect(b.left + 0.12 * b.w, b.top, 0.76 * b.w, b.h)) },
         contours = { b ->
             val k = 0.12 * b.w
@@ -305,7 +309,7 @@ internal object FlowchartKinds {
     )
 
     val SORT: ShapeKind = FlowDetailKind(
-        "flow_sort", symmetric = true, iconAspect = 1.3,
+        "flow_sort", flips = Flip.NONE, iconAspect = 1.3,
         text = { b -> Rect(b.left + b.w / 4.0, b.top + b.h / 4.0, b.w / 2.0, b.h / 2.0) },
         connections = { b ->
             ShapeKind.polygonConnections(listOf(Pt(b.centerX, b.top), Pt(b.right, b.centerY), Pt(b.centerX, b.bottom), Pt(b.left, b.centerY)))
@@ -315,7 +319,7 @@ internal object FlowchartKinds {
     )
 
     val SUMMING: ShapeKind = FlowDetailKind(
-        "flow_summing", symmetric = true, iconAspect = 1.0,
+        "flow_summing", flips = Flip.NONE, iconAspect = 1.0,
         text = { b -> ShapeKind.inset(b, 0.3) },
         connections = ::ellipseConnections,
         outline = { b -> ShapePath.ellipseContour(b.centerX, b.centerY, b.w / 2.0, b.h / 2.0) },
@@ -326,7 +330,7 @@ internal object FlowchartKinds {
     )
 
     val OR: ShapeKind = FlowDetailKind(
-        "flow_or", symmetric = true, iconAspect = 1.0,
+        "flow_or", flips = Flip.NONE, iconAspect = 1.0,
         text = { b -> ShapeKind.inset(b, 0.3) },
         connections = ::ellipseConnections,
         outline = { b -> ShapePath.ellipseContour(b.centerX, b.centerY, b.w / 2.0, b.h / 2.0) },

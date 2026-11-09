@@ -1,5 +1,6 @@
 package com.xnotes.core.shapes
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.pal.FillRule
@@ -23,7 +24,19 @@ class ShapeGeometry(
     val corners: List<Pt> = emptyList(),
     val connections: List<ConnectionPoint> = emptyList(),
     val textRect: Rect,
-)
+) {
+    /** This geometry mirrored by [flip] inside [box]; the text rect moves but stays a rect, so labels read as ever. */
+    fun flipped(flip: Flip, box: Rect): ShapeGeometry {
+        if (flip == Flip.NONE) return this
+        val f = { p: Pt -> flip.map(p, box) }
+        return ShapeGeometry(
+            paths.map { it.mapped(f) },
+            corners.map(f),
+            connections.map { c -> ConnectionPoint(f(c.at), c.normals.map(flip::direction)) },
+            flip.map(textRect, box),
+        )
+    }
+}
 
 /**
  * One of a kind's knobs (PowerPoint's yellow adjust handles): where it sits for the given box and
@@ -103,10 +116,17 @@ abstract class ShapeKind internal constructor(val id: String) {
     open val knobs: List<KnobDef> get() = emptyList()
 
     /**
-     * The knob values that draw this kind mirrored left to right, for a flip that keeps its frame;
-     * null when no knob setting can, and the shape must become a free outline instead.
+     * The flips a shape of this kind carries: those that change how it draws for some knob or
+     * count. None where it is symmetric both ways, and none for line, arrow and free outlines,
+     * which mirror by moving their own points.
      */
-    open fun mirroredAdj(adj: DoubleArray): DoubleArray? = adj
+    open val flips: Flip get() = Flip.XY
+
+    /**
+     * The flips a drag toward the left or upward gives a new shape, its chip being what a drag
+     * down and right draws. Shapes with a natural upright (a heart, a star) keep it.
+     */
+    open val dragFlips: Flip get() = flips
 
     /** Knob value [i] out of [adj], falling back to the default for one a file left out. */
     fun adjOf(adj: DoubleArray, i: Int): Double = adj.getOrNull(i)?.takeIf { it.isFinite() } ?: defaultAdj[i]
@@ -148,8 +168,17 @@ abstract class ShapeKind internal constructor(val id: String) {
         val PIE: ShapeKind = SliceKind("pie", pie = true)
         val ARC: ShapeKind = SliceKind("arc", pie = false)
 
+        /** A smooth curve through points a drag moves, adds or removes. */
+        val SPLINE: ShapeKind = SplineKind("spline")
+
+        /** The graph of a function, sampled into its own outline (breaking at poles). */
+        val FUNCTION: ShapeKind = FunctionKind("function")
+
         /** A label an eraser left behind as drawn text: its letters as filled outlines. */
         val GLYPHS: ShapeKind = GlyphsKind("glyphs")
+
+        /** A dropped colour's area: the rings it fills, never stroked. */
+        val FILL: ShapeKind = FillKind("fill")
 
         /**
          * Every kind, in a stable order. Lazy, because the page families are objects whose own
@@ -159,7 +188,7 @@ abstract class ShapeKind internal constructor(val id: String) {
             listOf(
                 LINE, ARROW, RECTANGLE, ELLIPSE, CIRCLE, TRIANGLE, POLYGON, POLYLINE, CURVE,
                 ROUNDED_RECT, SQUARE, CAPSULE, RIGHT_TRIANGLE, DIAMOND, PARALLELOGRAM, TRAPEZOID,
-                REGULAR_POLYGON, STAR, CROSS, HEART, CLOUD, RING, PIE, ARC, GLYPHS,
+                REGULAR_POLYGON, STAR, CROSS, HEART, CLOUD, RING, PIE, ARC, GLYPHS, FUNCTION, SPLINE, FILL,
             ) + FlowchartKinds.all + ArrowKinds.all + SolidMathKinds.all
         }
 
@@ -222,6 +251,7 @@ private class EndpointKind(id: String, override val defaultHeadEnd: Head) : Shap
     override val isClosed get() = false
     override val isEndpointShape get() = true
     override val staysInBox get() = false
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry =
         ShapeGeometry(listOf(ShapePath.polyline(listOf(box.topLeft, Pt(box.right, box.bottom)))), textRect = box)
 }
@@ -229,6 +259,7 @@ private class EndpointKind(id: String, override val defaultHeadEnd: Head) : Shap
 internal class RectangleKind(id: String, override val keepsAspect: Boolean) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = if (keepsAspect) 1.0 else 4.0 / 3.0
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val corners = listOf(Pt(box.left, box.top), Pt(box.right, box.top), Pt(box.right, box.bottom), Pt(box.left, box.bottom))
         return ShapeGeometry(listOf(ShapePath.polygon(corners)), corners, polygonConnections(corners), inset(box))
@@ -238,6 +269,7 @@ internal class RectangleKind(id: String, override val keepsAspect: Boolean) : Sh
 private class EllipseKind(id: String, override val keepsAspect: Boolean) : ShapeKind(id) {
     override val isClosed get() = true
     override val iconAspect get() = if (keepsAspect) 1.0 else 1.5
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val cx = box.centerX
         val cy = box.centerY
@@ -262,7 +294,8 @@ private class TriangleKind(id: String) : ShapeKind(id) {
             drag = { to, box, _, _ -> doubleArrayOf(if (box.w > 0.0) ((to.x - box.left) / box.w).coerceIn(0.0, 1.0) else 0.5) },
         ),
     )
-    override fun mirroredAdj(adj: DoubleArray) = doubleArrayOf(1.0 - adjOf(adj, 0))
+    // Left to right it only changes once the knob slides the apex off centre.
+    override val dragFlips get() = Flip.Y
     // Equilateral.
     override fun perfectAspect(n: Int) = 2.0 / sqrt(3.0)
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
@@ -280,14 +313,27 @@ private class GlyphsKind(id: String) : ShapeKind(id) {
     override val isFree get() = true
     override val pointEditable get() = false
     override val takesLabel get() = false
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry =
         ShapeGeometry(listOf(ShapePath(FreePath.place(p.path.orEmpty(), box), PathRole.FILL_ONLY, FillRule.NONZERO)), textRect = box)
+}
+
+/** A dropped colour's rings stored like a free outline, filled by parity so holes stay open, and never stroked. */
+private class FillKind(id: String) : ShapeKind(id) {
+    override val isClosed get() = true
+    override val isFree get() = true
+    override val pointEditable get() = false
+    override val takesLabel get() = false
+    override val flips get() = Flip.NONE
+    override fun build(box: Rect, p: ShapeParams): ShapeGeometry =
+        ShapeGeometry(listOf(ShapePath(FreePath.place(p.path.orEmpty(), box), PathRole.FILL_ONLY, FillRule.EVEN_ODD)), textRect = box)
 }
 
 /** Polygon, polyline, curve: the shape's own stored outline, placed in its box. */
 private class FreeKind(id: String, private val closed: Boolean) : ShapeKind(id) {
     override val isClosed get() = closed
     override val isFree get() = true
+    override val flips get() = Flip.NONE
     override fun build(box: Rect, p: ShapeParams): ShapeGeometry {
         val contours = FreePath.place(p.path.orEmpty(), box)
         val role = if (closed) PathRole.OUTLINE else PathRole.STROKE_ONLY
@@ -299,4 +345,15 @@ private class FreeKind(id: String, private val closed: Boolean) : ShapeKind(id) 
         }
         return ShapeGeometry(listOf(ShapePath(contours, role)), corners, connections, inset(box))
     }
+}
+
+/** A plotted function: the stored runs of its graph, only stroked, and replotted rather than point-edited. */
+private class FunctionKind(id: String) : ShapeKind(id) {
+    override val isClosed get() = false
+    override val isFree get() = true
+    override val pointEditable get() = false
+    override val takesLabel get() = false
+    override val flips get() = Flip.NONE
+    override fun build(box: Rect, p: ShapeParams): ShapeGeometry =
+        ShapeGeometry(listOf(ShapePath(FreePath.place(p.path.orEmpty(), box), PathRole.STROKE_ONLY)), textRect = box)
 }

@@ -21,9 +21,11 @@ import com.xnotes.core.model.PageSize
 import com.xnotes.core.model.PageSizeChoice
 import com.xnotes.core.model.PageStyle
 import com.xnotes.core.model.Rgba
+import com.xnotes.core.model.keepBorrowedTemplateSettings
 import com.xnotes.core.model.Room
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.FunctionSpec
 import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.ShapeLabel
 import com.xnotes.core.model.Stroke
@@ -44,6 +46,7 @@ import com.xnotes.core.platform.ZipEntry
 import com.xnotes.core.platform.ZipInputStream
 import com.xnotes.core.platform.ZipMethod
 import com.xnotes.core.platform.ZipOutputStream
+import com.xnotes.core.platform.asOutputStream
 import com.xnotes.core.platform.asPath
 import com.xnotes.core.platform.asSink
 import com.xnotes.core.platform.asSource
@@ -118,6 +121,61 @@ class DocumentCodec(
         /** Re-simplifying ink from a writer older than sample reduction, which builds every
          *  stroke's ribbon to do it. Zero for anything this build wrote. */
         var compactMs = 0L
+    }
+
+    /**
+     * A partial bundle holding a file's small entries (manifest first): what a [SyncMsg.FileHead]
+     * carries so the guest opens at once and fills images, audio and the source PDF in later.
+     * Entry names match the full bundle, so the same [read] parses it (with placeholders).
+     */
+    fun skeletonBytes(
+        manifest: ByteArray,
+        flow: ByteArray? = null,
+        markups: ByteArray? = null,
+        templates: Map<String, String> = emptyMap(),
+        packages: Map<String, ByteArray> = emptyMap(),
+    ): ByteArray {
+        val out = okio.Buffer()
+        ZipOutputStream(out.asOutputStream()).use { zos ->
+            zos.setLevel(DEFLATE_BEST_SPEED)
+            flow?.let { zos.putDeflated(FlowXml.ENTRY_NAME, it) }
+            for ((key, text) in templates) {
+                if (TEMPLATE_KEY.matches(key)) zos.putDeflated("$TEMPLATE_DIR$key$TEMPLATE_EXT", text.encodeToByteArray())
+            }
+            for ((key, bytes) in packages) {
+                if (TEMPLATE_KEY.matches(key)) zos.putDeflated("$TEMPLATE_ASSET$key$TEMPLATE_EXT", bytes)
+            }
+            markups?.let { zos.putDeflated(MarkupsXfdf.ENTRY_NAME, it) }
+            zos.putDeflated("manifest.json", manifest)
+        }
+        return out.readByteArray()
+    }
+
+    /**
+     * Fill a skeleton document's missing assets from its full read: the source PDF, image and
+     * audio files that stood in as empty placeholders, and template packages the head skipped.
+     * Items, history and view state are untouched, so live edits, undo and the scroll position
+     * survive the fill. Only runs when both docs describe the same file version.
+     */
+    fun absorbAssets(live: Document, full: Document) {
+        if (live.pdfFile == null) live.pdfFile = full.pdfFile
+        val missingPackages = full.templatePackages.filterKeys { it !in live.templatePackages }
+        if (missingPackages.isNotEmpty()) live.templatePackages = live.templatePackages + missingPackages
+        if (live.missingAssets.isEmpty()) return
+        for ((li, page) in live.pages.withIndex()) {
+            val fp = full.pages.getOrNull(li) ?: break
+            if (page.items.size != fp.items.size) continue
+            for ((ii, item) in page.items.withIndex()) {
+                val f = fp.items[ii]
+                if (item is ImageItem && f is ImageItem && live.missingAssets.remove(item.image.file.pathString)) {
+                    deleteQuietly(item.image.file)
+                    item.image = f.image
+                } else if (item is AudioItem && f is AudioItem && live.missingAssets.remove(item.audio.file.pathString)) {
+                    deleteQuietly(item.audio.file)
+                    item.audio = f.audio
+                }
+            }
+        }
     }
 
     fun write(
@@ -653,11 +711,17 @@ class DocumentCodec(
         // A shape older readers cannot draw goes down as the polygon they can, its real geometry after.
         val standIn = s.legacyOutline()
         val drawn = standIn?.let { Rect.bounding(it) }
-        // Drawn text has no shape an older reader could stand in, so it goes under a kind they skip.
-        val glyphs = s.shape == ShapeKind.GLYPHS
+        // Drawn text and a dropped colour's area have no shape an older reader could stand in, so each goes under a kind they skip.
+        val ownKind = when (s.shape) {
+            ShapeKind.GLYPHS -> ShapeItem.GLYPHS_KIND
+            ShapeKind.FILL -> ShapeItem.FILL_KIND
+            else -> null
+        }
+        val own = ownKind != null
         j.beginObject()
-        j.name("kind").value(if (glyphs) ShapeItem.GLYPHS_KIND else ShapeItem.KIND)
+        j.name("kind").value(ownKind ?: ShapeItem.KIND)
         id?.let { j.name("id").value(it) }
+        if (s.uid.isNotEmpty()) j.name("uid").value(s.uid)
         j.name("shape").value(s.legacyId())
         j.name("start").beginArray().value(drawn?.left ?: s.start.x).value(drawn?.top ?: s.start.y).endArray()
         j.name("end").beginArray().value(drawn?.right ?: s.end.x).value(drawn?.bottom ?: s.end.y).endArray()
@@ -667,17 +731,20 @@ class DocumentCodec(
         j.name("fill_rgba")
         s.fillRgba?.let { writeRgba(j, it) } ?: j.nullValue()
         // Polygon/polyline carry their vertices (absolute content px); other kinds omit them.
-        (standIn ?: s.vertices()?.takeUnless { glyphs })?.let { verts ->
+        (standIn ?: s.vertices()?.takeUnless { own })?.let { verts ->
             j.name("points").beginArray()
             for (p in verts) j.beginArray().value(p.x).value(p.y).endArray()
             j.endArray()
         }
-        if (standIn != null || glyphs) {
-            if (!s.isFree) j.name("geom").value(s.shape.id)
+        if (standIn != null || own) {
+            // A mirrored shape names its kind under a key readers before flips skip, so they keep the stand-in.
+            if (!s.isFree || s.shape == ShapeKind.FUNCTION || s.shape == ShapeKind.SPLINE) j.name(if (s.flip == Flip.NONE) "geom" else "flip_geom").value(s.shape.id)
+            if (s.flip != Flip.NONE) j.name("flip").value(s.flip.id)
             val f = s.box
             j.name("rect").beginArray().value(f.x).value(f.y).value(f.w).value(f.h).endArray()
             if (s.rotation != 0.0) j.name("angle").value(s.rotation)
-            s.path?.takeIf { s.isFree && (glyphs || !FreePath.isVertexList(it)) }?.let { j.name("path").value(FreePath.toSvg(it)) }
+            // A spline's points are not the line its stand-in draws, so they are always written.
+            s.path?.takeIf { s.isFree && (own || s.shape == ShapeKind.SPLINE || !FreePath.isVertexList(it)) }?.let { j.name("path").value(FreePath.toSvg(it)) }
         }
         if (s.n != s.shape.defaultN) j.name("n").value(s.n)
         if (s.headStart != s.shape.defaultHeadStart) j.name("head_start").value(s.headStart.id)
@@ -709,7 +776,19 @@ class DocumentCodec(
             if (s.labelAt != 0.5) j.name("at").value(s.labelAt)
             j.endObject()
         }
+        s.function?.let {
+            j.name("function").value(it.expr)
+            j.name("function_from").value(it.from)
+            j.name("function_to").value(it.to)
+            if (it.yMin != null && it.yMax != null) {
+                j.name("function_ymin").value(it.yMin)
+                j.name("function_ymax").value(it.yMax)
+            }
+        }
+        s.sync?.let { j.name("rec").value(it.rid); j.name("rec_ms").value(it.ms) }
         if (s.locked) j.name("locked").value(true)
+        s.link?.let { j.name("link").value(it) }
+        s.group?.let { j.name("group").value(it) }
         j.endObject()
     }
 
@@ -825,6 +904,8 @@ class DocumentCodec(
             }
             j.endObject()
         }
+        s.invertColors?.let { j.name("invert_colors").value(it) }
+        s.invertImages?.let { j.name("invert_images").value(it) }
         j.endObject()
     }
 
@@ -850,6 +931,13 @@ class DocumentCodec(
         pdfDir: File? = null,
         imageDir: File? = null,
         timing: ReadTiming? = null,
+        /**
+         * Keep items whose asset entries are absent as empty placeholders instead of
+         * dropping them, so a skeleton read (manifest without media) has the same
+         * pages and item order as the full file. A later [absorbAssets] swaps the
+         * real files in; until then the placeholders paint as empty boxes.
+         */
+        placeholders: Boolean = false,
     ): Document {
         var manifest: ParsedManifest? = null
         var flowBytes: ByteArray? = null
@@ -941,6 +1029,10 @@ class DocumentCodec(
         doc.newPageSize = m.newPageSize
         doc.mathStudioJson = m.mathStudio
         doc.templatePackages = packages
+        // Writers before template settings belonged to the template shown (not the level holding
+        // them) let pages borrow the note's colours, spacing and parameters across templates;
+        // copy what they borrowed into the pages once, so the new resolution draws the same.
+        if (m.writer < OWN_TEMPLATE_SETTINGS_SINCE) doc.keepBorrowedTemplateSettings()
 
         if (m.hasPdf) {
             doc.pdfFile = pdfFile
@@ -960,10 +1052,13 @@ class DocumentCodec(
 
         // Image entries stream out of the zip after the manifest, so image items materialize only
         // now that their files exist; the recorded index restores each one's z-order slot.
+        // With placeholders, a missing asset becomes an empty stand-in file (same slot, same uid);
+        // absorbAssets swaps the real file in when the full bytes land.
+        val placeholderDir = if (placeholders) imageDir else null
         for ((page, specs, glue) in m.pageImages) {
             var dropped = 0
             for (spec in specs) {
-                val item = materializeImage(spec, imageFiles)
+                val item = materializeImage(spec, imageFiles, placeholderDir, doc.missingAssets)
                 if (item == null) {
                     dropped++
                 } else {
@@ -975,7 +1070,7 @@ class DocumentCodec(
         for ((page, specs) in m.pageAudio) {
             var dropped = 0
             for (spec in specs) {
-                val item = materializeAudio(spec, audioFiles)
+                val item = materializeAudio(spec, audioFiles, placeholderDir, doc.missingAssets)
                 if (item == null) {
                     dropped++
                 } else {
@@ -1264,6 +1359,7 @@ class DocumentCodec(
         var fontFace = ""
         var shape: String? = null
         var geom: String? = null
+        var flipGeom: String? = null
         var path: String? = null
         var adj: DoubleArray? = null
         var n = 0
@@ -1278,6 +1374,11 @@ class DocumentCodec(
         var points: List<Pt>? = null
         var neon = false
         var neonStrength = 0.6
+        var function: String? = null
+        var functionFrom = 0.0
+        var functionTo = 0.0
+        var functionYMin: Double? = null
+        var functionYMax: Double? = null
         var dashed = false
         var dashLength = 10.0
         var dashGap = 8.0
@@ -1369,6 +1470,7 @@ class DocumentCodec(
                 "font_face" -> s.fontFace = stringOr(p, "")
                 "shape" -> s.shape = stringOr(p, "")
                 "geom" -> s.geom = stringOrNull(p)
+                "flip_geom" -> s.flipGeom = stringOrNull(p)
                 "path" -> s.path = stringOrNull(p)
                 "adj" -> s.adj = doublesOrNull(p)
                 "n" -> s.n = intOr(p, 0)
@@ -1386,6 +1488,11 @@ class DocumentCodec(
                 "dashed" -> s.dashed = boolOr(p, false)
                 "dash_length" -> s.dashLength = doubleOr(p, 10.0)
                 "dash_gap" -> s.dashGap = doubleOr(p, 8.0)
+                "function" -> s.function = stringOrNull(p)
+                "function_from" -> s.functionFrom = doubleOr(p, 0.0)
+                "function_to" -> s.functionTo = doubleOr(p, 0.0)
+                "function_ymin" -> s.functionYMin = doubleOrNull(p)
+                "function_ymax" -> s.functionYMax = doubleOrNull(p)
                 "color" -> s.linkColor = rgbaOrNull(p)
                 "collapsed" -> s.collapsed = boolOr(p, false)
                 "ink" -> s.stickyInk = parseStickyInk(p)
@@ -1464,7 +1571,7 @@ class DocumentCodec(
                     )
                 }
             }
-            ShapeItem.KIND, ShapeItem.GLYPHS_KIND -> {
+            ShapeItem.KIND, ShapeItem.GLYPHS_KIND, ShapeItem.FILL_KIND -> {
                 val c = s.connector
                 items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
             }
@@ -1481,6 +1588,7 @@ class DocumentCodec(
             when (item) {
                 is TextItem -> if (item.uid.isEmpty()) item.uid = legacyUid("text", item, before)
                 is TableItem -> if (item.uid.isEmpty()) item.uid = legacyUid("table", item, before)
+                is ShapeItem -> if (item.uid.isEmpty()) item.uid = s.uid ?: legacyUid("shape", item, before)
                 is ImageItem -> {} // materialized later (assets may follow)
                 else -> {}
             }
@@ -1661,11 +1769,13 @@ class DocumentCodec(
         val shape = buildDrawnShape(s)
         // The real geometry behind a stand-in polygon; or else an old file's baked turn.
         val frame = s.rect
-        if (frame != null && (s.geom != null || s.angle != 0.0 || s.path != null)) {
-            shape.restoreFrame(ShapeKind.fromIdOrNull(s.geom), frame, s.angle, FreePath.fromSvg(s.path))
+        val geom = s.geom ?: s.flipGeom
+        if (frame != null && (geom != null || s.angle != 0.0 || s.path != null)) {
+            shape.restoreFrame(ShapeKind.fromIdOrNull(geom), frame, s.angle, FreePath.fromSvg(s.path))
         } else {
             shape.unbake()
         }
+        if (!shape.shape.isFree && !shape.shape.isEndpointShape) shape.flip = s.flip
         if (s.n > 0) shape.n = s.n
         s.adj?.let { shape.adj = it }
         s.headStart?.let { shape.headStart = Head.fromId(it) }
@@ -1674,6 +1784,9 @@ class DocumentCodec(
             shape.label = ShapeLabel(l.text, TextStyle(l.rgba ?: shape.strokeRgba, l.pointSize, FontFace.fromId(l.fontFace)), textMeasurer)
             l.at?.takeIf { it.isFinite() }?.let { shape.labelAt = it.coerceIn(0.0, 1.0) }
         }
+        s.link?.let { shape.link = it }
+        s.group?.let { shape.group = it }
+        if (s.rec != null) shape.sync = SyncMark(s.rec ?: 0, s.recMs)
         return shape
     }
 
@@ -1802,11 +1915,12 @@ class DocumentCodec(
     private fun buildDrawnShape(s: ItemScratch): ShapeItem {
         val kind = ShapeKind.fromId(s.shape)
         val strokeRgba = s.strokeRgba ?: Rgba(0, 230, 118, 255)
+        val spec = s.function?.let { FunctionSpec(it, s.functionFrom, s.functionTo, s.functionYMin, s.functionYMax) }
         s.points?.let { verts ->
             return ShapeItem.poly(
                 kind, verts, strokeRgba, s.strokeWidth, s.fillRgba, s.neon, s.neonStrength,
                 s.dashed, s.dashLength, s.dashGap,
-            )
+            ).also { shape -> shape.function = spec }
         }
         return ShapeItem(
             shape = kind,
@@ -1820,7 +1934,7 @@ class DocumentCodec(
             dashed = s.dashed,
             dashLength = s.dashLength,
             dashGap = s.dashGap,
-        )
+        ).also { shape -> shape.function = spec }
     }
 
     private fun parseConfig(p: JsonPull): ConfigScratch? {
@@ -1895,6 +2009,8 @@ class DocumentCodec(
         var accent: Rgba? = null
         var params: Map<String, Double>? = null
         var colors: Map<String, Rgba>? = null
+        var invertColors: Boolean? = null
+        var invertImages: Boolean? = null
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
@@ -1906,6 +2022,8 @@ class DocumentCodec(
                 "accent_color" -> accent = rgbaOrNull(p)
                 "params" -> params = namedValues(p) { doubleOrNull(it) }
                 "colors" -> colors = namedValues(p) { rgbaOrNull(it) }
+                "invert_colors" -> invertColors = boolOrNull(p)
+                "invert_images" -> invertImages = boolOrNull(p)
                 else -> p.skipValue()
             }
         }
@@ -1918,6 +2036,8 @@ class DocumentCodec(
             accentColor = accent,
             params = params,
             colors = colors,
+            invertColors = invertColors,
+            invertImages = invertImages,
         )
     }
 
@@ -1961,8 +2081,10 @@ class DocumentCodec(
         return PageMargins(clamp(left), clamp(top), clamp(right), clamp(bottom))
     }
 
-    private fun materializeAudio(spec: PendingAudio, audioFiles: Map<String, File>): AudioItem? {
-        val file = audioFiles[spec.asset] ?: return null
+    private fun materializeAudio(spec: PendingAudio, audioFiles: Map<String, File>, placeholderDir: File? = null, missing: MutableSet<String>? = null): AudioItem? {
+        val file = audioFiles[spec.asset] ?: placeholderDir?.let {
+            runCatching { createTempFile("skel", null, it).also { f -> missing?.add(f.pathString) } }.getOrNull()
+        } ?: return null
         val rect = spec.rect?.takeIf { it.w.isFinite() && it.h.isFinite() && it.w > 0.0 && it.h > 0.0 } ?: return null
         val ext = spec.asset.substringAfterLast('.', "").lowercase()
             .takeIf { it.matches(Regex("[a-z0-9]{1,5}")) } ?: "m4a"
@@ -1976,15 +2098,24 @@ class DocumentCodec(
         }
     }
 
-    private fun materializeImage(spec: PendingImage, imageFiles: Map<String, File>): ImageItem? {
-        val file = imageFiles[spec.asset] ?: return null
+    private fun materializeImage(spec: PendingImage, imageFiles: Map<String, File>, placeholderDir: File? = null, missing: MutableSet<String>? = null): ImageItem? {
+        val existing = imageFiles[spec.asset]
+        val file = existing ?: placeholderDir?.let {
+            runCatching { createTempFile("skel", null, it).also { f -> missing?.add(f.pathString) } }.getOrNull()
+        } ?: return null
         var w = spec.srcW
         var h = spec.srcH
         if (w <= 0 || h <= 0) {
-            // Legacy notes (and any without stored dims): read the native size without decoding pixels.
-            val probed = imageCodec.probeFile(file.pathString) ?: return null
-            w = probed.width
-            h = probed.height
+            if (existing == null) {
+                // Placeholder: no pixels to probe yet; the recorded box (or nothing) stands in.
+                w = 0
+                h = 0
+            } else {
+                // Legacy notes (and any without stored dims): read the native size without decoding pixels.
+                val probed = imageCodec.probeFile(file.pathString) ?: return null
+                w = probed.width
+                h = probed.height
+            }
         }
         val rect = spec.rect ?: Rect(0.0, 0.0, w.toDouble(), h.toDouble())
         return ImageItem(ImageData(file, w, h), rect, spec.orientation, spec.angle, spec.flip, spec.part)
@@ -2151,7 +2282,15 @@ class DocumentCodec(
 
         /** The com.xnotes versionCode stamped into manifests this build writes ("writer"), kept
          *  in step with the release that carries it. Old readers ignore the unknown key. */
-        const val WRITER = 48
+        const val WRITER = 67
+
+        /**
+         * Writers before template settings belonged to the template shown carry the old borrowing
+         * (colours, spacing and parameters shared across templates); their pages are migrated once
+         * at load instead. Matches upstream, so notes round-trip between the apps without
+         * re-migrating (a migrated note is saved with a writer at or past this).
+         */
+        private const val OWN_TEMPLATE_SETTINGS_SINCE = 67
 
         /** Writers at/after this versionCode reduce ink samples at pen-up; ink from older
          *  writers (or files with no "writer" at all) is compacted once at load instead. */
@@ -2175,7 +2314,7 @@ class DocumentCodec(
 class NotePeek(val pages: Int, val hasPdf: Boolean, val created: Long?)
 
 /** Up to [limit] bytes of [input], or null when it holds more (the rest is left unread). */
-private fun readAtMost(input: InputStream, limit: Int): ByteArray? {
+internal fun readAtMost(input: InputStream, limit: Int): ByteArray? {
     val source = input.asSource()
     val out = okio.Buffer()
     while (true) {

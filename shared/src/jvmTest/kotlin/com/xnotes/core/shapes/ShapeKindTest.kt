@@ -1,5 +1,6 @@
 package com.xnotes.core.shapes
 
+import com.xnotes.core.geometry.Flip
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import org.junit.Assert.assertEquals
@@ -87,8 +88,34 @@ class ShapeKindTest {
         assertEquals("clamped to the top edge", 1.0, k.drag(Pt(500.0, 0.0), box, adj, 0)[0], 0.0)
     }
 
-    @Test fun aMirrorFlipsTheApexAcross() {
-        assertEquals(0.75, ShapeKind.TRIANGLE.mirroredAdj(doubleArrayOf(0.25))!![0], 1e-12)
-        assertEquals("a missing value reads as the default", 0.5, ShapeKind.TRIANGLE.adjOf(DoubleArray(0), 0), 0.0)
+    @Test fun aMissingKnobValueReadsAsTheDefault() {
+        assertEquals(0.5, ShapeKind.TRIANGLE.adjOf(DoubleArray(0), 0), 0.0)
+    }
+
+    @Test fun aFlipMirrorsEverythingAKindBuildsInsideItsBox() {
+        val g = ShapeKind.RIGHT_TRIANGLE.build(box, ShapeParams())
+        val f = g.flipped(Flip.X, box)
+        for (i in g.corners.indices) assertPt(Pt(box.left + box.right - g.corners[i].x, g.corners[i].y), f.corners[i])
+        for (i in g.connections.indices) {
+            assertPt(Flip.X.map(g.connections[i].at, box), f.connections[i].at)
+            for (j in g.connections[i].normals.indices) assertPt(Pt(-g.connections[i].normals[j].x, g.connections[i].normals[j].y), f.connections[i].normals[j])
+        }
+        val t = g.textRect
+        assertPt(Pt(box.left + box.right - t.right, t.y), f.textRect.topLeft)
+        assertPt(Pt(t.w, t.h), Pt(f.textRect.w, f.textRect.h))
+        val up = g.flipped(Flip.Y, box)
+        assertPt(Pt(box.left, box.bottom), up.corners[0])
+        assertSame(g, g.flipped(Flip.NONE, box))
+    }
+
+    @Test fun symmetricKindsCarryNoFlip() {
+        for (k in listOf(ShapeKind.RECTANGLE, ShapeKind.SQUARE, ShapeKind.ELLIPSE, ShapeKind.CIRCLE, ShapeKind.DIAMOND, ShapeKind.RING, ShapeKind.CROSS)) {
+            assertEquals("$k", Flip.NONE, k.flips)
+        }
+        assertEquals(Flip.Y, ShapeKind.HEART.flips)
+        assertEquals("a heart stays upright however it is dragged", Flip.NONE, ShapeKind.HEART.dragFlips)
+        assertEquals(Flip.XY, ShapeKind.RIGHT_TRIANGLE.dragFlips)
+        assertEquals(Flip.NONE, ShapeKind.LINE.flips)
+        assertEquals(Flip.NONE, ShapeKind.POLYGON.flips)
     }
 }

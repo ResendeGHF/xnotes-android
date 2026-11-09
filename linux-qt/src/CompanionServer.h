@@ -69,6 +69,7 @@ signals:
     void indexChanged();
     void fileReady(const QString& id);
     void fileGone(const QString& id);
+    void fileHeadReady(const QString& id);
     void resync(const QString& id, long long version);
     void paint();
     void deleteAnswered(bool ok, const QString& reason);
@@ -92,6 +93,7 @@ private:
     static void indexChangedThunk(void* ctx);
     static void fileChangedThunk(void* ctx, const char* id);
     static void fileGoneThunk(void* ctx, const char* id);
+    static void fileHeadReadyThunk(void* ctx, const char* id);
     static void resyncThunk(void* ctx, const char* id, long long version);
     static void liveDirtyThunk(void* ctx);
     static void deleteResultThunk(void* ctx, int ok, const char* reason);

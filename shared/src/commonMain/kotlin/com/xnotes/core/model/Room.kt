@@ -122,6 +122,40 @@ object Rooms {
         return out
     }
 
+    /**
+     * The paper [cover] leaves uncovered by rooms: full-width bands above and below them, and the
+     * margins beside them. A template on an imported PDF page paints only here, never over the page.
+     */
+    fun paper(cover: Rect, rooms: List<Room>, sourceW: Double, sourceH: Double): List<Rect> {
+        val xs = shown(bands(rooms, sourceW, true))
+        val ys = shown(bands(rooms, sourceH, false))
+        val out = ArrayList<Rect>()
+        for ((a, b) in gaps(cover.top, cover.bottom, ys)) out += Rect(cover.left, a, cover.w, b - a)
+        for ((a, b) in gaps(cover.left, cover.right, xs)) {
+            for ((t, u) in ys) {
+                val top = maxOf(t, cover.top)
+                val bottom = minOf(u, cover.bottom)
+                if (bottom - top > EPS) out += Rect(a, top, b - a, bottom - top)
+            }
+        }
+        return out
+    }
+
+    /** Where [bands] show, display intervals in order. */
+    private fun shown(bands: List<Band>): List<Pair<Double, Double>> = bands.map { it.from + it.shift to it.to + it.shift }
+
+    /** The stretches of [from] to [to] that [taken], intervals in order, leave. */
+    private fun gaps(from: Double, to: Double, taken: List<Pair<Double, Double>>): List<Pair<Double, Double>> {
+        val out = ArrayList<Pair<Double, Double>>()
+        var at = from
+        for ((a, b) in taken) {
+            if (a - at > EPS) out += at to minOf(a, to)
+            at = maxOf(at, b)
+        }
+        if (to - at > EPS) out += at to to
+        return out
+    }
+
     /** [rooms] scaled by [k] with their page. */
     fun scaled(rooms: List<Room>, k: Double): List<Room> = if (k == 1.0) rooms else rooms.map { Room(it.at * k, it.size * k, it.sideways) }
 }

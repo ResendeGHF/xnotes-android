@@ -1,8 +1,8 @@
 package com.xnotes.core.template
 
-import com.xnotes.core.platform.withLock
-import com.xnotes.core.platform.Lock
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.platform.Lock
+import com.xnotes.core.platform.withLock
 import com.xnotes.core.model.Rgba
 
 /**
@@ -24,12 +24,12 @@ class TemplateLayoutCache(private val eval: TemplateEval, private val capacity: 
         val colors: Map<String, Rgba>,
     )
 
-    /** Most recently used last; the first goes when [capacity] is passed. Guarded by [lock]. */
     private val map = LinkedHashMap<Key, TemplateOutput>()
     private val lock = Lock()
 
     fun layout(t: Template, page: TemplatePage): TemplateOutput {
         val key = Key(t, page.width, page.height, page.paper, page.ink, page.accent, page.values.numbers, page.values.colors)
+        // Most recently used last: a hit moves to the back, and over capacity the front goes.
         withLock(lock) { map.remove(key)?.let { map[key] = it; return it } }
         val out = eval.evaluate(t, page)
         withLock(lock) {

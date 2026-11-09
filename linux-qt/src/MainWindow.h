@@ -7,6 +7,8 @@
 #include <QHash>
 #include <QMainWindow>
 #include <QPointer>
+#include <QSet>
+#include <QTabWidget>
 #include <QTemporaryDir>
 
 #include <memory>
@@ -51,6 +53,7 @@ public:
     void approvePairing(const QString& device, const QString& fp);
     void openSharedFile(const QString& id);
     void openSharedReady(const QString& id);
+    void openSharedHeadReady(const QString& id);
     void reopenSharedFile(const QString& id);
     void linkFromSelection();
     void syncPresence();
@@ -75,14 +78,21 @@ private:
     QToolBar* navBar_ = nullptr;
     QList<QToolBar*> editorBars_;
     xn::CompanionServer* companion_ = nullptr;
-    QString pendingOpenId_;
+    /* Files with an open requested and no tab yet. */
+    QSet<QString> pendingIds_;
+
+    class Tab;
+    QTabWidget* tabs_ = nullptr;
+    QList<Tab*> tabs_;
+    /* Mirrors of the focused tab (null/empty when no tab is open); every
+     * canvas/note/path use below reads these, so tab switches just re-point. */
+    CanvasWidget* canvas_ = nullptr;
+    xn_note* note_ = nullptr;
+    QString path_;
     QString boundFileId_;
     int lastPresencePage_ = -2;
-
-    CanvasWidget* canvas_;
-    xn_note* note_ = nullptr;
-    std::unique_ptr<QTemporaryDir> workDir_;
-    QString path_;
+    QScrollBar* vbar_ = nullptr;
+    QScrollBar* hbar_ = nullptr;
     QString suggestedName_;  // where "Save" proposes to put a note made from a PDF
     QAction* undo_;
     QAction* redo_;
@@ -124,8 +134,6 @@ private:
     bool shapeFill_ = false;
     bool shapeDashed_ = false;
     bool clipboardIsNewer_ = false;
-    QScrollBar* vbar_;
-    QScrollBar* hbar_;
     QToolBar* findBar_ = nullptr;
     QLineEdit* findField_ = nullptr;
     QLabel* findCount_ = nullptr;
@@ -134,10 +142,35 @@ private:
     QTimer* findPoll_ = nullptr;
     bool syncingBars_ = false;  // the system clipboard changed after the last in-app copy
 
-    void install(xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path);
     void buildUi();
     void applyKind();
     void applyMarkupMode();
+    /* One open note: its own canvas (editor, undo, scroll) and sync binding. */
+    struct Tab {
+        CanvasWidget* canvas = nullptr;
+        QScrollBar* vbar = nullptr;
+        QScrollBar* hbar = nullptr;
+        QWidget* page = nullptr;
+        xn_note* note = nullptr;
+        std::unique_ptr<QTemporaryDir> workDir;
+        QString path;      // local file, or empty
+        QString fileId;    // shared file id, or empty
+        QString title;
+        int lastPresencePage = -2;
+        bool skeleton = false;  // head opened, full bytes still coming
+    };
+    /* The focused tab, its canvas and its note (null when no tab is open). */
+    Tab* activeTab() const;
+    CanvasWidget* activeCanvas() const;
+    xn_note* activeNote() const;
+    Tab* tabForFile(const QString& id) const;
+    Tab* tabForPath(const QString& path) const;
+    Tab* addTab();
+    void closeTab(int index);
+    void activateTab(int index);
+    void installTab(Tab* tab, xn_note* note, std::unique_ptr<QTemporaryDir> workDir, const QString& path);
+    void refreshTabTitle(Tab* tab);
+    void syncPresenceFor(Tab* tab);
     /* Paper for pages without a colour of their own: the canvas's, in the panel and in exports. */
     xn_rgba paper() const { return dark_ ? 0x161616FFu : 0xFFFFFFFFu; }
     void refresh();
