@@ -18,6 +18,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -50,7 +51,11 @@ class HostEngineTest {
     }
 
     private class FakeFiles(val files: MutableMap<String, ByteArray>) : SyncFiles {
-        override fun read(id: String): ByteArray? = files[id]
+        override fun read(id: String): ByteArray? {
+            reads++
+            return files[id]
+        }
+        var reads = 0
         override fun write(id: String, bytes: ByteArray): Boolean {
             files[id] = bytes
             return true
@@ -135,14 +140,21 @@ class HostEngineTest {
         override fun setGranted(uri: String, granted: Boolean) = policy.setShared(uri, granted)
     }
 
-    private data class Fixture(val engine: HostEngine, val host: FakeHost, val backend: FakeBackend, val policy: SharePolicy)
+    private data class Fixture(
+        val engine: HostEngine,
+        val host: FakeHost,
+        val backend: FakeBackend,
+        val policy: SharePolicy,
+        val files: FakeFiles,
+    )
 
     private fun engine(host: FakeHost = FakeHost(), backend: FakeBackend = FakeBackend(), dir: File? = null): Fixture {
         val d = dir ?: File(System.getProperty("java.io.tmpdir"), "sync-host-${System.nanoTime()}").apply { mkdirs() }
         val policy = SharePolicy.of(File(d, "share"))
         val versions = File(d, "versions.json")
-        val e = HostEngine(backend, FakeFiles(backend.files), FakeGrants(policy), versions, host, "Pixel 8")
-        return Fixture(e, host, backend, policy)
+        val files = FakeFiles(backend.files)
+        val e = HostEngine(backend, files, FakeGrants(policy), versions, host, "Pixel 8")
+        return Fixture(e, host, backend, policy, files)
     }
 
     private fun stroke(id: String = "#00e676"): Stroke =
@@ -801,5 +813,215 @@ class HostEngineTest {
         val end2 = System.currentTimeMillis() + 5000
         while (System.currentTimeMillis() < end2 && h.countOfType("index") < 3) Thread.sleep(20)
         assertEquals(0, h.lastOfType("index").optJSONArray("files")!!.length())
+    }
+
+    private val fetchCodec = DocumentCodec(com.xnotes.core.FakeImageCodec(), com.xnotes.core.FakeTextMeasurer())
+
+    /** Chunks for [id] now in [host.sent] (the fetch runs off-thread); waits for the last one. */
+    private fun waitForFile(host: FakeHost, id: String, timeoutMs: Long = 15000): List<JSONObject> {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) {
+            val got = synchronized(host.sent) { host.sent.filter { it.optString("t") == "file" && it.optString("id") == id } }
+            if (got.any { it.optBoolean("last") }) return got
+            Thread.sleep(20)
+        }
+        throw AssertionError("timed out waiting for file $id")
+    }
+
+    private fun reassemble(chunks: List<JSONObject>): ByteArray {
+        val total = chunks.first().getLong("total").toInt()
+        val buf = ByteArray(total)
+        for (c in chunks.sortedBy { it.getLong("offset") }) {
+            java.util.Base64.getDecoder().decode(c.getString("data")).copyInto(buf, c.getLong("offset").toInt())
+        }
+        return buf
+    }
+
+    private fun pdfNote(pdfBytes: ByteArray, invert: Boolean): ByteArray {
+        val dir = java.nio.file.Files.createTempDirectory("fetch-note").toFile()
+        try {
+            val pdf = File(dir, "in.pdf").apply { writeBytes(pdfBytes) }
+            val doc = Document(mutableListOf(Page(300.0, 200.0)))
+            doc.pages[0].pdfPage = 0
+            doc.pdfFile = pdf
+            if (invert) doc.style = doc.style.copy(invertColors = true)
+            val out = ByteArrayOutputStream()
+            fetchCodec.write(doc, out)
+            return out.toByteArray()
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun fetchStripsInvertButKeepsThePdf() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        val pdf = byteArrayOf(37, 80, 68, 70, 10) + ByteArray(5000) { it.toByte() }
+        b.addFile("n1", "plan.xnote", bytes = pdfNote(pdf, invert = true))
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        e.onMessage(JSONObject().put("t", "fetch").put("seq", 1).put("id", "n1").put("offset", 0))
+        val back = fetchCodec.read(
+            java.io.ByteArrayInputStream(reassemble(waitForFile(h, "n1"))),
+            File(System.getProperty("java.io.tmpdir")),
+            File(System.getProperty("java.io.tmpdir")),
+        )
+        // The guest keeps its own view: flags are gone, but the PDF rides along intact.
+        assertNull(back.style.invertColors)
+        assertNull(back.style.invertImages)
+        assertNotNull(back.pdfFile)
+        assertTrue(back.pdfFile!!.readBytes().contentEquals(pdf))
+    }
+
+    @Test fun remoteStrokeOnClosedPdfNoteKeepsThePdf() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        val pdf = byteArrayOf(37, 80, 68, 70, 10) + ByteArray(1000) { it.toByte() }
+        b.addFile("n1", "plan.xnote", bytes = pdfNote(pdf, invert = false))
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        // The companion draws while the host has the note closed: straight to the file.
+        val wire = SyncWire.toWire(stroke())
+        e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "n1").put("base_version", 1).put("dedupe", "s1")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_stroke").put("page", 0).put("stroke", wire))))
+        val stored = b.files["n1"]!!
+        val dir = java.nio.file.Files.createTempDirectory("op-pdf").toFile()
+        try {
+            val back = fetchCodec.read(java.io.ByteArrayInputStream(stored), dir, dir)
+            assertEquals(1, back.pages[0].items.size)
+            assertNotNull("a remote stroke must never eat the note's PDF", back.pdfFile)
+            assertTrue(back.pdfFile!!.readBytes().contentEquals(pdf))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun fetchHeadCarriesManifestBeforeChunks() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        val out = ByteArrayOutputStream()
+        fetchCodec.write(doc, out)
+        b.addFile("n1", "plan.xnote", bytes = out.toByteArray())
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        e.onMessage(JSONObject().put("t", "fetch").put("seq", 1).put("id", "n1").put("offset", 0))
+        val end = System.currentTimeMillis() + 15000
+        while (System.currentTimeMillis() < end) {
+            val types = synchronized(h.sent) { h.sent.map { it.optString("t") } }
+            if ("file_head" in types && types.count { it == "file" } >= 1) break
+            Thread.sleep(20)
+        }
+        val head = synchronized(h.sent) { h.sent.first { it.optString("t") == "file_head" } }
+        assertEquals("n1", head.optString("id"))
+        assertTrue(head.optString("manifest").contains("\"format\":\"xnote\""))
+        // The chunks still carry the whole file afterwards.
+        val chunks = waitForFile(h, "n1")
+        assertTrue(reassemble(chunks).contentEquals(out.toByteArray()))
+    }
+
+    @Test fun fetchOpsReplaysJournalWithoutRefetch() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        val out = ByteArrayOutputStream()
+        fetchCodec.write(doc, out)
+        b.addFile("n1", "plan.xnote", bytes = out.toByteArray())
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        // Two text commits move the head 1 -> 2 -> 3.
+        val docLive = Document(mutableListOf(Page(300.0, 200.0)))
+        h.docs["n1"] = docLive
+        e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "n1").put("base_version", 1).put("dedupe", "g1")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_text").put("page", 0)
+                .put("text", JSONObject().put("uid", "t1").put("x", 1.0).put("y", 2.0).put("width", 10.0).put("height", 10.0)
+                    .put("text", "hi").put("color", "#ff0000").put("point_size", 14.0).put("face", "sans")))))
+        e.onMessage(JSONObject().put("t", "op").put("seq", 2).put("file", "n1").put("base_version", 2).put("dedupe", "g2")
+            .put("ops", org.json.JSONArray().put(JSONObject().put("op", "add_text").put("page", 0)
+                .put("text", JSONObject().put("uid", "t2").put("x", 1.0).put("y", 2.0).put("width", 10.0).put("height", 10.0)
+                    .put("text", "yo").put("color", "#00ff00").put("point_size", 14.0).put("face", "sans")))))
+        h.sent.clear()
+        e.onMessage(JSONObject().put("t", "fetch_ops").put("seq", 2).put("id", "n1").put("since_version", 1))
+        val end = System.currentTimeMillis() + 15000
+        while (System.currentTimeMillis() < end) {
+            val ops = synchronized(h.sent) { h.sent.filter { it.optString("t") == "op" } }
+            if (ops.size >= 2) break
+            Thread.sleep(20)
+        }
+        val replayed = synchronized(h.sent) { h.sent.filter { it.optString("t") == "op" } }
+        assertEquals(2, replayed.size)
+        assertEquals(1, replayed[0].optLong("base_version"))
+        assertEquals(2, replayed[0].optLong("version"))
+        assertEquals(2, replayed[1].optLong("base_version"))
+        assertEquals(3, replayed[1].optLong("version"))
+        assertTrue(synchronized(h.sent) { h.sent.none { it.optString("t") == "file" } })
+        // A gap the journal no longer covers answers resync instead.
+        h.sent.clear()
+        e.onMessage(JSONObject().put("t", "fetch_ops").put("seq", 3).put("id", "n1").put("since_version", 0))
+        val end2 = System.currentTimeMillis() + 15000
+        while (System.currentTimeMillis() < end2) {
+            if (synchronized(h.sent) { h.sent.any { it.optString("t") == "resync" } }) break
+            Thread.sleep(20)
+        }
+        val rs = synchronized(h.sent) { h.sent.first { it.optString("t") == "resync" } }
+        assertEquals(3L, rs.optLong("version"))
+    }
+
+    @Test fun fetchOpsReplaysImagesWithTheirBytes() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        val doc = Document(mutableListOf(Page(300.0, 200.0)))
+        val out = ByteArrayOutputStream()
+        fetchCodec.write(doc, out)
+        b.addFile("n1", "plan.xnote", bytes = out.toByteArray())
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        // A local image commit (bytes + op) bumps the head to 2 and journals both.
+        val png = ByteArray(300 * 1024) { (it % 251).toByte() }
+        e.sendImageBytes("n1", "img-9", png)
+        h.sent.clear()
+        e.submitLocalImage("n1", 0, "img-9", png, 100, 80, com.xnotes.core.geometry.Rect(10.0, 20.0, 50.0, 40.0), 0, 0.0, false, false, null, "d-img")
+        // A stale guest asks for everything since 1: image bytes first, then the op.
+        e.onMessage(JSONObject().put("t", "fetch_ops").put("seq", 9).put("id", "n1").put("since_version", 1))
+        val end = System.currentTimeMillis() + 15000
+        while (System.currentTimeMillis() < end) {
+            val hasOp = synchronized(h.sent) { h.sent.any { it.optString("t") == "op" && it.optLong("version") == 2L } }
+            if (hasOp) break
+            Thread.sleep(20)
+        }
+        val chunks = synchronized(h.sent) { h.sent.filter { it.optString("t") == "image_data" } }
+        assertTrue(chunks.isNotEmpty())
+        assertTrue(chunks.any { it.optBoolean("last") })
+        val op = synchronized(h.sent) { h.sent.first { it.optString("t") == "op" && it.optLong("version") == 2L } }
+        assertEquals(1L, op.optLong("base_version"))
+        assertEquals("add_image", op.optJSONArray("ops")!!.getJSONObject(0).optString("op"))
+        assertTrue(reassemble(chunks.filter { it.optString("image_id") == "img-9" }.map { it.put("id", "img-9") }).contentEquals(png))
+    }
+
+    @Test fun repeatFetchServesFromCacheWithoutRereading() {
+        val f = engine()
+        val (e, h, b) = Triple(f.engine, f.host, f.backend)
+        // 2.5 MiB: three 1 MiB chunks (pins the bigger window); must stay under the frame cap.
+        val note = ByteArray(2 * 1024 * 1024 + 512 * 1024) { (it % 251).toByte() }
+        b.addFile("n1", "big.xnote", bytes = note)
+        f.policy.setShared("n1", true)
+        e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
+        h.waitForIndex()
+        e.onMessage(JSONObject().put("t", "fetch").put("seq", 1).put("id", "n1").put("offset", 0))
+        val first = waitForFile(h, "n1")
+        assertEquals(3, first.size)
+        assertTrue(reassemble(first).contentEquals(note))
+        val readsAfterFirst = f.files.reads
+        assertTrue(readsAfterFirst >= 1)
+        h.sent.clear()
+        e.onMessage(JSONObject().put("t", "fetch").put("seq", 2).put("id", "n1").put("offset", 0))
+        val second = waitForFile(h, "n1")
+        assertTrue(reassemble(second).contentEquals(note))
+        assertEquals("a repeat fetch must not touch the disk again", readsAfterFirst, f.files.reads)
     }
 }

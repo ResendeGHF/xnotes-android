@@ -1,6 +1,5 @@
 package com.xnotes.share.companion
 
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.json.JSONObject
@@ -26,25 +25,35 @@ object Frames {
      * messages. Malformed lengths throw; callers close the connection then.
      */
     class Decoder {
-        private val pending = ByteArrayOutputStream()
+        private var pending = ByteArray(0)
+        private var at = 0
 
         /** Bytes fed so far that do not yet make a frame (for close-time logs). */
-        val buffered: Int get() = pending.size()
+        val buffered: Int get() = pending.size - at
 
         fun feed(bytes: ByteArray, from: Int = 0, to: Int = bytes.size): List<JSONObject> {
-            pending.write(bytes, from, to - from)
+            if (at > 0) {
+                // A previous feed ended mid-message: drop the consumed prefix once here
+                // instead of copying it on every feed.
+                pending = pending.copyOfRange(at, pending.size)
+                at = 0
+            }
+            pending += bytes.sliceArray(from until to)
             val out = ArrayList<JSONObject>()
-            val buf = pending.toByteArray()
-            var at = 0
-            while (buf.size - at >= 4) {
-                val n = ByteBuffer.wrap(buf, at, 4).order(ByteOrder.BIG_ENDIAN).int
+            while (pending.size - at >= 4) {
+                val n = ByteBuffer.wrap(pending, at, 4).order(ByteOrder.BIG_ENDIAN).int
                 require(n in 1..MAX_FRAME) { "bad frame length $n" }
-                if (buf.size - at - 4 < n) break
-                out += JSONObject(String(buf, at + 4, n, Charsets.UTF_8))
+                if (pending.size - at - 4 < n) break
+                out += JSONObject(String(pending, at + 4, n, Charsets.UTF_8))
                 at += 4 + n
             }
-            pending.reset()
-            if (at < buf.size) pending.write(buf, at, buf.size - at)
+            if (at >= pending.size) {
+                pending = ByteArray(0)
+                at = 0
+            } else if (at > 65536) {
+                pending = pending.copyOfRange(at, pending.size)
+                at = 0
+            }
             return out
         }
     }

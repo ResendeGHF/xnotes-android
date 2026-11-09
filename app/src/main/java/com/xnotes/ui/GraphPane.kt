@@ -32,7 +32,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -87,52 +86,45 @@ internal fun GraphPane(
     val root = editor.browseRoot
     val scope = rememberCoroutineScope()
     var refreshTick by remember { mutableIntStateOf(0) }
-    var notes by remember { mutableStateOf<List<Editor.GraphNote>?>(null) }
     var graph by remember { mutableStateOf<Editor.LinkGraph?>(null) }
-    // Starts true so the very first frame already shows the working state instead of
-    // flashing an error; there is no full-screen spinner anywhere on this screen.
-    var scanning by remember { mutableStateOf(true) }
-    var progress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    // Set once the first full pass completes, so a genuinely empty vault ("no notes") never
+    // flashes while that pass is still running. There is no loading state on this screen:
+    // the cached index paints at once and every rescan happens silently in the background.
+    var settled by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var loadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
-    /** (Re)build the graph: list fast, paint the cached index at once, then rescan. */
+    /** (Re)build the graph silently: paint the cached index at once, then rescan behind it.
+     * Nothing here ever shows a loading state; content swaps in when it is ready. */
     fun reload() {
         if (loadJob?.isActive == true) return
         loadJob = scope.launch {
-            scanning = true
-            error = null
-            progress = null
             try {
                 // Instant first paint straight from the index: no folder walk, no file reads.
                 graph = withContext(Dispatchers.IO) { editor.cachedLinkGraph() }
                 val listed = withContext(Dispatchers.IO) { editor.listGraphNotes() }
                 if (listed == null) {
-                    error = context.getString(R.string.graph_failed)
+                    // Listing failed (folder gone?): keep whatever is on screen; complain only
+                    // when there is nothing to show at all.
+                    if (graph == null) error = context.getString(R.string.graph_failed)
                     return@launch
                 }
-                notes = listed
-                val fresh = withContext(Dispatchers.IO) {
-                    editor.refreshLinkGraph(listed) { done, total -> progress = done to total }
-                }
+                val fresh = withContext(Dispatchers.IO) { editor.refreshLinkGraph(listed) }
                 graph = fresh
-                if (fresh.partial) error = context.getString(R.string.graph_partial)
+                error = null
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.graph_failed)
-                if (graph == null) graph = Editor.LinkGraph(emptyList(), emptyMap())
+            } catch (_: Exception) {
+                if (graph == null) error = context.getString(R.string.graph_failed)
             } finally {
-                scanning = false
-                progress = null
+                settled = true
             }
         }
     }
-    LaunchedEffect(root, refreshTick) {
+    LaunchedEffect(root, refreshTick, editor.noteOpen) {
         if (root == null) {
-            notes = null
             graph = null
-            scanning = false
+            settled = false
         } else {
             reload()
         }
@@ -181,7 +173,7 @@ internal fun GraphPane(
             }
             Text(stringResource(R.string.graph), color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 20.sp, maxLines = 1, modifier = Modifier.weight(1f))
             TextButton(onClick = onBackToHome) { Text(stringResource(R.string.home)) }
-            IconButton(onClick = { refreshTick++ }, enabled = !scanning) {
+            IconButton(onClick = { refreshTick++ }) {
                 Icon(XnotesIcons.redo, stringResource(R.string.graph_refresh), tint = palette.text.toComposeColor(), modifier = Modifier.size(22.dp))
             }
         }
@@ -262,55 +254,32 @@ internal fun GraphPane(
         // stay visible and usable at all times.
         val data = graph
         if (data == null) {
-            // No full-screen spinner anywhere: while the index loads, the search
-            // and toggles above stay usable and only quiet text shows here.
-            Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val (done, total) = progress ?: (0 to 0)
-                    Text(
-                        when {
-                            error != null -> error!!
-                            scanning && total > 0 -> stringResource(R.string.graph_scanning, done, total)
-                            scanning -> stringResource(R.string.graph_rescanning)
-                            else -> stringResource(R.string.graph_no_notes)
-                        },
-                        color = palette.textDim.toComposeColor(), fontSize = 14.sp,
-                    )
-                    if (!scanning) TextButton(onClick = { refreshTick++ }) { Text(stringResource(R.string.retry)) }
+            // No indicators of any kind here: while the first pass runs, the search
+            // and toggles above stay usable over a blank canvas. Only a hard failure
+            // with nothing to show earns text (plus a retry).
+            if (error != null) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(error!!, color = palette.textDim.toComposeColor(), fontSize = 14.sp)
+                        TextButton(onClick = { refreshTick++ }) { Text(stringResource(R.string.retry)) }
+                    }
                 }
+            } else {
+                Box(Modifier.fillMaxWidth().weight(1f)) {}
             }
             return@Column
         }
-        if (data.files.isEmpty() && !scanning) {
-            Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                Text(stringResource(R.string.graph_no_notes), color = palette.textDim.toComposeColor())
-            }
-            return@Column
-        }
-        // Status: live scan progress, a partial-scan notice, or a rescan error.
-        if (scanning || error != null || data.partial) {
-            Row(
-                Modifier.fillMaxWidth().padding(bottom = 4.dp)
-                    .clip(RoundedCornerShape(8.dp)).background(palette.surface.toComposeColor())
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (scanning) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
+        if (data.files.isEmpty()) {
+            // Genuinely empty only once a pass has settled; otherwise the first
+            // background pass is still running and the canvas stays blank, not wrong.
+            if (settled) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    Text(stringResource(R.string.graph_no_notes), color = palette.textDim.toComposeColor())
                 }
-                val (done, total) = progress ?: (0 to 0)
-                Text(
-                    when {
-                        scanning && total > 0 -> stringResource(R.string.graph_scanning, done, total)
-                        scanning -> stringResource(R.string.graph_rescanning)
-                        else -> error ?: stringResource(R.string.graph_partial)
-                    },
-                    color = palette.textDim.toComposeColor(), fontSize = 12.sp,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
-                )
-                if (!scanning) TextButton(onClick = { refreshTick++ }) { Text(stringResource(R.string.retry)) }
+                return@Column
             }
+            Box(Modifier.fillMaxWidth().weight(1f)) {}
+            return@Column
         }
 
         // --- canvas: rendered by the vendored kuiver graph package (hierarchical

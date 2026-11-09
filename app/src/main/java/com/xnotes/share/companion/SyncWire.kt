@@ -287,6 +287,114 @@ object SyncWire {
         return o
     }
 
+    /** Wire form of a shape, for add_shape ops (full snapshot, upserted by uid). */
+    fun toWireShape(item: com.xnotes.core.model.ShapeItem, liveId: String = ""): JSONObject {
+        val o = JSONObject()
+            .put("uid", item.uid).put("kind", item.shape.id)
+            .put("start", JSONArray().put(item.start.x).put(item.start.y))
+            .put("end", JSONArray().put(item.end.x).put(item.end.y))
+            .put("stroke_color", hexAlpha(item.strokeRgba)).put("stroke_width", item.strokeWidth)
+        item.fillRgba?.let { o.put("fill_color", hexAlpha(it)) }
+        if (item.neon) {
+            o.put("neon", true)
+            o.put("neon_strength", item.neonStrength)
+        }
+        if (item.dashed) {
+            o.put("dashed", true)
+            o.put("dash_length", item.dashLength)
+            o.put("dash_gap", item.dashGap)
+        }
+        if (item.rotation != 0.0) o.put("rotation", item.rotation)
+        if (item.flip != com.xnotes.core.geometry.Flip.NONE) o.put("flip", item.flip.id)
+        if (item.adj.isNotEmpty()) o.put("adj", JSONArray(item.adj.toList()))
+        if (item.n != 0) o.put("n", item.n)
+        if (item.headStart != com.xnotes.core.shapes.Head.NONE) o.put("head_start", item.headStart.id)
+        if (item.headEnd != com.xnotes.core.shapes.Head.NONE) o.put("head_end", item.headEnd.id)
+        item.path?.let { o.put("path", com.xnotes.core.shapes.FreePath.toSvg(it)) }
+        item.function?.let { f ->
+            val fo = JSONObject().put("expr", f.expr).put("from", f.from).put("to", f.to)
+            f.yMin?.let { fo.put("ymin", it) }
+            f.yMax?.let { fo.put("ymax", it) }
+            o.put("function", fo)
+        }
+        item.label?.takeIf { it.text.isNotEmpty() }?.let { l ->
+            val lo = JSONObject().put("text", l.text)
+                .put("color", hexAlpha(l.style.rgba)).put("point_size", l.style.pointSize)
+            if (l.style.face != com.xnotes.core.model.TextItem.DEFAULT_FACE) lo.put("face", l.style.face.id)
+            if (item.labelAt != 0.5) lo.put("at", item.labelAt)
+            o.put("label", lo)
+        }
+        if (item.locked) o.put("locked", true)
+        if (liveId.isNotEmpty()) o.put("live_id", liveId)
+        return o
+    }
+
+    /** Model form of a received shape op (upserted by uid on either side). */
+    fun toNativeShape(o: JSONObject): com.xnotes.core.model.ShapeItem? {
+        val uid = o.optString("uid")
+        if (uid.isEmpty()) return null
+        val kind = com.xnotes.core.shapes.ShapeKind.fromIdOrNull(o.optString("kind")) ?: return null
+        val start = o.optJSONArray("start") ?: return null
+        val end = o.optJSONArray("end") ?: return null
+        val stroke = com.xnotes.canvas.RemoteLiveStrokes.parseColor(o.optString("stroke_color")) ?: return null
+        val fill = o.optString("fill_color").takeIf { it.isNotEmpty() }?.let {
+            com.xnotes.canvas.RemoteLiveStrokes.parseColor(it)
+        }
+        val item = com.xnotes.core.model.ShapeItem(
+            shape = kind,
+            start = com.xnotes.core.geometry.Pt(start.optDouble(0), start.optDouble(1)),
+            end = com.xnotes.core.geometry.Pt(end.optDouble(0), end.optDouble(1)),
+            strokeRgba = stroke,
+            strokeWidth = o.optDouble("stroke_width", 3.0),
+            fillRgba = fill,
+            neon = o.optBoolean("neon", false),
+            neonStrength = o.optDouble("neon_strength", 0.6),
+            dashed = o.optBoolean("dashed", false),
+            dashLength = o.optDouble("dash_length", 10.0),
+            dashGap = o.optDouble("dash_gap", 8.0),
+        )
+        item.uid = uid
+        item.rotation = o.optDouble("rotation", 0.0)
+        item.flip = com.xnotes.core.geometry.Flip.fromId(o.optString("flip"))
+        o.optJSONArray("adj")?.let { arr ->
+            item.adj = DoubleArray(arr.length()) { arr.optDouble(it) }
+        }
+        val n = o.optInt("n", 0)
+        if (n != 0) item.n = n
+        item.headStart = com.xnotes.core.shapes.Head.fromId(o.optString("head_start"))
+        item.headEnd = com.xnotes.core.shapes.Head.fromId(o.optString("head_end"))
+        o.optString("path").takeIf { it.isNotEmpty() }?.let { item.path = com.xnotes.core.shapes.FreePath.fromSvg(it) }
+        o.optJSONObject("function")?.let { f ->
+            val expr = f.optString("expr")
+            if (expr.isNotEmpty()) {
+                item.setFunction(
+                    com.xnotes.core.model.FunctionSpec(
+                        expr, f.optDouble("from"), f.optDouble("to"),
+                        f.optDouble("ymin", Double.NaN).takeIf { it.isFinite() },
+                        f.optDouble("ymax", Double.NaN).takeIf { it.isFinite() },
+                    ),
+                )
+            }
+        }
+        o.optJSONObject("label")?.let { l ->
+            val text = l.optString("text")
+            if (text.isNotEmpty()) {
+                item.label = com.xnotes.core.model.ShapeLabel(
+                    text,
+                    com.xnotes.core.model.TextStyle(
+                        com.xnotes.canvas.RemoteLiveStrokes.parseColor(l.optString("color")) ?: stroke,
+                        l.optDouble("point_size"),
+                        com.xnotes.core.pal.FontFace.fromId(l.optString("face")),
+                    ),
+                    com.xnotes.platform.AndroidTextMeasurer(),
+                )
+                item.labelAt = l.optDouble("at", 0.5).coerceIn(0.0, 1.0)
+            }
+        }
+        item.locked = o.optBoolean("locked", false)
+        return item
+    }
+
     /** Wire form of an audio pill, for add_audio ops (bytes travel separately). */
     fun toWireAudio(
         audioId: String,

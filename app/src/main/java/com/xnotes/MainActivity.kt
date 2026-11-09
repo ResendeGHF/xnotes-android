@@ -115,10 +115,6 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** Minimum time the launch loader stays up, so its animation is briefly seen even
- *  when the session restores instantly. */
-private const val MIN_LOADER_MS = 2000L
-
 /** How long the maths waits for the font bytes it measures with before going without. */
 private const val MATH_FONT_WAIT_MS = 1500L
 
@@ -200,10 +196,10 @@ class MainActivity : ComponentActivity() {
             var ready by remember { mutableStateOf(false) }
 
             LaunchedEffect(Unit) {
-                val start = android.os.SystemClock.uptimeMillis()
+                // No launch animation and no minimum hold: the session restores, the content
+                // shows the moment it is ready. Until then the window background (dark stage)
+                // is already on screen from the launch theme.
                 ed.restoreSession()
-                val elapsed = android.os.SystemClock.uptimeMillis() - start
-                if (elapsed < MIN_LOADER_MS) kotlinx.coroutines.delay(MIN_LOADER_MS - elapsed)
                 ready = true
                 ed.prewarmBackstage()
             }
@@ -226,13 +222,6 @@ class MainActivity : ComponentActivity() {
                                 importPdfUri = pendingPdfImport,
                                 onImportConsumed = { pendingPdfImport = null },
                             )
-                        }
-                        androidx.compose.animation.AnimatedVisibility(
-                            visible = !ready,
-                            enter = androidx.compose.animation.EnterTransition.None,
-                            exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(280)),
-                        ) {
-                            com.xnotes.ui.XnotesLoader()
                         }
                         com.xnotes.ui.EyedropperOverlay()
                     }

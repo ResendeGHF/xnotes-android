@@ -77,6 +77,8 @@ class ShapeItem(
     override var locked = false
     override var link: String? = null
     override var group: Int? = null
+    /** Stable id for sync (add/remove converge across hosts); empty until saved or synced. */
+    var uid: String = ""
     override var sync: SyncMark? = null
 
     /** What a [ShapeKind.FUNCTION] plots; its sampled curve lives in [path]. */

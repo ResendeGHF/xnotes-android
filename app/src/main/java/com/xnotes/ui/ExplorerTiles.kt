@@ -338,7 +338,7 @@ internal fun GridFileTile(b: ExplorerBody, e: BrowseEntry) {
         // Only the thumbnail is outlined, so the colour code and selection show on it alone.
         Box(
             Modifier.fillMaxWidth().aspectRatio(if (b.view.thumb == ThumbShape.PAGE) 100f / 141f else 1f)
-                .clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) accent else (code ?: palette.border.toComposeColor()), shape),
+                .clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) accent else palette.border.toComposeColor(), shape),
         ) {
             EntryThumb(b.editor, e, b.view.thumb, Modifier.fillMaxSize())
             if (selected) Box(Modifier.fillMaxSize().background(palette.selectionBackground.withAlpha(77).toComposeColor()))
@@ -351,7 +351,11 @@ internal fun GridFileTile(b: ExplorerBody, e: BrowseEntry) {
                 .heightIn(min = 50.dp)
                 .padding(start = 10.dp, end = 2.dp, top = 7.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            if (code != null) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 val meta = b.metaText(e)
@@ -395,8 +399,7 @@ internal fun FolderChipTile(b: ExplorerBody, e: BrowseEntry, height: Dp = 60.dp)
             .registered(b, e)
             .clip(shape)
             .background(if (active) palette.selectionBackground.toComposeColor() else Color.Transparent)
-            .then(if (!active && code != null) Modifier.colorHatch(code) else Modifier)
-            .border(1.dp, if (active) accent else (code ?: palette.border.toComposeColor()), shape)
+            .border(1.dp, if (active) accent else palette.border.toComposeColor(), shape)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -407,12 +410,16 @@ internal fun FolderChipTile(b: ExplorerBody, e: BrowseEntry, height: Dp = 60.dp)
             .padding(start = 12.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(XnotesIcons.folder, null, tint = if (active) onAccent else (code ?: palette.textDim.toComposeColor()), modifier = Modifier.size(22.dp))
+        Icon(XnotesIcons.folder, null, tint = if (active) onAccent else palette.textDim.toComposeColor(), modifier = Modifier.size(22.dp))
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(b.label(e), color = if (active) onAccent else palette.text.toComposeColor(), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val meta = b.metaOverride?.invoke(e) ?: b.counts[e.documentUri]?.let { itemsLabel(b.words, it) }
             if (meta != null) Text(meta, color = if (active) onAccent else palette.textDim.toComposeColor(), fontSize = 11.5.sp, maxLines = 1)
+        }
+        if (code != null && !active) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            Spacer(Modifier.width(8.dp))
         }
         if (b.host.isPinned(e)) Icon(XnotesIcons.pin, stringResource(R.string.pinned_to_sidebar), tint = if (active) onAccent else palette.textDim.toComposeColor(), modifier = Modifier.size(14.dp))
         // Kept in select mode so the chip never changes width; there it only ends the selection.
@@ -450,10 +457,10 @@ internal fun FolderCardTile(b: ExplorerBody, e: BrowseEntry) {
         Box(
             Modifier.fillMaxWidth().aspectRatio(if (b.view.thumb == ThumbShape.PAGE) 100f / 141f else 1f)
                 .clip(shape).background(palette.surface.toComposeColor())
-                .border(if (active) 2.dp else 1.dp, if (active) accent else (code ?: palette.border.toComposeColor()), shape),
+                .border(if (active) 2.dp else 1.dp, if (active) accent else palette.border.toComposeColor(), shape),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(XnotesIcons.folder, null, tint = code ?: palette.textDim.toComposeColor(), modifier = Modifier.size(44.dp))
+            Icon(XnotesIcons.folder, null, tint = palette.textDim.toComposeColor(), modifier = Modifier.size(44.dp))
             if (selecting) CheckRing(b.host.isSelected(e), Modifier.align(Alignment.TopStart).padding(8.dp))
         }
         Row(
@@ -462,7 +469,11 @@ internal fun FolderCardTile(b: ExplorerBody, e: BrowseEntry) {
                 .heightIn(min = 50.dp)
                 .padding(start = 10.dp, end = 2.dp, top = 7.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            if (code != null) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(b.metaText(e), color = palette.textDim.toComposeColor(), fontSize = 11.5.sp, maxLines = 1)
@@ -508,7 +519,7 @@ internal fun ListRow(b: ExplorerBody, e: BrowseEntry, wide: Boolean) {
         val shape = MaterialTheme.shapes.small
         if (e.isDir || compact) {
             Box(Modifier.size(box).clip(shape).background(palette.surface.toComposeColor()), contentAlignment = Alignment.Center) {
-                Icon(kindIcon(kind), null, tint = code ?: dim, modifier = Modifier.size(if (compact) 17.dp else 22.dp))
+                Icon(kindIcon(kind), null, tint = dim, modifier = Modifier.size(if (compact) 17.dp else 22.dp))
             }
         } else {
             EntryThumb(b.editor, e, ThumbShape.TOP, Modifier.size(box).clip(shape).border(1.dp, palette.border.toComposeColor(), shape))
@@ -520,7 +531,7 @@ internal fun ListRow(b: ExplorerBody, e: BrowseEntry, wide: Boolean) {
                 if (!wide && !compact) Text(listOfNotNull(where, b.metaText(e).ifEmpty { null }).joinToString(" · "), color = dim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 else if (where != null && !compact) Text(where, color = dim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (code != null && !e.isDir) Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            if (code != null) Box(Modifier.size(8.dp).clip(CircleShape).background(code))
             if (b.host.isPinned(e)) Icon(XnotesIcons.pin, stringResource(R.string.pinned_to_sidebar), tint = dim, modifier = Modifier.size(14.dp))
         }
         if (wide) {
@@ -555,7 +566,7 @@ internal fun GalleryItem(b: ExplorerBody, e: BrowseEntry, shelf: Dp) {
     val img = rememberThumb(b.editor, e, whole = true)
     val ratio = pageRatio(img, if (kind == EntryKind.CANVAS) CANVAS_RATIO else A4_RATIO)
     val code = b.colorOf(e)?.let { codeTint(it, palette) }
-    val edge = if (selected) palette.accent.toComposeColor() else (code ?: palette.paperBorder.toComposeColor())
+    val edge = if (selected) palette.accent.toComposeColor() else palette.paperBorder.toComposeColor()
     val pages = b.pages(e)
     Column(
         Modifier
@@ -616,7 +627,7 @@ internal fun TimelineCard(b: ExplorerBody, e: BrowseEntry, side: Dp) {
             .registered(b, e),
         verticalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        Box(Modifier.size(side).clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else (code ?: palette.border.toComposeColor()), shape)) {
+        Box(Modifier.size(side).clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else palette.border.toComposeColor(), shape)) {
             EntryThumb(b.editor, e, ThumbShape.TOP, Modifier.fillMaxSize())
             if (selected) Box(Modifier.fillMaxSize().background(palette.selectionBackground.withAlpha(77).toComposeColor()))
             if (b.view.showKind) {
@@ -630,6 +641,9 @@ internal fun TimelineCard(b: ExplorerBody, e: BrowseEntry, side: Dp) {
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                if (code != null) {
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+                }
                 Text(formatClock(b.words, b.view.timelineTime(e), b.clock24, b.zone), color = palette.textDim.toComposeColor(), fontSize = 11.5.sp, maxLines = 1)
                 val where = b.whereOf?.invoke(e)
                 if (where != null) {
@@ -655,8 +669,7 @@ internal fun GalleryFolderChip(b: ExplorerBody, e: BrowseEntry) {
             .registered(b, e)
             .clip(shape)
             .background(if (active) palette.selectionBackground.toComposeColor() else Color.Transparent)
-            .then(if (!active && code != null) Modifier.colorHatch(code) else Modifier)
-            .border(1.dp, if (active) palette.accent.toComposeColor() else (code ?: palette.border.toComposeColor()), shape)
+            .border(1.dp, if (active) palette.accent.toComposeColor() else palette.border.toComposeColor(), shape)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -668,8 +681,11 @@ internal fun GalleryFolderChip(b: ExplorerBody, e: BrowseEntry) {
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         val fg = if (active) palette.selectionForeground.toComposeColor() else palette.text.toComposeColor()
-        Icon(XnotesIcons.folder, null, tint = if (active) fg else (code ?: palette.textDim.toComposeColor()), modifier = Modifier.size(20.dp))
+        Icon(XnotesIcons.folder, null, tint = if (active) fg else palette.textDim.toComposeColor(), modifier = Modifier.size(20.dp))
         Text(b.label(e), color = fg, fontSize = 14.sp, maxLines = 1)
+        if (code != null && !active) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+        }
         b.counts[e.documentUri]?.let { Text("$it", color = if (active) fg else palette.textDim.toComposeColor(), fontSize = 12.sp) }
     }
 }
@@ -751,12 +767,17 @@ private fun RecentCard(b: ExplorerBody, r: RecentEntry, onOpen: (BrowseEntry) ->
         Modifier.width(168.dp).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onOpen(e) },
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Box(Modifier.size(168.dp).clip(shape).border(1.dp, code ?: palette.border.toComposeColor(), shape)) {
+        Box(Modifier.size(168.dp).clip(shape).border(1.dp, palette.border.toComposeColor(), shape)) {
             EntryThumb(b.editor, e, ThumbShape.TOP, Modifier.fillMaxSize())
             ThumbBadges(b, e, 6.dp)
         }
         Spacer(Modifier.height(4.dp))
-        Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            if (code != null) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            }
+            Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         Text(openedLabel(b.words, r.opened, b.now, b.zone), color = palette.textDim.toComposeColor(), fontSize = 11.5.sp, maxLines = 1)
         r.where?.let { where ->
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -792,7 +813,7 @@ internal fun PinnedCard(b: ExplorerBody, e: BrowseEntry, whole: Boolean) {
             val (pageW, pageH) = pageFit(pageRatio(img, if (b.kind(e) == EntryKind.CANVAS) CANVAS_RATIO else A4_RATIO), width, width / A4_RATIO)
             val sheet = RoundedCornerShape(3.dp)
             Box(Modifier.size(width, width / A4_RATIO), contentAlignment = Alignment.BottomStart) {
-                Box(Modifier.size(pageW, pageH).clip(sheet).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else (code ?: palette.paperBorder.toComposeColor()), sheet)) {
+                Box(Modifier.size(pageW, pageH).clip(sheet).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else palette.paperBorder.toComposeColor(), sheet)) {
                     ThumbImage(img, whole = true, Modifier.fillMaxSize())
                     if (selected) Box(Modifier.fillMaxSize().background(palette.selectionBackground.withAlpha(77).toComposeColor()))
                     ThumbBadges(b, e, 6.dp)
@@ -801,7 +822,7 @@ internal fun PinnedCard(b: ExplorerBody, e: BrowseEntry, whole: Boolean) {
             }
         } else {
             val shape = MaterialTheme.shapes.medium
-            Box(Modifier.size(width).clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else (code ?: palette.border.toComposeColor()), shape)) {
+            Box(Modifier.size(width).clip(shape).border(if (selected) 2.dp else 1.dp, if (selected) palette.accent.toComposeColor() else palette.border.toComposeColor(), shape)) {
                 EntryThumb(b.editor, e, ThumbShape.TOP, Modifier.fillMaxSize())
                 if (selected) Box(Modifier.fillMaxSize().background(palette.selectionBackground.withAlpha(77).toComposeColor()))
                 ThumbBadges(b, e, 6.dp)
@@ -809,7 +830,12 @@ internal fun PinnedCard(b: ExplorerBody, e: BrowseEntry, whole: Boolean) {
             }
         }
         Spacer(Modifier.height(4.dp))
-        Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            if (code != null) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(code))
+            }
+            Text(b.label(e), color = palette.text.toComposeColor(), fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         val meta = b.metaText(e)
         if (meta.isNotEmpty()) Text(meta, color = palette.textDim.toComposeColor(), fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         b.pinnedWhere(e)?.let { where ->

@@ -36,7 +36,7 @@ class ThumbnailCacheFiles(private val dir: File, private val format: Int, privat
 
     fun <T> load(uri: String, generation: Long, read: (File) -> T?): T? = synchronized(state) {
         if (!isCurrent(generation)) return@synchronized null
-        val file = File(dir, "${key(uri)}.png")
+        val file = File(dir, "${key(uri)}.$EXT")
         if (!file.exists()) return@synchronized null
         runCatching { read(file) }.getOrNull()
     }
@@ -45,15 +45,15 @@ class ThumbnailCacheFiles(private val dir: File, private val format: Int, privat
         if (!isCurrent(generation)) return@synchronized
         runCatching {
             dir.mkdirs()
-            write(File(dir, "${key(uri)}.png"))
-            val pngs = dir.listFiles { f -> f.name.endsWith(".png") }.orEmpty()
-            pngs.sortedByDescending { it.lastModified() }.drop(maxFiles).forEach { removeFile(it) }
+            write(File(dir, "${key(uri)}.$EXT"))
+            val thumbs = dir.listFiles { f -> f.name.endsWith(".$EXT") }.orEmpty()
+            thumbs.sortedByDescending { it.lastModified() }.drop(maxFiles).forEach { removeFile(it) }
         }
         Unit
     }
 
     fun remove(uri: String) = synchronized(state) {
-        removeFile(File(dir, "${key(uri)}.png"))
+        removeFile(File(dir, "${key(uri)}.$EXT"))
     }
 
     fun prune(keep: Set<String>) = synchronized(state) {
@@ -76,6 +76,10 @@ class ThumbnailCacheFiles(private val dir: File, private val format: Int, privat
 
     private companion object {
         const val MARK = "format"
+
+        /** Thumbnails are opaque (paper is painted first), so JPEG: ~5x smaller and far
+         *  faster to encode than PNG, with no visible difference at tile size. */
+        const val EXT = "jpg"
         val states = ConcurrentHashMap<String, State>()
     }
 }

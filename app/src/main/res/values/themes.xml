@@ -7,8 +7,8 @@
         <item name="android:windowLightStatusBar">false</item>
     </style>
 
-    <!-- Launch theme: dark stage matching the loader so there's no logo/white flash
-         before the animation appears. Swapped for Theme.Xnotes in MainActivity.onCreate. -->
+    <!-- Launch theme: plain dark stage so there's no logo/white flash before the
+         content shows. No animation: the session content appears the moment it is ready. -->
     <style name="Theme.Xnotes.Splash" parent="Theme.Xnotes">
         <item name="android:windowBackground">@color/loader_bg</item>
     </style>

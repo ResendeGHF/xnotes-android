@@ -579,12 +579,13 @@ class CompanionService : Service() {
                 eachHost { it.submitLocalStroke(uri, page, stroke, id) }
             }
         }
-        editor.controller.onShapeCommitted = { _, _ ->
-            // The snap superseded any in-flight live run: forget it without
-            // painting raw ink on the companion, then push the new shape at
-            // once instead of waiting out the debounce.
-            pendingLive.remove(editor)
-            eachHost { it.pushFile(uri) }
+        editor.controller.onShapeCommitted = { page, shape ->
+            // The snap superseded any in-flight live run: hand its id over so the companion
+            // drops the pre-snap ink the moment the shape lands, then stream the shape as an
+            // op instead of pushing the whole file.
+            val liveId = pendingLive.remove(editor)?.id.orEmpty()
+            val id = newDedupe()
+            eachHost { it.submitLocalShape(uri, page, shape, liveId, id) }
         }
         editor.controller.onStrokesErased = { page, strokes ->
             val ids = strokes.map { SyncWire.fingerprintOf(it) }
@@ -723,6 +724,7 @@ class CompanionService : Service() {
                     "table" -> ops.put(JSONObject().put("op", "remove_table").put("page", pi).put("ids", JSONArray(listOf(uid))))
                     "image" -> ops.put(JSONObject().put("op", "remove_image").put("page", pi).put("ids", JSONArray(listOf(uid))))
                     "audio" -> ops.put(JSONObject().put("op", "remove_audio").put("page", pi).put("ids", JSONArray(listOf(uid))))
+                    "shape" -> ops.put(JSONObject().put("op", "remove_shape").put("page", pi).put("ids", JSONArray(listOf(uid))))
                     else -> ops.put(JSONObject().put("op", "remove_text").put("page", pi).put("ids", JSONArray(listOf(uid))))
                 }
             }
@@ -759,6 +761,10 @@ class CompanionService : Service() {
                         sendContentBytes(uri, audioId, it.audio.peaks, kind = "peaks")
                         ops.put(JSONObject().put("op", "add_audio").put("page", pi).put("audio", SyncWire.toWireAudio(audioId, it, pi)))
                     }
+                    is com.xnotes.core.model.ShapeItem -> {
+                        if (it.uid.isEmpty()) it.uid = newDedupe()
+                        ops.put(JSONObject().put("op", "add_shape").put("page", pi).put("shape", SyncWire.toWireShape(it)))
+                    }
                     else -> covered = false
                 }
             }
@@ -766,7 +772,7 @@ class CompanionService : Service() {
                 val id = newDedupe()
                 eachHost { it.submitContentOps(uri, ops, id) }
             }
-            if (items.any { it !is com.xnotes.core.model.TextItem && it !is com.xnotes.core.model.TableItem && it !is com.xnotes.core.model.ImageItem && it !is com.xnotes.core.model.AudioItem }) covered = false
+            if (items.any { it !is com.xnotes.core.model.TextItem && it !is com.xnotes.core.model.TableItem && it !is com.xnotes.core.model.ImageItem && it !is com.xnotes.core.model.AudioItem && it !is com.xnotes.core.model.ShapeItem }) covered = false
         }
         return covered
     }
@@ -776,6 +782,7 @@ class CompanionService : Service() {
         is com.xnotes.core.model.TableItem -> item.uid
         is com.xnotes.core.model.ImageItem -> item.uid
         is com.xnotes.core.model.AudioItem -> item.uid
+        is com.xnotes.core.model.ShapeItem -> item.uid
         else -> null
     }
 
@@ -786,6 +793,7 @@ class CompanionService : Service() {
             is com.xnotes.core.model.TableItem -> "table"
             is com.xnotes.core.model.ImageItem -> "image"
             is com.xnotes.core.model.AudioItem -> "audio"
+            is com.xnotes.core.model.ShapeItem -> "shape"
             else -> null
         }
     }
@@ -799,9 +807,8 @@ class CompanionService : Service() {
     }
 
     /**
-     * Debounced full-file push for content ops have no wire form (text/table
-     * edits, image moves/removes, shape refills): collapses a typing burst
-     * into one reload so the companion converges in real time without
+     * Debounced full-file push for content ops have no wire form (image moves/removes):
+     * collapses a burst into one reload so the companion converges in real time without
      * per-keystroke full files.
      */
     private fun pushFileSoon(uri: String) {

@@ -159,7 +159,6 @@ dependencies {
     implementation(libs.commonmark.alerts)
     implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.ui.tooling)
-    implementation(libs.lottie.compose)
     // Bouncy Castle ships two artifact lines: jdk15to18 (Java 8+) and jdk18on (Java 8+,
     // multi-release). PDFBox pulls the former transitively while OpenPGP needs the latter.
     // Both contain the same classes, so keep exactly one line: the OpenPGP artifacts and

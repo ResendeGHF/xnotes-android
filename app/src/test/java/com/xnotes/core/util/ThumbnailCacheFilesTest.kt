@@ -112,4 +112,19 @@ class ThumbnailCacheFilesTest {
         assertNull(cache.load("note#page", current) { it.readText() })
         assertTrue(cache.isCurrent(current))
     }
+
+    @Test fun thumbnailsPersistAsJpegsAndPruneDropsStalePngs() {
+        val cache = cache()
+        val current = cache.useTheme("dark")
+        cache.store("note", current) { it.writeText("pixels") }
+        val names = folder.root.listFiles()!!.map { it.name }
+        assertEquals(1, names.count { it.endsWith(".jpg") })
+        assertTrue(names.none { it.endsWith(".png") })
+        assertEquals("pixels", cache.load("note", current) { it.readText() })
+        // A leftover from the PNG era is orphaned: prune wipes it.
+        File(folder.root, "deadbeef.png").writeText("old")
+        cache.prune(setOf("note"))
+        assertFalse(File(folder.root, "deadbeef.png").exists())
+        assertEquals("pixels", cache.load("note", current) { it.readText() })
+    }
 }

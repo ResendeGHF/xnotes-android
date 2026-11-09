@@ -87,7 +87,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -164,7 +163,6 @@ import androidx.compose.material.icons.Icons
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.ColorMath
 import com.xnotes.ui.theme.LocalPalette
-import com.xnotes.ui.theme.NotesBrandFont
 import com.xnotes.ui.theme.toComposeColor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -427,15 +425,17 @@ private fun BackstageContent(
             }
         }
     } else {
-        // Expanding pushes the explorer along with the panel; collapsing hands it the room at once and the panel
-        // folds away over it, as the old sidebar did, since resizing the grid on every frame is what a fold costs.
-        // The width is read only in layout, so neither direction recomposes anything.
-        val width = animateDpAsState(if (railed) RAIL_WIDTH else SIDEBAR_WIDTH, tween(SIDEBAR_ANIM_MS), label = "sidebarWidth")
+        // The main pane jumps to its final width at once while only the panel's own box
+        // animates (clip-revealed): resizing the grid on every animation frame remeasured
+        // and rescaled every tile — in Gallery/Grid that meant hundreds of bitmap rescales
+        // per frame. Neither direction recomposes or remeasures the explorer now.
+        val targetW = if (railed) RAIL_WIDTH else SIDEBAR_WIDTH
+        val gapW by animateDpAsState(targetW, tween(SIDEBAR_ANIM_MS), label = "sidebarWidth")
         Box(Modifier.fillMaxSize().background(palette.bg.toComposeColor())) {
             // A navigation surface is always on screen here, so the panes never need their own menu button.
             BackstageMain(
                 Modifier.fillMaxSize().layout { measurable, constraints ->
-                    val inset = (if (railed) RAIL_WIDTH else width.value).roundToPx().coerceIn(0, constraints.maxWidth)
+                    val inset = targetW.roundToPx().coerceIn(0, constraints.maxWidth)
                     val w = constraints.maxWidth - inset
                     val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
                     layout(constraints.maxWidth, placeable.height) { placeable.place(inset, 0) }
@@ -444,7 +444,10 @@ private fun BackstageContent(
                 calls, createMode, { createMode = it }, onImportCodeTheme, onImportFont, onBackup, link, { selectView(BackstageView.PREFERENCES) },
                 onCloseTabsForDeletion,
             )
-            // Both stay composed so a fold never pays to build one; only the current one is measured and placed.
+            // The gap animates and the panel content follows its width, so labels reflow
+            // instead of clipping mid-glyph; only a few rows ever remeasure, and the explorer
+            // beside it never moves until the toggle lands. Both stay composed so a fold
+            // never pays to build one; only the current one is measured and placed.
             Layout(
                 content = {
                     BackstageRail(Modifier.width(RAIL_WIDTH), nav) { setRailed(false) }
@@ -453,14 +456,17 @@ private fun BackstageContent(
                 modifier = Modifier
                     .fillMaxHeight()
                     .layout { measurable, constraints ->
-                        val w = width.value.roundToPx().coerceIn(constraints.minWidth, constraints.maxWidth)
+                        val w = gapW.roundToPx().coerceIn(constraints.minWidth, constraints.maxWidth)
                         val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
                         layout(w, placeable.height) { placeable.place(0, 0) }
                     }
                     .background(palette.panel.toComposeColor())
                     .clipToBounds(),
             ) { measurables, constraints ->
-                val shown = measurables[if (railed) 0 else 1].measure(Constraints(maxHeight = constraints.maxHeight, minHeight = constraints.maxHeight))
+                val gapPx = gapW.roundToPx().coerceIn(0, constraints.maxWidth)
+                val shown = measurables[if (railed) 0 else 1].measure(
+                    Constraints.fixedWidth(gapPx.coerceAtLeast(0)).copy(minHeight = constraints.maxHeight, maxHeight = constraints.maxHeight)
+                )
                 layout(constraints.maxWidth, constraints.maxHeight) { shown.place(0, 0) }
             }
         }
@@ -519,10 +525,8 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
             Text(
                 "Notes",
                 color = palette.text.toComposeColor(),
-                fontFamily = NotesBrandFont,
-                fontWeight = FontWeight.Normal,
+                fontWeight = FontWeight.Bold,
                 fontSize = 20.sp,
-                letterSpacing = 1.2.sp,
             )
             Spacer(Modifier.weight(1f))
             Tooltip(stringResource(R.string.collapse_sidebar)) {
@@ -699,6 +703,8 @@ private fun Command(
             color = if (selected) palette.selectionForeground.toComposeColor() else palette.text.toComposeColor(),
             fontSize = 15.sp,
             fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
         if (count != null) Text(count, color = palette.textDim.toComposeColor(), fontSize = 13.sp)
@@ -1057,7 +1063,7 @@ private fun ExplorerSection(
                         }
                     }
                     Spacer(Modifier.width(4.dp))
-                    Text("Notes", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 19.sp, letterSpacing = 1.0.sp)
+                    Text("Notes", color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 19.sp)
                 }
             }
             Column(Modifier.weight(1f).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -2800,18 +2806,6 @@ internal fun EntryMenu(
                 if (onExportPgp != null) DropdownMenuItem(text = { Text(stringResource(R.string.export_pgp)) }, onClick = { onDismiss(); onExportPgp() })
             }
         }
-    }
-}
-
-/** Slanted parallel lines that shade a colour-coded card without hiding what's on it. */
-internal fun Modifier.colorHatch(color: Color): Modifier = drawBehind {
-    val step = 10.dp.toPx()
-    val stroke = 1.5.dp.toPx()
-    val faint = color.copy(alpha = 0.28f)
-    var x = -size.height
-    while (x < size.width) {
-        drawLine(faint, Offset(x, size.height), Offset(x + size.height, 0f), stroke)
-        x += step
     }
 }
 

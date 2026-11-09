@@ -36,6 +36,12 @@ class FakeRenderer : Renderer {
     /** Dashed runs as `from to count` paired with the phase they started at. */
     val dashRuns = mutableListOf<Triple<Int, Int, Double>>()
 
+    /** Pencil/graphite union runs as from/count with the tone each band was painted at. */
+    val unionRuns = mutableListOf<UnionRun>()
+
+    /** One [Renderer.fillRibbonUnion] call: local slice range plus the band tone. */
+    data class UnionRun(val from: Int, val count: Int, val density: Double, val shade: Double)
+
     /** Page-space rects a raster was blitted into. */
     val rasterDests = mutableListOf<Rect>()
 
@@ -57,6 +63,30 @@ class FakeRenderer : Renderer {
     override fun strokePolyline(pts: FloatArray, from: Int, count: Int, pen: Pen) {
         dashRuns += Triple(from, count, pen.dashPhase)
         super.strokePolyline(pts, from, count, pen)
+    }
+
+    override fun fillRibbonUnion(
+        centers: FloatArray,
+        radii: FloatArray,
+        from: Int,
+        count: Int,
+        color: Rgba,
+        radiusScale: Float,
+        capStart: Boolean,
+        capEnd: Boolean,
+        overwrite: Boolean,
+        endJoin: Boolean,
+        ox: Double,
+        oy: Double,
+        density: Double,
+        shade: Double,
+        grainSize: Double,
+    ) {
+        unionRuns += UnionRun(from, count, density, shade)
+        super.fillRibbonUnion(
+            centers, radii, from, count, color, radiusScale,
+            capStart, capEnd, overwrite, endJoin, ox, oy, density, shade, grainSize,
+        )
     }
 
     override fun save() { ops += "save" }

@@ -343,6 +343,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         j.beginObject()
         j.name("kind").value(ownKind ?: ShapeItem.KIND)
         id?.let { j.name("id").value(it) }
+        if (s.uid.isNotEmpty()) j.name("uid").value(s.uid)
         j.name("shape").value(s.legacyId())
         j.name("start").beginArray().value(drawn?.left ?: s.start.x).value(drawn?.top ?: s.start.y).endArray()
         j.name("end").beginArray().value(drawn?.right ?: s.end.x).value(drawn?.bottom ?: s.end.y).endArray()
@@ -901,6 +902,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var functionTo = 0.0
         var functionYMin: Double? = null
         var functionYMax: Double? = null
+        var uid: String? = null
         var rid = 0
         var name = ""
         var durationMs = 0
@@ -993,6 +995,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "function_to" -> s.functionTo = doubleOr(p, 0.0)
                 "function_ymin" -> s.functionYMin = doubleOr(p, 0.0)
                 "function_ymax" -> s.functionYMax = doubleOr(p, 0.0)
+                "uid" -> s.uid = stringOrNull(p)
                 "locked" -> s.locked = boolOr(p, false)
                 "group" -> s.group = intOrNull(p)
                 "rid" -> s.rid = intOr(p, 0)
@@ -1210,6 +1213,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             shape.label = ShapeLabel(l.text, TextStyle(l.rgba ?: shape.strokeRgba, l.pointSize, FontFace.fromId(l.fontFace)), textMeasurer)
             l.at?.takeIf { it.isFinite() }?.let { shape.labelAt = it.coerceIn(0.0, 1.0) }
         }
+        shape.uid = s.uid ?: ""
         return shape
     }
 

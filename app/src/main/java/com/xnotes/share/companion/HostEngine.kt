@@ -84,6 +84,16 @@ class HostEngine(
     private val lock = Any()
     private val io: Executor = Executors.newSingleThreadExecutor { r -> Thread(r, "xnotes-sync-io").apply { isDaemon = true } }
     private var seq = 0
+
+    /** A committed batch for delta catch-up: the version it produced and its ops. */
+    private data class JournalEntry(val version: Long, val ops: JSONArray)
+
+    /** Per-file op journals (newest last), bounded so catch-up never hoards the heap. */
+    private val journals = HashMap<String, ArrayDeque<JournalEntry>>()
+
+    /** Media bytes a replayed op may reference: file to kind+id to bytes. */
+    private val mediaKept = HashMap<String, LinkedHashMap<String, ByteArray>>()
+    private var mediaKeptBytes = 0L
     private val companionPresence = HashMap<String, Int>()
     private val coveredIds = HashSet<String>()
     private val idPaths = HashMap<String, String>()
@@ -102,6 +112,7 @@ class HostEngine(
                 pushStyleSnapshots()
             }
             "fetch" -> onFetch(msg)
+            "fetch_ops" -> onFetchOps(msg)
             "op" -> onOp(msg)
             "live" -> onLive(msg)
             "room_live" -> onRoomLive(msg)
@@ -310,6 +321,29 @@ class HostEngine(
                 return@execute
             }
             var offset = msg.optLong("offset", 0L).coerceIn(0L, total)
+            if (offset == 0L) {
+                // The small entries first: the guest opens a skeleton at once and fills
+                // images, audio and the source PDF in as the chunks land.
+                extractHead(bytes)?.let { head ->
+                    val o = JSONObject().put("t", "file_head").put("id", id)
+                        .put("version", version).put("total", total)
+                        .put("manifest", head.manifest)
+                    head.flow?.let { o.put("flow", it) }
+                    head.markups?.let { o.put("markups", it) }
+                    if (head.templates.isNotEmpty()) {
+                        val t = JSONObject()
+                        for ((k, v) in head.templates) t.put(k, v)
+                        o.put("templates", t)
+                    }
+                    if (head.packages.isNotEmpty()) {
+                        val p = JSONObject()
+                        val enc = java.util.Base64.getEncoder()
+                        for ((k, v) in head.packages) p.put(k, enc.encodeToString(v))
+                        o.put("packages", p)
+                    }
+                    send(o)
+                }
+            }
             while (offset < total) {
                 val end = minOf(offset + CHUNK, total)
                 val last = end >= total
@@ -322,6 +356,153 @@ class HostEngine(
                 offset = end
             }
         }
+    }
+
+    private data class HeadParts(
+        val manifest: String,
+        val flow: String?,
+        val markups: String?,
+        val templates: Map<String, String>,
+        val packages: Map<String, ByteArray>,
+    )
+
+    /**
+     * The small entries of a bundle for a file head: manifest (required), flow,
+     * markups, inline templates and template packages. Images, audio and the
+     * source PDF always ride the chunks. Bounded, so a huge template package
+     * degrades to chunks-only instead of stalling the head.
+     */
+    private fun extractHead(bytes: ByteArray): HeadParts? {
+        var manifest: String? = null
+        var flow: String? = null
+        var markups: String? = null
+        val templates = LinkedHashMap<String, String>()
+        val packages = LinkedHashMap<String, ByteArray>()
+        var templateBytes = 0L
+        var packageBytes = 0L
+        try {
+            java.util.zip.ZipInputStream(bytes.inputStream()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val name = entry.name
+                        fun capped(limit: Long): ByteArray? {
+                            val out = java.io.ByteArrayOutputStream()
+                            val buf = ByteArray(8192)
+                            var left = limit
+                            while (left > 0) {
+                                val n = zis.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                                left -= n
+                            }
+                            // Drain the rest so the stream stays positioned.
+                            val drain = ByteArray(8192)
+                            while (zis.read(drain) >= 0) Unit
+                            return out.toByteArray()
+                        }
+                        when {
+                            name == "manifest.json" -> capped(HEAD_MANIFEST_MAX)?.let { manifest = it.toString(Charsets.UTF_8) }
+                            name == "flow.xml" -> capped(HEAD_ENTRY_MAX)?.let { flow = it.toString(Charsets.UTF_8) }
+                            name == "markups.xfdf" -> capped(HEAD_ENTRY_MAX)?.let { markups = it.toString(Charsets.UTF_8) }
+                            name.startsWith("templates/") && name.endsWith(".xtemplate") -> {
+                                if (templateBytes < HEAD_TEMPLATES_MAX) {
+                                    capped(HEAD_TEMPLATE_MAX)?.let {
+                                        templates[name.removePrefix("templates/").removeSuffix(".xtemplate")] = it.toString(Charsets.UTF_8)
+                                        templateBytes += it.size
+                                    }
+                                }
+                            }
+                            name.startsWith("assets/template-") && name.endsWith(".xtemplate") -> {
+                                if (packageBytes < HEAD_PACKAGES_MAX) {
+                                    capped(HEAD_PACKAGE_MAX)?.let {
+                                        packages[name.removePrefix("assets/template-").removeSuffix(".xtemplate")] = it
+                                        packageBytes += it.size
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        return manifest?.let { HeadParts(it, flow, markups, templates, packages) }
+    }
+
+    /**
+     * Replay the journaled batches after [sinceVersion] so the guest converges
+     * without the whole file. Media an op references rides ahead of it, exactly
+     * like a live broadcast. Anything the journal no longer covers answers
+     * `resync` and the guest refetches whole.
+     */
+    private fun onFetchOps(msg: JSONObject) {
+        val id = msg.optString("id")
+        if (id.isEmpty()) return
+        if (!policyAllows(id)) {
+            host.onError("Fetch denied (not shared): ${displayName(id)}")
+            return
+        }
+        val since = msg.optLong("since_version", -1)
+        val head = headVersion(id)
+        if (since < 0 || since >= head) {
+            if (since != head) send(JSONObject().put("t", "resync").put("file", id).put("version", head))
+            return
+        }
+        val q = journals[id]
+        if (q == null || q.isEmpty() || q.first().version != since + 1) {
+            send(JSONObject().put("t", "resync").put("file", id).put("version", head))
+            return
+        }
+        io.execute {
+            var v = since
+            for (e in q.toList()) {
+                if (e.version != v + 1) {
+                    send(JSONObject().put("t", "resync").put("file", id).put("version", headVersion(id)))
+                    return@execute
+                }
+                if (!replayMedia(id, e.ops)) {
+                    send(JSONObject().put("t", "resync").put("file", id).put("version", headVersion(id)))
+                    return@execute
+                }
+                send(
+                    JSONObject().put("t", "op").put("file", id)
+                        .put("base_version", e.version - 1).put("version", e.version)
+                        .put("ops", e.ops).put("dedupe", "replay-${e.version}"),
+                )
+                v = e.version
+                if (v >= headVersion(id)) break
+            }
+            if (v != headVersion(id)) {
+                send(JSONObject().put("t", "resync").put("file", id).put("version", headVersion(id)))
+            }
+        }
+    }
+
+    /** Resend the media bytes the ops reference, ahead of them. False when evicted. */
+    private fun replayMedia(file: String, ops: JSONArray): Boolean {
+        for (i in 0 until ops.length()) {
+            val op = ops.optJSONObject(i) ?: continue
+            when (op.optString("op")) {
+                "add_image" -> {
+                    val imageId = op.optString("image_id")
+                    val bytes = mediaKept[file]?.get("image:$imageId") ?: return false
+                    sendImageBytes(file, imageId, bytes)
+                }
+                "add_audio" -> {
+                    val audioId = op.optJSONObject("audio")?.optString("audio_id").orEmpty()
+                    if (audioId.isEmpty()) return false
+                    val bytes = mediaKept[file]?.get("audio:$audioId") ?: return false
+                    sendAudioBytes(file, audioId, bytes)
+                    val peaks = mediaKept[file]?.get("peaks:$audioId") ?: return false
+                    sendAudioPeaks(file, audioId, peaks)
+                }
+            }
+        }
+        return true
     }
 
     /** Committed bytes, or the live document when it is open and dirty. */
@@ -338,28 +519,77 @@ class HostEngine(
      * Served file bytes never carry invert flags: invert mirrors over
      * page_style (host↔companion), and guests keep their own view. When no
      * flag is set anywhere the original bytes go out untouched.
+     *
+     * Serving is version-keyed and cached: a repeat fetch — or a stall resume
+     * that re-asks from an offset — must not re-read the file and re-run the
+     * codec. A dirty open document snapshots live state instead, which the
+     * head version does not cover, so it is never cached.
      */
-    private fun serveBytes(id: String): ByteArray? = stripInvertForSync(readFileBytes(id))
+    private var serveCache = LinkedHashMap<String, ServeEntry>()
+
+    private data class ServeEntry(val version: Long, val bytes: ByteArray, var lastUsedMs: Long)
+
+    private fun serveBytes(id: String): ByteArray? {
+        host.openDocument(id)?.let { doc ->
+            if (doc.dirty) return stripInvertForSync(host.snapshotBytes(doc))
+        }
+        val version = headVersion(id)
+        synchronized(lock) {
+            serveCache[id]?.let { e ->
+                if (e.version == version) {
+                    e.lastUsedMs = System.currentTimeMillis()
+                    return e.bytes
+                }
+            }
+        }
+        val bytes = stripInvertForSync(files.read(id)) ?: return null
+        synchronized(lock) {
+            serveCache[id] = ServeEntry(version, bytes, System.currentTimeMillis())
+            var total = serveCache.values.sumOf { it.bytes.size.toLong() }
+            while (total > MAX_SERVE_CACHE_BYTES && serveCache.size > 1) {
+                val oldest = serveCache.minByOrNull { it.value.lastUsedMs } ?: break
+                serveCache.remove(oldest.key)
+                total -= oldest.value.bytes.size
+            }
+        }
+        return bytes
+    }
+
+    /**
+     * Decode [bytes] with the embedded assets (source PDF, images, audio,
+     * template packages) streamed to a fresh temp dir. The caller owns the
+     * dir and must delete it when done. Reads with null dirs skip the assets,
+     * so a decode→edit→encode round trip through them silently drops the
+     * note's PDF and media — never use one for anything that writes back.
+     */
+    private fun readWithAssets(bytes: ByteArray): Pair<Document, File> {
+        val dir = File(imageDir, "rt-${System.nanoTime()}").apply { mkdirs() }
+        val pdfDir = File(dir, "pdf").apply { mkdirs() }
+        val imgDir = File(dir, "img").apply { mkdirs() }
+        return codec.read(bytes.inputStream(), pdfDir, imgDir) to dir
+    }
 
     private fun stripInvertForSync(bytes: ByteArray?): ByteArray? {
         if (bytes == null) return null
         return try {
             val doc = codec.read(bytes.inputStream(), null, null)
-            var touched = false
-            if (doc.style.invertColors != null || doc.style.invertImages != null) {
-                doc.style = doc.style.copy(invertColors = null, invertImages = null)
-                touched = true
-            }
-            for (pg in doc.pages) {
-                if (pg.style.invertColors != null || pg.style.invertImages != null) {
-                    pg.style = pg.style.copy(invertColors = null, invertImages = null)
-                    touched = true
-                }
-            }
+            val touched = doc.style.invertColors != null || doc.style.invertImages != null ||
+                doc.pages.any { it.style.invertColors != null || it.style.invertImages != null }
             if (!touched) return bytes
-            val out = ByteArrayOutputStream()
-            codec.write(doc, out)
-            out.toByteArray()
+            // Re-read with asset dirs: the first pass skips the embedded PDF and media,
+            // and re-encoding that model would drop them (blank PDF pages, lost images).
+            val (full, tmp) = readWithAssets(bytes)
+            try {
+                full.style = full.style.copy(invertColors = null, invertImages = null)
+                for (pg in full.pages) {
+                    pg.style = pg.style.copy(invertColors = null, invertImages = null)
+                }
+                val out = ByteArrayOutputStream()
+                codec.write(full, out)
+                out.toByteArray()
+            } finally {
+                tmp.deleteRecursively()
+            }
         } catch (_: Exception) {
             bytes
         }
@@ -426,6 +656,13 @@ class HostEngine(
                     val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
                     if (ids.isNotEmpty() && applyTableRemove(file, op.optInt("page", 0), ids)) changed = true
                 }
+                "add_shape" -> {
+                    if (applyShapeAdd(file, op.optInt("page", 0), op.optJSONObject("shape") ?: JSONObject())) changed = true
+                }
+                "remove_shape" -> {
+                    val ids = op.optJSONArray("ids")?.let { arr -> List(arr.length()) { arr.optString(it) } } ?: emptyList()
+                    if (ids.isNotEmpty() && applyShapeRemove(file, op.optInt("page", 0), ids)) changed = true
+                }
                 "add_audio" -> {
                     if (applyRemoteAudio(file, op)) changed = true
                 }
@@ -454,6 +691,7 @@ class HostEngine(
         }
         val version = if (!changed) head else bumpVersion(file)
         if (changed) {
+            journal(file, version, ops)
             // Same dedupe end to end: the sender recognizes its own echo and
             // drops it instead of applying the strokes twice.
             broadcastOp(file, version, ops, dedupe)
@@ -536,6 +774,25 @@ class HostEngine(
         submitLocalOps(uri, JSONArray().put(JSONObject().put("op", "remove_table").put("page", page).put("ids", JSONArray(uids))), dedupe)
     }
 
+    /**
+     * A local shape commit to broadcast (full snapshot, upserted by uid). Snaps, shape-tool
+     * drags, moves, resizes and restyles all funnel through here as upserts; [liveId] names
+     * the live run the shape snaps from, so the guest drops the pre-snap ink at once.
+     */
+    fun submitLocalShape(uri: String, page: Int, item: com.xnotes.core.model.ShapeItem, liveId: String, dedupe: String) {
+        if (item.uid.isEmpty()) item.uid = java.util.UUID.randomUUID().toString()
+        val ops = JSONArray().put(
+            JSONObject().put("op", "add_shape").put("page", page).put("shape", SyncWire.toWireShape(item, liveId)),
+        )
+        submitLocalOps(uri, ops, dedupe)
+    }
+
+    /** A local shape removal to broadcast, by uid. */
+    fun submitLocalShapeRemove(uri: String, page: Int, uids: List<String>, dedupe: String) {
+        if (uids.isEmpty()) return
+        submitLocalOps(uri, JSONArray().put(JSONObject().put("op", "remove_shape").put("page", page).put("ids", JSONArray(uids))), dedupe)
+    }
+
     /** A local image move/restyle to broadcast (same image id, new rect): upserts everywhere. */
     fun submitLocalImageMove(uri: String, page: Int, imageId: String, item: com.xnotes.core.model.ImageItem, dedupe: String) {
         val op = JSONObject().put("op", "add_image").put("page", page).put("image_id", imageId)
@@ -572,6 +829,7 @@ class HostEngine(
 
     /** Chunked image bytes ahead of their op (256 KiB frames, base64 like file chunks). */
     fun sendImageBytes(uri: String, imageId: String, bytes: ByteArray) {
+        if (bytes.isNotEmpty()) keepMedia(uri, "image", imageId, bytes)
         if (bytes.isEmpty()) {
             send(JSONObject().put("t", "image_data").put("file", uri).put("image_id", imageId)
                 .put("total", 0).put("offset", 0).put("data", "").put("last", true))
@@ -591,11 +849,13 @@ class HostEngine(
 
     /** Chunked audio bytes ahead of their op (same framing as image bytes). */
     fun sendAudioBytes(uri: String, audioId: String, bytes: ByteArray) {
+        if (bytes.isNotEmpty()) keepMedia(uri, "audio", audioId, bytes)
         sendChunked(uri, audioId, bytes, "audio_data", "audio_id")
     }
 
     /** Chunked waveform peaks for [audioId] (small, but still framed). */
     fun sendAudioPeaks(uri: String, audioId: String, peaks: ByteArray) {
+        if (peaks.isNotEmpty()) keepMedia(uri, "peaks", audioId, peaks)
         sendChunked(uri, audioId, peaks, "audio_peaks", "audio_id")
     }
 
@@ -750,6 +1010,7 @@ class HostEngine(
 
         if (!markDedupe(uri, dedupe)) return
         val version = bumpVersion(uri)
+        journal(uri, version, ops)
         broadcastOp(uri, version, ops, dedupe)
     }
     /** Content ops from the service history hook (uid-keyed text/table/image/audio). */
@@ -762,6 +1023,44 @@ class HostEngine(
                 .put("base_version", version - 1).put("version", version)
                 .put("ops", ops).put("dedupe", dedupe),
         )
+    }
+
+    /**
+     * Remember a committed batch for delta catch-up. Oversized batches (a pasted
+     * wall of ink) are left out: a guest that missed them refetches whole.
+     */
+    private fun journal(file: String, version: Long, ops: JSONArray) {
+        if (ops.toString().length > JOURNAL_OP_BYTES) return
+        val q = journals.getOrPut(file) { ArrayDeque() }
+        q.addLast(JournalEntry(version, ops))
+        while (q.size > JOURNAL_KEPT) q.removeFirst()
+        pruneMedia()
+    }
+
+    /** Keep one copy of media a replayed op may reference, bounded in total. */
+    private fun keepMedia(file: String, kind: String, id: String, bytes: ByteArray) {
+        if (bytes.isEmpty() || bytes.size > MEDIA_BLOB_MAX) return
+        val perFile = mediaKept.getOrPut(file) { LinkedHashMap() }
+        val key = "$kind:$id"
+        val old = perFile.put(key, bytes)
+        mediaKeptBytes += bytes.size - (old?.size ?: 0)
+        pruneMedia()
+    }
+
+    private fun pruneMedia() {
+        if (mediaKeptBytes <= MAX_MEDIA_BYTES) return
+        val it = mediaKept.entries.iterator()
+        while (it.hasNext() && mediaKeptBytes > MAX_MEDIA_BYTES) {
+            val e = it.next()
+            while (e.value.isNotEmpty() && mediaKeptBytes > MAX_MEDIA_BYTES) {
+                val oldest = e.value.entries.iterator().next()
+                mediaKeptBytes -= oldest.value.size
+                e.value.remove(oldest.key)
+            }
+            if (e.value.isEmpty()) it.remove()
+        }
+        // Journals whose media is gone can no longer replay: drop them too.
+        if (mediaKeptBytes > MAX_MEDIA_BYTES) journals.clear()
     }
 
     /** Apply a committed remote stroke; straight to the file when not open. */
@@ -996,6 +1295,7 @@ class HostEngine(
                 ?: (it as? com.xnotes.core.model.TableItem)?.uid
                 ?: (it as? com.xnotes.core.model.ImageItem)?.uid
                 ?: (it as? com.xnotes.core.model.AudioItem)?.uid
+                ?: (it as? com.xnotes.core.model.ShapeItem)?.uid
                 ?: continue
             if (u == uid) return it
         }
@@ -1097,6 +1397,50 @@ class HostEngine(
             val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
             if (pg.items.none { (it as? com.xnotes.core.model.TextItem)?.uid in ids }) return@modifyFile false
             pg.items.removeAll { (it as? com.xnotes.core.model.TextItem)?.uid in ids }
+            true
+        }
+    }
+
+    /** Apply a committed remote shape (upsert by uid); straight to the file when not open. */
+    private fun applyShapeAdd(file: String, page: Int, o: JSONObject): Boolean {
+        val fresh = SyncWire.toNativeShape(o) ?: return false
+        host.openDocument(file)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            (findByUid(pg, fresh.uid) as? com.xnotes.core.model.ShapeItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) pg.items[i] = fresh
+            } ?: pg.items.add(fresh)
+            doc.dirty = true
+            host.editorState(file)?.invalidatePage(pg)
+            host.repaintDocument(file)
+            return true
+        }
+        return modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            (findByUid(pg, fresh.uid) as? com.xnotes.core.model.ShapeItem)?.let { cur ->
+                val i = pg.items.indexOf(cur)
+                if (i >= 0) pg.items[i] = fresh
+            } ?: pg.items.add(fresh)
+            true
+        }
+    }
+
+    /** Take remote shapes off [page] by uid. */
+    private fun applyShapeRemove(file: String, page: Int, ids: List<String>): Boolean {
+        if (ids.isEmpty()) return false
+        host.openDocument(file)?.let { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return false
+            if (pg.items.none { (it as? com.xnotes.core.model.ShapeItem)?.uid in ids }) return false
+            pg.items.removeAll { (it as? com.xnotes.core.model.ShapeItem)?.uid in ids }
+            doc.dirty = true
+            host.editorState(file)?.invalidatePage(pg)
+            host.repaintDocument(file)
+            return true
+        }
+        return modifyFile(file) { doc ->
+            val pg = doc.pages.getOrNull(page) ?: return@modifyFile false
+            if (pg.items.none { (it as? com.xnotes.core.model.ShapeItem)?.uid in ids }) return@modifyFile false
+            pg.items.removeAll { (it as? com.xnotes.core.model.ShapeItem)?.uid in ids }
             true
         }
     }
@@ -1586,14 +1930,23 @@ class HostEngine(
     /** Read-modify-write a closed file through the codec. */
     private fun modifyFile(file: String, edit: (Document) -> Boolean): Boolean {
         val bytes = files.read(file) ?: return false
-        return try {
-            val doc = codec.read(bytes.inputStream(), null, null)
+        // With asset dirs: a null-dir decode drops the embedded PDF, images, audio and
+        // template packages from the model, and the encode below would write them away
+        // for good. A companion stroke on a closed PDF note must never eat its PDF.
+        val (doc, tmp) = try {
+            readWithAssets(bytes)
+        } catch (_: Exception) {
+            return false
+        }
+        try {
             if (!edit(doc)) return false
             val out = ByteArrayOutputStream()
             codec.write(doc, out)
-            files.write(file, out.toByteArray())
+            return files.write(file, out.toByteArray())
         } catch (_: Exception) {
-            false
+            return false
+        } finally {
+            tmp.deleteRecursively()
         }
     }
 
@@ -1821,15 +2174,39 @@ class HostEngine(
 
     private fun dropFile(id: String) {
         store.drop(id)
+        journals.remove(id)
+        mediaKept.remove(id)?.let { perFile ->
+            mediaKeptBytes -= perFile.values.sumOf { it.size.toLong() }
+        }
     }
 
     companion object {
-        const val CHUNK = 256 * 1024L
+        /**
+         * File-chunk window: 1 MiB of raw bytes (~1.4 MiB on the wire after base64+JSON),
+         * far under the 16 MiB frame cap. Fewer, bigger messages means fewer base64
+         * passes, fewer JSON parses and fewer stalls per fetch on slow Wi-Fi.
+         */
+        const val CHUNK = 1024 * 1024L
         const val IMAGE_CHUNK = 256 * 1024
         const val IMAGE_MAX_BYTES = 64L * 1024 * 1024
         const val IMAGE_KEPT = 8
         const val AUDIO_MAX_BYTES = 64L * 1024 * 1024
         const val AUDIO_KEPT = 8
+        /** Served-bytes cache: repeat fetches and stall resumes never re-read the file. */
+        const val MAX_SERVE_CACHE_BYTES = 64L * 1024 * 1024
+        /** Delta catch-up: journaled batches per file (oversized ones fall back to a full fetch). */
+        const val JOURNAL_KEPT = 200
+        const val JOURNAL_OP_BYTES = 256 * 1024
+        /** Head entries: manifest cap, small entries cap, template/package caps. */
+        const val HEAD_MANIFEST_MAX = 8L * 1024 * 1024
+        const val HEAD_ENTRY_MAX = 1L * 1024 * 1024
+        const val HEAD_TEMPLATE_MAX = 512L * 1024
+        const val HEAD_TEMPLATES_MAX = 2L * 1024 * 1024
+        const val HEAD_PACKAGE_MAX = 1L * 1024 * 1024
+        const val HEAD_PACKAGES_MAX = 4L * 1024 * 1024
+        /** Media a replay may need, bounded in total across files. */
+        const val MAX_MEDIA_BYTES = 24L * 1024 * 1024
+        const val MEDIA_BLOB_MAX = 8 * 1024 * 1024
         const val VERSIONS = "sync_versions.json"
     }
 }

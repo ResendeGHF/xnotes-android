@@ -118,13 +118,65 @@ class WetInkCacheTest {
         assertTrue("neither should have taken a surface", factory.created.isEmpty())
     }
 
-    @Test fun pencilKeepsThePlainRedrawSoCrossingsNeverDarken() {
-        // The pencil's bands replace each other inside one isolating layer,
-        // which only works when settled runs and the tail paint together. A
-        // baked settled run with a composited tail over it would darken where
-        // the stroke crosses itself — the committed look it has to match.
-        assertFalse("pencil must not be baked in pieces", frame(liveStroke(Tool.PENCIL, 300)).first)
-        assertTrue("no surface for pencil", factory.created.isEmpty())
+    @Test fun aPencilStrokeBakesItsSettledBands() {
+        val stroke = liveStroke(Tool.PENCIL, 300)
+        val (took, screen) = frame(stroke)
+        assertTrue("pencil should bake like any other opaque ink", took)
+        assertEquals("one raster blit for the baked run", 1, screen.rasterDests.size)
+        val ribbon = stroke.wetRibbon!!
+        val settled = ribbon.settledCount
+        val n = ribbon.pointCount
+        // The baked run tiles the settled slice [0, settled); the live tail tiles
+        // [settled - 1, n) — locals, since each run packs its own slice. The tail
+        // starts one point into the baked run, so bands meet on a shared station.
+        val bakedPainter = factory.created.last().painter
+        assertTrue("nothing baked", bakedPainter.unionRuns.isNotEmpty())
+        assertTrue("no live tail", screen.unionRuns.isNotEmpty())
+        assertEquals(settled, bakedPainter.unionRuns.maxOf { it.from + it.count })
+        assertEquals(n - settled + 1, screen.unionRuns.maxOf { it.from + it.count })
+        assertTrue("baked ink missing", bakedPainter.circles.isNotEmpty() || bakedPainter.ops.contains("fillPolygon"))
+        assertTrue("live ink missing", screen.circles.isNotEmpty() || screen.ops.contains("fillPolygon"))
+    }
+
+    /**
+     * Splitting a pencil run must not change a single graphite dot's tone: the settled run and
+     * the live tail, painted in two pieces, must use exactly the density/shade the whole-stroke
+     * repaint uses at every station. Both orders land on the same opaque pixels, so crossings
+     * cannot darken either.
+     */
+    @Test fun bakedPencilBandsMatchTheWholeStrokeStationByStation() {
+        val stroke = liveStroke(Tool.PENCIL, 300)
+        val ribbon = stroke.wetRibbon!!
+        val n = ribbon.pointCount
+        val split = n / 2
+        fun tones(runs: List<FakeRenderer.UnionRun>, base: Int): Map<Int, Pair<Double, Double>> {
+            val out = mutableMapOf<Int, Pair<Double, Double>>()
+            for (run in runs) {
+                for (i in run.from until run.from + run.count) {
+                    // Bands share their seam station: the earlier band paints it first with its
+                    // own tone and the later band repaints it (overwrite) — last writer wins,
+                    // which is the station's own band tone.
+                    out[base + i] = run.density to run.shade
+                }
+            }
+            return out
+        }
+        val whole = FakeRenderer()
+        stroke.paintPencilRuns(whole, ribbon, 0, n, stroke.renderColor)
+        val wholeMap = tones(whole.unionRuns, 0)
+        assertEquals((0 until n).toSet(), wholeMap.keys)
+        assertTrue("expected several pressure bands", whole.unionRuns.map { it.density to it.shade }.toSet().size > 1)
+        // The cache's split: settled run [0, split), live tail [split - 1, n).
+        val head = FakeRenderer()
+        stroke.paintPencilRuns(head, ribbon, 0, split, stroke.renderColor)
+        val tail = FakeRenderer()
+        stroke.paintPencilRuns(tail, ribbon, split - 1, n - (split - 1), stroke.renderColor)
+        val cached = tones(head.unionRuns, 0) + tones(tail.unionRuns, split - 1)
+        assertEquals(wholeMap.keys, cached.keys)
+        for ((station, tone) in wholeMap) {
+            assertEquals("density at $station", tone.first, cached.getValue(station).first, 0.0)
+            assertEquals("shade at $station", tone.second, cached.getValue(station).second, 0.0)
+        }
     }
 
     @Test fun theTaperPenKeepsThePlainRedraw() {

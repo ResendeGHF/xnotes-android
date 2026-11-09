@@ -1658,7 +1658,11 @@ class InteractionController(
         // floor when zoomed out. A fixed content-px gate discarded ever-finer detail the more you
         // zoomed in, so strokes drawn while zoomed faceted into ~zoom-px chords.
         val gate = (MIN_SAMPLE_DIST / state.zoom).coerceAtMost(MIN_SAMPLE_DIST)
-        if (force || last == null || Pt(last.x, last.y).manhattanTo(local) >= gate) {
+        // Manhattan distance inline: Pt.manhattanTo allocates a point per sample, and this runs
+        // once per pen sample at the display's full rate while drawing.
+        val farEnough = last == null ||
+            kotlin.math.abs(last.x - local.x) + kotlin.math.abs(last.y - local.y) >= gate
+        if (force || farEnough) {
             stroke.addSample(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()))
             if (stickyDrawTarget == null && stickyTarget == null) onStrokeSample?.invoke(pi, local.x, local.y, pressure.coerceIn(0.0, 1.0))
         }

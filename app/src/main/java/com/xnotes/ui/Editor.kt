@@ -147,6 +147,9 @@ import java.io.OutputStream
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -322,6 +325,9 @@ private const val SETTINGS_SAVE_DELAY_MS = 400L
 
 /** How many opened documents Recent remembers. */
 private const val RECENT_MAX = 40
+
+/** Recents resolved concurrently per chunk: bounds parallel SAF queries like the meta badges. */
+private const val RECENT_BATCH = 16
 
 /** How long the view must sit still before a PDF text selection's menu shows again. */
 private const val PDF_TEXT_MENU_SETTLE_MS = 250L
@@ -5846,29 +5852,47 @@ class Editor(
     }
 
     /**
-     * What Recent shows under [treeUri]: each document as it is now, when it was opened and the folder it's in.
-     * A document that has gone is dropped from Recent. One query per document; IO.
+     * Recents for [treeUri], newest storage order first. What Recent shows under [treeUri]:
+     * each document as it is now, when it was opened and the folder it's in. A document
+     * that has gone is dropped from Recent. Every document costs several SAF queries
+     * (id, stamp, name, parent, sidecar colors), so entries resolve concurrently in small
+     * chunks — a serial loop made Home wait one provider round-trip per recent, which is
+     * what made the start screen feel slow. Order is preserved; gone files are pruned.
      */
-    fun recentEntries(treeUri: String): List<RecentEntry> {
+    suspend fun recentEntries(treeUri: String): List<RecentEntry> {
         val tree = android.net.Uri.parse(treeUri)
         val colors = HashMap<String, Map<String, Rgba>>()
         val folders = HashMap<String, String?>()
-        val gone = ArrayList<String>()
-        val out = recentDocs.filter { isUnderTree(it.uri, treeUri) }.mapNotNull { r ->
-            val docId = runCatching { android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(r.uri)) }.getOrNull() ?: return@mapNotNull null
+        val gone = java.util.Collections.synchronizedList(ArrayList<String>())
+        suspend fun entryOf(r: com.xnotes.settings.RecentDoc): RecentEntry? {
+            val docId = runCatching { android.provider.DocumentsContract.getDocumentId(android.net.Uri.parse(r.uri)) }.getOrNull() ?: return null
             val uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, docId)
-            val stamp = stampOf(uri.toString()) ?: run { gone.add(r.uri); return@mapNotNull null }
+            val stamp = stampOf(uri.toString()) ?: run { gone.add(r.uri); return null }
             val name = queryDisplayName(uri) ?: r.name
             val parent = parentDocIdOf(uri.toString())
             val color = parent?.let { p ->
-                colors.getOrPut(p) { findChildDocId(tree, p, SIDECAR_DIR, dir = true)?.let { readSidecarColors(tree, it) }.orEmpty() }[name]
+                synchronized(colors) {
+                    colors.getOrPut(p) { findChildDocId(tree, p, SIDECAR_DIR, dir = true)?.let { readSidecarColors(tree, it) }.orEmpty() }
+                }[name]
             }
-            val where = parent?.let { p -> folders.getOrPut(p) { queryDisplayName(android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, p)) } }
-            val entry = BrowseEntry(
-                name, uri.toString(), false, stamp.size.coerceAtLeast(0), stamp.modified.coerceAtLeast(0),
-                createdStore.get(documentKey(uri.toString())) ?: 0, parent.orEmpty(), color,
+            val where = parent?.let { p ->
+                synchronized(folders) {
+                    folders.getOrPut(p) { queryDisplayName(android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, p)) }
+                }
+            }
+            return RecentEntry(
+                BrowseEntry(
+                    name, uri.toString(), false, stamp.size.coerceAtLeast(0), stamp.modified.coerceAtLeast(0),
+                    createdStore.get(documentKey(uri.toString())) ?: 0, parent.orEmpty(), color,
+                ),
+                r.opened, where,
             )
-            RecentEntry(entry, r.opened, where)
+        }
+        val mine = recentDocs.filter { isUnderTree(it.uri, treeUri) }
+        val out = kotlinx.coroutines.coroutineScope {
+            mine.chunked(RECENT_BATCH).flatMap { chunk ->
+                chunk.map { r -> async { runCatching { entryOf(r) }.getOrNull() } }.awaitAll().filterNotNull()
+            }
         }
         if (gone.isNotEmpty()) autosaveScope.launch { setRecents(recentDocs.filterNot { it.uri in gone }) }
         return out.distinctBy { it.entry.documentUri }
@@ -8653,18 +8677,20 @@ class Editor(
     }
 
     /** The pinned notes and canvases as the explorer lists them, dropping pins whose file is gone. IO. */
-    fun pinnedEntries(root: String): List<BrowseEntry> {
+    /**
+     * Pinned entries for [root], in pin order. One 4-column SAF query per pin, resolved
+     * concurrently in chunks like recents (serial pins stalled Home the same way).
+     */
+    suspend fun pinnedEntries(root: String): List<BrowseEntry> {
         val pins = notePins
         if (pins.isEmpty()) return emptyList()
         val tree = android.net.Uri.parse(root)
         val rootId = browseRootDocId(root)
         val colours = HashMap<String, Map<String, Rgba>>()
-        val kept = ArrayList<String>()
-        val out = ArrayList<BrowseEntry>()
-        for (path in pins) {
+        suspend fun entryOf(path: String): Pair<String, BrowseEntry>? {
             val id = "$rootId/$path"
             // Vault pins from before the seal stay out of the UI, and are pruned from the sidecar below.
-            if (isVaultPinPath(root, rootId, path)) continue
+            if (isVaultPinPath(root, rootId, path)) return null
             val uri = android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, id)
             val entry = runCatching {
                 appContext.contentResolver.query(
@@ -8681,19 +8707,25 @@ class Editor(
                     val name = c.getString(0) ?: return@use null
                     if (c.getString(1) == android.provider.DocumentsContract.Document.MIME_TYPE_DIR || !com.xnotes.core.util.DocumentKind.isDocument(name)) return@use null
                     val parentId = id.substringBeforeLast('/')
-                    val colour = colours.getOrPut(parentId) { sidecarDir(tree, parentId, create = false)?.let { readSidecarColors(tree, it) }.orEmpty() }[name]
+                    val colour = synchronized(colours) {
+                        colours.getOrPut(parentId) { sidecarDir(tree, parentId, create = false)?.let { readSidecarColors(tree, it) }.orEmpty() }
+                    }[name]
                     val modified = if (!c.isNull(3)) c.getLong(3) else 0L
                     BrowseEntry(
                         name, uri.toString(), false, if (!c.isNull(2)) c.getLong(2) else 0L, modified,
                         created = createdStore.get(documentKey(uri.toString())) ?: modified, parentDocId = parentId, color = colour,
                     )
                 }
-            }.getOrNull() ?: continue
-            kept += path
-            out += entry
+            }.getOrNull() ?: return null
+            return path to entry
         }
-        if (kept.size < pins.size) writeNotePins(root, kept)
-        return out
+        val out = kotlinx.coroutines.coroutineScope {
+            pins.chunked(RECENT_BATCH).flatMap { chunk ->
+                chunk.map { path -> async { runCatching { entryOf(path) }.getOrNull() } }.awaitAll().filterNotNull()
+            }
+        }
+        if (out.size < pins.size) writeNotePins(root, out.map { it.first })
+        return out.map { it.second }
     }
 
     /** Re-reads [colorNames] for the current root, which another device may have changed. IO. */
@@ -9157,6 +9189,27 @@ class Editor(
                         browseRootName(root)
                         browseChildren(root, browseRootDocId(root))
                     }
+                }
+            }
+        }
+        prewarmLinkGraph()
+    }
+
+    private var linkPrewarmJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Warm the link index in the background (list once, scan changed files only) so the first
+     * Graph open paints its cached nodes and edges instantly and its silent rescan finds
+     * nothing left to do. Single-flight: overlapping calls collapse into the running pass.
+     */
+    fun prewarmLinkGraph() {
+        if (linkPrewarmJob?.isActive == true) return
+        linkPrewarmJob = autosaveScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val root = browseRoot ?: return@runCatching
+                    val listed = listGraphNotes() ?: return@runCatching
+                    refreshLinkGraph(listed)
                 }
             }
         }

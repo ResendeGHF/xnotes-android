@@ -554,6 +554,7 @@ class DocumentCodec(
         j.beginObject()
         j.name("kind").value(ownKind ?: ShapeItem.KIND)
         id?.let { j.name("id").value(it) }
+        if (s.uid.isNotEmpty()) j.name("uid").value(s.uid)
         j.name("shape").value(s.legacyId())
         j.name("start").beginArray().value(drawn?.left ?: s.start.x).value(drawn?.top ?: s.start.y).endArray()
         j.name("end").beginArray().value(drawn?.right ?: s.end.x).value(drawn?.bottom ?: s.end.y).endArray()
@@ -1534,7 +1535,9 @@ class DocumentCodec(
             )
             ShapeItem.KIND, ShapeItem.GLYPHS_KIND, ShapeItem.FILL_KIND -> {
                 val c = s.connector
-                items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s))
+                items.add(if (c != null && s.kind == ShapeItem.KIND) buildConnector(s, c, glue) else buildShape(s).also {
+                    it.uid = s.uid?.takeIf { it.isNotEmpty() } ?: legacyUid("shape", it, items.size)
+                })
             }
             TableItem.KIND -> buildTable(s)?.let { t ->
             t.uid = s.uid?.takeIf { it.isNotEmpty() } ?: legacyUid("table", t, items.size)

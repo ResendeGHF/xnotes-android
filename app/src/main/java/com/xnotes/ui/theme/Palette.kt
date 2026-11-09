@@ -37,6 +37,19 @@ data class Palette(
     val selectionBackground: Rgba get() = materialColors.primaryContainer
     val selectionForeground: Rgba get() = materialColors.onPrimaryContainer
 
+    /**
+     * Accent-derived tone behind tab strips. The tabs are rounded chips with gaps between them;
+     * without a backing those gaps — and the corners outside each tab's rounding — show the
+     * default background (#000000 on OLED). This fills the strip's whole bounds (rectangular,
+     * never clipped) with a tone derived from the current accent, so the spacing around and
+     * between the tabs reads as the accent's own colour: e.g. a blue accent sits on dark blue,
+     * never on black. Dark themes deepen the accent hard (labels and the selection pill stay
+     * readable on it); light themes tint the strip toward the accent instead, where a dark
+     * fill would swallow the dark tab labels.
+     */
+    val tabStripBackground: Rgba
+        get() = if (isDark) ColorMath.darken(accent, 0.85) else ColorMath.mix(accent, bg, 0.85)
+
     /** Material's disabled content: onSurface at 38%. */
     val disabled: Rgba get() = materialColors.onSurface.withAlpha(97)
 

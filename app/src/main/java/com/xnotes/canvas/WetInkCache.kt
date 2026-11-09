@@ -70,12 +70,9 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
     fun paint(r: Renderer, stroke: Stroke, res: Double, maxPixels: Long): Boolean {
         val ribbon = stroke.wetRibbon ?: return false
         if (!stroke.wetCacheable) return false
-        // The pencil repaints whole every frame instead: its bands replace
-        // each other inside one isolating layer, which only works when the
-        // settled runs and the tail paint together. A baked settled run with
-        // a composited tail over it would darken where the stroke crosses
-        // itself, exactly what the layer exists to prevent.
-        if (stroke.tool == Tool.PENCIL) return false
+        // Bands split on stations shared verbatim by neighbouring runs (see paintPencilRuns),
+        // so a baked settled run and the live tail over it agree exactly: the pencil bakes
+        // like any other opaque ink instead of refilling its whole ribbon every frame.
         if (owner !== stroke || abs(this.res - res) > 1e-9) {
             owner = stroke
             this.res = res
@@ -189,9 +186,14 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
     companion object {
         private val TRANSPARENT = Rgba(0, 0, 0, 0)
 
-        /** Below this the stroke redraws whole: a short one costs nothing, and a surface for it is
-         *  memory and a blit spent to save a few dozen discs. */
-        const val MIN_BAKE_POINTS = 48
+        /**
+         * Below this the stroke redraws whole: a short one costs nothing, and a surface for it is
+         * memory and a blit spent to save a couple dozen discs. Bakes from 24 points: past that
+         * the per-frame refill of the whole ribbon costs more than one blit, so live feedback
+         * stays locked to the display refresh instead of trailing the pen. Baking is exact for
+         * cacheable (opaque, non-neon) ink, so the pixels are identical either way.
+         */
+        const val MIN_BAKE_POINTS = 24
 
         /** Page-px slack around the ink, so an ordinary stroke outgrows its surface a handful of
          *  times rather than on every sample. Capped at the top end because a stroke that already
