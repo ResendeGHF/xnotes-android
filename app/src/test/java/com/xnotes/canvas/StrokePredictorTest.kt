@@ -1,7 +1,9 @@
 package com.xnotes.canvas
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StrokePredictorTest {
@@ -29,6 +31,19 @@ class StrokePredictorTest {
 
     @Test fun teleportPredictsNothing() {
         assertNull(StrokePredictor.predict(0.0, 0.0, 0.0, 10000.0, 0.0, 10.0, maxLead = 1e9))
+    }
+
+    @Test fun commitTipNeedsAForwardExtensionWithinReach() {
+        // Straight continuation just past the nib: commit it.
+        assertTrue(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 108.0, 0.0, maxLead = 12.0))
+        // A tip behind the nib (the hand outran an old prediction): never commit.
+        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 90.0, 0.0, maxLead = 12.0))
+        // Too far away to be this stroke's tip: stale or a glitch.
+        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 200.0, 0.0, maxLead = 12.0))
+        // Sideways, not forward: a turn the gating already killed, or noise.
+        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 100.0, 8.0, maxLead = 12.0))
+        // Zero-length: nothing to commit.
+        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 100.0, 0.0, maxLead = 12.0))
     }
 
     @Test fun nonFiniteInputPredictsNothing() {

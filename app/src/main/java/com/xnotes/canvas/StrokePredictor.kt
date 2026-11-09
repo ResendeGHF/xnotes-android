@@ -32,6 +32,27 @@ object StrokePredictor {
     const val MIN_LEAD_UNITS = 0.5
 
     /**
+     * Whether committing [tip] keeps what-you-see-is-what-you-get: it extends the
+     * stroke from its last sample ([lx],[ly]) past [px],[py], within [maxLead]
+     * content units, and strictly forward — never a hook back over ink already
+     * laid down (that happens when the hand outran an old prediction).
+     */
+    fun shouldCommitTip(
+        px: Double, py: Double,
+        lx: Double, ly: Double,
+        tx: Double, ty: Double,
+        maxLead: Double,
+    ): Boolean {
+        if (!px.isFinite() || !py.isFinite() || !lx.isFinite() || !ly.isFinite()) return false
+        if (!tx.isFinite() || !ty.isFinite() || !maxLead.isFinite() || maxLead <= 0.0) return false
+        val dx = tx - lx
+        val dy = ty - ly
+        val dist = kotlin.math.hypot(dx, dy)
+        if (!dist.isFinite() || dist <= 0.0 || dist > maxLead + 1e-6) return false
+        return (lx - px) * dx + (ly - py) * dy > 0.0
+    }
+
+    /**
      * Extrapolate from the last two samples ([x1],[y1] at [t1] after [x0],[y0]
      * at [t0], milliseconds) up to [LEAD_MS] ahead, clamped to [maxLead]
      * content units. No deceleration history: full lead. Null when there is

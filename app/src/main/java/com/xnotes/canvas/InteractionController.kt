@@ -1831,8 +1831,14 @@ class InteractionController(
                     stickyDrawTarget = null
                     stickyDrawBefore = null
                 }
-                stickyDrawTarget != null && pi == stickyDrawPage -> fileStickyStroke(stroke, stickyDrawTarget!!, stickyDrawPage, stickyDrawBefore ?: emptyList())
-                else -> pushStrokeEdit(fileStroke(stroke, pi))
+                stickyDrawTarget != null && pi == stickyDrawPage -> {
+                    commitPresentedTip(stroke, e.eventTime)
+                    fileStickyStroke(stroke, stickyDrawTarget!!, stickyDrawPage, stickyDrawBefore ?: emptyList())
+                }
+                else -> {
+                    commitPresentedTip(stroke, e.eventTime)
+                    pushStrokeEdit(fileStroke(stroke, pi))
+                }
             }
         }
         // Nothing was committed here (a dismissing tap, or ephemeral ink), but a crossing may
@@ -1855,6 +1861,28 @@ class InteractionController(
             refreshSelectionMenu()
         }
         requestRender()
+    }
+
+    /**
+     * Commit the last presented prediction tip as a real final sample, so ink
+     * shown live never vanishes on commit. Only a forward continuation within
+     * reach is kept: a tip behind the nib (the hand outran an old prediction)
+     * or off to the side is dropped, and the showing frame already covers it.
+     */
+    private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
+        val tip = frontInk?.lastPresentedTip ?: return
+        val n = stroke.sampleCount
+        if (n < 2 || stroke.tool == com.xnotes.core.tools.Tool.DASHED) return
+        val zoom = state.zoom
+        if (!zoom.isFinite() || zoom <= 0.0) return
+        val maxLead = com.xnotes.canvas.StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
+        if (!com.xnotes.canvas.StrokePredictor.shouldCommitTip(
+                stroke.xAt(n - 2), stroke.yAt(n - 2),
+                stroke.xAt(n - 1), stroke.yAt(n - 1),
+                tip.x, tip.y, maxLead,
+            )
+        ) return
+        stroke.addSample(Sample(tip.x, tip.y, stroke.pAt(n - 1), (upTimeMs - strokeStartTimeMs).toDouble()))
     }
 
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport

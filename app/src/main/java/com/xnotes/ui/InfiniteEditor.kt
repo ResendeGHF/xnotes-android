@@ -130,6 +130,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         configFor = { configFor(it) },
         onWetStroke = { publishWetStroke(it) },
         onCommitStroke = { commitStroke(it) },
+        presentedTip = { lastPresentedTip },
         onScribbleErase = { stroke, taken -> commitScribbleErase(stroke, taken) },
         onEraseBegin = { EraseSession(document) },
         onEraseEnd = { commitErase(it) },
@@ -2115,6 +2116,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         // is corrected by the next sample, so it can never corrupt the stroke.
         val predicted = predictedTailPart(stroke, ribbon, wetTol)
         val tailed = if (predicted == null) parts else parts + predicted
+        if (predicted == null) lastPresentedTip = null
         val tailedBounds = if (predicted == null) bounds else bounds.outset(predictLeadContent())
         if (frontInk) pad.setTail(tailed) else scene.setWetTail(tailed, tailedBounds)
         scene.noteWetMesh((System.nanoTime() - meshStartNs) / 1_000_000.0)
@@ -2136,6 +2138,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         return if (!z.isFinite() || z <= 0.0) 0.0
         else com.xnotes.canvas.StrokePredictor.MAX_LEAD_SCREEN_PX / z
     }
+
+    /**
+     * The tip the last presented tail showed past the nib, or null when the tail
+     * went out plain. Read back at pen-up so the commit keeps shown ink: what
+     * you saw is what the stroke keeps. Set wherever a predicted tail presents;
+     * cleared wherever a plain tail presents.
+     */
+    var lastPresentedTip: com.xnotes.core.geometry.Pt? = null
+        private set
 
     /**
      * A one-segment mesh from the nib toward where it is heading, for plain opaque
@@ -2171,6 +2182,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     ): com.xnotes.core.infinite.MeshPart? {
         if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
         if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
+        lastPresentedTip = null
         val n = ribbon.pointCount
         if (n < 2) return null
         if (maxLead <= 0.0) return null
@@ -2194,6 +2206,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         builder.polylineRibbon(listOf(Pt(stroke.xAt(n - 1), stroke.yAt(n - 1)), head), hw, false, tolerance)
         val mesh = builder.build()
         if (mesh.isEmpty) return null
+        lastPresentedTip = head
         val part = com.xnotes.core.infinite.MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
         return if (invertInk) part.inverted() else part
     }
@@ -2237,6 +2250,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Re-mesh the live tail without prediction and present it. */
     private fun refreshWetTail(stroke: Stroke) {
+        lastPresentedTip = null
         val ribbon = stroke.wetRibbon ?: return
         if (wetOwner !== stroke) return
         val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
@@ -2398,6 +2412,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         wholeMeshStroke = null
         predictGen++
         predictStroke = null
+        lastPresentedTip = null
         mainHandler.removeCallbacks(dropPrediction)
     }
 
@@ -3070,14 +3085,11 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             }
         }
         // The commit message releases the wet buffers on the GL thread, so forget what was in them.
+        // The last presented prediction was committed into the stroke itself (see
+        // commitPresentedTip), so the mesh arriving here already ends where the wet
+        // tail did: nothing shown vanishes.
         val tail = wetTail
         val front = frontInk
-        // Present the tail without prediction first (must run before forgetWetStroke
-        // below disarms the prediction state): the commit clears the wet buffers in
-        // the same message the stroke arrives in, so any frame drawn after this one
-        // already matches the committed ink. When the GL thread coalesces, this is a
-        // no-op and the prediction gating is what keeps the last frame honest.
-        if (!front && predictStroke === stroke) refreshWetTail(stroke)
         forgetWetStroke()
         frontInk = false
         if (!front) {

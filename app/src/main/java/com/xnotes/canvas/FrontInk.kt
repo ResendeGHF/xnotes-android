@@ -169,6 +169,7 @@ class FrontInk(
         // Pixels-only lookahead past the nib, corrected by the next sample; plain opaque
         // ink only, so dash rhythm is never faked (the pad only hosts opaque runs anyway).
         val predicted = predictedTailPart(stroke, ribbon, pageIndex)
+        if (predicted == null) lastPresentedTip = null
         pad.setTail(if (predicted == null) tailParts else tailParts + predicted)
         // A prediction with no follow-up samples is stale ink: shrink it back onto
         // the nib a step at a time so a held pen never keeps showing a tip the
@@ -201,6 +202,7 @@ class FrontInk(
         tailPart = tail
         val tailParts = listOf(if (invert) tail.inverted() else tail)
         val predicted = predictedTailPart(stroke, ribbon, predictPage, predictLeadLeft)
+        if (predicted == null) lastPresentedTip = null
         pad.setTail(if (predicted == null) tailParts else tailParts + predicted)
         view.requestRender()
         if (predicted != null) handler.postDelayed(dropPrediction, PREDICT_TICK_MS)
@@ -221,6 +223,10 @@ class FrontInk(
      * deceleration and with turning, so a stopping or turning pen converges
      * instead of overshooting into ink that vanishes on commit.
      */
+    /** The tip the last presented tail showed past the nib, or null when it went out plain. */
+    var lastPresentedTip: Pt? = null
+        private set
+
     private fun predictedTailPart(stroke: Stroke, ribbon: com.xnotes.core.stroke.RibbonPoints, pageIndex: Int): MeshPart? {
         if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
         return predictedTailPart(stroke, ribbon, pageIndex, leadForPage(pageIndex))
@@ -258,6 +264,7 @@ class FrontInk(
         )
         val mesh = builder.build()
         if (mesh.isEmpty) return null
+        lastPresentedTip = head
         val part = MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
         return if (invert) part.inverted() else part
     }
@@ -266,6 +273,7 @@ class FrontInk(
     private fun disarmPrediction() {
         predictGen++
         predictStroke = null
+        lastPresentedTip = null
         handler.removeCallbacks(dropPrediction)
     }
 

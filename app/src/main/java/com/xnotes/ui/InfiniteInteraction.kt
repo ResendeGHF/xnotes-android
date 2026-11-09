@@ -9,6 +9,7 @@ import com.xnotes.canvas.HandleId
 import com.xnotes.canvas.InteractionController
 import com.xnotes.canvas.ResizeMath
 import com.xnotes.canvas.SelectionMath
+import com.xnotes.canvas.StrokePredictor
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Pt
@@ -74,6 +75,11 @@ class InfiniteInteraction(
     private val onWetStroke: (Stroke?) -> Unit = {},
     /** Pen up on a finished stroke: add it to the document and push the undo command. */
     private val onCommitStroke: (Stroke) -> Unit = {},
+    /**
+     * The tip the live feedback last showed past the nib, if any. Read back at
+     * pen-up so the commit keeps shown ink: what you saw is what the stroke keeps.
+     */
+    private val presentedTip: () -> Pt? = { null },
     /** Pen up on a scribble over ink: take what it touched off, the scribble with it. */
     private val onScribbleErase: (Stroke, List<CanvasItem>) -> Unit = { _, _ -> },
     /** Begin an eraser drag; the host owns the document and the undo stack. */
@@ -1024,7 +1030,32 @@ class InfiniteInteraction(
         stroke.finished = true
         simplifyForCommit(stroke)
         if (scribbleErase(stroke)) return
+        commitPresentedTip(stroke, e.eventTime)
         onCommitStroke(stroke)
+    }
+
+    /**
+     * Commit the last presented prediction tip as a real final sample, so ink
+     * shown live never vanishes on commit. Only a forward continuation within
+     * reach is kept: a tip behind the nib (the hand outran an old prediction)
+     * or off to the side is dropped, and the showing frame already covers it.
+     */
+    private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
+        val tip = presentedTip() ?: return
+        val n = stroke.sampleCount
+        if (n < 2 || stroke.tool == Tool.DASHED) return
+        val zoom = viewport.zoom
+        if (!zoom.isFinite() || zoom <= 0.0) return
+        val maxLead = StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
+        if (!StrokePredictor.shouldCommitTip(
+                stroke.xAt(n - 2), stroke.yAt(n - 2),
+                stroke.xAt(n - 1), stroke.yAt(n - 1),
+                tip.x, tip.y, maxLead,
+            )
+        ) return
+        stroke.addSample(
+            com.xnotes.core.stroke.Sample(tip.x, tip.y, stroke.pAt(n - 1), (upTimeMs - strokeStartTimeMs).toDouble()),
+        )
     }
 
     /** Scribble to erase: when [stroke] reads as a scribble over ink, erase that instead of committing it. */
