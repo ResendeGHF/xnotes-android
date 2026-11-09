@@ -41,9 +41,10 @@ object StrokePredictor {
     ): Pt? = predictCore(x0, y0, t0, x1, y1, t1, maxLead, ratio = 1.0)
 
     /**
-     * Three-point form: the lead scales with the deceleration from segment
-     * 0→1 to segment 1→2, so a pen that is stopping converges onto its real
-     * position instead of overshooting into ink that vanishes on commit.
+     * Three-point form: the lead shrinks with deceleration and with turning, so a
+     * stopping pen converges onto its real position and a pen whipping around a
+     * corner does not fire a spike off in the old direction — either would paint
+     * ink that vanishes on commit.
      */
     fun predict(
         x0: Double, y0: Double, t0: Double,
@@ -56,8 +57,30 @@ object StrokePredictor {
         if (!vPrev.isFinite()) return null
         // Was stopped, now moving: full lead. Stopping: shrink toward nothing.
         val vLast = lastSpeed(x1, y1, t1, x2, y2, t2) ?: return null
-        val ratio = (vLast / vPrev.coerceAtLeast(1e-9)).coerceIn(0.0, 1.0)
+        // Turning scrubs the lead: only the component still heading where the
+        // hand is going is safe to draw ahead.
+        val align = alignment(x0, y0, x1, y1, x2, y2)
+        val ratio = (vLast / vPrev.coerceAtLeast(1e-9)).coerceIn(0.0, 1.0) * align
         return predictCore(x1, y1, t1, x2, y2, t2, maxLead, ratio)
+    }
+
+    /**
+     * How much of the last segment still heads the way the previous one did,
+     * as clamped cosine similarity: 1 straight on, 0 at a right angle or more.
+     */
+    private fun alignment(
+        x0: Double, y0: Double,
+        x1: Double, y1: Double,
+        x2: Double, y2: Double,
+    ): Double {
+        val ax = x1 - x0
+        val ay = y1 - y0
+        val bx = x2 - x1
+        val by = y2 - y1
+        val na = kotlin.math.hypot(ax, ay)
+        val nb = kotlin.math.hypot(bx, by)
+        if (!na.isFinite() || !nb.isFinite() || na <= 0.0 || nb <= 0.0) return 1.0
+        return ((ax * bx + ay * by) / (na * nb)).coerceIn(0.0, 1.0)
     }
 
     private fun lastSpeed(

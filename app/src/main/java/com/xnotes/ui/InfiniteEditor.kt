@@ -3028,8 +3028,14 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         }
         // The commit message releases the wet buffers on the GL thread, so forget what was in them.
         val tail = wetTail
-        forgetWetStroke()
         val front = frontInk
+        // Present the tail without prediction first (must run before forgetWetStroke
+        // below disarms the prediction state): the commit clears the wet buffers in
+        // the same message the stroke arrives in, so any frame drawn after this one
+        // already matches the committed ink. When the GL thread coalesces, this is a
+        // no-op and the prediction gating is what keeps the last frame honest.
+        if (!front && predictStroke === stroke) refreshWetTail(stroke)
+        forgetWetStroke()
         frontInk = false
         if (!front) {
             if (wandEnabled && stroke.tool.isStroke) holdEphemeral(stroke) else commitItem(stroke)

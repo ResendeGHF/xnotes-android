@@ -55,6 +55,21 @@ class StrokePredictorTest {
         assertNull(StrokePredictor.predict(0.0, 0.0, 0.0, 100.0, 0.0, 10.0, 100.1, 0.0, 20.0, maxLead = 20.0))
     }
 
+    @Test fun sharpTurnSuppressesPrediction() {
+        // Full speed into a right angle: nothing ahead is safe to draw.
+        assertNull(StrokePredictor.predict(0.0, 0.0, 0.0, 100.0, 0.0, 10.0, 100.0, 100.0, 20.0, maxLead = 1e9))
+    }
+
+    @Test fun gentleCurveKeepsScaledLead() {
+        // 45 degrees keeps cos(45deg) of the lead.
+        val straight = StrokePredictor.predict(0.0, 0.0, 0.0, 100.0, 0.0, 10.0, 200.0, 0.0, 20.0, maxLead = 1e9)!!
+        val turn = StrokePredictor.predict(0.0, 0.0, 0.0, 100.0, 0.0, 10.0, 200.0, 100.0, 20.0, maxLead = 1e9)!!
+        assertEquals(280.0, straight.x, 1e-9)
+        val lead = 8.0 * 0.70710678
+        assertEquals(200.0 + 10.0 * lead, turn.x, 0.01)
+        assertEquals(100.0 + 10.0 * lead, turn.y, 0.01)
+    }
+
     @Test fun degenerateThreePointTimingPredictsNothing() {
         assertNull(StrokePredictor.predict(0.0, 0.0, 10.0, 1.0, 0.0, 10.0, 2.0, 0.0, 11.0, maxLead = 20.0))
     }
