@@ -2065,10 +2065,20 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         if (ribbon == null || !stroke.wetCacheable) {
             endFrontInk()
             forgetWetStroke()
-            val meshed = ItemMesher.mesh(stroke) ?: return
-            // Every run, not just the first: a neon stroke is a halo, a lit body and a white core,
-            // and keeping only one of them left the wet stroke invisible until the pen lifted.
-            scene.setWetParts(invertParts(meshed.parts), meshed.bounds)
+            // Neon, translucent and taper ink is meshed whole every sample, so a fast
+            // event stream re-tessellates the entire stroke per event. Collapse meshes
+            // closer together than a frame: the drawn mesh goes at most one frame stale,
+            // with identical pixels, whatever the digitizer rate.
+            val wholeStartNs = System.nanoTime()
+            if (wholeMeshStroke !== stroke || wholeStartNs - lastWholeMeshNs >= WHOLE_MESH_MIN_NS) {
+                val meshed = ItemMesher.mesh(stroke) ?: return
+                // Every run, not just the first: a neon stroke is a halo, a lit body and a white core,
+                // and keeping only one of them left the wet stroke invisible until the pen lifted.
+                scene.setWetParts(invertParts(meshed.parts), meshed.bounds)
+                wholeMeshStroke = stroke
+                lastWholeMeshNs = wholeStartNs
+                scene.noteWetMesh((System.nanoTime() - wholeStartNs) / 1_000_000.0)
+            }
             return
         }
         if (wetOwner !== stroke) {
@@ -2108,6 +2118,14 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val tailedBounds = if (predicted == null) bounds else bounds.outset(predictLeadContent())
         if (frontInk) pad.setTail(tailed) else scene.setWetTail(tailed, tailedBounds)
         scene.noteWetMesh((System.nanoTime() - meshStartNs) / 1_000_000.0)
+        // A prediction with no follow-up samples is stale ink: retract it so a held
+        // pen never keeps showing a tip the commit would take away.
+        mainHandler.removeCallbacks(dropPrediction)
+        if (predicted != null) {
+            predictArmGen = predictGen
+            predictStroke = stroke
+            mainHandler.postDelayed(dropPrediction, PREDICT_HOLD_MS)
+        }
     }
 
     /** Content units the prediction may reach: a fixed on-screen distance whatever the zoom. */
@@ -2120,7 +2138,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     /**
      * A one-segment mesh from the nib toward where it is heading, for plain opaque
      * ink only: pencil tone, dash rhythm and neon blooms cannot be faked for a frame
-     * without showing, so those tools keep the un-predicted tail.
+     * without showing, so those tools keep the un-predicted tail. The lead shrinks
+     * with deceleration, so a stopping pen converges onto its real position instead
+     * of overshooting into ink that vanishes on commit.
      */
     private fun predictedTailPart(
         stroke: Stroke,
@@ -2133,11 +2153,20 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         if (n < 2) return null
         val lead = predictLeadContent()
         if (lead <= 0.0) return null
-        val head = com.xnotes.canvas.StrokePredictor.predict(
-            stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
-            stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-            lead,
-        ) ?: return null
+        val head = if (n >= 3) {
+            com.xnotes.canvas.StrokePredictor.predict(
+                stroke.xAt(n - 3), stroke.yAt(n - 3), stroke.tAt(n - 3),
+                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
+                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
+                lead,
+            )
+        } else {
+            com.xnotes.canvas.StrokePredictor.predict(
+                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
+                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
+                lead,
+            )
+        } ?: return null
         val hw = ribbon.hw(n - 1)
         if (!hw.isFinite() || hw <= 0.0) return null
         val builder = com.xnotes.core.infinite.MeshBuilder()
@@ -2146,6 +2175,34 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         if (mesh.isEmpty) return null
         val part = com.xnotes.core.infinite.MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
         return if (invertInk) part.inverted() else part
+    }
+
+    /**
+     * Retract a stale prediction: with no new samples the tail is re-meshed plain
+     * so a pen held still never keeps showing ink past its nib, which would snap
+     * back on commit. Armed only while a prediction is on screen; any new sample,
+     * stroke change or commit disarms it.
+     */
+    private var predictGen = 0
+    private var predictArmGen = -1
+    private var predictStroke: Stroke? = null
+    private val dropPrediction = Runnable {
+        val stroke = predictStroke
+        if (stroke == null || predictArmGen != predictGen || wetOwner !== stroke) return@Runnable
+        refreshWetTail(stroke)
+    }
+
+    /** Re-mesh the live tail without prediction and present it. */
+    private fun refreshWetTail(stroke: Stroke) {
+        val ribbon = stroke.wetRibbon ?: return
+        if (wetOwner !== stroke) return
+        val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
+        val tailFrom = (wetMeshed - 1).coerceAtLeast(0)
+        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, wetArc, wetTol) ?: return
+        val parts = listOf(if (invertInk) tail.inverted() else tail)
+        wetTail = parts
+        if (frontInk) pad.setTail(parts) else scene.setWetTail(parts, stroke.paintBounds())
+        requestRender()
     }
 
     /**
@@ -2295,7 +2352,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         wetMeshed = 0
         wetArc = 0.0
         wetTail = emptyList()
+        wholeMeshStroke = null
+        predictGen++
+        predictStroke = null
+        mainHandler.removeCallbacks(dropPrediction)
     }
+
+    /** A whole wet mesh at most this often; closer events reuse the mesh in flight. */
+    private var wholeMeshStroke: Stroke? = null
+    private var lastWholeMeshNs = 0L
 
     /**
      * Rebuild the chrome drawn over the content: the selection box and handles, or whichever
@@ -3559,6 +3624,16 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
         /** Lod settle delay: zoom-out downgrades wait for the camera to stop, like text. */
         const val LOD_REFINE_DELAY_MS = 250L
+
+        /**
+         * A meshed-whole wet stroke re-meshes at most this often: faster samples
+         * reuse the mesh already posted, so the tessellation cost per second stays
+         * flat whatever the digitizer rate.
+         */
+        const val WHOLE_MESH_MIN_NS = 8_000_000L
+
+        /** How long a prediction may sit on screen with no new samples before it is retracted. */
+        const val PREDICT_HOLD_MS = 60L
 
         /** Strokes re-meshed per frame by the settle refinement, to never stall a frame. */
         const val LOD_REFINE_BATCH = 12
