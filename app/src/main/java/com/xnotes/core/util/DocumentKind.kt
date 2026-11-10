@@ -41,8 +41,13 @@ enum class DocumentKind(val extension: String, private val legacyExtensions: Lis
             return name.dropLast(hit.length)
         }
 
-        /** [name] with [kind]'s extension, added only if it is not already the right one. */
-        fun withSuffix(name: String, kind: DocumentKind): String =
-            if (name.endsWith(kind.suffix, ignoreCase = true)) name else "$name${kind.suffix}"
+        /** [name] with [kind]'s extension, added only if it is not already the right
+         *  one (a legacy extension of the same kind migrates to the new one; another
+         *  kind's is left alone). */
+        fun withSuffix(name: String, kind: DocumentKind): String {
+            if (name.endsWith(kind.suffix, ignoreCase = true)) return name
+            val base = if (ofName(name) == kind) stripSuffix(name) else name
+            return "$base${kind.suffix}"
+        }
     }
 }

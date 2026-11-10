@@ -36,14 +36,20 @@ class StrokePredictorTest {
     @Test fun commitTipNeedsAForwardExtensionWithinReach() {
         // Straight continuation just past the nib: commit it.
         assertTrue(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 108.0, 0.0, maxLead = 12.0))
-        // A tip behind the nib (the hand outran an old prediction): never commit.
+        // A tip behind the nib on the drawn path is already covered: nothing would vanish.
         assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 90.0, 0.0, maxLead = 12.0))
         // Too far away to be this stroke's tip: stale or a glitch.
         assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 200.0, 0.0, maxLead = 12.0))
-        // Sideways, not forward: a turn the gating already killed, or noise.
-        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 100.0, 8.0, maxLead = 12.0))
+        // Off to the side but within reach: it was shown, so the commit keeps it.
+        assertTrue(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 100.0, 8.0, maxLead = 12.0))
         // Zero-length: nothing to commit.
         assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 100.0, 0.0, 100.0, 0.0, maxLead = 12.0))
+        // Covered mid-segment: already drawn, appending would only double-draw.
+        assertFalse(StrokePredictor.shouldCommitTip(0.0, 0.0, 10.0, 0.0, 5.0, 0.3, maxLead = 12.0))
+        // Degenerate last segment (pen held still): a tip just ahead still commits.
+        assertTrue(StrokePredictor.shouldCommitTip(50.0, 0.0, 50.0, 0.0, 54.0, 0.0, maxLead = 12.0))
+        // A turn after the last sample: the shown tip is kept, not snapped away.
+        assertTrue(StrokePredictor.shouldCommitTip(0.0, 0.0, 10.0, 0.0, 16.0, 6.0, maxLead = 12.0))
     }
 
     @Test fun nonFiniteInputPredictsNothing() {

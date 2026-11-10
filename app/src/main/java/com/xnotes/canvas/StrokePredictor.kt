@@ -34,8 +34,11 @@ object StrokePredictor {
     /**
      * Whether committing [tip] keeps what-you-see-is-what-you-get: it extends the
      * stroke from its last sample ([lx],[ly]) past [px],[py], within [maxLead]
-     * content units, and strictly forward — never a hook back over ink already
-     * laid down (that happens when the hand outran an old prediction).
+     * content units. A tip the committed stroke already covers needs nothing:
+     * appending it could only double-draw or hook back over laid ink (that is
+     * what the hand outrunning an old prediction looks like), and the showing
+     * frame already matches. Anything shown beyond reach is either stale or a
+     * glitch and is dropped the same way.
      */
     fun shouldCommitTip(
         px: Double, py: Double,
@@ -45,11 +48,34 @@ object StrokePredictor {
     ): Boolean {
         if (!px.isFinite() || !py.isFinite() || !lx.isFinite() || !ly.isFinite()) return false
         if (!tx.isFinite() || !ty.isFinite() || !maxLead.isFinite() || maxLead <= 0.0) return false
+        val cover = (maxLead * COVER_FRACTION).coerceAtLeast(MIN_COVER_PX)
         val dx = tx - lx
         val dy = ty - ly
         val dist = kotlin.math.hypot(dx, dy)
-        if (!dist.isFinite() || dist <= 0.0 || dist > maxLead + 1e-6) return false
-        return (lx - px) * dx + (ly - py) * dy > 0.0
+        if (!dist.isFinite() || dist <= 0.0 || dist > maxLead + cover) return false
+        // Already drawn by the committed stroke: nothing would vanish by leaving it out.
+        return distPointToSegment(tx, ty, px, py, lx, ly) > cover
+    }
+
+    /** Fraction of the lead within which shown ink counts as already committed. */
+    private const val COVER_FRACTION = 0.15
+
+    /** Floor for the same, in content units, so it never vanishes at high zoom. */
+    private const val MIN_COVER_PX = 0.5
+
+    private fun distPointToSegment(
+        px: Double, py: Double,
+        ax: Double, ay: Double,
+        bx: Double, by: Double,
+    ): Double {
+        val dx = bx - ax
+        val dy = by - ay
+        val len2 = dx * dx + dy * dy
+        if (!(len2 > 0.0)) return kotlin.math.hypot(px - ax, py - ay)
+        val t = (((px - ax) * dx + (py - ay) * dy) / len2).coerceIn(0.0, 1.0)
+        val cx = ax + t * dx
+        val cy = ay + t * dy
+        return kotlin.math.hypot(px - cx, py - cy)
     }
 
     /**
