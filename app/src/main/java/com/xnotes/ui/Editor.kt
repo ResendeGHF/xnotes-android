@@ -9463,6 +9463,34 @@ class Editor(
         warmColorIndex()
     }
 
+    /** For the launch placeholder: synchronously warm the first folder so the
+     *  first Backstage paint already has names, vault gate and metadata. Used
+     *  by MainActivity while the Lottie loader is still showing, so the user
+     *  never sees a "Loading" flash or late metadata pop-in after the animation.
+     *  Thumbnails are permissive and still load on demand. */
+    suspend fun awaitInitialListing() = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        runCatching {
+            val root = browseRoot ?: return@withContext
+            val docId = browseRootDocId(root)
+            browseRootName(root)
+            val children = browseChildren(root, docId)
+            vaultHere(root, docId)
+            // Warm metadata for the first page of documents so counts/badges
+            // are already cached when Backstage's first frame paints.
+            // Vault items are excluded (docMetaFor returns null for folders).
+            for (e in children.take(60)) {
+                if (!e.isDir && com.xnotes.core.util.DocumentKind.isDocument(e.name) && cachedMeta(e) == null) {
+                    runCatching { docMetaFor(e) }
+                }
+            }
+            // Warm folder counts for the first folders so the "N items" line
+            // is already cached alongside the names.
+            for (f in children.filter { it.isDir }.take(30)) {
+                runCatching { folderItemCount(root, f) }
+            }
+        }
+    }
+
     private var linkPrewarmJob: kotlinx.coroutines.Job? = null
 
     /**

@@ -96,11 +96,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.airbnb.lottie.compose.LottieAnimation
-import com.airbnb.lottie.compose.LottieCompositionSpec
-import com.airbnb.lottie.compose.LottieConstants
-import com.airbnb.lottie.compose.animateLottieCompositionAsState
-import com.airbnb.lottie.compose.rememberLottieComposition
+import com.airbnb.lottie.LottieAnimationView
+import com.airbnb.lottie.LottieDrawable
 import com.xnotes.R
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.platform.PdfOpenError
@@ -118,6 +115,7 @@ import com.xnotes.ui.theme.toComposeColor
 import com.xnotes.core.workspace.NoteTabs
 import com.xnotes.platform.NoteTabsStore
 import kotlin.math.roundToInt
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -205,14 +203,19 @@ class MainActivity : ComponentActivity() {
             var ready by remember { mutableStateOf(false) }
 
             LaunchedEffect(Unit) {
-                // Branded launch: the session restores while the Polars loader plays,
-                // with a minimum hold of one loop so it never just flashes by.
-                // Until then the window background (dark stage) is already on screen
-                // from the launch theme.
+                // Branded launch: the loader is a placeholder until the first
+                // folder is actually ready, so the user never sees a "Loading"
+                // flash or late metadata pop-in after the animation.
+                // Session restores while the loader plays, with a minimum hold
+                // of one loop so it never just flashes by, and the first
+                // listing (names + vault gate + metadata/counts for the first
+                // page) is awaited synchronously before the editor appears.
                 val started = System.currentTimeMillis()
                 ed.restoreSession()
+                val listing = async(kotlinx.coroutines.Dispatchers.IO) { ed.awaitInitialListing() }
                 val elapsed = System.currentTimeMillis() - started
                 if (elapsed < LAUNCH_HOLD_MS) delay(LAUNCH_HOLD_MS - elapsed)
+                listing.await()
                 ready = true
                 ed.prewarmBackstage()
             }
@@ -381,18 +384,18 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun LaunchLoader() {
-    val composition by rememberLottieComposition(LottieCompositionSpec.Asset("polars.json"))
-    val progress by animateLottieCompositionAsState(
-        composition,
-        iterations = LottieConstants.IterateForever,
-    )
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
-        LottieAnimation(
-            composition = composition,
-            progress = { progress },
+        AndroidView<LottieAnimationView>(
+            factory = { context ->
+                LottieAnimationView(context).apply {
+                    setAnimation("polars.json")
+                    repeatCount = LottieDrawable.INFINITE
+                    playAnimation()
+                }
+            },
             modifier = Modifier.size(220.dp),
         )
     }
