@@ -145,7 +145,7 @@ class TextReflowTest : InstrumentationTestCase() {
 
     /** Optional private fixture, copied to the debug app cache by the developer. Never writes it. */
     fun testDeviceFixtureReflowIfPresent() {
-        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.xcanvas")
+        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.pcanvas")
         if (!fixture.isFile) {
             Log.i("XnotesReflow", "No local fixture supplied; skipping device fixture measurement")
             return

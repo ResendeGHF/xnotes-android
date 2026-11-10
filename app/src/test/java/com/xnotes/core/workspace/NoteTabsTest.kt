@@ -62,14 +62,14 @@ class NoteTabsTest {
     }
 
     @Test fun canvasAndPagedNotesCoexistAsTabs() {
-        val workspace = NoteTabs().open("content://notes/math.xnote", "Math")
-            .open("content://notes/diagram.xcanvas", "Diagram")
-            .open("content://notes/math.xnote", "Math")
-        assertEquals("content://notes/math.xnote", workspace.primaryUri)
+        val workspace = NoteTabs().open("content://notes/math.pnotes", "Math")
+            .open("content://notes/diagram.pcanvas", "Diagram")
+            .open("content://notes/math.pnotes", "Math")
+        assertEquals("content://notes/math.pnotes", workspace.primaryUri)
         assertEquals(2, workspace.tabs.size)
-        val backToCanvas = workspace.open("content://notes/diagram.xcanvas", "Diagram")
-        assertEquals("content://notes/diagram.xcanvas", backToCanvas.primaryUri)
-        assertEquals("content://notes/math.xnote", backToCanvas.close("content://notes/diagram.xcanvas").primaryUri)
+        val backToCanvas = workspace.open("content://notes/diagram.pcanvas", "Diagram")
+        assertEquals("content://notes/diagram.pcanvas", backToCanvas.primaryUri)
+        assertEquals("content://notes/math.pnotes", backToCanvas.close("content://notes/diagram.pcanvas").primaryUri)
     }
 
     @Test fun closeUrisRemovesDeletedTabsAndKeepsSurvivorSelected() {

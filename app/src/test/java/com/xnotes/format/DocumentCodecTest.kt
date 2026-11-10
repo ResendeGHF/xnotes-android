@@ -372,7 +372,7 @@ class DocumentCodecTest {
             val doc = Document.blank(count = 3)
             doc.pdfFile = pdf
             doc.created = 1_758_000_000_000L
-            val file = File(dir, "n.xnote")
+            val file = File(dir, "n.pnotes")
             file.outputStream().use { codec.write(doc, it) }
             val viaChannel = java.io.RandomAccessFile(file, "r").use { codec.peek(it.channel) }!!
             assertEquals(3, viaChannel.pages)
@@ -381,7 +381,7 @@ class DocumentCodecTest {
             val viaStream = file.inputStream().use { codec.peek(it) }!!
             assertEquals(3, viaStream.pages)
             assertTrue(viaStream.hasPdf)
-            val plain = File(dir, "p.xnote")
+            val plain = File(dir, "p.pnotes")
             plain.outputStream().use { codec.write(Document.blank(count = 1), it) }
             val one = java.io.RandomAccessFile(plain, "r").use { codec.peek(it.channel) }!!
             assertEquals(1, one.pages)
@@ -393,7 +393,7 @@ class DocumentCodecTest {
     }
 
     @Test fun aPeekAtSomethingElseComesBackEmpty() {
-        val junk = File.createTempFile("junk", ".xnote").apply { writeBytes(byteArrayOf(1, 2, 3)); deleteOnExit() }
+        val junk = File.createTempFile("junk", ".pnotes").apply { writeBytes(byteArrayOf(1, 2, 3)); deleteOnExit() }
         assertNull(java.io.RandomAccessFile(junk, "r").use { codec.peek(it.channel) })
         assertNull(codec.peek(ByteArrayInputStream(byteArrayOf(1, 2, 3))))
         assertNull(codec.peekManifest(ByteArrayInputStream("""{"format":"xcanvas","items":[]}""".toByteArray())))
@@ -655,7 +655,8 @@ class DocumentCodecTest {
         // (key order, integral doubles as longs, escaped slashes); the only departure is
         // that sample values serialize rounded (x/y 2dp, pressure 3dp). The writer stamp is
         // the versionCode, so it is read from the codec rather than typed in: spelled out it
-        // turns every release bump into a failing test.
+        // turns every release bump into a failing test. The format tag is the renamed
+        // `.pnotes` mark; legacy `.xnote` manifests still read (see legacyFormatStillReads).
         val doc = Document(dpi = 150)
         doc.style = PageStyle(template = PagePattern.LINES.id, spacing = 48.0)
         doc.bookmarks.add(Bookmark(0, "Intro"))
@@ -684,7 +685,7 @@ class DocumentCodecTest {
             }
         }
         assertEquals(
-            "{\"format\":\"xnote\",\"version\":1,\"writer\":${DocumentCodec.WRITER},\"dpi\":150,\"has_pdf\":false," +
+            "{\"format\":\"pnotes\",\"version\":1,\"writer\":${DocumentCodec.WRITER},\"dpi\":150,\"has_pdf\":false," +
                 "\"bookmarks\":[{\"page\":0,\"label\":\"Intro\"}]," +
                 "\"pages\":[{\"width\":100,\"height\":200,\"pdf_page\":null,\"items\":[" +
                 "{\"kind\":\"stroke\",\"tool\":\"speed\",\"config\":{\"base_width\":3.5," +

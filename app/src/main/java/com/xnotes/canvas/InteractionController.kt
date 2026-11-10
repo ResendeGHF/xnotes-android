@@ -1868,6 +1868,8 @@ class InteractionController(
      * shown live never vanishes on commit. Only a forward continuation within
      * reach is kept: a tip behind the nib (the hand outran an old prediction)
      * or off to the side is dropped, and the showing frame already covers it.
+     * The tip carries the last real sample's pressure, not the lifting pen's:
+     * that is the width it was shown with.
      */
     private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
         val tip = frontInk?.lastPresentedTip ?: return
@@ -1882,7 +1884,7 @@ class InteractionController(
                 tip.x, tip.y, maxLead,
             )
         ) return
-        stroke.addSample(Sample(tip.x, tip.y, stroke.pAt(n - 1), (upTimeMs - strokeStartTimeMs).toDouble()))
+        stroke.addSample(Sample(tip.x, tip.y, stroke.pAt(n - 2), (upTimeMs - strokeStartTimeMs).toDouble()))
     }
 
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport

@@ -51,10 +51,10 @@ class PgpKeyStoreTest {
             val alice = store.generate("Alice <alice@example.com>", "alice-passphrase".toCharArray())
             val bob = store.generate("Bob <bob@example.com>", "bob-passphrase".toCharArray())
             val note = "sealed note".toByteArray()
-            val message = store.encryptAndSign(note, "Note.xnote", bob.fingerprint, alice.fingerprint, "alice-passphrase".toCharArray())
+            val message = store.encryptAndSign(note, "Note.pnotes", bob.fingerprint, alice.fingerprint, "alice-passphrase".toCharArray())
             val opened = store.decryptAndVerify(message, bob.fingerprint, "bob-passphrase".toCharArray())
             assertArrayEquals(note, opened.plain)
-            assertEquals("Note.xnote", opened.fileName)
+            assertEquals("Note.pnotes", opened.fileName)
             assertEquals(alice.fingerprint, opened.signerFingerprint)
             assertEquals("Alice <alice@example.com>", opened.signerUserId)
 

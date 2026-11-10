@@ -7,29 +7,38 @@ package com.xnotes.core.util
  * `.xnote`. That matters now there are two: every place that lists, names, renames or opens a file
  * has to agree on which extensions are documents, and a place that forgets one silently hides the
  * user's files from the explorer.
+ *
+ * Renamed from `.xnote`/`.xcanvas` to `.pnotes`/`.pcanvas`; the old extensions stay readable
+ * (see [legacyExtensions]) so existing libraries keep opening, but everything the app
+ * writes uses the new ones.
  */
-enum class DocumentKind(val extension: String) {
+enum class DocumentKind(val extension: String, private val legacyExtensions: List<String> = emptyList()) {
     /** The paged notebook. */
-    NOTE("xnote"),
+    NOTE("pnotes", listOf("xnote")),
 
     /** The infinite canvas. */
-    CANVAS("xcanvas"),
+    CANVAS("pcanvas", listOf("xcanvas")),
     ;
 
     /** The extension with its dot, as it appears at the end of a file name. */
     val suffix: String get() = ".$extension"
 
     companion object {
+        /** Every suffix [kind] is recognised by, new first. */
+        private fun DocumentKind.allSuffixes(): List<String> =
+            listOf(suffix) + legacyExtensions.map { ".$it" }
+
         /** The kind [name] denotes, or null when it is not a document at all. */
         fun ofName(name: String): DocumentKind? =
-            entries.firstOrNull { name.endsWith(it.suffix, ignoreCase = true) }
+            entries.firstOrNull { kind -> kind.allSuffixes().any { name.endsWith(it, ignoreCase = true) } }
 
         fun isDocument(name: String): Boolean = ofName(name) != null
 
-        /** [name] without its document extension, or unchanged when it has none. */
+        /** [name] without its document extension (old or new), or unchanged when it has none. */
         fun stripSuffix(name: String): String {
             val kind = ofName(name) ?: return name
-            return name.dropLast(kind.suffix.length)
+            val hit = kind.allSuffixes().firstOrNull { name.endsWith(it, ignoreCase = true) } ?: return name
+            return name.dropLast(hit.length)
         }
 
         /** [name] with [kind]'s extension, added only if it is not already the right one. */

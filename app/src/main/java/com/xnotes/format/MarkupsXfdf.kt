@@ -18,7 +18,7 @@ import java.util.Locale
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * Reads/writes a note's text markups as `markups.xfdf` inside the `.xnote` bundle: XFDF (ISO
+ * Reads/writes a note's text markups as `markups.xfdf` inside the `.pnotes` bundle: XFDF (ISO
  * 19444-1), one text markup annotation per markup on the note page it lies on, which is the page
  * of the same number in an exported PDF. For other tools `coords` and `rect` are in the PDF user
  * space of the page's source page (a page of no PDF: its own points, y up); xnotes reads back

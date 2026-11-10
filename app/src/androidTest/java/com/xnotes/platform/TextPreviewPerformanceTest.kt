@@ -91,7 +91,7 @@ class TextPreviewPerformanceTest : InstrumentationTestCase() {
 
     /** Reads only an existing private test copy; never logs its text or writes the real note. */
     fun testNativePreviewOnPrivateDeviceFixtureIfPresent() {
-        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.xcanvas")
+        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.pcanvas")
         if (!fixture.isFile) {
             Log.i("XnotesPreviewFixture", "No fixture present; benchmark skipped")
             return
@@ -156,7 +156,7 @@ class TextPreviewPerformanceTest : InstrumentationTestCase() {
 
     /** Benchmark the actual canonical-wrap raster path on an existing private fixture copy. */
     fun testCanonicalPreviewOnPrivateDeviceFixtureIfPresent() {
-        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.xcanvas")
+        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.pcanvas")
         if (!fixture.isFile) return
         val codec = com.xnotes.format.CanvasCodec(AndroidImageCodec(), AndroidTextMeasurer())
         val doc = fixture.inputStream().use { codec.read(it) }
@@ -213,7 +213,7 @@ class TextPreviewPerformanceTest : InstrumentationTestCase() {
 
     /** Detect font-metric rewrap during uniform scaling, without exposing fixture text. */
     fun testDiagonalScaleKeepsLineBreaksOnDeviceFixtureIfPresent() {
-        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.xcanvas")
+        val fixture = java.io.File(instrumentation.targetContext.cacheDir, "reflow-fixture.pcanvas")
         if (!fixture.isFile) return
         val codec = com.xnotes.format.CanvasCodec(AndroidImageCodec(), AndroidTextMeasurer())
         val doc = fixture.inputStream().use { codec.read(it) }

@@ -74,6 +74,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.foundation.focusable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
@@ -95,6 +96,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.airbnb.lottie.compose.LottieAnimation
+import com.airbnb.lottie.compose.LottieCompositionSpec
+import com.airbnb.lottie.compose.LottieConstants
+import com.airbnb.lottie.compose.animateLottieCompositionAsState
+import com.airbnb.lottie.compose.rememberLottieComposition
 import com.xnotes.R
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.platform.PdfOpenError
@@ -117,6 +123,9 @@ import kotlinx.coroutines.launch
 
 /** How long the maths waits for the font bytes it measures with before going without. */
 private const val MATH_FONT_WAIT_MS = 1500L
+
+/** Minimum time the branded launch loader stays up, about one loop of the animation. */
+private const val LAUNCH_HOLD_MS = 1000L
 
 /** Whether the display has a camera cutout (notch/hole-punch). False below API 29, which has no
  *  cutout API; such devices fall back to fullscreen by default. Also false for a context with no
@@ -196,10 +205,14 @@ class MainActivity : ComponentActivity() {
             var ready by remember { mutableStateOf(false) }
 
             LaunchedEffect(Unit) {
-                // No launch animation and no minimum hold: the session restores, the content
-                // shows the moment it is ready. Until then the window background (dark stage)
-                // is already on screen from the launch theme.
+                // Branded launch: the session restores while the Polars loader plays,
+                // with a minimum hold of one loop so it never just flashes by.
+                // Until then the window background (dark stage) is already on screen
+                // from the launch theme.
+                val started = System.currentTimeMillis()
                 ed.restoreSession()
+                val elapsed = System.currentTimeMillis() - started
+                if (elapsed < LAUNCH_HOLD_MS) delay(LAUNCH_HOLD_MS - elapsed)
                 ready = true
                 ed.prewarmBackstage()
             }
@@ -222,6 +235,8 @@ class MainActivity : ComponentActivity() {
                                 importPdfUri = pendingPdfImport,
                                 onImportConsumed = { pendingPdfImport = null },
                             )
+                        } else {
+                            LaunchLoader()
                         }
                         com.xnotes.ui.EyedropperOverlay()
                     }
@@ -361,6 +376,25 @@ class MainActivity : ComponentActivity() {
          * live session is never torn down by a config change.
          */
         private val bootSharingReset = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
+}
+
+@Composable
+private fun LaunchLoader() {
+    val composition by rememberLottieComposition(LottieCompositionSpec.Asset("polars.json"))
+    val progress by animateLottieCompositionAsState(
+        composition,
+        iterations = LottieConstants.IterateForever,
+    )
+    Box(
+        modifier = Modifier.fillMaxSize().background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        LottieAnimation(
+            composition = composition,
+            progress = { progress },
+            modifier = Modifier.size(220.dp),
+        )
     }
 }
 
@@ -1037,7 +1071,7 @@ private fun EditorScreen(
         /** Open the "Save as" picker for [target], remembering which pane its result belongs to. */
         fun launchSaveAs(target: Editor) {
             savePane = target
-            createLauncher.launch("${target.title}.xnote")
+            createLauncher.launch("${target.title}.pnotes")
         }
 
         fun saveOrPrompt() {
@@ -1473,7 +1507,7 @@ private fun EditorScreen(
                     onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
             } else if (withLinks && note) {
                 // A self-contained bundle: linked pages inlined below their link, links rewired.
-                runSdocxExport(stem, ext = "xnote", shareDir = true, titleRes = R.string.exporting_note, errorRes = R.string.err_share_note,
+                runSdocxExport(stem, ext = "pnotes", shareDir = true, titleRes = R.string.exporting_note, errorRes = R.string.err_share_note,
                     render = { o, _, cancel -> editor.exportFileToXnote(uriStr, o, withLinks = true) { cancel() } },
                     onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
             } else {
@@ -2807,7 +2841,7 @@ private fun SavingDialog() {
 }
 
 /**
- * Indeterminate "Importing PDF…"/"Importing note…" dialog shown while a picked PDF (or `.xnote`) is
+ * Indeterminate "Importing PDF…"/"Importing note…" dialog shown while a picked PDF (or `.pnotes`) is
  * streamed into a new note off the main thread. Import has no natural page-by-page progress — the
  * cost is copying the (possibly large) source bytes — so it shows an animated spinner.
  */
@@ -3057,7 +3091,7 @@ private suspend fun openInto(
     val expected = if (name.endsWith(".pdf", ignoreCase = true)) {
         val newUri = target.importPdfDirectly(uriStr, name)
         if (newUri != null) {
-            target.openAsync(newUri, "${com.xnotes.core.util.Paths.stem(name)}.xnote")
+            target.openAsync(newUri, "${com.xnotes.core.util.Paths.stem(name)}.pnotes")
         } else {
             target.message = context.getString(R.string.err_insert_pdf)
         }

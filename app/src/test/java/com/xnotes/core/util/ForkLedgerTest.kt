@@ -5,9 +5,9 @@ import org.junit.Test
 
 class ForkLedgerTest {
 
-    private val original = "content://notes/document/Embedded%2Fweek-02.xnote"
-    private val fork = "content://notes/document/Embedded%2Fweek-02_1.xnote"
-    private val forkOfFork = "content://notes/document/Embedded%2Fweek-02_2.xnote"
+    private val original = "content://notes/document/Embedded%2Fweek-02.pnotes"
+    private val fork = "content://notes/document/Embedded%2Fweek-02_1.pnotes"
+    private val forkOfFork = "content://notes/document/Embedded%2Fweek-02_2.pnotes"
     private val note = Any()
 
     private fun ForkLedger.forkOriginal() = record(original, fork, note, "week-02_1", "week-02")

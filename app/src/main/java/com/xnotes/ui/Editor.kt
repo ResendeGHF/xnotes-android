@@ -177,7 +177,7 @@ data class ContextMenuTarget(
 )
 
 /**
- * One entry (folder or .xnote file) in the in-app explorer. [documentUri] is a SAF document URI.
+ * One entry (folder or .pnotes file) in the in-app explorer. [documentUri] is a SAF document URI.
  * [modified] is SAF's last-modified time; [created] is the app-tracked creation time used for grid
  * ordering (SAF exposes no creation time — see [CreationTimeStore]). [parentDocId] is the listing
  * folder (where colour writes go), and [color] is the item's explorer colour code, if any.
@@ -196,7 +196,7 @@ data class BrowseEntry(
 /**
  * How a picked file should be imported: as a PDF-backed note, an image note, a text note (extracted
  * from txt/csv/rtf/html/docx/xlsx/epub), a Samsung Notes note (from .sdocx), or an existing
- * `.xnote`/`.xcanvas` opened as-is.
+ * `.pnotes`/`.pcanvas` opened as-is (legacy `.xnote`/`.xcanvas` too).
  */
 enum class ImportKind {
     PDF, IMAGE, TEXT, SDOCX, OPEN;
@@ -221,7 +221,7 @@ enum class ImportKind {
         fun classify(name: String, mime: String?): ImportKind {
             val ext = name.substringAfterLast('.', "").lowercase()
             return when {
-                ext == "xnote" || ext == "xcanvas" -> OPEN
+                ext == "pnotes" || ext == "pcanvas" || ext == "xnote" || ext == "xcanvas" -> OPEN
                 ext == "sdocx" -> SDOCX
                 ext == "pdf" || mime == "application/pdf" -> PDF
                 ext in IMAGE_EXT || mime?.startsWith("image/") == true -> IMAGE
@@ -239,7 +239,7 @@ enum class ImportKind {
         fun isKnownImport(name: String, mime: String?): Boolean {
             val ext = name.substringAfterLast('.', "").lowercase()
             if (ext in IMPORT_EXTENSIONS) return true
-            if (ext == "xnote" || ext == "xcanvas") return true
+            if (ext == "pnotes" || ext == "pcanvas" || ext == "xnote" || ext == "xcanvas") return true
             val m = mime.orEmpty()
             return m == "application/pdf" || m.startsWith("image/") ||
                 m.startsWith("text/") || m == "text/markdown" || m == "text/x-markdown"
@@ -1540,7 +1540,7 @@ class Editor(
     }
 
     /**
-     * Read the `.xcanvas` at [uri] and push its editor on top of backstage. IO, so call it off the
+     * Read the `.pcanvas` at [uri] and push its editor on top of backstage. IO, so call it off the
      * main thread; the model swap itself hops back to the main thread.
      */
     suspend fun openCanvasAsync(uri: String, name: String?): Boolean {
@@ -1646,7 +1646,7 @@ class Editor(
                 SealedWrite.NOT_VAULT -> Unit
             }
             runCatching {
-                val tmp = java.io.File.createTempFile("save", ".xcanvas", saveTmpDir)
+                val tmp = java.io.File.createTempFile("save", ".pcanvas", saveTmpDir)
                 try {
                     java.io.FileOutputStream(tmp).use { canvasCodec.write(doc, it) }
                     if (!tmpCanvasValidates(tmp)) return@runCatching false
@@ -4040,7 +4040,7 @@ class Editor(
     }
 
     /**
-     * Write the open note as a self-contained `.xnote` bundle (linked pages inlined,
+     * Write the open note as a self-contained `.pnotes` bundle (linked pages inlined,
      * links rewired, appended pages color-framed) or a plain copy when [withLinks] is
      * false. The caller runs this off the main thread; it throws on failure.
      */
@@ -6381,7 +6381,7 @@ class Editor(
         return "${base}_$n$ext"
     }
 
-    /** Creates a new `.xnote` named [name] under [parentDocId], written by [write]; returns its URI, or null.
+    /** Creates a new `.pnotes` named [name] under [parentDocId], written by [write]; returns its URI, or null.
      *  If [write] throws (an IO error, or a cancelled import), the half-written file is deleted so a failed
      *  import never leaves an empty/partial note behind. */
     private fun createNoteFile(treeUri: String, parentDocId: String, name: String, write: (OutputStream) -> Unit): String? {
@@ -6404,7 +6404,7 @@ class Editor(
         }
     }
 
-    /** Creates a blank `.xcanvas` under [parentDocId]; returns its URI, or null. IO — call off-thread. */
+    /** Creates a blank `.pcanvas` under [parentDocId]; returns its URI, or null. IO — call off-thread. */
     fun createBlankCanvasFile(treeUri: String, parentDocId: String, rawName: String): String? {
         val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.CANVAS)
         return createNoteFile(treeUri, parentDocId, name) {
@@ -6415,7 +6415,7 @@ class Editor(
         }
     }
 
-    /** Creates a blank `.xnote` under [parentDocId]; returns its URI, or null. IO — call off-thread.
+    /** Creates a blank `.pnotes` under [parentDocId]; returns its URI, or null. IO — call off-thread.
      *  [style] overrides the new-note default page style (template + colour) when non-null. */
     fun createBlankNoteFile(
         treeUri: String,
@@ -6437,7 +6437,7 @@ class Editor(
     /** What the New note screen chose: the page size in mm, every page's style, and the cover's when there is one. */
     class NewNoteSetup(val widthMm: Double, val heightMm: Double, val style: PageStyle, val cover: PageStyle?)
 
-    /** Creates a `.xnote` under [parentDocId] as [setup] describes, a cover first when it has one; returns its URI, or null. IO. */
+    /** Creates a `.pnotes` under [parentDocId] as [setup] describes, a cover first when it has one; returns its URI, or null. IO. */
     fun createNoteFile(treeUri: String, parentDocId: String, rawName: String, setup: NewNoteSetup): String? {
         val name = uniqueDocumentName(treeUri, parentDocId, rawName, com.xnotes.core.util.DocumentKind.NOTE)
         val dpi = PageSize.DEFAULT_DPI
@@ -6489,7 +6489,7 @@ class Editor(
         return createNoteFile(treeUri, parentDocId, name) { out -> copyStream(java.io.FileInputStream(file), out) { importCancelled.get() } }
     }
 
-    /** Imports the image at [imgFile] into a new single-page `.xnote` whose page matches the image,
+    /** Imports the image at [imgFile] into a new single-page `.pnotes` whose page matches the image,
      *  the image filling it edge to edge. Returns its URI, or null. IO — call off-thread. */
     fun createImageNoteFile(treeUri: String, parentDocId: String, rawName: String, imgFile: java.io.File): String? {
         val doc = imageDocument(imgFile) ?: return null
@@ -6535,7 +6535,7 @@ class Editor(
     }
 
     /**
-     * Writes a new `.xnote` holding [pages] traced strokes (no scan background —
+     * Writes a new `.pnotes` holding [pages] traced strokes (no scan background —
      * the source photo/PDF is discarded) under [parentDocId]; returns its URI, or
      * null. IO — call off-thread.
      */
@@ -6555,7 +6555,7 @@ class Editor(
     }
 
     /**
-     * Writes a new `.xnote` holding the corrected scan image at [imgFile] (a
+     * Writes a new `.pnotes` holding the corrected scan image at [imgFile] (a
      * de-warped camera photo) edge to edge, without tracing it. The file is
      * copied into this editor's own dir first, so it outlives the staged copy.
      * Returns its URI, or null. IO — call off-thread.
@@ -6637,7 +6637,7 @@ class Editor(
         return doc
     }
 
-    /** Imports [file] (txt/csv/rtf/html/md/docx/xlsx/epub) as a new `.xnote` whose flow text holds the
+    /** Imports [file] (txt/csv/rtf/html/md/docx/xlsx/epub) as a new `.pnotes` whose flow text holds the
      *  content, laid out across as many pages as it needs. Markdown is parsed into rich text (headings,
      *  bold/italic, lists, code); the other formats are extracted as plain paragraphs. Returns its URI. IO. */
     fun createTextNoteFile(treeUri: String, parentDocId: String, rawName: String, file: java.io.File, sourceName: String, mime: String): String? {
@@ -6953,7 +6953,7 @@ class Editor(
             SealedWrite.FAILED -> return@runCatching false
             SealedWrite.NOT_VAULT -> Unit
         }
-        val tmp = java.io.File.createTempFile("merge", ".xnote", saveTmpDir)
+        val tmp = java.io.File.createTempFile("merge", ".pnotes", saveTmpDir)
         try {
             java.io.FileOutputStream(tmp).use { codec.write(doc, it) }
             appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")?.use { out ->
@@ -7086,8 +7086,10 @@ class Editor(
         val existingEntries = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             browseChildren(root, parentId)
         }
-        val expectedNoteName = "$rawName.xnote"
-        val existingNote = existingEntries.find { it.name.equals(expectedNoteName, ignoreCase = true) }
+        val existingNote = existingEntries.find {
+            !it.isDir && com.xnotes.core.util.DocumentKind.ofName(it.name) == com.xnotes.core.util.DocumentKind.NOTE &&
+                com.xnotes.core.util.Paths.stem(it.name).equals(rawName, ignoreCase = true)
+        }
 
         if (existingNote != null) return existingNote.documentUri
 
@@ -7147,7 +7149,7 @@ class Editor(
             val entries = browseChildren(root, parentId)
             // The names already in this folder, so an imported PDF is recognised by its note.
             val noteNames = entries.asSequence()
-                .filter { !it.isDir && it.name.endsWith(".xnote", ignoreCase = true) }
+                .filter { !it.isDir && com.xnotes.core.util.DocumentKind.ofName(it.name) == com.xnotes.core.util.DocumentKind.NOTE }
                 .mapTo(HashSet()) { it.name.lowercase() }
             for (e in entries) {
                 if (e.isDir) {
@@ -7158,7 +7160,7 @@ class Editor(
                 if (e.isDir || !e.name.endsWith(".pdf", ignoreCase = true) || e.name.startsWith(".")) continue
                 val stem = com.xnotes.core.util.Paths.stem(e.name)
                 if (stem.isBlank()) continue
-                val noteName = "${stem.lowercase()}.xnote"
+                val noteName = "${stem.lowercase()}${com.xnotes.core.util.DocumentKind.NOTE.suffix}"
                 if (noteName in noteNames) continue
                 val staged = runCatching {
                     appContext.contentResolver.openInputStream(android.net.Uri.parse(e.documentUri))
@@ -7239,7 +7241,7 @@ class Editor(
     }
 
     /** Imports every queued PDF into [parentDocId] one at a time; returns how many landed. Each file
-     *  is staged to its own temp, written into its `.xnote`, then dropped before the next is opened,
+     *  is staged to its own temp, written into its `.pnotes`, then dropped before the next is opened,
      *  so a batch costs the same memory as a single import however long the list is. Names come from
      *  the source files. Cancel stops after the file in flight, discarding only that one; whatever
      *  already landed stays. [importProgress] drives the dialog's count. IO — runs off-thread. */
@@ -7354,7 +7356,8 @@ class Editor(
     fun renameCurrentDocument(rawName: String): Boolean {
         val name = rawName.trim()
         if (name.isEmpty()) return false
-        val fileName = if (name.endsWith(".xnote", ignoreCase = true)) name else "$name.xnote"
+        val fileName = com.xnotes.core.util.DocumentKind.ofName(name)?.let { name }
+            ?: "$name${com.xnotes.core.util.DocumentKind.NOTE.suffix}"
         val uri = currentUri
         return if (uri != null) {
             renameDocument(uri, fileName)
@@ -7900,7 +7903,7 @@ class Editor(
             return true
         }
         runCatching {
-            val tmp = java.io.File.createTempFile("save", ".xnote", saveTmpDir)
+            val tmp = java.io.File.createTempFile("save", ".pnotes", saveTmpDir)
             try {
                 val encodeStart = System.nanoTime()
                 val timing = com.xnotes.format.DocumentCodec.WriteTiming()
@@ -9140,7 +9143,7 @@ class Editor(
     }
 
     /**
-     * Recursively finds notes at or below [startDocId] in tree [treeUri] whose name (sans `.xnote`)
+     * Recursively finds notes at or below [startDocId] in tree [treeUri] whose name (sans `.pnotes`)
      * contains [query], case-insensitively. Folders are descended into but not themselves returned;
      * results follow the explorer's chosen sort order. Does one provider query per folder, so it's IO
      * and can be slow on deep trees — call off-thread (and debounce the keystrokes that drive it).
@@ -9343,7 +9346,7 @@ class Editor(
         true
     }.getOrDefault(false)
 
-    /** "Name (2).xnote": [name] made free among [taken] (lowercased). */
+    /** "Name (2).pnotes": [name] made free among [taken] (lowercased). */
     private fun freeName(name: String, taken: Set<String>, splitExtension: Boolean): String {
         val dot = if (splitExtension) name.lastIndexOf('.') else -1
         val stem = if (dot > 0) name.substring(0, dot) else name
@@ -9482,7 +9485,7 @@ class Editor(
 
     // --- per-file actions in the explorer (operate on a stored note URI, not the open document) ---
 
-    /** Streams a stored note's raw bytes to [out] (share-as-.xnote / save-a-copy). */
+    /** Streams a stored note's raw bytes to [out] (share-as-.pnotes / save-a-copy). */
     fun copyFileTo(srcUri: String, out: OutputStream) {
         appContext.contentResolver.openInputStream(android.net.Uri.parse(srcUri))?.use { it.copyTo(out) }
     }
@@ -9491,7 +9494,7 @@ class Editor(
      * Loads the document at [srcUri] and writes it flattened to a PDF in [out] (share-as-PDF /
      * export). Dispatches on the stored file's kind, because a canvas is a different bundle read by a
      * different codec and flattened by a different exporter. The decision lives here rather than at
-     * the call sites so neither of them can forget it and export an `.xcanvas` as a paged note.
+     * the call sites so neither of them can forget it and export a `.pcanvas` as a paged note.
      */
     fun exportFileToPdf(
         srcUri: String,
@@ -9726,7 +9729,7 @@ class Editor(
     }
 
     /**
-     * Loads the note at [srcUri] and writes it as a `.xnote` bundle in [out]. With
+     * Loads the note at [srcUri] and writes it as a `.pnotes` bundle in [out]. With
      * [withLinks], linked pages are inlined below their link and the links rewired to
      * the appended same-file pages (a self-contained document). IO — call off-thread.
      */

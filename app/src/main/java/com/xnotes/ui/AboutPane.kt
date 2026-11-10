@@ -98,7 +98,7 @@ fun AboutPane() {
             Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 16.dp, bottom = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("Notes", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 22.sp, letterSpacing = 1.2.sp)
+            Text("Polars", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 22.sp, letterSpacing = 1.2.sp)
             Spacer(Modifier.height(5.dp))
             Text(
                 "A customized fork of xnotes, a handwriting notes and sketching app for Android",

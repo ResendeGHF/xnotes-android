@@ -953,7 +953,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private val vectorMeshSeq = java.util.concurrent.atomic.AtomicLong()
 
     /**
-     * Building every stroke synchronously here blocked the UI while a dense .xcanvas opened.
+     * Building every stroke synchronously here blocked the UI while a dense .pcanvas opened.
      * Publish the first few items immediately, then yield a frame between later batches.
      * A document switch invalidates the old callbacks, and removals cannot resurrect items.
      */

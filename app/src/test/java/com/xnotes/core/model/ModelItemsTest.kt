@@ -171,7 +171,7 @@ class ModelItemsTest {
         val d = Document.blank()
         assertEquals(1, d.pages.size)
         assertEquals("Untitled", d.title)
-        d.path = "/home/user/notes/Meeting.xnote"
+        d.path = "/home/user/notes/Meeting.pnotes"
         assertEquals("Meeting", d.title)
     }
 

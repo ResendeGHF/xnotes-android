@@ -17,7 +17,7 @@ import java.io.FileNotFoundException
 /**
  * Exposes an app-owned directory as a SAF tree, so the in-app explorer can browse "Internal
  * storage" with the very same DocumentsContract calls it uses for a user-granted folder. Document
- * ids are paths relative to the root ("root", "root/sub", "root/sub/note.xnote"), so they stay
+ * ids are paths relative to the root ("root", "root/sub", "root/sub/note.pnotes"), so they stay
  * valid even if the backing directory ever moves. The framework requires a DocumentsProvider to
  * be exported and MANAGE_DOCUMENTS-protected; with no DOCUMENTS_PROVIDER intent filter it stays
  * out of the system file picker, so only xnotes reaches it. Its files go on app uninstall.

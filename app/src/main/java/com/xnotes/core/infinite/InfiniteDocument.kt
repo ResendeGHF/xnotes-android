@@ -328,6 +328,6 @@ class InfiniteDocument(
 
     companion object {
         /** Extension of the on-disk bundle. */
-        const val EXTENSION = "xcanvas"
+        const val EXTENSION = "pcanvas"
     }
 }

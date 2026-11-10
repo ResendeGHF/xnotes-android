@@ -20,8 +20,8 @@ class ExportZipTest {
     @Test
     fun `picked documents land at the top as PDFs`() {
         assertEquals(
-            listOf(pdf("Board.pdf", "a/Board.xcanvas"), pdf("Lecture 1.pdf", "b/Lecture 1.xnote")),
-            ExportZip.plan(listOf(doc("b/Lecture 1.xnote"), doc("a/Board.xcanvas"))),
+            listOf(pdf("Board.pdf", "a/Board.pcanvas"), pdf("Lecture 1.pdf", "b/Lecture 1.pnotes")),
+            ExportZip.plan(listOf(doc("b/Lecture 1.pnotes"), doc("a/Board.pcanvas"))),
         )
     }
 
@@ -29,8 +29,8 @@ class ExportZipTest {
     fun `a picked folder keeps its tree, empty folders included`() {
         val school = dir(
             "School",
-            doc("School/Timetable.xnote"),
-            dir("School/Maths", doc("School/Maths/Algebra.xnote"), dir("School/Maths/Old")),
+            doc("School/Timetable.pnotes"),
+            dir("School/Maths", doc("School/Maths/Algebra.pnotes"), dir("School/Maths/Old")),
             dir("School/Art"),
         )
         assertEquals(
@@ -39,8 +39,8 @@ class ExportZipTest {
                 folder("School/Art/"),
                 folder("School/Maths/"),
                 folder("School/Maths/Old/"),
-                pdf("School/Maths/Algebra.pdf", "School/Maths/Algebra.xnote"),
-                pdf("School/Timetable.pdf", "School/Timetable.xnote"),
+                pdf("School/Maths/Algebra.pdf", "School/Maths/Algebra.pnotes"),
+                pdf("School/Timetable.pdf", "School/Timetable.pnotes"),
             ),
             ExportZip.plan(listOf(school)),
         )
@@ -52,12 +52,12 @@ class ExportZipTest {
             listOf(
                 dir(
                     "Notes",
-                    doc("Notes/plan.xnote"),
-                    doc("Notes/Plan.xcanvas"),
-                    doc("Notes/plan (2).xnote"),
+                    doc("Notes/plan.pnotes"),
+                    doc("Notes/Plan.pcanvas"),
+                    doc("Notes/plan (2).pnotes"),
                     dir("Notes/plan.pdf"),
                 ),
-                doc("x/Notes.xnote"),
+                doc("x/Notes.pnotes"),
                 dir("y/Notes"),
             ),
         )
@@ -72,15 +72,15 @@ class ExportZipTest {
 
     @Test
     fun `a pick inside another picked folder is exported only there`() {
-        val inner = dir("Top/Inner", doc("Top/Inner/deep.xnote"))
-        val top = dir("Top", inner, doc("Top/note.xnote"))
-        val plan = ExportZip.plan(listOf(doc("Top/Inner/deep.xnote"), inner, top))
+        val inner = dir("Top/Inner", doc("Top/Inner/deep.pnotes"))
+        val top = dir("Top", inner, doc("Top/note.pnotes"))
+        val plan = ExportZip.plan(listOf(doc("Top/Inner/deep.pnotes"), inner, top))
         assertEquals(
             listOf(
                 folder("Top/"),
                 folder("Top/Inner/"),
-                pdf("Top/Inner/deep.pdf", "Top/Inner/deep.xnote"),
-                pdf("Top/note.pdf", "Top/note.xnote"),
+                pdf("Top/Inner/deep.pdf", "Top/Inner/deep.pnotes"),
+                pdf("Top/note.pdf", "Top/note.pnotes"),
             ),
             plan,
         )
@@ -88,24 +88,24 @@ class ExportZipTest {
 
     @Test
     fun `the same pick twice is exported once`() {
-        assertEquals(listOf(pdf("a.pdf", "a.xnote")), ExportZip.plan(listOf(doc("a.xnote"), doc("a.xnote"))))
+        assertEquals(listOf(pdf("a.pdf", "a.pnotes")), ExportZip.plan(listOf(doc("a.pnotes"), doc("a.pnotes"))))
     }
 
     @Test
     fun `names are kept to one path segment`() {
         val plan = ExportZip.plan(
             listOf(
-                Node("a/b\\c.xnote", "k1", "s1", isDir = false),
-                Node("..", "k2", "s2", isDir = true, children = listOf(Node("tab\there.xnote", "k3", "s3", isDir = false))),
-                Node(".xnote", "k4", "s4", isDir = false),
+                Node("a/b\\c.pnotes", "k1", "s1", isDir = false),
+                Node("..", "k2", "s2", isDir = true, children = listOf(Node("tab\there.pnotes", "k3", "s3", isDir = false))),
+                Node(".pnotes", "k4", "s4", isDir = false),
             ),
         )
         assertEquals(
             listOf(
                 Entry("_/", null, ".."),
-                Entry("_/tab_here.pdf", "s3", "tab\there.xnote"),
-                Entry("_.pdf", "s4", ".xnote"),
-                Entry("a_b_c.pdf", "s1", "a/b\\c.xnote"),
+                Entry("_/tab_here.pdf", "s3", "tab\there.pnotes"),
+                Entry("_.pdf", "s4", ".pnotes"),
+                Entry("a_b_c.pdf", "s1", "a/b\\c.pnotes"),
             ),
             plan,
         )

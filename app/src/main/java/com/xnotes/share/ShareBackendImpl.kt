@@ -258,7 +258,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
     // --- PUT writers ---
 
     /**
-     * Run [block] with the stored `.xnote` decoded. Asset files land in an
+     * Run [block] with the stored `.pnotes` decoded. Asset files land in an
      * isolated temp dir that is removed afterwards; the returned document
      * must not escape the block with live asset references.
      */
@@ -277,7 +277,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
 
     /** Sealed rewrite of [doc] over [uri]: temp-encode, validate, copy, never truncate. */
     private fun storeNoteDoc(uri: String, doc: com.xnotes.core.model.Document): Boolean {
-        val tmpNote = File.createTempFile("share-put", ".xnote", tmpDir)
+        val tmpNote = File.createTempFile("share-put", ".pnotes", tmpDir)
         try {
             FileOutputStream(tmpNote).use { codec.write(doc, it) }
             if (!validates(tmpNote, doc.pages.size)) return false
@@ -289,7 +289,7 @@ class ShareBackendImpl(private val appContext: Context) : ShareServer.ShareBacke
         }
     }
 
-    /** Swap the embedded source PDF of a `.xnote` bundle, preserving ink and markups on top. */
+    /** Swap the embedded source PDF of a `.pnotes` bundle, preserving ink and markups on top. */
     private fun replaceEmbeddedPdf(uri: String, bytes: ByteArray): Boolean {
         return try {
             val newPdf = File.createTempFile("share-put", ".pdf", tmpDir)

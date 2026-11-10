@@ -13,7 +13,7 @@ import java.io.FileOutputStream
  * the view state (zoom/scroll) — under a private directory, so relaunching reopens
  * the last note where the user left off instead of a blank one.
  *
- * The document is written in the normal `.xnote` format via [DocumentCodec]; the
+ * The document is written in the normal `.pnotes` format via [DocumentCodec]; the
  * file's identity ([Document.path]/[Document.displayName]/[Document.dirty], which
  * the codec doesn't carry) and the view state go in a small sidecar JSON.
  * Best-effort: failures are swallowed, and a missing or corrupt session restores
@@ -21,7 +21,7 @@ import java.io.FileOutputStream
  */
 class SessionStore(private val dir: File, private val codec: DocumentCodec, private val pdfDir: File, private val imageDir: File) {
 
-    private val docFile = File(dir, "document.xnote")
+    private val docFile = File(dir, "document.pnotes")
     private val meta = JsonStore(File(dir, "session.json"))
 
     /** A restored session: the document plus the view state to reapply. */
@@ -51,7 +51,7 @@ class SessionStore(private val dir: File, private val codec: DocumentCodec, priv
         runCatching {
             dir.mkdirs()
             if (writeDocument || !docFile.exists()) {
-                val tmp = File(dir, "document.xnote.tmp")
+                val tmp = File(dir, "document.pnotes.tmp")
                 FileOutputStream(tmp).use { codec.write(document, it) }
                 if (!tmp.renameTo(docFile)) {
                     docFile.delete()

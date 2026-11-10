@@ -4,7 +4,7 @@ package com.xnotes.core.util
 object Paths {
     fun baseName(path: String): String {
         // SAF content URIs encode the path inside the last URL segment
-        // (e.g. ".../document/primary%3ADocs%2FNote.xnote"); decode first so the
+        // (e.g. ".../document/primary%3ADocs%2FNote.pnotes"); decode first so the
         // real separators surface, then split on path / document-id delimiters.
         val decoded = percentDecode(path)
         val i = decoded.lastIndexOfAny(charArrayOf('/', '\\', ':'))

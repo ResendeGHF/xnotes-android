@@ -118,8 +118,8 @@ fun NoteTabBar(
                         .padding(horizontal = 14.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val isCanvas = tab.uri.substringBefore('?').endsWith(".xcanvas", ignoreCase = true) ||
-                        tab.title.endsWith(".xcanvas", ignoreCase = true)
+                    val isCanvas = com.xnotes.core.util.DocumentKind.ofName(tab.uri.substringBefore('?')) == com.xnotes.core.util.DocumentKind.CANVAS ||
+                        com.xnotes.core.util.DocumentKind.ofName(tab.title) == com.xnotes.core.util.DocumentKind.CANVAS
                     Icon(
                         imageVector = if (isCanvas) Icons.Outlined.Gesture else Icons.AutoMirrored.Outlined.Article,
                         contentDescription = if (isCanvas) "Canvas" else "Note",
@@ -127,7 +127,7 @@ fun NoteTabBar(
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        tab.title.replace(Regex("(?i)\\.(xnote|xcanvas)$"), ""),
+                        tab.title.replace(Regex("(?i)\\.(pnotes|pcanvas|xnote|xcanvas)$"), ""),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         fontSize = 12.sp,

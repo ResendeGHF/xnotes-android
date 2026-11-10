@@ -69,11 +69,11 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-/** Thrown when a file is not a valid `.xnote` bundle. */
+/** Thrown when a file is not a valid `.pnotes` bundle. */
 class XNoteFormatException(message: String) : Exception(message)
 
 /**
- * Reads and writes the native `.xnote` bundle (spec 08): a ZIP with a deflated
+ * Reads and writes the native `.pnotes` bundle (spec 08): a ZIP with a deflated
  * `manifest.json` plus stored binary assets (`assets/image-NNN.png`,
  * `assets/source.pdf`). Strokes are kept as editable vector samples; nothing is
  * flattened. Loading is forgiving — unknown item kinds are skipped and missing
@@ -904,7 +904,7 @@ class DocumentCodec(
     }
 
     /**
-     * Read a `.xnote` from [input]. When [pdfDir] is non-null an embedded source PDF, and when
+     * Read a `.pnotes` from [input]. When [pdfDir] is non-null an embedded source PDF, and when
      * [imageDir] is non-null the inserted images, are streamed out to fresh temp files in those dirs
      * (so neither is ever held in RAM) and the caller owns those files' lifetime. When a dir is null
      * that asset is skipped, which is what validation-only reads want.
@@ -1158,7 +1158,7 @@ class DocumentCodec(
         p.beginObject()
         while (p.hasNext()) {
             when (p.nextName()) {
-                "format" -> isNote = stringOr(p, "") == FORMAT
+                "format" -> isNote = stringOr(p, "") in NOTE_FORMATS
                 "created" -> created = stringOrNull(p)?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() }
                 "has_pdf" -> hasPdf = boolOr(p, false)
                 "pages" -> {
@@ -1181,7 +1181,7 @@ class DocumentCodec(
         while (p.hasNext()) {
             when (p.nextName()) {
                 "format" -> {
-                    if (stringOr(p, "") != FORMAT) throw XNoteFormatException(NOT_XNOTE)
+                    if (stringOr(p, "") !in NOTE_FORMATS) throw XNoteFormatException(NOT_XNOTE)
                     m.formatOk = true
                 }
                 "writer" -> m.writer = intOr(p, 0)
@@ -2381,7 +2381,9 @@ class DocumentCodec(
     }
 
     companion object {
-        const val FORMAT = "xnote"
+        const val FORMAT = "pnotes"
+        /** Manifest formats this build reads: what it writes, plus the legacy `.xnote` mark. */
+        private val NOTE_FORMATS = setOf(FORMAT, "xnote")
         const val VERSION = 1
 
         /** The com.xnotes versionCode stamped into manifests this build writes ("writer"), kept

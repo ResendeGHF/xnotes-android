@@ -395,7 +395,7 @@ private val PAGED_TOOL_KEYS = mapOf(
     Tool.TEXT to "T",
 )
 
-/** Renames the open note: a small prefilled text field; the ".xnote" suffix is implicit. */
+/** Renames the open note: a small prefilled text field; the ".pnotes" suffix is implicit. */
 @Composable
 private fun RenameDialog(initial: String, onConfirm: (String) -> Boolean, onDismiss: () -> Unit) {
     var text by remember { mutableStateOf(initial) }

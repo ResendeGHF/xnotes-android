@@ -21,7 +21,7 @@ import java.io.FileOutputStream
  */
 class CanvasSessionStore(private val dir: File, private val codec: CanvasCodec, private val imageDir: File) {
 
-    private val docFile = File(dir, "canvas.xcanvas")
+    private val docFile = File(dir, "canvas.pcanvas")
     private val meta = JsonStore(File(dir, "canvas-session.json"))
 
     /** Whether a canvas session exists, so the host knows which editor to restore into. */
@@ -31,7 +31,7 @@ class CanvasSessionStore(private val dir: File, private val codec: CanvasCodec, 
         runCatching {
             dir.mkdirs()
             if (writeDocument || !docFile.exists()) {
-                val tmp = File(dir, "canvas.xcanvas.tmp")
+                val tmp = File(dir, "canvas.pcanvas.tmp")
                 FileOutputStream(tmp).use { codec.write(document, it) }
                 if (!tmp.renameTo(docFile)) {
                     docFile.delete()

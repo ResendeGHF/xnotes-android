@@ -74,8 +74,8 @@ class PdfBatchTest {
     private val plan = listOf(
         Entry("School/", null, "School"),
         Entry("School/Art/", null, "Art"),
-        Entry("School/Algebra.pdf", "a", "Algebra.xnote"),
-        Entry("Board.pdf", "b", "Board.xcanvas"),
+        Entry("School/Algebra.pdf", "a", "Algebra.pnotes"),
+        Entry("Board.pdf", "b", "Board.pcanvas"),
     )
 
     @Test
@@ -105,7 +105,7 @@ class PdfBatchTest {
             }
         }
         val sink = Sink()
-        val result = batch(render).zip(plan + Entry("Empty.pdf", "c", "Empty.xnote") + Entry("Last/", null, "Last"), sink)
+        val result = batch(render).zip(plan + Entry("Empty.pdf", "c", "Empty.pnotes") + Entry("Last/", null, "Last"), sink)
         assertTrue(result.kept)
         assertEquals(3, result.found)
         assertEquals(1, result.written)
@@ -123,13 +123,13 @@ class PdfBatchTest {
             renderAll(source, out, p, c)
         }
         val sink = Sink()
-        val result = batch(render).zip(plan + Entry("Later.pdf", "c", "Later.xnote"), sink)
+        val result = batch(render).zip(plan + Entry("Later.pdf", "c", "Later.pnotes"), sink)
         assertTrue(result.cancelled)
         assertFalse(result.kept)
         assertTrue(sink.discarded)
         assertTrue(sink.closed)
         assertEquals(0, scratchDir.listFiles()!!.size)
-        assertTrue(progress.none { it.name == "Later.xnote" })
+        assertTrue(progress.none { it.name == "Later.pnotes" })
     }
 
     @Test
@@ -168,7 +168,7 @@ class PdfBatchTest {
     @Test
     fun `a lone document is written as it rendered`() {
         val sink = Sink()
-        val result = batch(renderAll).single("a", "Algebra.xnote", sink)
+        val result = batch(renderAll).single("a", "Algebra.pnotes", sink)
         assertTrue(result.kept)
         assertEquals(1, result.written)
         assertArrayEquals(body("a"), sink.bytes.toByteArray())
@@ -178,7 +178,7 @@ class PdfBatchTest {
     @Test
     fun `a lone document that fails is discarded`() {
         val sink = Sink()
-        val result = batch { _, _, _, _ -> throw IOException() }.single("a", "Algebra.xnote", sink)
+        val result = batch { _, _, _, _ -> throw IOException() }.single("a", "Algebra.pnotes", sink)
         assertFalse(result.kept)
         assertFalse(result.cancelled)
         assertEquals(0, sink.opened)
@@ -188,7 +188,7 @@ class PdfBatchTest {
     @Test
     fun `progress walks the documents and only ever grows`() {
         batch(renderAll).zip(plan, Sink())
-        assertEquals(listOf("Algebra.xnote", "Board.xcanvas"), progress.map { it.name }.distinct())
+        assertEquals(listOf("Algebra.pnotes", "Board.pcanvas"), progress.map { it.name }.distinct())
         assertTrue(progress.all { it.count == 2 })
         val fractions = progress.map { it.fraction }
         assertEquals(fractions.sorted(), fractions)

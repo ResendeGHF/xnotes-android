@@ -14,7 +14,7 @@ import java.util.zip.ZipEntry
  * Replaces the tail of an existing bundle in place, so a save does not have to rebuild the whole
  * file around assets that did not change.
  *
- * A `.xnote` is written assets first, manifest last. When only the ink changed, everything ahead of
+ * A `.pnotes` is written assets first, manifest last. When only the ink changed, everything ahead of
  * the manifest is byte for byte what it should already be: for a note built from a 500-page PDF
  * that is essentially the entire file, re-read and re-written twice per save (once into the temp
  * bundle, once out through the storage provider) to record one stroke. Splicing writes only the

@@ -255,7 +255,7 @@ class PgpKeyStore(private val dir: File) {
             if (!intact) throw Failure("message was modified")
             val signer = verifySignatures(plain, onePass, signatures)
                 ?: throw Failure("signer is not a trusted key")
-            Opened(plain, literal.fileName.ifBlank { "Imported.xnote" }, signer.userId, signer.fingerprint)
+            Opened(plain, literal.fileName.ifBlank { "Imported.pnotes" }, signer.userId, signer.fingerprint)
         } catch (t: Throwable) {
             plain.fill(0)
             if (t is Failure) throw t

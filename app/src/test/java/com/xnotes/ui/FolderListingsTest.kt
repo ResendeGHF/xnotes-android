@@ -18,26 +18,26 @@ class FolderListingsTest {
         val dir = Files.createTempDirectory("xnotes-listings").toFile()
         val s = FolderListings(store(File(dir, "folder_listings.json")))
         assertNull(s.get("auth|root"))
-        s.note("auth|root", listOf(row("a.xnote", "root/a.xnote"), row("sub", "root/sub", dir = true)))
+        s.note("auth|root", listOf(row("a.pnotes", "root/a.pnotes"), row("sub", "root/sub", dir = true)))
         val back = s.get("auth|root")!!
         assertEquals(2, back.size)
-        assertEquals("a.xnote", back[0].name)
-        assertEquals("root/a.xnote", back[0].childDocId)
+        assertEquals("a.pnotes", back[0].name)
+        assertEquals("root/a.pnotes", back[0].childDocId)
         assertEquals(90L, back[0].created)
     }
 
     @Test fun dropParentAndMatching() {
         val dir = Files.createTempDirectory("xnotes-listings").toFile()
         val s = FolderListings(store(File(dir, "folder_listings.json")))
-        s.note("auth|root", listOf(row("a.xnote", "root/a.xnote")))
-        s.note("auth|root/sub", listOf(row("b.xnote", "root/sub/b.xnote")))
+        s.note("auth|root", listOf(row("a.pnotes", "root/a.pnotes")))
+        s.note("auth|root/sub", listOf(row("b.pnotes", "root/sub/b.pnotes")))
         // A deleted folder drops its own listing and its rows in the parent.
         s.dropMatching { com.xnotes.core.util.DocKeys.within(it, "auth|root/sub") }
         assertNull(s.get("auth|root/sub"))
         s.dropParent("auth|root")
         assertNull(s.get("auth|root"))
         // Clearing drops everything.
-        s.note("auth|root", listOf(row("a.xnote", "root/a.xnote")))
+        s.note("auth|root", listOf(row("a.pnotes", "root/a.pnotes")))
         s.clear()
         assertNull(s.get("auth|root"))
     }
@@ -47,7 +47,7 @@ class FolderListingsTest {
         val file = File(dir, "folder_listings.json")
         FolderListings(store(file)).note(
             "auth|root",
-            listOf(FolderListings.Row("a.xnote", "root/a.xnote", false, 11L, 101L, 91L, "#ff0000")),
+            listOf(FolderListings.Row("a.pnotes", "root/a.pnotes", false, 11L, 101L, 91L, "#ff0000")),
         )
         Thread.sleep(2200) // let the batched writer flush
         val back = FolderListings(store(file)).get("auth|root")!!

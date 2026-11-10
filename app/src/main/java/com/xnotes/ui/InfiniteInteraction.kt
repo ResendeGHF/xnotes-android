@@ -1039,6 +1039,8 @@ class InfiniteInteraction(
      * shown live never vanishes on commit. Only a forward continuation within
      * reach is kept: a tip behind the nib (the hand outran an old prediction)
      * or off to the side is dropped, and the showing frame already covers it.
+     * The tip carries the last real sample's pressure, not the lifting pen's:
+     * that is the width it was shown with.
      */
     private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
         val tip = presentedTip() ?: return
@@ -1054,7 +1056,7 @@ class InfiniteInteraction(
             )
         ) return
         stroke.addSample(
-            com.xnotes.core.stroke.Sample(tip.x, tip.y, stroke.pAt(n - 1), (upTimeMs - strokeStartTimeMs).toDouble()),
+            com.xnotes.core.stroke.Sample(tip.x, tip.y, stroke.pAt(n - 2), (upTimeMs - strokeStartTimeMs).toDouble()),
         )
     }
 

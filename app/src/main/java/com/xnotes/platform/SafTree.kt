@@ -9,7 +9,7 @@ import android.provider.DocumentsContract
  * visit every note under the browse root without opening it.
  */
 object SafTree {
-    private val NOTE_EXTENSIONS = listOf(".xnote", ".xcanvas")
+    private val NOTE_EXTENSIONS = listOf(".pnotes", ".pcanvas", ".xnote", ".xcanvas")
 
     data class LocalEntry(val relativePath: String, val documentUri: String, val size: Long, val modified: Long)
 

@@ -60,7 +60,7 @@ data class ViewSettings(
  * defaults, set fields shadow them for this note. Scoped to the
  * open file but stored app-side — in [com.xnotes.platform.ViewStateStore] for folder
  * notes and the session sidecar for the open note, exactly like zoom and scroll —
- * never in the .xnote format.
+ * never in the .pnotes format.
  */
 data class ViewOverrides(
     val mode: ViewingMode? = null,
