@@ -179,7 +179,7 @@ import kotlinx.coroutines.withTimeout
 import kotlin.math.roundToInt
 
 /** Which pane the backstage shows on the right. */
-enum class BackstageView { HOME, GRAPH, COMPANION, PREFERENCES, ABOUT, TRASH }
+enum class BackstageView { HOME, GRAPH, COMPANION, PREFERENCES, TOOLBARS, ABOUT, TRASH }
 
 /** Whether the Home explorer is awaiting a new file/folder name. */
 private enum class CreateMode { NONE, FILE, CANVAS, FOLDER, ENCRYPTED_FOLDER }
@@ -572,7 +572,7 @@ private fun BackstageSidebar(modifier: Modifier, editor: Editor, nav: SidebarNav
             }
         }
         RailDivider()
-        Command(XnotesIcons.sliders, stringResource(R.string.preferences), selected = nav.view == BackstageView.PREFERENCES) { nav.onSelectView(BackstageView.PREFERENCES) }
+        Command(XnotesIcons.sliders, stringResource(R.string.preferences), selected = nav.view == BackstageView.PREFERENCES || nav.view == BackstageView.TOOLBARS) { nav.onSelectView(BackstageView.PREFERENCES) }
         if (nav.showAbout) Command(XnotesIcons.info, stringResource(R.string.about), selected = nav.view == BackstageView.ABOUT) { nav.onSelectView(BackstageView.ABOUT) }
     }
 }
@@ -610,7 +610,7 @@ private fun BackstageRail(modifier: Modifier, nav: SidebarNav, onExpand: () -> U
                 }
             }
         }
-        RailItem(XnotesIcons.sliders, stringResource(R.string.preferences), selected = nav.view == BackstageView.PREFERENCES) { nav.onSelectView(BackstageView.PREFERENCES) }
+        RailItem(XnotesIcons.sliders, stringResource(R.string.preferences), selected = nav.view == BackstageView.PREFERENCES || nav.view == BackstageView.TOOLBARS) { nav.onSelectView(BackstageView.PREFERENCES) }
         if (nav.showAbout) RailItem(XnotesIcons.info, stringResource(R.string.about), selected = nav.view == BackstageView.ABOUT) { nav.onSelectView(BackstageView.ABOUT) }
     }
 }
@@ -664,7 +664,7 @@ private fun BackstageMain(
                 BackstageView.HOME -> HomePane(editor, calls, createMode, onCreateMode, sidebarOpen, onShowSidebar, link)
                 BackstageView.GRAPH -> GraphPane(editor, sidebarOpen, onShowSidebar, onBackToHome, calls.openFile)
                 BackstageView.COMPANION -> CompanionPane(editor)
-                BackstageView.PREFERENCES -> PreferencesPane(editor, compact, sidebarOpen, onShowSidebar, onBackToHome, onImportCodeTheme, onImportFont, onBackup)
+                BackstageView.PREFERENCES, BackstageView.TOOLBARS -> PreferencesPane(editor, compact, sidebarOpen, onShowSidebar, onBackToHome, onImportCodeTheme, onImportFont, onBackup, openToolbarEditor = view == BackstageView.TOOLBARS)
                 BackstageView.TRASH -> TrashPane(editor, sidebarOpen, onShowSidebar, onOpenPreferences, onCloseTabsForDeletion)
                 BackstageView.ABOUT -> AboutPane()
             }

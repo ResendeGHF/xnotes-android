@@ -237,8 +237,11 @@ internal fun UnifiedPenLauncher(
                     .onGloballyPositioned { coordinates ->
                         if (glideKey != null) {
                             glide?.row?.let { row ->
-                                glide.centers[glideKey] = row.localPositionOf(
-                                    coordinates, Offset(coordinates.size.width / 2f, coordinates.size.height / 2f),
+                                glide.centers[glideKey] = ToolGlideTarget(
+                                    center = row.localPositionOf(
+                                        coordinates, Offset(coordinates.size.width / 2f, coordinates.size.height / 2f),
+                                    ),
+                                    radiusPx = coordinates.size.width / 2f,
                                 )
                             }
                         }

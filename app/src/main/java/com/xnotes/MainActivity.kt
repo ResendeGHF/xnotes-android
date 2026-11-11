@@ -71,6 +71,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.layout.boundsInRoot
@@ -102,6 +105,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.xnotes.R
 import com.xnotes.canvas.StylusButtonLatch
+import com.xnotes.core.tools.ToolbarContext
 import com.xnotes.platform.PdfOpenError
 import com.xnotes.ui.CanvasToastPill
 import com.xnotes.ui.PdfLinkBackButtons
@@ -109,6 +113,8 @@ import com.xnotes.ui.externalDropTarget
 import com.xnotes.ui.Editor
 import com.xnotes.ui.Toolbar
 import com.xnotes.ui.ToolbarAround
+import com.xnotes.ui.ToolbarDragSurface
+import com.xnotes.ui.WorkspaceFloatingBars
 import com.xnotes.ui.NoteTabBar
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
@@ -1777,6 +1783,12 @@ private fun EditorScreen(
                             backstageView = com.xnotes.ui.BackstageView.HOME
                             guardedAll { editor.goHomeAll() }
                         },
+                        onConfigureToolbars = {
+                            guardedAll {
+                                backstageView = com.xnotes.ui.BackstageView.TOOLBARS
+                                editor.goHomeAll()
+                            }
+                        },
                         onClosePane = { pane -> guarded(pane) { pane.goHome() } },
                         onInsertImage = { pane, at ->
                             pendingInsert = PendingInsert(pane, at)
@@ -2303,6 +2315,7 @@ private class PaneActions(
     val onToggleFullscreen: () -> Unit,
     /** Leave for the backstage, closing every open pane. */
     val onOpenBackstage: () -> Unit,
+    val onConfigureToolbars: () -> Unit,
     /** Close just this pane, leaving the other one to fill the window. */
     val onClosePane: (Editor) -> Unit,
     val onInsertImage: (Editor, com.xnotes.core.geometry.Pt?) -> Unit,
@@ -2385,12 +2398,15 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
     val sharedChrome = !split || preferences.sharedSplitToolbars
     val useCanvasLayout = if (mixed) preferences.mixedSplitToolbar == com.xnotes.core.tools.SplitToolbarInterface.CANVAS else active.canvasOpen
     val layout = if (useCanvasLayout) editor.canvasToolbarLayout else editor.toolbarLayout
+    val sharedGeometry = editor.toolbarWorkspaces.forContext(
+        if (useCanvasLayout) ToolbarContext.CANVAS else ToolbarContext.NOTE,
+    ).bars.firstOrNull()?.geometry
     val occlusion = remember { com.xnotes.ui.SharedToolbarOcclusion() }
     Column(Modifier.fillMaxSize().then(SwallowTouches).imePadding()) {
         if (split) {
             com.xnotes.ui.SplitWorkspaceHeader(editor, second, mixed, onClose = actions.onClosePane)
         }
-        val bar: @Composable () -> Unit = { WorkspaceToolbar(active, layout, actions, occlusion) }
+        val bar: @Composable () -> Unit = { WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry) }
         OptionalToolbarAround(sharedChrome, bar) { floatingBar ->
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 val fullW = maxWidth
@@ -2469,24 +2485,28 @@ private fun WorkspaceToolbar(
     layout: com.xnotes.core.tools.ToolbarLayout,
     actions: PaneActions,
     occlusion: com.xnotes.ui.SharedToolbarOcclusion,
+    geometry: com.xnotes.core.tools.ToolbarGeometry? = null,
 ) {
     Box(Modifier.onGloballyPositioned { occlusion.bar = it.boundsInRoot() }
         .then(if (!editor.canvasOpen) Modifier.endsPageSelection(editor) else Modifier)) {
         // The frame (scroll position and tool animation) survives focus changes; popups do not.
-        com.xnotes.ui.SharedToolbarFrame(if (editor.canvasOpen) editor.infinite.tool else editor.tool) {
+        com.xnotes.ui.SharedToolbarFrame(if (editor.canvasOpen) editor.infinite.tool else editor.tool, layout, geometry) {
             androidx.compose.runtime.key(editor, editor.canvasOpen) {
                 if (editor.canvasOpen) {
                     com.xnotes.ui.InfiniteToolbar(editor.infinite,
                         onOpenBackstage = actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
                         onInsertImage = { actions.onInsertCanvasImage(editor, null) },
                         onTakePhoto = { actions.onTakePhoto(editor, null) },
                         onScanPages = { actions.onScanPages(editor, null) },
                         onOpenMathStudio = actions.onOpenMathStudio,
                         onInsertAudio = { actions.onInsertAudio(editor) },
                         onRecordAudio = { actions.onRecordAudio(editor) },
-                        layout = layout)
+                        layout = layout,
+                        geometry = geometry)
                 } else {
                     Toolbar(editor, actions.onToggleFullscreen, actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
                         onInsertImage = { actions.onInsertImage(editor, null) },
                         onAddStickers = actions.onAddStickers,
                         onImportTemplate = actions.onImportTemplate,
@@ -2497,7 +2517,8 @@ private fun WorkspaceToolbar(
                         onInsertAudio = { actions.onInsertAudio(editor) },
                         onRecordAudio = { actions.onRecordAudio(editor) },
                         onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
-                        layout = layout)
+                        layout = layout,
+                        geometry = geometry)
                 }
             }
         }
@@ -2536,11 +2557,14 @@ private fun EditorPane(
         }
     }
     // Shared-toolbar occlusion: when the workspace owns the bar, each pane reports its position
-    // so the shared bar insets only the pane it overlaps.
+    // so the shared bar insets only the pane it overlaps. Per-pane mode keeps its own local bar
+    // driven by the workspace multi-dock below.
     val localOcclusion = remember(editor) { com.xnotes.ui.SharedToolbarOcclusion() }
     val occlusion = sharedOcclusion ?: localOcclusion
     val nativeLayout = if (editor.canvasOpen) app.canvasToolbarLayout else app.toolbarLayout
     var bounds by remember { mutableStateOf(androidx.compose.ui.geometry.Rect.Zero) }
+    // Workspace drag surfaces position against the pane in root coordinates.
+    var paneBounds by remember { mutableStateOf(Rect.Zero) }
     val insets = occlusion.insets(bounds, com.xnotes.ui.LocalToolbarLook.current)
     SideEffect {
         if (editor.canvasOpen) editor.infinite.setToolbarCover(insets.left, insets.top, insets.right, insets.bottom)
@@ -2553,7 +2577,7 @@ private fun EditorPane(
     CompositionLocalProvider(com.xnotes.ui.LocalToolbarCover provides cover) {
     // The colour drag is drawn over the pane, not as another column child: a full-height child
     // measured before the weighted canvas takes the whole pane and the surfaces collapse to black.
-    Box(modifier) {
+    Box(modifier.onGloballyPositioned { paneBounds = it.boundsInRoot() }) {
     Column(
         Modifier
             .fillMaxSize()
@@ -2577,10 +2601,8 @@ private fun EditorPane(
         }
         if (editor.canvasOpen) {
             val canvas = editor.infinite
-            val bar: @Composable () -> Unit = {
-                WorkspaceToolbar(editor, nativeLayout, actions, occlusion)
-            }
-            OptionalToolbarAround(sharedOcclusion == null, bar) { floatingBar ->
+            if (sharedOcclusion != null) {
+                // Shared mode: the workspace bar lives in SplitHost; this pane is a bare canvas.
                 Box(modifier = Modifier.fillMaxSize().clipToBounds()) {
                     AndroidView(
                         factory = { detached(canvas.surfaces) },
@@ -2603,14 +2625,87 @@ private fun EditorPane(
                     com.xnotes.ui.CanvasDebugOverlay(canvas)
                     com.xnotes.ui.StickyColorPopup(editor)
                     CanvasToastPill(canvas)
-                    Box(Modifier.fillMaxSize().zIndex(1f)) { floatingBar() }
+                }
+            } else {
+                // Per-pane mode: workspace multi-dock + floating bars (PR431) with downstream overlays.
+                val primary = app.toolbarWorkspaces.forContext(ToolbarContext.CANVAS).bars.firstOrNull()
+                val bareBar: @Composable () -> Unit = {
+                    com.xnotes.ui.InfiniteToolbar(
+                        canvas,
+                        onOpenBackstage = actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
+                        onInsertImage = { actions.onInsertCanvasImage(editor, null) },
+                        onClosePane = onClose,
+                        onInsertAudio = { actions.onInsertAudio(editor) },
+                        onRecordAudio = { actions.onRecordAudio(editor) },
+                        onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onScanPages = { actions.onScanPages(editor, null) },
+                        onOpenMathStudio = actions.onOpenMathStudio,
+                        layout = primary?.layout ?: nativeLayout,
+                        geometry = primary?.geometry,
+                    )
+                }
+                val bar: @Composable () -> Unit = {
+                    if (primary != null && !primary.geometry.floating) {
+                        ToolbarDragSurface(
+                            primary.id, primary.geometry.anchor, primary.geometry.movable,
+                            paneBounds, { id, anchor -> app.moveToolbarBar(ToolbarContext.CANVAS, id, anchor) },
+                        ) { bareBar() }
+                    } else bareBar()
+                }
+                val activeWorkspace = app.toolbarWorkspaces.forContext(ToolbarContext.CANVAS)
+                val secondaryBar: @Composable (com.xnotes.core.tools.ToolbarBar) -> Unit = { extraBar ->
+                    com.xnotes.ui.InfiniteToolbar(
+                        canvas,
+                        onOpenBackstage = actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
+                        onInsertImage = { actions.onInsertCanvasImage(editor, null) },
+                        onInsertAudio = { actions.onInsertAudio(editor) },
+                        onRecordAudio = { actions.onRecordAudio(editor) },
+                        onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onScanPages = { actions.onScanPages(editor, null) },
+                        onOpenMathStudio = actions.onOpenMathStudio,
+                        layout = extraBar.layout,
+                        geometry = extraBar.geometry,
+                    )
+                }
+                ToolbarAround(bar, onCover = canvas::setToolbarCover, suppressBar = primary?.geometry?.floating == true, barLayout = primary?.layout, barGeometry = primary?.geometry, workspace = activeWorkspace, dockedContent = secondaryBar) { floatingBar ->
+                    Box(modifier = Modifier.fillMaxSize().clipToBounds()) {
+                        AndroidView(
+                            factory = { detached(canvas.surfaces) },
+                            modifier = Modifier.fillMaxSize().externalDropTarget(canvas.externalDrop).onGloballyPositioned { bounds = it.boundsInRoot() },
+                            update = { canvas.view.publish() },
+                        )
+                        canvas.editingField?.let { field ->
+                            com.xnotes.ui.TextEditorOverlay(canvas, field)
+                        }
+                        floatingBar()
+                        WorkspaceFloatingBars(
+                            workspace = activeWorkspace,
+                            onMoveBar = { id, anchor -> app.moveToolbarBar(ToolbarContext.CANVAS, id, anchor) },
+                            primaryContent = { bar() },
+                            content = secondaryBar,
+                            colorCount = editor.toolbarColorCount,
+                        )
+                        com.xnotes.ui.SelectionMenu(
+                            canvas,
+                            onSaveAudio = { actions.onSaveAudio(editor, it) },
+                            onShareAudio = { actions.onShareAudio(editor, it) },
+                            onShareImage = actions.onShareImage,
+                        )
+                        com.xnotes.ui.CropOverlay(canvas)
+                        com.xnotes.ui.TextStyleBar(canvas)
+                        com.xnotes.ui.LongPressMenu(canvas, onInsertImageAt = { c -> actions.onInsertCanvasImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onScanPagesAt = { c -> actions.onScanPages(editor, c) }, onInsertStickyAt = { c -> editor.insertStickyNote(c) })
+                        com.xnotes.ui.PenMenu(canvas)
+                        com.xnotes.ui.CanvasDebugOverlay(canvas)
+                        com.xnotes.ui.StickyColorPopup(editor)
+                        CanvasToastPill(canvas)
+                    }
                 }
             }
         } else {
-            val bar: @Composable () -> Unit = {
-                WorkspaceToolbar(editor, nativeLayout, actions, occlusion)
-            }
-            OptionalToolbarAround(sharedOcclusion == null, bar) { floatingBar ->
+            if (sharedOcclusion != null) {
+                // Shared mode: bare document surface; the workspace bar lives in SplitHost.
                 Row(modifier = Modifier.fillMaxSize()) {
                     if (editor.sidebarVisible) {
                         com.xnotes.ui.SidePanel(
@@ -2658,7 +2753,118 @@ private fun EditorPane(
                         ZoomLockHint(editor)
                         PdfLinkBackButtons(editor)
                         CanvasToastPill(editor)
-                        Box(Modifier.fillMaxSize().zIndex(1f)) { floatingBar() }
+                    }
+                }
+            } else {
+                // Per-pane mode: workspace multi-dock + floating bars (PR431) with downstream overlays.
+                val primary = app.toolbarWorkspaces.forContext(ToolbarContext.NOTE).bars.firstOrNull()
+                val bareBar: @Composable () -> Unit = {
+                    Box(Modifier.endsPageSelection(editor)) { Toolbar(
+                        editor,
+                        onToggleFullscreen = actions.onToggleFullscreen,
+                        onOpenBackstage = actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
+                        onInsertImage = { actions.onInsertImage(editor, null) },
+                        onAddStickers = actions.onAddStickers,
+                        onClosePane = onClose,
+                        onImportTemplate = actions.onImportTemplate,
+                        onInsertAudio = { actions.onInsertAudio(editor) },
+                        onRecordAudio = { actions.onRecordAudio(editor) },
+                        onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onScanPages = { actions.onScanPages(editor, null) },
+                        onImagePage = { actions.onImagePage(editor) },
+                        onOpenMathStudio = actions.onOpenMathStudio,
+                        onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
+                        layout = primary?.layout ?: nativeLayout,
+                        geometry = primary?.geometry,
+                    ) }
+                }
+                val bar: @Composable () -> Unit = {
+                    if (primary != null && !primary.geometry.floating) {
+                        ToolbarDragSurface(
+                            primary.id, primary.geometry.anchor, primary.geometry.movable,
+                            paneBounds, { id, anchor -> app.moveToolbarBar(ToolbarContext.NOTE, id, anchor) },
+                        ) { bareBar() }
+                    } else bareBar()
+                }
+                val activeWorkspace = app.toolbarWorkspaces.forContext(ToolbarContext.NOTE)
+                val secondaryBar: @Composable (com.xnotes.core.tools.ToolbarBar) -> Unit = { extraBar ->
+                    Toolbar(
+                        editor,
+                        onToggleFullscreen = actions.onToggleFullscreen,
+                        onOpenBackstage = actions.onOpenBackstage,
+                        onConfigureToolbars = actions.onConfigureToolbars,
+                        onInsertImage = { actions.onInsertImage(editor, null) },
+                        onAddStickers = actions.onAddStickers,
+                        onImportTemplate = actions.onImportTemplate,
+                        onInsertAudio = { actions.onInsertAudio(editor) },
+                        onRecordAudio = { actions.onRecordAudio(editor) },
+                        onTakePhoto = { actions.onTakePhoto(editor, null) },
+                        onScanPages = { actions.onScanPages(editor, null) },
+                        onImagePage = { actions.onImagePage(editor) },
+                        onOpenMathStudio = actions.onOpenMathStudio,
+                        onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
+                        layout = extraBar.layout,
+                        geometry = extraBar.geometry,
+                    )
+                }
+                ToolbarAround(bar, onCover = editor::setToolbarCover, suppressBar = primary?.geometry?.floating == true, barLayout = primary?.layout, barGeometry = primary?.geometry, workspace = activeWorkspace, dockedContent = secondaryBar) { floatingBar ->
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        if (editor.sidebarVisible) {
+                            com.xnotes.ui.SidePanel(
+                                editor,
+                                onSharePages = { pages, asPdf -> actions.onSharePages(editor, pages, asPdf) },
+                                onSavePagesAsPdf = { pages -> actions.onSavePagesAsPdf(editor, pages) },
+                                onSavePagesAsImages = { pages -> actions.onSavePagesAsImages(editor, pages) },
+                                onInsertPdf = { after -> actions.onInsertPdf(editor, after) },
+                                onInsertPages = { kind, at -> actions.onInsertPages(editor, kind, at) },
+                                onImportTemplate = actions.onImportTemplate,
+                                onTemplateFromImage = actions.onTemplateFromImage,
+                            )
+                        }
+                        Box(modifier = Modifier.weight(1f).fillMaxHeight().clipToBounds().endsPageSelection(editor)) {
+                            AndroidView(
+                                factory = { detached(editor.surfaces) },
+                                modifier = Modifier.fillMaxSize().externalDropTarget(editor.externalDrop).onGloballyPositioned { bounds = it.boundsInRoot() },
+                                update = { editor.view.requestRender() }, // repaint on (re)attach so a push never flashes blank
+                            )
+                            editor.editingField?.let { field ->
+                                com.xnotes.ui.TextEditorOverlay(editor, field)
+                            }
+                            floatingBar()
+                            WorkspaceFloatingBars(
+                                workspace = activeWorkspace,
+                                onMoveBar = { id, anchor -> app.moveToolbarBar(ToolbarContext.NOTE, id, anchor) },
+                                primaryContent = { bar() },
+                                content = secondaryBar,
+                                colorCount = editor.toolbarColorCount,
+                            )
+                            com.xnotes.ui.SelectionMenu(
+                                editor,
+                                onSaveAudio = { actions.onSaveAudio(editor, it) },
+                                onShareAudio = { actions.onShareAudio(editor, it) },
+                                onShareImage = actions.onShareImage,
+                            )
+                            com.xnotes.ui.CropOverlay(editor)
+                            com.xnotes.ui.ScreenshotMenu(editor, onShare = actions.onShareImage)
+                            com.xnotes.ui.CropMenu(editor)
+                            com.xnotes.ui.TextStyleBar(editor)
+                            com.xnotes.ui.LongPressMenu(editor, onInsertImageAt = { c -> actions.onInsertImage(editor, c) }, onTakePhotoAt = { c -> actions.onTakePhoto(editor, c) }, onScanPagesAt = { c -> actions.onScanPages(editor, c) }, onInsertNoteLinkAt = { c -> actions.onInsertNoteLink(editor, c) }, onInsertStickyAt = { c -> editor.insertStickyNote(c) })
+                            com.xnotes.ui.PenMenu(editor)
+                            com.xnotes.ui.FlowEditMenu(editor)
+                            com.xnotes.ui.PdfSelectionMenu(editor)
+                            com.xnotes.ui.MarkupNotePeek(editor)
+                            com.xnotes.ui.MarkupMenu(editor)
+                            com.xnotes.ui.MarkupNoteDialog(editor)
+                            com.xnotes.ui.StickyNoteDialog(editor)
+                            com.xnotes.ui.StickyColorPopup(editor)
+                            com.xnotes.ui.SlashMenu(editor)
+                            com.xnotes.ui.FlowTableMenu(editor)
+                            com.xnotes.ui.TableChrome(editor)
+                            ZoomLockHint(editor)
+                            PdfLinkBackButtons(editor)
+                            CanvasToastPill(editor)
+                        }
                     }
                 }
             }
