@@ -138,7 +138,7 @@ internal fun UnifiedPenDetails(
                 }
             }
             HorizontalDivider(color = border)
-            Text("Canetas", color = palette.textDim.toComposeColor(),
+            Text("Pens", color = palette.textDim.toComposeColor(),
                 style = MaterialTheme.typography.labelMedium)
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),

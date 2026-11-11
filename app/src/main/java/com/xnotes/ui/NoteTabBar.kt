@@ -74,11 +74,11 @@ fun NoteTabBar(
         val highlightWidth by animateFloatAsState(targetWidth, highlightMotion, label = "tabHighlightWidth")
     Row(
         Modifier.fillMaxWidth()
-            // The strip's own backing: a darkened tone of the accent, so the gaps around and
-            // between the rounded tabs (and the corners outside each tab's rounding) never show
-            // the default background (#000000 on OLED). Rectangular on purpose: a rounded
+            // The strip shares the toolbar's panel color, so the gaps around and
+            // between the rounded tabs (and the corners outside each tab's rounding)
+            // blend with the bar below. Rectangular on purpose: a rounded
             // container would re-create the same reveal one level out.
-            .background(palette.tabStripBackground.toComposeColor())
+            .background(palette.panel.toComposeColor())
             .horizontalScroll(rememberScrollState())
             .height(42.dp)
             .drawBehind {

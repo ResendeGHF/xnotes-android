@@ -53,11 +53,11 @@ internal fun ToolbarCopyDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Copiar barra para $targetLabel") },
+        title = { Text("Copy bar to $targetLabel") },
         text = {
             Column(Modifier.heightIn(max = 450.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Pré-visualização no destino · ${draft.retainedCount} elementos compatíveis")
+                Text("Preview in the destination · ${draft.retainedCount} elements compatible")
                 ToolbarWorkspacePreview(
                     workspace = candidate,
                     look = look,
@@ -74,19 +74,19 @@ internal fun ToolbarCopyDialog(
                     onMoveBar = { _, _ -> },
                 )
                 if (draft.omitted.isNotEmpty()) {
-                    Text("Não serão copiados (${draft.omitted.size}): " +
+                    Text("Will not be copied (${draft.omitted.size}): " +
                         draft.omitted.joinToString { it.id.replace('_', ' ') })
-                } else Text("Todos os elementos são compatíveis.")
+                } else Text("All elements are compatible.")
                 if (sharedCanvasWillDisable) {
-                    Text("O XCanvas usa o perfil compartilhado. Ao confirmar, seu perfil individual será ativado.")
+                    Text("pcanvas uses the shared profile. Confirming will enable its individual profile.")
                 }
-                Text("Dimensões, seções, espaçamento e alinhamento da barra serão preservados.")
+                Text("The bar's dimensions, sections, spacing and alignment will be preserved.")
             }
         },
         confirmButton = {
-            TextButton(onClick = onCopy, enabled = draft.retainedCount > 0) { Text("Copiar barra") }
+            TextButton(onClick = onCopy, enabled = draft.retainedCount > 0) { Text("Copy bar") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
@@ -121,32 +121,32 @@ internal fun ToolbarPresetsDialog(
             Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = selectedTab == 0, onClick = { onSelectTab(0) }, label = { Text("Meus salvos") })
-                    FilterChip(selected = selectedTab == 1, onClick = { onSelectTab(1) }, label = { Text("Modelos") })
+                    FilterChip(selected = selectedTab == 0, onClick = { onSelectTab(0) }, label = { Text("My saved") })
+                    FilterChip(selected = selectedTab == 1, onClick = { onSelectTab(1) }, label = { Text("Templates") })
                 }
                 statusMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 if (selectedTab == 0) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { saving = !saving; error = null }) { Text("Salvar atual") }
+                        TextButton(onClick = { saving = !saving; error = null }) { Text("Save current") }
                         Spacer(Modifier.weight(1f))
                         Box {
                             IconButton(onClick = { libraryMenuOpen = true }) {
-                                Icon(XnotesIcons.more, contentDescription = "Importar e exportar workspaces")
+                                Icon(XnotesIcons.more, contentDescription = "Import and export workspaces")
                             }
                             DropdownMenu(
                                 expanded = libraryMenuOpen,
                                 onDismissRequest = { libraryMenuOpen = false },
                             ) {
-                                DropdownMenuItem(text = { Text("Importar") }, onClick = {
+                                DropdownMenuItem(text = { Text("Import") }, onClick = {
                                     libraryMenuOpen = false
                                     onImport()
                                 })
-                                DropdownMenuItem(text = { Text("Exportar workspace atual") }, onClick = {
+                                DropdownMenuItem(text = { Text("Export current workspace") }, onClick = {
                                     libraryMenuOpen = false
                                     onExportCurrent()
                                 })
                                 if (presets.isNotEmpty()) {
-                                    DropdownMenuItem(text = { Text("Exportar todos os salvos") }, onClick = {
+                                    DropdownMenuItem(text = { Text("Export all saved") }, onClick = {
                                         libraryMenuOpen = false
                                         onExportAll()
                                     })
@@ -158,7 +158,7 @@ internal fun ToolbarPresetsDialog(
                         OutlinedTextField(
                             value = name,
                             onValueChange = { name = it.take(48); error = null },
-                            label = { Text("Nome do workspace") },
+                            label = { Text("Workspace name") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -168,13 +168,13 @@ internal fun ToolbarPresetsDialog(
                                     saving = false
                                     name = ""
                                     error = null
-                                } else error = "Use um nome diferente (limite de 20)."
-                            }) { Text("Salvar") }
-                            TextButton(onClick = { saving = false }) { Text("Cancelar") }
+                                } else error = "Use a different name (limit of 20)."
+                            }) { Text("Save") }
+                            TextButton(onClick = { saving = false }) { Text("Cancel") }
                         }
                         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     }
-                    if (presets.isEmpty()) Text("Nenhum workspace salvo ainda.")
+                    if (presets.isEmpty()) Text("No saved workspaces yet.")
                     presets.forEach { preset ->
                         Column(
                             Modifier.fillMaxWidth()
@@ -189,22 +189,22 @@ internal fun ToolbarPresetsDialog(
                                     verticalArrangement = Arrangement.spacedBy(3.dp),
                                 ) {
                                     Text(preset.name, style = MaterialTheme.typography.titleSmall)
-                                    Text("${preset.workspaces.note.bars.size} barras XNotes · ${preset.workspaces.canvas.bars.size} XCanvas",
+                                    Text("${preset.workspaces.note.bars.size} pnotes bars · ${preset.workspaces.canvas.bars.size} pcanvas",
                                         style = MaterialTheme.typography.bodySmall)
                                 }
                                 Box {
                                     IconButton(onClick = { presetMenuOpen = preset.id }) {
-                                        Icon(XnotesIcons.more, contentDescription = "Opções de ${preset.name}")
+                                        Icon(XnotesIcons.more, contentDescription = "Options for ${preset.name}")
                                     }
                                     DropdownMenu(
                                         expanded = presetMenuOpen == preset.id,
                                         onDismissRequest = { presetMenuOpen = null },
                                     ) {
-                                        DropdownMenuItem(text = { Text("Exportar") }, onClick = {
+                                        DropdownMenuItem(text = { Text("Export") }, onClick = {
                                             presetMenuOpen = null
                                             onExportOne(preset)
                                         })
-                                        DropdownMenuItem(text = { Text("Excluir") }, onClick = {
+                                        DropdownMenuItem(text = { Text("Delete") }, onClick = {
                                             presetMenuOpen = null
                                             pendingDelete = preset.id
                                         })
@@ -213,8 +213,8 @@ internal fun ToolbarPresetsDialog(
                             }
                             if (pendingDelete == preset.id) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    TextButton(onClick = { onDelete(preset.id); pendingDelete = null }) { Text("Confirmar exclusão") }
-                                    TextButton(onClick = { pendingDelete = null }) { Text("Cancelar") }
+                                    TextButton(onClick = { onDelete(preset.id); pendingDelete = null }) { Text("Confirm delete") }
+                                    TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
                                 }
                             }
                         }
@@ -236,20 +236,20 @@ internal fun ToolbarPresetsDialog(
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Fechar") } },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
 
 private fun workspaceTemplateDescription(id: String): String = when (id) {
-    "builtin-original" -> "Barra padrão do XNotes, para recomeçar uma personalização."
-    "builtin-focus" -> "Uma única barra inferior, compacta, para escrever sem distrações."
-    "builtin-study" -> "Navegação superior e escrita em uma barra independente na parte inferior."
-    "builtin-pdf" -> "Navegação de documentos acima e ferramentas de anotação à direita."
-    "builtin-drawing" -> "Traços organizados em duas linhas, paleta inferior e ações no topo."
-    "builtin-markup" -> "Estojo inferior de marcação com controles de documento separados."
-    "builtin-complete" -> "Todas as ações principais no topo, alinhadas em início, centro e fim."
-    "builtin-two-rows" -> "Ferramentas em duas fileiras na parte inferior e navegação no topo."
-    else -> "Outra disposição de ferramentas."
+    "builtin-original" -> "Default pnotes bar, to restart a customization."
+    "builtin-focus" -> "A single compact bottom bar for distraction-free writing."
+    "builtin-study" -> "Top navigation with writing on a separate bottom bar."
+    "builtin-pdf" -> "Document navigation on top, annotation tools on the right."
+    "builtin-drawing" -> "Strokes arranged in two rows, bottom palette, actions on top."
+    "builtin-markup" -> "Bottom markup case with separate document controls."
+    "builtin-complete" -> "All main actions on top, aligned to start, center and end."
+    "builtin-two-rows" -> "Tools in two bottom rows with navigation on top."
+    else -> "Another tool arrangement."
 }
 
 /** Preview both profiles before replacing the live workspace with a saved or built-in layout. */
@@ -272,9 +272,9 @@ internal fun ToolbarPresetPreviewDialog(
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = !canvasPreview, onClick = { canvasPreview = false },
-                        label = { Text("XNotes") })
+                        label = { Text("pnotes") })
                     FilterChip(selected = canvasPreview, onClick = { canvasPreview = true },
-                        label = { Text("XCanvas") })
+                        label = { Text("pcanvas") })
                 }
                 ToolbarWorkspacePreview(
                     workspace = workspace,
@@ -294,18 +294,18 @@ internal fun ToolbarPresetPreviewDialog(
                 FilterChip(
                     selected = applyBoth,
                     onClick = { applyBoth = !applyBoth },
-                    label = { Text("Aplicar também ao outro editor") },
+                    label = { Text("Also apply to the other editor") },
                 )
                 Text(if (applyBoth)
-                    "Substitui as barras de XNotes e XCanvas, além da aparência e paleta globais."
-                    else "Substitui somente as barras de ${if (canvasPreview) "XCanvas" else "XNotes"}. O outro editor, as cores e a aparência globais serão preservados.")
+                    "Replaces the pnotes and pcanvas bars, plus the global appearance and palette."
+                    else "Replaces only the ${if (canvasPreview) "pcanvas" else "pnotes"} bars. The other editor, colors and global appearance will be preserved.")
             }
         },
         confirmButton = {
             TextButton(onClick = { onApply(if (applyBoth) null else context) }) {
-                Text(if (applyBoth) "Aplicar nos dois" else "Aplicar em ${if (canvasPreview) "XCanvas" else "XNotes"}")
+                Text(if (applyBoth) "Apply to both" else "Apply to ${if (canvasPreview) "pcanvas" else "pnotes"}")
             }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Voltar à lista") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Back to list") } },
     )
 }

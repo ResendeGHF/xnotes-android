@@ -362,7 +362,7 @@ private fun PenFanPalette(
 @Composable
 internal fun PenSilhouette(item: ToolbarItem, ink: Color, modifier: Modifier = Modifier) {
     // One consistent outlined icon family: dark/light adaptive strokes and a small live ink
-    // accent, without the photorealistic shaded bodies that clash with the rest of XNotes.
+    // accent, without the photorealistic shaded bodies that clash with the rest of Polars.
     val foreground = LocalPalette.current.text.toComposeColor()
     Canvas(modifier) {
         val w = size.width

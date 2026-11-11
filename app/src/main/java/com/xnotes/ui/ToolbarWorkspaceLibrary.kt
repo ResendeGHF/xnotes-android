@@ -48,9 +48,9 @@ internal fun ToolbarWorkspaceLibrary(
             runCatching {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     out.write(state.exportContent.toByteArray(Charsets.UTF_8))
-                } ?: error("Não foi possível abrir o arquivo.")
-            }.onSuccess { state.statusMessage = "Workspace exportado com sucesso." }
-                .onFailure { state.statusMessage = "Falha ao exportar: ${it.message}" }
+                } ?: error("Could not open the file.")
+            }.onSuccess { state.statusMessage = "Workspace exported successfully." }
+                .onFailure { state.statusMessage = "Export failed: ${it.message}" }
         }
     }
     val importLauncher = rememberLauncherForActivityResult(
@@ -59,14 +59,14 @@ internal fun ToolbarWorkspaceLibrary(
         if (uri != null) {
             runCatching {
                 val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                    ?: error("Não foi possível ler o arquivo.")
-                require(raw.length <= 1_000_000) { "Arquivo muito grande." }
+                    ?: error("Could not read the file.")
+                require(raw.length <= 1_000_000) { "File too large." }
                 onImport(ToolbarWorkspaceExchangeJson.import(raw))
             }.onSuccess { count ->
                 state.presets = getPresets()
-                state.statusMessage = if (count > 0) "$count workspace(s) importado(s)."
-                    else "Limite de 20 workspaces salvos atingido."
-            }.onFailure { state.statusMessage = "Falha ao importar: ${it.message}" }
+                state.statusMessage = if (count > 0) "$count workspace(s) imported."
+                    else "Saved workspace limit of 20 reached."
+            }.onFailure { state.statusMessage = "Import failed: ${it.message}" }
         }
     }
     fun export(presets: List<ToolbarWorkspacePreset>, filename: String) {
@@ -88,8 +88,8 @@ internal fun ToolbarWorkspaceLibrary(
                 val basename = preset.name.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(40)
                 export(listOf(preset), "$basename.xworkspaces.json")
             },
-            onExportCurrent = { export(listOf(currentPreset()), "toolbar-atual.xworkspaces.json") },
-            onExportAll = { export(state.presets, "toolbars-salvas.xworkspaces.json") },
+            onExportCurrent = { export(listOf(currentPreset()), "toolbar-current.xworkspaces.json") },
+            onExportAll = { export(state.presets, "saved-toolbars.xworkspaces.json") },
             onImport = { importLauncher.launch(arrayOf("application/json", "application/octet-stream")) },
             onUseTemplate = { showPreview(it) },
             onSave = { name ->

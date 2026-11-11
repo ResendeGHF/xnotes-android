@@ -36,19 +36,19 @@ internal fun ToolbarGeometryControls(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        ToolbarMeasure("Largura", geometry.widthDp, screen.screenWidthDp.coerceIn(48, 1200), 48, 1200) {
+        ToolbarMeasure("Width", geometry.widthDp, screen.screenWidthDp.coerceIn(48, 1200), 48, 1200) {
             onChange(geometry.copy(widthDp = it))
         }
-        ToolbarMeasure("Altura", geometry.heightDp, 56, 48, 800) {
+        ToolbarMeasure("Height", geometry.heightDp, 56, 48, 800) {
             onChange(geometry.copy(heightDp = it))
         }
         ToolbarMeasure("Padding", geometry.paddingDp, 4, 0, 32) {
             onChange(geometry.copy(paddingDp = it))
         }
-        ToolbarMeasure("Espaçamento", geometry.spacingDp, 2, 0, 32) {
+        ToolbarMeasure("Spacing", geometry.spacingDp, 2, 0, 32) {
             onChange(geometry.copy(spacingDp = it))
         }
-        ToolbarMeasure("Botões", geometry.elementSizeDp, 42, 28, 72) {
+        ToolbarMeasure("Buttons", geometry.elementSizeDp, 42, 28, 72) {
             onChange(geometry.copy(elementSizeDp = it))
         }
     }
@@ -66,7 +66,7 @@ private fun ToolbarMeasure(
     Column(Modifier.width(196.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "$title: ${value?.let { "$it dp" } ?: "automático"}",
+                "$title: ${value?.let { "$it dp" } ?: "auto"}",
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.weight(1f),
             )
@@ -94,7 +94,7 @@ internal fun ToolbarEntrySizeControls(
 ) {
     if (entry == null) {
         Text(
-            "Toque em uma ferramenta do preview para ajustar o tamanho somente dela.",
+            "Tap a tool in the preview to resize only that tool.",
             style = MaterialTheme.typography.bodySmall,
         )
         return
@@ -105,7 +105,7 @@ internal fun ToolbarEntrySizeControls(
     )
     val isSpacer = entry.item == com.xnotes.core.tools.ToolbarItem.SPACER
     ToolbarMeasure(
-        title = if (isSpacer) "Espaço entre elementos" else "Tamanho individual",
+        title = if (isSpacer) "Space between elements" else "Individual size",
         value = entry.sizeDp,
         defaultValue = if (isSpacer) ToolbarEntry.DEFAULT_SPACER_DP else defaultSizeDp.coerceIn(28, 72),
         minimum = if (isSpacer) 4 else 28,

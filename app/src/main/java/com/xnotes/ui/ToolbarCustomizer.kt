@@ -175,7 +175,7 @@ fun ToolbarCustomizerBody(
                             verticalArrangement = Arrangement.spacedBy(3.dp),
                         ) {
                             if (section.lanes > 1) {
-                                Text("Linha ${lane + 1}", color = palette.textDim.toComposeColor(), fontSize = 11.sp)
+                                Text("Row ${lane + 1}", color = palette.textDim.toComposeColor(), fontSize = 11.sp)
                             }
                             if (cells.isEmpty()) {
                                 Text(
@@ -219,7 +219,7 @@ fun ToolbarCustomizerBody(
         }
         if (draggingSection && sectionDropTarget == ToolbarSectionTarget(region ?: ToolbarRegion.START, null)) SectionCaret()
         if (dragging && region != null && dragRegionTarget == region && dropTarget == null) {
-            Text("Solte para criar uma section aqui", color = palette.accent.toComposeColor(), fontSize = 12.sp)
+            Text("Drop to create a section here", color = palette.accent.toComposeColor(), fontSize = 12.sp)
         }
         AddSectionChip(onClick = { lines -> onAdd(lines, region ?: ToolbarRegion.START) })
             }
@@ -367,10 +367,10 @@ private fun SectionCard(
                     onCancel = onGrabCancel,
                 )
                 Box {
-                    Tooltip("Configurar linhas da section") {
+                    Tooltip("Configure section rows") {
                         IconButton(onClick = { sectionMenuOpen = true }, modifier = Modifier.size(26.dp)) {
                             Icon(
-                                XnotesIcons.more, "Configurar linhas da section",
+                                XnotesIcons.more, "Configure section rows",
                                 tint = palette.textDim.toComposeColor(),
                                 modifier = Modifier.size(14.dp),
                             )
@@ -379,7 +379,7 @@ private fun SectionCard(
                     DropdownMenu(expanded = sectionMenuOpen, onDismissRequest = { sectionMenuOpen = false }) {
                         for (count in 1..3) {
                             DropdownMenuItem(
-                                text = { Text(if (count == 1) "1 linha" else "$count linhas") },
+                                text = { Text(if (count == 1) "1 row" else "$count rows") },
                                 leadingIcon = if (lanes == count) {
                                     { Icon(XnotesIcons.check, null, modifier = Modifier.size(16.dp)) }
                                 } else null,
@@ -570,13 +570,13 @@ private fun LayerFace(item: ToolbarItem, visible: Boolean, modifier: Modifier, s
             modifier = Modifier.weight(1f),
         )
         if (!visible) {
-            Text("Oculto", color = palette.textDim.toComposeColor(),
+            Text("Hidden", color = palette.textDim.toComposeColor(),
                 style = MaterialTheme.typography.labelSmall)
         }
         if (onToggle != null) {
             Box(Modifier.size(30.dp).clip(MaterialTheme.shapes.small).clickable(onClick = onToggle),
                 contentAlignment = Alignment.Center) {
-                Icon(XnotesIcons.view, if (visible) "Ocultar elemento" else "Mostrar elemento",
+                Icon(XnotesIcons.view, if (visible) "Hide element" else "Show element",
                     tint = (if (visible) palette.accent else palette.textDim).toComposeColor(),
                     modifier = Modifier.size(16.dp))
             }
@@ -714,15 +714,15 @@ private fun AddSectionChip(onClick: (Int) -> Unit) {
             Text(stringResource(R.string.add_section), color = palette.accent.toComposeColor(), fontSize = 12.sp)
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-            DropdownMenuItem(text = { Text("Uma linha") }, onClick = {
+            DropdownMenuItem(text = { Text("One row") }, onClick = {
                 menuOpen = false
                 onClick(1)
             })
-            DropdownMenuItem(text = { Text("Duas linhas") }, onClick = {
+            DropdownMenuItem(text = { Text("Two rows") }, onClick = {
                 menuOpen = false
                 onClick(2)
             })
-            DropdownMenuItem(text = { Text("Três linhas") }, onClick = {
+            DropdownMenuItem(text = { Text("Three rows") }, onClick = {
                 menuOpen = false
                 onClick(3)
             })

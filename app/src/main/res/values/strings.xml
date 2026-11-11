@@ -859,7 +859,7 @@
     <string name="settings_exported">Settings exported.</string>
     <string name="settings_imported">Settings imported.</string>
     <string name="err_export_settings">Couldn’t export the settings.</string>
-    <string name="err_import_settings">That file holds no xnotes settings.</string>
+    <string name="err_import_settings">That file holds no Polars settings.</string>
     <string name="replace">Replace</string>
     <string name="crop">Crop</string>
     <string name="group">Group</string>
@@ -1747,8 +1747,8 @@
     <string name="toolbar_unified_pen">Pen group</string>
     <string name="toolbar_pen_advanced_settings">Advanced settings</string>
     <string name="split_interface_title">Shared toolbar layout</string>
-    <string name="split_interface_note">xnote interface</string>
-    <string name="split_interface_canvas">xcanvas interface</string>
+    <string name="split_interface_note">pnote interface</string>
+    <string name="split_interface_canvas">pcanvas interface</string>
     <string name="split_tool_unavailable">%1$s — unavailable in this document</string>
     <string name="split_close_document">Close %1$s</string>
     <string name="split_settings">Split view</string>
@@ -1756,5 +1756,5 @@
     <string name="split_per_pane">Tools per pane</string>
     <string name="split_shared_help">One toolbox controls the active document. Tap a document or its title to activate it.</string>
     <string name="split_per_pane_help">Each document has its own toolbar and tool selection.</string>
-    <string name="split_mixed_help">For xnote + xcanvas only. Both documents use this layout; unavailable tools are disabled for the active format.</string>
+    <string name="split_mixed_help">For pnote + pcanvas only. Both documents use this layout; unavailable tools are disabled for the active format.</string>
 </resources>

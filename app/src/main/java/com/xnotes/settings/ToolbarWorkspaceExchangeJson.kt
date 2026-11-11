@@ -18,10 +18,10 @@ object ToolbarWorkspaceExchangeJson {
 
     fun import(raw: String): List<ToolbarWorkspacePreset> {
         val json = JSONObject(raw)
-        require(json.optString("format") == FORMAT) { "Arquivo incompatível com workspaces do XNotes." }
-        require(json.optInt("version") == VERSION) { "Versão de arquivo não suportada." }
+        require(json.optString("format") == FORMAT) { "File is not compatible with Polars workspaces." }
+        require(json.optInt("version") == VERSION) { "Unsupported file version." }
         return ToolbarWorkspacePresetsJson.read(json.optJSONArray("presets")).also {
-            require(it.isNotEmpty()) { "Nenhum workspace válido encontrado." }
+            require(it.isNotEmpty()) { "No valid workspace found." }
         }
     }
 }

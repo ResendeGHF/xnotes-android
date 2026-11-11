@@ -88,21 +88,21 @@ internal fun ToolbarBarSettings(
             }
         }
         val secondaryDocked = currentBar.geometry.dockEdge != null && !currentBar.geometry.floating
-        ToolbarSettingsLabel("Posicionamento")
+        ToolbarSettingsLabel("Positioning")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PreferenceChoiceChip("Encaixada", secondaryDocked) {
+            PreferenceChoiceChip("Docked", secondaryDocked) {
                 configureDock(toolbarDockedGeometry(currentBar, barIndex, look))
             }
-            PreferenceChoiceChip("Flutuante", !secondaryDocked) {
+            PreferenceChoiceChip("Floating", !secondaryDocked) {
                 configureDock(toolbarFloatingGeometry(currentBar, barIndex, look))
             }
         }
         if (secondaryDocked) {
-            ToolbarSettingsLabel("Borda")
+            ToolbarSettingsLabel("Edge")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for ((edge, label) in listOf(
-                    ToolbarDockEdge.TOP to "Superior", ToolbarDockEdge.BOTTOM to "Inferior",
-                    ToolbarDockEdge.LEFT to "Esquerda", ToolbarDockEdge.RIGHT to "Direita",
+                    ToolbarDockEdge.TOP to "Top", ToolbarDockEdge.BOTTOM to "Bottom",
+                    ToolbarDockEdge.LEFT to "Left", ToolbarDockEdge.RIGHT to "Right",
                 )) {
                     PreferenceChoiceChip(label, currentBar.geometry.dockEdge == edge) {
                         val geo = currentBar.geometry
@@ -168,23 +168,23 @@ internal fun ToolbarBarSettings(
     val floatingBar = !isPrimaryDock && !isSecondaryDock
     FlowRow(horizontalArrangement = Arrangement.spacedBy(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            ToolbarSettingsLabel(if (floatingBar) "Faixa flutuante preferida · máximo 3"
-                else "Faixa de encaixe · máximo 3 por borda")
+            ToolbarSettingsLabel(if (floatingBar) "Preferred floating bar · max 3"
+                else "Docked bar · max 3 per edge")
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for (lane in 0..2) {
-                    PreferenceChoiceChip("Faixa ${lane + 1}", currentBar.geometry.dockLane == lane) {
+                    PreferenceChoiceChip("Lane ${lane + 1}", currentBar.geometry.dockLane == lane) {
                         configureDock(currentBar.geometry.copy(dockLane = lane))
                     }
                 }
             }
         }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            ToolbarSettingsLabel("Alinhamento na faixa")
+            ToolbarSettingsLabel("Lane alignment")
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for ((align, label) in listOf(
-                    ToolbarDockAlignment.START to "Início",
-                    ToolbarDockAlignment.CENTER to "Centro",
-                    ToolbarDockAlignment.END to "Fim",
+                    ToolbarDockAlignment.START to "Start",
+                    ToolbarDockAlignment.CENTER to "Center",
+                    ToolbarDockAlignment.END to "End",
                 )) {
                     PreferenceChoiceChip(label, (if (floatingBar) toolbarFloatingAlignment(currentBar)
                             else currentBar.geometry.dockAlignment) == align) {

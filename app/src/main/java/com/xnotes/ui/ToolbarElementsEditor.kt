@@ -62,9 +62,9 @@ internal fun ToolbarElementsEditor(
     fun retargetSection() = interaction.retargetSection(currentLayout())
     if (activeEntry != null) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Tamanho do elemento", style = MaterialTheme.typography.titleSmall)
+            Text("Element size", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = { selectedEntry = null }) { Text("Fechar") }
+            TextButton(onClick = { selectedEntry = null }) { Text("Close") }
         }
         ToolbarEntrySizeControls(
             entry = activeEntry,
@@ -75,10 +75,10 @@ internal fun ToolbarElementsEditor(
         )
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Paleta de cores", style = MaterialTheme.typography.titleSmall)
+        Text("Color palette", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.weight(1f))
         TextButton(onClick = { onToggleColorControls() }) {
-            Text(if (colorControlsExpanded) "Recolher" else "Configurar")
+            Text(if (colorControlsExpanded) "Collapse" else "Configure")
         }
     }
     if (colorControlsExpanded) {
@@ -96,7 +96,7 @@ internal fun ToolbarElementsEditor(
             steps = InkPalette.MAX_SWATCHES - 2,
             modifier = Modifier.width(280.dp),
         )
-        ElementsFieldLabel("Distribuir cores em ${layout.colorBlockCount} blocos")
+        ElementsFieldLabel("Distribute colors across ${layout.colorBlockCount} blocks")
         if (colorCount > 1 && layout.colorBlockCount > 0) {
             Slider(
                 value = layout.colorBlockCount.coerceIn(1, colorCount).toFloat(),
@@ -123,7 +123,7 @@ internal fun ToolbarElementsEditor(
         TextButton(onClick = {
             selectedEntry = null
             onApplyLayout(currentLayout().gatherSectionsAtStart())
-        }) { Text("Reunir sections no início", fontSize = 12.sp) }
+        }) { Text("Gather sections at the start", fontSize = 12.sp) }
     }
     ToolbarCustomizerBody(
         layout = layout,

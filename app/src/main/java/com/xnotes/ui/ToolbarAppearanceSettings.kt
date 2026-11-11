@@ -21,7 +21,7 @@ internal fun ToolbarAppearanceSettings(
     onGeometryChange: (ToolbarGeometry) -> Unit,
     onScaleChange: (ToolbarScale) -> Unit,
 ) {
-    Text("Tamanho e espaçamento", style = MaterialTheme.typography.titleSmall)
+    Text("Size and spacing", style = MaterialTheme.typography.titleSmall)
     ToolbarGeometryControls(geometry = geometry, onChange = onGeometryChange)
     Text(
         stringResource(R.string.pref_toolbar_size),
