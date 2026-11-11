@@ -105,6 +105,7 @@ fun Toolbar(
     onInsertAudio: () -> Unit = {},
     onRecordAudio: () -> Unit = {},
     onInsertNoteLink: () -> Unit = {},
+    layout: com.xnotes.core.tools.ToolbarLayout = editor.toolbarLayout,
 ) {
     // The five stroke tools use the designed vector drawables (res/drawable/ic_stroke_*),
     // tinted at the call site like every other icon; the rest use the built-in line set.
@@ -185,7 +186,7 @@ fun Toolbar(
         ToolbarFrame(armed = editor.tool, trailing = onClosePane?.let { { ClosePaneButton(it) } }) {
             // The bar is driven by the user-customisable layout; separators sit between non-empty
             // sections, and each item dispatches to its renderer (see ToolbarItemView).
-            editor.toolbarLayout.visibleSections.forEachIndexed { si, section ->
+            layout.visibleSections.forEachIndexed { si, section ->
                 if (si > 0) Separator()
                 section.visibleEntries.forEach { entry -> Item(entry.item) }
             }
@@ -227,7 +228,8 @@ private fun ToolbarItemView(
 ) {
     when (item) {
         // Canvas-only items; a stored paged layout can never hold one, so nothing is drawn.
-        ToolbarItem.WAYPOINTS, ToolbarItem.MINIMAP -> Unit
+        // In a shared split toolbar a format-exclusive item renders disabled instead of vanishing.
+        ToolbarItem.WAYPOINTS, ToolbarItem.MINIMAP -> UnavailableSharedToolbarItem(item)
 
         ToolbarItem.UNIFIED_PEN -> UnifiedPenLauncher(
             host = editor, armedTool = editor.tool, ink = editor.controller.inkColor.toComposeColor(),

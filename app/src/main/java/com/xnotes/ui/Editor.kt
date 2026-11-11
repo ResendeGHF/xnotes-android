@@ -10106,6 +10106,14 @@ class Editor(
     /** The colour selected on the toolbar, which typed and pasted ==text== highlights in. */
     private fun toolbarInk(): Rgba = toolbarColors[activeColorIndex.coerceIn(0, toolbarColors.lastIndex)]
 
+    /** Share future ink between panes without restyling their selected or edited content. */
+    internal fun adoptSharedInk(source: ToolPopupHost, color: Rgba) {
+        toolbarColors = source.hostToolbarColors
+        toolbarColorCount = source.hostToolbarColorCount
+        activeColorIndex = source.hostActiveColorIndex.coerceIn(0, toolbarColors.lastIndex)
+        controller.inkColor = color
+    }
+
     fun pickColor(index: Int) {
         activeColorIndex = index
         // pickInk also recolours the active text box (editing or selected), so the 5 toolbar
@@ -13311,7 +13319,11 @@ class Editor(
 
     /** Give [pane] the keyboard and the file actions. */
     fun focusPane(pane: Pane) {
-        if (focusedPane != pane) focusedPane = pane
+        if (focusedPane == pane) return
+        val next = if (pane == Pane.PRIMARY) this else secondary
+        // Opening a split requests primary focus before its asynchronous file load completes.
+        if (inSplit && preferences.sharedSplitToolbars && next != null) active.transferSplitToolsTo(next)
+        focusedPane = pane
     }
 
     /** Set once the second pane has actually had a document pushed onto it, so it is not released in
