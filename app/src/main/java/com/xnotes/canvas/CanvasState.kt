@@ -552,6 +552,29 @@ class CanvasState(
     private val pendingInk = HashSet<Page>()
     private val pendingBg = HashSet<Page>()
 
+    /**
+     * Latest keep set published by [dropCachesExcept] (visible + prefetch rows). A queued
+     * build that is still waiting when its page leaves the set skips its encode: the draw
+     * loop reschedules if the page comes back, so the settled view still builds exactly
+     * once, but a fast fling no longer waits behind obsolete encodes. Empty until the
+     * first prune runs; while empty only the generation check applies.
+     */
+    @Volatile
+    private var keepSnapshot: Set<Page> = emptySet()
+
+    /**
+     * True when a queued build must not pay for its encode: an edit (or zoom) has already
+     * invalidated its snapshot, or its page scrolled out of the keep band while waiting
+     * behind earlier encodes. The draw loop reschedules on the next frame if the page is
+     * still needed — with a fresh snapshot — so skipping only drops wasted work, and the
+     * worker stays on the pages the viewport actually shows, even mid-fling.
+     */
+    private fun isBuildObsolete(page: Page, gen: Int): Boolean {
+        if (gen != cacheGen) return true
+        val keep = keepSnapshot
+        return keep.isNotEmpty() && page !in keep
+    }
+
     /** Where [repairRegion] repainted a page while its build was in flight, to paint again on what the build brings. */
     private val repairedMeanwhile = HashMap<Page, Rect>()
 
@@ -567,7 +590,9 @@ class CanvasState(
      * Bumped by every cache invalidation. An in-flight async build captures the value at
      * schedule time and its result is discarded if the generation has since moved on, so
      * an edit (or zoom) that lands mid-build never gets overwritten by the stale surface.
+     * Volatile: queued builds re-check it on the worker before paying for an encode.
      */
+    @Volatile
     private var cacheGen = 0
 
     // --- sharp viewport (past the resolution cap) ---
@@ -1282,6 +1307,14 @@ class CanvasState(
         val items = cacheItems(page) // snapshot on the UI thread
         val withFlow = !flowLifted // snapshot too; the generation guard discards stale builds
         runAsync {
+            if (isBuildObsolete(page, gen)) {
+                postToMain {
+                    pendingInk.remove(page)
+                    repairedMeanwhile.remove(page)
+                    onCacheReady?.invoke()
+                }
+                return@runAsync
+            }
             val entry = runBuild { renderInk(page, res, items, withFlow) }
             postToMain {
                 pendingInk.remove(page)
@@ -1504,6 +1537,13 @@ class CanvasState(
         val gen = cacheGen
         val seq = markupSeq // the build reads the markups after this, so it holds every edit up to here
         runAsync {
+            if (isBuildObsolete(page, gen)) {
+                postToMain {
+                    pendingBg.remove(page)
+                    onCacheReady?.invoke()
+                }
+                return@runAsync
+            }
             val entry = runBuild { buildBackground(page, res) }
             postToMain {
                 pendingBg.remove(page)
@@ -1889,6 +1929,11 @@ class CanvasState(
     }
 
     fun dropCachesExcept(visible: Set<Page>) {
+        // Publish the keep set for queued builds: work waiting behind earlier encodes
+        // skips itself when its page has since scrolled away, instead of blocking the
+        // fresh builds the viewport needs right now. Reference swap is atomic; pages
+        // compare by identity, like the cache maps below.
+        keepSnapshot = visible
         caches.keys.retainAll(visible)
         staleInk.retainAll(visible)
         bgCaches.keys.retainAll(visible)
