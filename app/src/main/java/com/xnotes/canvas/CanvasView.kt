@@ -561,7 +561,11 @@ class CanvasView @JvmOverloads constructor(
                         ) {
                             // Blit the pre-rendered opaque ribbon at the ink's alpha and blend,
                             // instead of re-tessellating the ribbon every frame.
-                            val hc = if (degraded) st.highlighterCacheForDraw(item, page) ?: continue
+                            // Degraded path: reuse the stale-resolution bitmap as-is and skip
+                            // the cut-outs for the gesture's duration; a highlighter with no
+                            // reusable entry still builds once (then caches) instead of vanishing.
+                            val hc = if (degraded) st.highlighterCacheForDraw(item, page)
+                                ?: st.highlighterCacheFor(item, page)
                             else st.highlighterCacheFor(item, page)
                             val faint = if (st.fade?.fades(item) == true) com.xnotes.core.audio.InkFade.ALPHA else 1.0
                             // Composited over the finished page, so tape laid over it has to be cut out by hand.
@@ -778,7 +782,11 @@ class CanvasView @JvmOverloads constructor(
     private var sharpPending = false
 
     private fun scheduleSharp() {
-        if (sharpPending) return
+        // Sliding window: every inexact frame re-arms the timer so a settle render is
+        // only requested once the view has actually been still for SHARP_SETTLE_MS. Firing
+        // mid-pan would start a viewport encode that is discarded on publish while fresher
+        // cache builds wait behind it on the single worker.
+        mainHandler.removeCallbacks(sharpDebounce)
         sharpPending = true
         mainHandler.postDelayed(sharpDebounce, SHARP_SETTLE_MS)
     }

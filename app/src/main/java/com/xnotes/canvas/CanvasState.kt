@@ -552,6 +552,9 @@ class CanvasState(
     private val pendingInk = HashSet<Page>()
     private val pendingBg = HashSet<Page>()
 
+    /** Last math-prefetch sweep, so a fast fling re-warms at most twice a second instead of per frame. */
+    private var lastPrefetchMathNs = 0L
+
     /**
      * Latest keep set published by [dropCachesExcept] (visible + prefetch rows). A queued
      * build that is still waiting when its page leaves the set skips its encode: the draw
@@ -1353,6 +1356,10 @@ class CanvasState(
             Thread.currentThread().interrupt()
             null
         } catch (_: Throwable) {
+            // Surface allocation failures (OOM) land here: the caller clears pending state so
+            // the page retries instead of blanking for good. Deliberately silent: this runs
+            // on the worker (and under plain JVM unit tests, android.util.Log is a stub
+            // that throws), so logging here would kill the worker thread.
             null
         }
     }
@@ -1997,10 +2004,16 @@ class CanvasState(
     fun prefetchAndPrune() {
         val band = cacheBand()
         if (!zoomingInProgress) {
+            // Formula setup walks every formula on the page: throttle it so a fling does not
+            // re-run it every frame. Cache builds below still run per frame (they self-skip
+            // when usable), and the draw path wants anything missing immediately anyway.
+            val nowNs = System.nanoTime()
+            val wantMath = nowNs - lastPrefetchMathNs >= PREFETCH_MATH_NS
+            if (wantMath) lastPrefetchMathNs = nowNs
             for (page in band.prefetch) {
                 backgroundForOrSchedule(page)
                 cacheForOrSchedule(page)
-                prefetchMath?.invoke(page, zoom)
+                if (wantMath) prefetchMath?.invoke(page, zoom)
             }
         }
         dropCachesExcept(band.keep)
@@ -2357,6 +2370,10 @@ class CanvasState(
 
         /** Gap (viewport px) left above the page top so nothing hides behind the toolbar. */
         const val TOP_GAP = 16.0
+
+        /** Minimum interval between math-prefetch sweeps; the draw path wants missing
+         *  formulas immediately, so this only throttles redundant re-warming. */
+        const val PREFETCH_MATH_NS = 500_000_000L
         val TRANSPARENT = Rgba(0, 0, 0, 0)
     }
 }

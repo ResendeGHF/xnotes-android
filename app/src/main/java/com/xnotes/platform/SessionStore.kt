@@ -24,6 +24,9 @@ class SessionStore(private val dir: File, private val codec: DocumentCodec, priv
     private val docFile = File(dir, "document.pnote")
     private val meta = JsonStore(File(dir, "session.json"))
 
+    /** Whether a session was persisted before (used to skip redundant no-change writes). */
+    fun exists(): Boolean = docFile.exists()
+
     /** A restored session: the document plus the view state to reapply. */
     class Snapshot(
         val document: Document,
@@ -66,6 +69,34 @@ class SessionStore(private val dir: File, private val codec: DocumentCodec, priv
                 .put("zoomLocked", zoomLocked)
             document.path?.let { m.put("path", it) }
             document.displayName?.let { m.put("displayName", it) }
+            meta.write(ViewOverridesJson.write(m, viewOverrides))
+        }
+    }
+
+    /**
+     * Refresh only the view-state sidecar, without touching (or snapshotting) the document.
+     * Used on pause/swap when the content hasn't changed since the last write: reopening
+     * still restores the latest zoom/scroll without paying for a full in-memory copy.
+     */
+    fun saveViewState(
+        zoom: Double,
+        scrollX: Double,
+        scrollY: Double,
+        zoomLocked: Boolean,
+        viewOverrides: ViewOverrides,
+        dirty: Boolean,
+        path: String?,
+        displayName: String?,
+    ) {
+        runCatching {
+            val m = JSONObject()
+                .put("dirty", dirty)
+                .put("zoom", zoom)
+                .put("scrollX", scrollX)
+                .put("scrollY", scrollY)
+                .put("zoomLocked", zoomLocked)
+            path?.let { m.put("path", it) }
+            displayName?.let { m.put("displayName", it) }
             meta.write(ViewOverridesJson.write(m, viewOverrides))
         }
     }

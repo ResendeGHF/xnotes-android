@@ -4535,10 +4535,27 @@ class Editor(
         }
         val contentChanged = contentVersion != lastSessionContentVersion
         lastSessionContentVersion = contentVersion
+        if (!contentChanged && session.exists()) {
+            // View-only pause (pan/zoom without edits): refresh just the sidecar off-thread
+            // instead of snapshotting the whole document on the UI thread.
+            val zoom = state.zoom
+            val sx = state.scrollX
+            val sy = state.scrollY
+            val locked = zoomLocked
+            val vo = viewOverrides
+            val dirty = state.document.dirty
+            val path = state.document.path
+            val displayName = state.document.displayName
+            autosaveScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                session.saveViewState(zoom, sx, sy, locked, vo, dirty, path, displayName)
+            }
+            return
+        }
+        if (!contentChanged && session.exists()) return
         // Snapshot on the main thread, then write the session off-thread, so saving a big note's
-        // session never freezes the UI. Unconditionally, even for a view-state-only refresh: the
-        // store re-encodes whatever it is handed when the session file is missing, and handing it
-        // the live document would put the writer back on the mutating model.
+        // session never freezes the UI. Unconditionally when the file is missing: the store
+        // re-encodes whatever it is handed, and handing it the live document would put the writer
+        // back on the mutating model.
         val snapshot = state.document.snapshot()
         val zoom = state.zoom
         val sx = state.scrollX
@@ -4635,12 +4652,19 @@ class Editor(
 
     /** Proactively parse the visible pages' PDF links off-thread (coalesced) so a tap lands on
      *  a warm cache and the link boxes can draw. Cheap and idempotent; the on-tap parse stays
-     *  as a fallback for a page tapped before its warm lands. */
+     *  as a fallback for a page tapped before its warm lands. Skipped when the visible set
+     *  hasn't changed, so pan/zoom frames don't rebuild the key list every time. */
+    private var lastWarmedLinkRange: IntRange? = null
+    private var lastWarmedLinkDoc: Any? = null
     private fun warmVisibleLinks(pageIndex: Int) {
         val src = pdfSource ?: return
         val visible = state.visiblePageRange() ?: (pageIndex..pageIndex)
+        val doc = state.document
+        if (visible == lastWarmedLinkRange && lastWarmedLinkDoc === doc) return
+        lastWarmedLinkRange = visible
+        lastWarmedLinkDoc = doc
         val keys = ArrayList<Int>(visible.count())
-        for (i in visible) state.document.pages.getOrNull(i)?.pdfKey?.let { keys += it }
+        for (i in visible) doc.pages.getOrNull(i)?.pdfKey?.let { keys += it }
         if (keys.isNotEmpty()) src.warmLinks(keys)
     }
 
