@@ -209,6 +209,22 @@ data class Settings(
 
             val (darkColors, lightColors) = toolbarColors(o)
 
+            val toolbarWorkspaces = ToolbarWorkspaceJson.read(o.optJSONObject("toolbar_workspaces"))
+            // The workspace profile is the source of truth once it exists: the legacy
+            // single-bar keys only persist (id, visible) pairs, and reading them back
+            // through fromRaw() appends every missing tool, inflating an intentionally
+            // minimal primary bar (e.g. a preset's 6-item bar) into a full bar on restart.
+            // Derive the legacy fields from the workspace instead, so a reopened app
+            // renders exactly what was configured; legacy files without workspaces
+            // still migrate through the appending reader below.
+            val notePrimaryLayout = toolbarWorkspaces?.note?.bars?.firstOrNull()?.layout
+                ?: toolbarLayout(o.optJSONObject("toolbar_layout"))
+            val canvasPrimaryLayout = toolbarWorkspaces?.canvas?.bars?.firstOrNull()?.layout
+                ?: toolbarLayout(
+                    o.optJSONObject("canvas_toolbar_layout"),
+                    ToolbarLayout.CANVAS_ITEMS,
+                    ToolbarLayout.CANVAS_DEFAULT,
+                )
             return Settings(
                 viewDefaults = o.optJSONObject("view_defaults")
                     ?.let { com.xnotes.platform.ViewSettingsJson.read(it) }
@@ -218,13 +234,9 @@ data class Settings(
                 toolbarColorsDark = darkColors,
                 toolbarColorsLight = lightColors,
                 toolbarColorCount = o.optInt("toolbar_color_count", 5).coerceIn(1, InkPalette.MAX_SWATCHES),
-                toolbarLayout = toolbarLayout(o.optJSONObject("toolbar_layout")),
-                canvasToolbarLayout = toolbarLayout(
-                    o.optJSONObject("canvas_toolbar_layout"),
-                    ToolbarLayout.CANVAS_ITEMS,
-                    ToolbarLayout.CANVAS_DEFAULT,
-                ),
-                toolbarWorkspaces = ToolbarWorkspaceJson.read(o.optJSONObject("toolbar_workspaces")),
+                toolbarLayout = notePrimaryLayout,
+                canvasToolbarLayout = canvasPrimaryLayout,
+                toolbarWorkspaces = toolbarWorkspaces,
                 toolbarWorkspacePresets = ToolbarWorkspacePresetsJson.read(o.optJSONArray("toolbar_workspace_presets")),
                 activeColor = o.optInt("active_color", 0).coerceIn(0, InkPalette.MAX_SWATCHES - 1),
                 // Only tools the toolbar can arm come back; a transient one (e.g. TEXT_BOX) would
