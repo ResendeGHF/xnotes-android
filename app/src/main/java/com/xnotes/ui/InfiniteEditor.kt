@@ -18,6 +18,8 @@ import com.xnotes.core.geometry.Rect
 import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.EditLabel
+import com.xnotes.core.history.EditText
+import com.xnotes.core.history.RestyleText
 import com.xnotes.core.history.History
 import com.xnotes.core.history.LockItems
 import com.xnotes.core.history.RefillShapes
@@ -112,12 +114,48 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     val pad = com.xnotes.gl.GlWetPad(appContext)
 
     /**
+     * During text resize, draw with the very same StaticLayout as paged XNote text.
+     * Layout is inexpensive; vector triangulation is deferred until the gesture ends.
+     */
+    private val nativeTextResize = object : android.view.View(appContext) {
+        var item: TextItem? = null
+
+        init {
+            setWillNotDraw(false)
+            isClickable = false
+            visibility = android.view.View.GONE
+        }
+
+        override fun onDraw(canvas: android.graphics.Canvas) {
+            val text = item ?: return
+            if (text.text.isEmpty()) return
+            val paint = com.xnotes.platform.AndroidText.textPaint(
+                text.font,
+                android.graphics.Color.argb(text.rgba.a, text.rgba.r, text.rgba.g, text.rgba.b),
+            )
+            val layout = com.xnotes.platform.AndroidText.layout(
+                text.text, text.width.toInt(), paint, com.xnotes.core.pal.TextFlags(
+                    wordWrap = true, alignLeft = true, alignTop = true,
+                    underline = text.underline, strike = text.strike, hAlign = text.align,
+                ),
+            )
+            val at = view.viewport.contentToViewport(text.pos)
+            canvas.save()
+            canvas.translate(at.x.toFloat(), at.y.toFloat())
+            canvas.scale(view.viewport.zoom.toFloat(), view.viewport.zoom.toFloat())
+            layout.draw(canvas)
+            canvas.restore()
+        }
+    }
+
+    /**
      * The two surfaces, in order. They are siblings rather than one view because the canvas needs a
      * multisampled config and the front buffer cannot have one.
      */
     val surfaces = android.widget.FrameLayout(appContext).apply {
         addView(view, android.widget.FrameLayout.LayoutParams(-1, -1))
         addView(pad, android.widget.FrameLayout.LayoutParams(-1, -1))
+        addView(nativeTextResize, android.widget.FrameLayout.LayoutParams(-1, -1))
     }
 
     val viewport: CanvasViewport get() = view.viewport
@@ -157,6 +195,16 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
                 scene.setLift(items, at)
                 maybeStartLiftProxy(items, liftGen)
             }
+            // A recently reflowed text box may still use the native fallback while its GL
+            // mesh is being rebuilt. Move that fallback with the selection too, otherwise
+            // the outline follows the pointer while the glyphs remain at their old spot.
+            val nativeItem = nativeTextResize.item
+            if (nativeItem != null) {
+                val follows = nativeItem in items && at.isLinearIdentity
+                nativeTextResize.translationX = if (follows) (at.dx * viewport.zoom).toFloat() else 0f
+                nativeTextResize.translationY = if (follows) (at.dy * viewport.zoom).toFloat() else 0f
+                if (!follows) nativeTextResize.invalidate()
+            }
         },
         onLiftAt = { at -> scene.setLiftAt(at) },
         onTextResizeStart = { startTextResizePreview(it) },
@@ -168,8 +216,11 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         hasPasteContent = { hasClipboardItems || clipboardHasImage },
         onToolChanged = { adoptTool(it) },
         onDoubleTap = { vp, toolType, selectedBefore -> onDoubleTap(vp, toolType, selectedBefore) },
-        isEditingText = { editingLabel != null },
+        isEditingText = { editingLabel != null || editingTextItem != null },
         onCommitText = { commitText() },
+        onCreateText = { createTextItem(it) },
+        onNativeTextResizeStart = { startNativeTextResize(it) },
+        onNativeTextResizeEnd = { finishNativeTextResize(it) },
         onAudioTap = { tapAudio(it) },
         onMathAnimTap = { tapMathAnim(it) },
         onPeelTape = { peelTape(it) },
@@ -549,6 +600,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             textRasters.cancel(item)
             preparedText.remove(item)
             presentedText.remove(item)
+            if (item is TextItem) {
+                textMeshGen.remove(item)
+                textMeshPreview.remove(item)
+                if (nativeTextResize.item === item) {
+                    liveResizingText = null
+                    nativeTextResize.item = null
+                    nativeTextResize.visibility = android.view.View.GONE
+                }
+            }
             scene.remove(item)
             if (item === AudioPlayback.session?.item) AudioPlayback.closeIfGone(this@InfiniteEditor)
         }
@@ -631,6 +691,10 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         for (h in heldItems) if (h === item) return
         if (item is ImageItem) {
             if (!pushVectorImage(item)) scene.upsertImage(item, item.paintBounds())
+            return
+        }
+        if (item is TextItem) {
+            pushTextAsync(item)
             return
         }
         if (item is ShapeItem && item.isTextOnlyBox() && !item.labelHidden && !item.label?.text.isNullOrEmpty()) {
@@ -924,6 +988,108 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     /**
+     * Meshing text can take tens of milliseconds. Capture mutable properties on the UI thread,
+     * then mesh the snapshot off-thread. A generation token discards old resize/edit results.
+     * The previous mesh remains visible until the newest result is ready.
+     */
+    private var liveResizingText: TextItem? = null
+
+    private fun startNativeTextResize(item: TextItem) {
+        liveResizingText = item
+        textMeshGen.remove(item)
+        nativeTextResize.item = item
+        nativeTextResize.visibility = android.view.View.VISIBLE
+        nativeTextResize.invalidate()
+        scene.remove(item)
+        view.publish()
+    }
+
+    private fun finishNativeTextResize(item: TextItem) {
+        if (liveResizingText !== item) return
+        liveResizingText = null
+        pushTextAsync(item)
+    }
+
+    private fun pushTextAsync(item: TextItem) {
+        if (liveResizingText === item) {
+            nativeTextResize.invalidate()
+            return
+        }
+        val snapshot = TextItem(
+            item.pos, item.width, item.height, item.text, item.rgba,
+            item.pointSize, item.face, com.xnotes.platform.AndroidTextMeasurer(),
+        )
+        val token = textMeshSeq.incrementAndGet()
+        textMeshGen[item] = token
+        if (item.canvasEditingHidden || item.text.isEmpty()) {
+            scene.remove(item)
+            return
+        }
+        // Publish an inexpensive visual transform now, before the pointer-up lift clears.
+        // The worker replaces it with correctly reflowed glyphs once tessellation finishes.
+        textMeshPreview[item]?.takeIf { nativeTextResize.item !== item && it.text == snapshot.text }?.let { previous ->
+            val from = previous.meshed.bounds
+            val to = snapshot.bounds()
+            // Only move the previous glyph mesh. Scaling it to the new width would stretch
+            // individual letters; the worker will replace it with correctly wrapped lines.
+            val dx = to.left - from.left
+            val dy = to.top - from.top
+            val parts = previous.meshed.parts.map { part ->
+                val mesh = part.mesh
+                val positions = mesh.positions.copyOf()
+                for (i in positions.indices step 2) {
+                    positions[i] += dx
+                    positions[i + 1] += dy
+                }
+                MeshPart(
+                    com.xnotes.core.infinite.MeshData(positions, mesh.offsets, mesh.indices, mesh.colors),
+                    snapshot.rgba, part.pass, part.glow, part.covers,
+                )
+            }
+            scene.upsert(item, parts, to)
+        }
+        decodeExecutor.execute {
+            // Skip queued work already superseded by subsequent drag events.
+            if (textMeshGen[item] != token) return@execute
+            val started = System.nanoTime()
+            val meshed = ItemMesher.mesh(snapshot)
+            val elapsed = (System.nanoTime() - started) / 1_000_000.0
+            view.post {
+                if (!textMeshGen.remove(item, token)) return@post
+                scene.lastTessellateMs = elapsed
+                if (meshed == null || meshed.isEmpty) {
+                    textMeshPreview.remove(item)
+                    scene.remove(item)
+                } else {
+                    textMeshPreview[item] = TextMeshPreview(meshed, snapshot.text)
+                    scene.upsert(item, meshed.parts, meshed.bounds)
+                }
+                if (nativeTextResize.item === item && liveResizingText !== item) {
+                    // Wait for the GL frame containing this mesh to be submitted before
+                    // removing the native fallback; a time-based delay can still blink.
+                    view.publishThen {
+                        view.post {
+                            if (nativeTextResize.item === item && liveResizingText !== item && !item.canvasEditingHidden) {
+                                nativeTextResize.item = null
+                                nativeTextResize.visibility = android.view.View.GONE
+                            }
+                        }
+                    }
+                } else {
+                    view.publish()
+                }
+            }
+        }
+    }
+
+    private data class TextMeshPreview(val meshed: MeshedItem, val text: String)
+    /** Last fully tessellated geometry per live text item; used for immediate drag previews. */
+    private val textMeshPreview = java.util.WeakHashMap<TextItem, TextMeshPreview>()
+
+    private val textMeshGen = java.util.concurrent.ConcurrentHashMap<TextItem, Long>()
+    private val textMeshSeq = java.util.concurrent.atomic.AtomicLong()
+
+    /**
      * A placed SVG becomes triangles like everything else, so it stays sharp at any zoom instead of
      * magnifying a texture. Nothing about it is cached as pixels, which is why a pinch costs it
      * nothing.
@@ -1008,6 +1174,11 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         textRasters.clear()
         preparedText.clear()
         presentedText.clear()
+        textMeshGen.clear()
+        textMeshPreview.clear()
+        liveResizingText = null
+        nativeTextResize.item = null
+        nativeTextResize.visibility = android.view.View.GONE
         val items = document.items.toList()
         scene.setOrder(items)
         sceneBuild.start(
@@ -1545,9 +1716,17 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private var labelBefore: ShapeLabel? = null
     /** New text hosts are drafts until the user commits nonblank text. */
     private var newTextBoxDraft: ShapeItem? = null
+    private var editingTextItem: TextItem? = null
+    private var newEditingTextItem: TextItem? = null
+    private var textItemBefore: String? = null
+    private var textStyleBefore: TextStyle? = null
 
     /** Where the overlay sits while a label is open, or null. */
     var editingField by mutableStateOf<com.xnotes.canvas.EditingField?>(null)
+        private set
+
+    /** Stable identity for one edit session; never carry an IME buffer into another box. */
+    var textEditSession by mutableStateOf(0L)
         private set
 
     override var textBar by mutableStateOf<com.xnotes.canvas.TextBar?>(null)
@@ -1593,7 +1772,15 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** A double tap on an unselected shape that takes a label types it, with the tools a note allows. */
     private fun onDoubleTap(vp: com.xnotes.core.geometry.Pt, toolType: Int, selectedBefore: Set<CanvasItem>) {
-        if (editingLabel != null) return
+        if (editingLabel != null || editingTextItem != null) return
+        val at = viewport.viewportToContent(vp)
+        val text = document.itemsIn(Rect(at.x - 1.0, at.y - 1.0, 2.0, 2.0)).lastOrNull {
+            it is TextItem && !it.locked && it.contains(at)
+        } as? TextItem
+        if (text != null) {
+            startTextItemEdit(text)
+            return
+        }
         interaction.labelTargetAt(vp, toolType, selectedBefore)?.let { startLabelEdit(it) }
     }
 
@@ -1601,10 +1788,51 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      * Open the overlay on [shape]'s label, giving it one in the text box defaults if it has none.
      * The shape is meshed without its words while the field shows them.
      */
+    /** Start an editable text box at the point tapped with the canvas text tool. */
+    private fun createTextItem(at: Pt) {
+        commitText()
+        // Re-enter an existing box rather than stacking an empty box over it.
+        val existing = document.itemsIn(Rect(at.x - 1.0, at.y - 1.0, 2.0, 2.0)).lastOrNull {
+            it is TextItem && !it.locked && it.contains(at)
+        } as? TextItem
+        if (existing != null) {
+            startTextItemEdit(existing)
+            return
+        }
+        val item = TextItem(
+            at, TextItem.DEFAULT_WIDTH, 0.0, "", inkColor,
+            textPointSize, textFace, textMeasurer,
+        )
+        document.add(item)
+        newEditingTextItem = item
+        startTextItemEdit(item)
+    }
+
+    private fun startTextItemEdit(item: TextItem) {
+        commitText()
+        interaction.clearSelection()
+        textMeshGen.remove(item)
+        if (nativeTextResize.item === item) {
+            nativeTextResize.item = null
+            nativeTextResize.visibility = android.view.View.GONE
+        }
+        editingTextItem = item
+        textEditSession++
+        item.canvasEditingHidden = true
+        document.itemChanged(item)
+        textItemBefore = item.text
+        textStyleBefore = TextStyle.of(item)
+        textFace = item.face
+        textPointSize = item.pointSize
+        refreshField()
+        view.publish()
+    }
+
     private fun startLabelEdit(shape: Labelled) {
         commitText()
         interaction.clearSelection()
         editingLabel = shape
+        textEditSession++
         labelBefore = shape.label
         val l = shape.label ?: ShapeLabel("", ShapeLabel.styleFor(shape, textPointSize, textFace), textMeasurer).also { shape.label = it }
         textFace = l.style.face
@@ -1616,6 +1844,13 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     override fun updateEditingText(text: String) {
+        editingTextItem?.let {
+            it.text = text
+            // Keep the native editor and its IME selection/caret alive while typing.
+            // Replacing EditingField for each keystroke resets the Compose text field.
+            document.itemChanged(it)
+            return
+        }
         val shape = editingLabel ?: return
         shape.label = shape.label?.withText(text)
         document.itemChanged(shape)
@@ -1623,7 +1858,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     override fun panWhileEditing(dxFinger: Float, dyFinger: Float) {
-        if (editingLabel == null) return
+        if (editingLabel == null && editingTextItem == null) return
         viewport.panByViewport(dxFinger.toDouble(), dyFinger.toDouble())
         onViewChanged()
         view.publish()
@@ -1642,6 +1877,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Restyle the open label; the whole edit is one undo step, taken when it ends. */
     private fun restyleLabel(change: (TextStyle) -> TextStyle) {
+        editingTextItem?.let {
+            change(TextStyle.of(it)).applyTo(it)
+            document.itemChanged(it)
+            refreshField()
+            return
+        }
         val shape = editingLabel ?: return
         val l = shape.label ?: return
         shape.label = l.withStyle(change(l.style))
@@ -1651,6 +1892,49 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** End the label edit with its current (or [text]) words: blank clears the label; any change is one undo step. */
     override fun commitText(text: String?) {
+        editingTextItem?.let { item ->
+            text?.let { item.text = it }
+            val beforeText = textItemBefore ?: item.text
+            val beforeStyle = textStyleBefore ?: TextStyle.of(item)
+            val commands = mutableListOf<Command>()
+            if (beforeText != item.text) commands.add(EditText(item, beforeText, item.text))
+            if (beforeStyle != TextStyle.of(item)) commands.add(RestyleText(item, beforeStyle, TextStyle.of(item)))
+            item.canvasEditingHidden = false
+            // Keep large text visible with native StaticLayout while its GL mesh is built.
+            // Without this fallback, closing the editor leaves a blank area for the entire
+            // background tessellation (particularly noticeable on long paragraphs).
+            if (item.text.isNotBlank()) {
+                nativeTextResize.item = item
+                nativeTextResize.visibility = android.view.View.VISIBLE
+                nativeTextResize.invalidate()
+            }
+            editingTextItem = null
+            textItemBefore = null
+            textStyleBefore = null
+            editingField = null
+            textBar = null
+            val isNew = newEditingTextItem === item
+            if (isNew) {
+                newEditingTextItem = null
+                if (item.text.isBlank()) {
+                    document.remove(item)
+                } else {
+                    document.itemChanged(item)
+                    history.push(AddCanvasItem(document, item))
+                    markDirty()
+                    refresh()
+                }
+            } else {
+                document.itemChanged(item)
+                if (commands.isNotEmpty()) {
+                    history.push(OnCanvas(document, CompositeCommand(commands), listOf(item)))
+                    markDirty()
+                    refresh()
+                }
+            }
+            view.publish()
+            return
+        }
         val shape = editingLabel ?: return
         text?.let { t -> shape.label = shape.label?.withText(t) }
         val before = labelBefore
@@ -1690,6 +1974,18 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Put the overlay back over the open label after its text, its style or the view moved. */
     private fun refreshField() {
+        editingTextItem?.let { item ->
+            val topLeft = viewport.contentToViewport(item.pos)
+            val f = com.xnotes.canvas.EditingField(
+                x = topLeft.x, y = topLeft.y, width = item.width, height = item.bounds().h,
+                fontPx = item.pointSize * com.xnotes.platform.AndroidText.POINTS_TO_PX,
+                zoom = viewport.zoom, face = item.face, rgba = item.rgba,
+                text = item.text, centred = false,
+            )
+            editingField = f
+            textBar = com.xnotes.canvas.TextBar(f.screenBounds(), item.face, item.pointSize, item.rgba, editing = true)
+            return
+        }
         val shape = editingLabel
         val l = shape?.label
         val r = shape?.labelFrame()
@@ -3281,8 +3577,9 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Keyboard shortcuts. Only the ones that mean something without pages. */
     fun handleKeyDown(e: android.view.KeyEvent): Boolean {
-        // An open label's field takes the keys; only Escape ends it.
-        if (editingLabel != null) {
+        // A text box or shape label owns Backspace, Delete and navigation while editing.
+        // Otherwise canvas shortcuts can delete the selected item instead of its characters.
+        if (editingLabel != null || editingTextItem != null) {
             if (e.keyCode != android.view.KeyEvent.KEYCODE_ESCAPE) return false
             commitText()
             return true
@@ -3372,6 +3669,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         editingLabel?.labelHidden = false
         editingLabel = null
         labelBefore = null
+        editingTextItem?.canvasEditingHidden = false
+        editingTextItem = null
+        newEditingTextItem = null
+        textItemBefore = null
+        textStyleBefore = null
+        newTextBoxDraft = null
         editingField = null
         textBar = null
         document.listener = null
@@ -3525,7 +3828,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     private fun onViewChanged() {
-        if (editingLabel != null) refreshField()
+        nativeTextResize.invalidate()
+        if (editingLabel != null || editingTextItem != null) refreshField()
         // The connection marks are sized for the screen and only cover what is on it.
         if (interaction.marking) publishOverlay()
         document.lastView = viewport.toWaypoint()

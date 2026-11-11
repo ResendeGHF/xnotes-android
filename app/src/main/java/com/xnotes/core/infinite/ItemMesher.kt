@@ -12,6 +12,7 @@ import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TapeItem
+import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TapePattern
 import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.stroke.PencilStyle
@@ -140,6 +141,7 @@ object ItemMesher {
             is AudioItem -> meshAudio(item, tolerance)
             is TapeItem -> meshTape(item, tolerance)
             is StickyNoteItem -> meshSticky(item, tolerance)
+            is TextItem -> meshText(item)
             else -> null // images carry a texture rather than a colour, and take their own path
         }
 
@@ -437,6 +439,37 @@ object ItemMesher {
         var min = Double.MAX_VALUE
         for (w in widths) if (w > 0f && w < min) min = w.toDouble()
         return if (min == Double.MAX_VALUE) 0.0 else min
+    }
+
+    /**
+     * A text item's GL geometry is expensive to outline and triangulate. Reuse it while its
+     * visual properties are unchanged; selection, redraw and viewport changes need no new mesh.
+     * Weak keys ensure removed items do not keep their glyph geometry alive.
+     */
+    private data class TextMeshKey(
+        val text: String,
+        val pos: Pt,
+        val width: Double,
+        val height: Double,
+        val rgba: Rgba,
+        val pointSize: Double,
+        val face: com.xnotes.core.pal.FontFace,
+    )
+
+    private val textMeshes = java.util.WeakHashMap<TextItem, Pair<TextMeshKey, MeshedItem?>>()
+
+    private fun meshText(item: TextItem): MeshedItem? {
+        if (item.canvasEditingHidden) return null
+        val key = TextMeshKey(item.text, item.pos, item.width, item.height, item.rgba, item.pointSize, item.face)
+        synchronized(textMeshes) {
+            textMeshes[item]?.let { (cachedKey, cachedMesh) ->
+                if (cachedKey == key) return cachedMesh
+            }
+        }
+        val part = ShapeTessellator.textPart(item.glyphContours(), item.rgba) { it + item.pos }
+        val result = part?.let { MeshedItem(listOf(it), item.bounds(), 0.0) }
+        synchronized(textMeshes) { textMeshes[item] = key to result }
+        return result
     }
 
     private fun meshShape(shape: ShapeItem, tolerance: Double): MeshedItem? {

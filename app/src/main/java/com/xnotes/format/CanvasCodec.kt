@@ -34,6 +34,7 @@ import com.xnotes.core.model.TapeShape
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextStyle
 import com.xnotes.core.pal.FontFace
+import com.xnotes.core.pal.HAlign
 import com.xnotes.core.pal.ImageCodec
 import com.xnotes.core.pal.TextMeasurer
 import com.xnotes.core.stroke.Sample
@@ -184,8 +185,35 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             is TapeItem -> writeTape(j, item)
             is NoteLinkItem -> writeNoteLink(j, item, ids[item])
             is StickyNoteItem -> writeSticky(j, item, ids[item])
-            else -> {} // text and any unrecognized kind: not written, the canvas has none
+            is TextItem -> writeText(j, item, ids[item])
+            else -> {} // unrecognized kinds are not written
         }
+    }
+
+    private fun writeText(j: JsonWrite, item: TextItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(TextItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("pos").beginArray().value(item.pos.x).value(item.pos.y).endArray()
+        j.name("width").value(item.width)
+        j.name("text").value(item.text)
+        j.name("rgba")
+        writeRgba(j, item.rgba)
+        j.name("point_size").value(item.pointSize)
+        if (item.height > 0.0) j.name("height").value(item.height)
+        if (item.face != TextItem.DEFAULT_FACE) j.name("font_face").value(item.face.id)
+        if (item.bold) j.name("bold").value(true)
+        if (item.italic) j.name("italic").value(true)
+        if (item.underline) j.name("underline").value(true)
+        if (item.strike) j.name("strike").value(true)
+        if (item.align != HAlign.LEFT) j.name("align").value(item.align.name.lowercase())
+        if (item.math) j.name("math").value(true)
+        if (item.uid.isNotEmpty()) j.name("uid").value(item.uid)
+        item.sync?.let { writeSync(j, it) }
+        if (item.locked) j.name("locked").value(true)
+        item.link?.let { j.name("link").value(it) }
+        item.group?.let { j.name("group").value(it) }
+        j.endObject()
     }
 
     /**
@@ -862,6 +890,19 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var locked = false
         var group: Int? = null
         var kind: String? = null
+        var pos: Pt? = null
+        var width = TextItem.DEFAULT_WIDTH
+        var height = 0.0
+        var text = ""
+        var pointSize = TextItem.DEFAULT_POINT_SIZE
+        var fontFace = TextItem.DEFAULT_FACE.id
+        var textBold = false
+        var textItalic = false
+        var textUnderline = false
+        var textStrike = false
+        var textAlign = "left"
+        var textMath = false
+        var link: String? = null
         var id: Int? = null
         var connector: ConnectorScratch? = null
         var tool: String? = null
@@ -919,7 +960,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var notePages: List<Int>? = null
         var linkColor: Rgba? = null
         var linkRounded = false
-        var text = ""
         var collapsed = false
         var stickyInk: MutableList<Stroke>? = null
         var cuts: List<CutEdge> = emptyList()
@@ -955,6 +995,18 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         while (p.hasNext()) {
             when (p.nextName()) {
                 "kind" -> s.kind = stringOr(p, "")
+                "pos" -> s.pos = ptOrNull(p)
+                "height" -> s.height = doubleOr(p, 0.0)
+                "text" -> s.text = stringOr(p, "")
+                "point_size" -> s.pointSize = doubleOr(p, TextItem.DEFAULT_POINT_SIZE)
+                "font_face" -> s.fontFace = stringOr(p, TextItem.DEFAULT_FACE.id)
+                "bold" -> s.textBold = boolOr(p, false)
+                "italic" -> s.textItalic = boolOr(p, false)
+                "underline" -> s.textUnderline = boolOr(p, false)
+                "strike" -> s.textStrike = boolOr(p, false)
+                "align" -> s.textAlign = stringOr(p, "left")
+                "math" -> s.textMath = boolOr(p, false)
+                "link" -> s.link = stringOr(p, "").ifEmpty { null }
                 "id" -> s.id = intOrNull(p)
                 "connector" -> s.connector = parseConnector(p)
                 "tool" -> s.tool = stringOr(p, "")
@@ -1006,7 +1058,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "rec_ms" -> s.recMs = intOr(p, 0)
                 "mode" -> s.mode = stringOrNull(p)
                 "pattern" -> s.pattern = stringOrNull(p)
-                "width" -> s.tapeWidth = doubleOrNull(p)
+                "width" -> doubleOrNull(p)?.let { s.width = it; s.tapeWidth = it }
                 "rgba" -> s.rgba = rgbaOrNull(p)
                 "target_uri" -> s.targetUri = stringOr(p, "")
                 "target_name" -> s.targetName = stringOr(p, "")
@@ -1014,7 +1066,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "pages" -> s.notePages = intListOrNull(p)
                 "color" -> s.linkColor = rgbaOrNull(p)
                 "rounded" -> s.linkRounded = boolOr(p, false)
-                "text" -> s.text = stringOr(p, "")
                 "collapsed" -> s.collapsed = boolOr(p, false)
                 "ink" -> s.stickyInk = parseStickyInk(p)
                 "cuts" -> s.cuts = parseCuts(p)
@@ -1051,7 +1102,28 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
             NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
             StickyNoteItem.KIND -> buildSticky(s)?.let { items.add(it) }
-            else -> {} // text and any unrecognized kind: skipped (forgiving)
+            TextItem.KIND -> {
+                val pos = s.pos
+                if (pos != null && s.height.isFinite() && s.width.isFinite() && s.width > 0.0 && s.pointSize.isFinite() && s.pointSize > 0.0) {
+                    items.add(TextItem(pos, s.width, s.height.coerceAtLeast(0.0), s.text,
+                        s.rgba ?: TextItem.DEFAULT_COLOR, s.pointSize,
+                        FontFace.fromId(s.fontFace), textMeasurer,
+                        bold = s.textBold,
+                        italic = s.textItalic,
+                        underline = s.textUnderline,
+                        strike = s.textStrike,
+                        align = when (s.textAlign) {
+                            "center" -> HAlign.CENTER
+                            "right" -> HAlign.RIGHT
+                            else -> HAlign.LEFT
+                        },
+                        math = s.textMath).also { t ->
+                        t.uid = s.uid ?: ""
+                        s.link?.let { t.link = it }
+                    })
+                }
+            }
+            else -> {} // unrecognized kinds are skipped (forgiving)
         }
         if (items.size > before) glue.named(items[before], s.id)
         // Absent on every canvas written before locking existed, which reads back as unlocked.

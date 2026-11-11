@@ -176,4 +176,5 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.json)
     testImplementation(libs.kxml2)
+    androidTestImplementation(libs.junit)
 }

@@ -16,6 +16,7 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.Routing
 import com.xnotes.core.model.ShapeItem
 import com.xnotes.core.model.ShapeLabel
+import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TextStyle
 import com.xnotes.core.pal.FontFace
 import com.xnotes.core.model.Stroke
@@ -284,6 +285,26 @@ class CanvasSelectionTest {
         assertEquals(18.0, item.label!!.style.pointSize, 1e-6)
         sel.resizeLive(HandleId.BR, Pt(100.0, 50.0))
         assertEquals(12.0, item.label!!.style.pointSize, 1e-6)
+    }
+
+    @Test fun aTextResizeUsesXNoteGeometryAndTracksReflow() {
+        val item = TextItem(Pt(100.0, 100.0), width = 300.0,
+            text = "Wrapping long text across several lines should change height when width changes. ".repeat(5),
+            pointSize = 20.0, measurer = FakeTextMeasurer())
+        val sel = CanvasSelection(docOf(item))
+        sel.select(listOf(item))
+        sel.beginTransform()
+        sel.resizeLive(HandleId.R, Pt(175.0, 120.0))
+        val actual = item.bounds()
+        assertEquals(20.0, item.pointSize, 1e-9)
+        assertEquals(actual.center.x, sel.box!!.center.x, 1e-6)
+        assertEquals(actual.center.y, sel.box!!.center.y, 1e-6)
+        assertEquals(actual.w / 2, sel.box!!.halfW, 1e-6)
+        assertEquals(actual.h / 2, sel.box!!.halfH, 1e-6)
+        sel.beginTransform()
+        sel.moveLive(500.0, 300.0)
+        assertEquals(item.bounds().center.x, sel.box!!.center.x, 1e-6)
+        assertEquals(item.bounds().center.y, sel.box!!.center.y, 1e-6)
     }
 
     @Test fun aCornerDragScalesTheSelection() {
