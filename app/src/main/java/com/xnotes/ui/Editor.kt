@@ -891,8 +891,11 @@ class Editor(
 
     var activeColorIndex by mutableStateOf(0)
         private set
-    var toolbarColors by mutableStateOf(InkPalette.presets)
+    /** The swatches of the appearance in use; the other appearance's wait in [otherSwatches]. */
+    var toolbarColors by mutableStateOf(InkPalette.dark)
         private set
+    private var otherSwatches = InkPalette.light
+    private var swatchesDark = true
     var toolbarColorCount by mutableStateOf(5)
         private set
     var toolbarLayout by mutableStateOf(ToolbarLayout.DEFAULT)
@@ -2640,6 +2643,8 @@ class Editor(
         controller.frontInk = com.xnotes.canvas.FrontInk(state, view, pad)
         pad.onSurfaceLost = { controller.frontInk?.surfaceLost() }
         view.debugOverlay.frontHud = { controller.frontInk?.hud }
+        view.debugOverlay.steadyHud = { controller.steadyReadout.lines() }
+        controller.measureSteadying = { view.debugOverlay.enabled }
         view.afterLayout = { refreshView() }
         view.onScrollbarScrolled = { refreshView() }
         // The canvas starts at built-in defaults; push any non-default global View settings
@@ -4110,7 +4115,9 @@ class Editor(
     }
 
     private fun applySettings() {
-        toolbarColors = settings.toolbarColors
+        swatchesDark = resolvedAppearance(settings.prefs) != "light"
+        toolbarColors = settings.toolbarColors(swatchesDark)
+        otherSwatches = settings.toolbarColors(!swatchesDark)
         toolbarColorCount = settings.toolbarColorCount
         toolbarLayout = settings.toolbarLayout
         canvasToolbarLayout = settings.canvasToolbarLayout
@@ -4141,7 +4148,7 @@ class Editor(
             MaterialColourMode.DUAL -> MaterialColors.seeded(p.materialDualSeed, dark, p.materialStyle, p.materialSurfaceSeed, p.materialContrast)
             MaterialColourMode.SINGLE -> MaterialColors.seeded(p.materialSingleSeed, dark, p.materialStyle, contrast = p.materialContrast)
             MaterialColourMode.SYSTEM -> dynamicMaterialColors(appContext, dark = dark)
-                ?: MaterialColors.seeded(Preferences.DEFAULT_ACCENT, dark = dark)
+                ?: MaterialColors.seeded(Preferences.DEFAULT_MATERIAL_DUAL, dark, surfaceSeed = Preferences.DEFAULT_MATERIAL_SURFACE)
         }
         return Palette.material(appearance, m)
     }
@@ -4171,6 +4178,8 @@ class Editor(
 
     private fun applyPagePrefsToState(p: Preferences) {
         palette = buildPalette(p)
+        com.xnotes.platform.AppNightMode.follow(appContext, p.uiAppearance)
+        useSwatchesFor(dark = resolvedAppearance(p) != "light")
         cornerStyle = p.cornerStyle
         toolbarLook = p.toolbarLook
         state.palette = palette
@@ -4378,14 +4387,18 @@ class Editor(
             applyToolbarWorkspaces(applyToolbarPresetToContext(toolbarWorkspaces, preset, targetContext))
             return
         }
-        toolbarColors = (preset.colors + InkPalette.presets.drop(preset.colors.size)).take(InkPalette.MAX_SWATCHES)
+        toolbarColors = (preset.colors + activeSwatchDefaults().drop(preset.colors.size)).take(InkPalette.MAX_SWATCHES)
         toolbarColorCount = preset.colorCount.coerceIn(1, InkPalette.MAX_SWATCHES)
         infiniteOrNull?.toolbarColors = toolbarColors
         infiniteOrNull?.toolbarColorCount = toolbarColorCount
         pickColor(activeColorIndex.coerceIn(0, toolbarColorCount - 1))
         applyHomePreferences(settings.prefs.copy(toolbarLook = preset.look))
         applyToolbarWorkspaces(preset.workspaces)
-        settings = settings.copy(toolbarColors = toolbarColors, toolbarColorCount = toolbarColorCount)
+        settings = settings.copy(
+            toolbarColorsDark = if (swatchesDark) toolbarColors else otherSwatches,
+            toolbarColorsLight = if (swatchesDark) otherSwatches else toolbarColors,
+            toolbarColorCount = toolbarColorCount,
+        )
         settingsRepo.save(settings)
     }
 
@@ -4459,7 +4472,8 @@ class Editor(
             settings = settings.copy(
                 tools = tools,
                 shapeConfig = controller.shapeConfig,
-                toolbarColors = toolbarColors,
+                toolbarColorsDark = if (swatchesDark) toolbarColors else otherSwatches,
+                toolbarColorsLight = if (swatchesDark) otherSwatches else toolbarColors,
                 toolbarColorCount = toolbarColorCount,
                 activeColor = activeColorIndex,
                 lastTool = tool,
@@ -10202,6 +10216,7 @@ class Editor(
         action == "redo" -> redo()
         action == "toggle_pan" -> toggleTool(Tool.PAN)
         action == "toggle_eraser" -> toggleTool(Tool.ERASER)
+        action == "toggle_lasso" -> toggleTool(Tool.LASSO)
         action == "toggle_previous" -> toggleToPreviousTool()
         else -> Unit
     }
@@ -10222,6 +10237,18 @@ class Editor(
     private fun toggleToPreviousTool() {
         controller.previousTool?.let { selectTool(it) }
     }
+
+    /** Show the light or the dark appearance's swatches; the armed slot stays, so the ink becomes its partner. */
+    private fun useSwatchesFor(dark: Boolean) {
+        if (dark == swatchesDark) return
+        otherSwatches = toolbarColors.also { toolbarColors = otherSwatches }
+        swatchesDark = dark
+        controller.inkColor = toolbarInk()
+        infiniteOrNull?.adoptSwatches(toolbarColors)
+    }
+
+    /** The factory swatches of the appearance in use, for filling a preset's tail. */
+    private fun activeSwatchDefaults(): List<Rgba> = if (swatchesDark) InkPalette.dark else InkPalette.light
 
     /** The colour selected on the toolbar, which typed and pasted ==text== highlights in. */
     private fun toolbarInk(): Rgba = toolbarColors[activeColorIndex.coerceIn(0, toolbarColors.lastIndex)]
@@ -13339,8 +13366,12 @@ class Editor(
     }
 
     // Held side buttons whose hardware also reports a quick click, so the user gets both (see
-    // ButtonClick): a click runs the side button's tap action. OnePlus Pad Go 2 Stylo -> F21.
-    private val penButtonClickKeycodes = setOf(android.view.KeyEvent.KEYCODE_F21)
+    // ButtonClick): a click runs the side button's tap action. OnePlus Pad Go 2 Stylo -> F21;
+    // Xiaomi Focus Pen Pro, which has no button, sends its pinch -> BUTTON_7.
+    private val penButtonClickKeycodes = setOf(
+        android.view.KeyEvent.KEYCODE_F21,
+        com.xnotes.canvas.InteractionController.FOCUS_PEN_PRO_PINCH_KEYCODE,
+    )
     private fun onPenButtonClick(e: android.view.KeyEvent) {
         val clicks = StylusButtonLatch.clicks
         if (e.action == android.view.KeyEvent.ACTION_DOWN) {

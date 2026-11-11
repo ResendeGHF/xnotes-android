@@ -85,6 +85,19 @@ internal fun UnifiedPenDetails(
     var speed by remember(tool) {
         mutableFloatStateOf(ToolConversions.strengthToSpeed(initial.speedStrength).toFloat())
     }
+    var smoothing by remember(tool) {
+        mutableFloatStateOf(ToolConversions.blurToSmoothing(initial.speedSmoothing).toFloat())
+    }
+    var topSpeed by remember(tool) {
+        mutableFloatStateOf(ToolConversions.dpPerMsToTopSpeed(initial.speedTop).toFloat())
+    }
+    var steady by remember(tool) { mutableStateOf(initial.stabilize) }
+    var steadyStrength by remember(tool) {
+        mutableFloatStateOf(ToolConversions.trailToStrength(initial.stabilizeTrail).toFloat())
+    }
+    var crossover by remember(tool) {
+        mutableFloatStateOf(ToolConversions.dpPerSToCrossover(initial.stabilizeCrossover).toFloat())
+    }
     var tipWidth by remember(tool) { mutableFloatStateOf((initial.taperMinFactor * 100).toFloat()) }
     var dash by remember(tool) { mutableFloatStateOf(initial.dashLength.toFloat()) }
     var gap by remember(tool) { mutableFloatStateOf(initial.dashGap.toFloat()) }
@@ -296,13 +309,26 @@ internal fun UnifiedPenDetails(
                                 directionStrength = ToolConversions.multiplierToDirectionStrength(it.toDouble()),
                             ))
                         }
-                    Tool.SPEED ->
-                        PenDetailSlider(stringResource(R.string.caption_speed), speed, 0f..100f) {
+                    Tool.SPEED -> {
+                        PenDetailSlider(stringResource(R.string.caption_thinning), speed, 0f..100f) {
                             speed = it
                             host.updateToolConfig(tool, host.toolConfig(tool).copy(
                                 speedStrength = ToolConversions.speedToStrength(it.toDouble()),
                             ))
                         }
+                        PenDetailSlider(stringResource(R.string.caption_smoothing), smoothing, 0f..100f) {
+                            smoothing = it
+                            host.updateToolConfig(tool, host.toolConfig(tool).copy(
+                                speedSmoothing = ToolConversions.smoothingToBlur(it.toDouble()),
+                            ))
+                        }
+                        PenDetailSlider(stringResource(R.string.caption_top_speed), topSpeed, 0f..100f) {
+                            topSpeed = it
+                            host.updateToolConfig(tool, host.toolConfig(tool).copy(
+                                speedTop = ToolConversions.topSpeedToDpPerMs(it.toDouble()),
+                            ))
+                        }
+                    }
                     Tool.TAPER ->
                         PenDetailSlider(stringResource(R.string.caption_tip_width), tipWidth, 0f..100f) {
                             tipWidth = it
@@ -335,6 +361,26 @@ internal fun UnifiedPenDetails(
                         }
                     }
                     else -> Unit
+                }
+                if (tool != Tool.HIGHLIGHTER || !straight) {
+                    PenDetailToggle(stringResource(R.string.caption_stabilization), steady) {
+                        steady = it
+                        host.updateToolConfig(tool, host.toolConfig(tool).copy(stabilize = it))
+                    }
+                    if (steady) {
+                        PenDetailSlider(stringResource(R.string.caption_strength), steadyStrength, 0f..100f) {
+                            steadyStrength = it
+                            host.updateToolConfig(tool, host.toolConfig(tool).copy(
+                                stabilizeTrail = ToolConversions.strengthToTrail(it.toDouble()),
+                            ))
+                        }
+                        PenDetailSlider(stringResource(R.string.caption_crossover), crossover, 0f..100f) {
+                            crossover = it
+                            host.updateToolConfig(tool, host.toolConfig(tool).copy(
+                                stabilizeCrossover = ToolConversions.dpPerSToCrossover(it.toDouble()),
+                            ))
+                        }
+                    }
                 }
                 if (tool != Tool.HIGHLIGHTER && tool != Tool.DASHED && tool != Tool.PENCIL) {
                     PenDetailToggle(stringResource(R.string.caption_neon), neon) {

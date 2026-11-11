@@ -211,6 +211,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         onTextResizeMove = { previewTextResize(it) },
         onTextResizeEnd = { cancelled -> finishTextResizePreview(cancelled) },
         devicePxPerDp = { devicePxPerDp },
+        measureSteadying = { debugVisible },
         onMinimapPress = { vx, vy -> minimapTap(vx, vy) },
         onContextMenu = { vp, content, locked -> contextMenu = ContextMenuTarget(vp.x, vp.y, content, locked) },
         hasPasteContent = { hasClipboardItems || clipboardHasImage },
@@ -1250,6 +1251,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             "redo" -> redo()
             "toggle_pan" -> toggleTool(Tool.PAN)
             "toggle_eraser" -> toggleTool(Tool.ERASER)
+            "toggle_lasso" -> toggleTool(Tool.LASSO)
             "toggle_previous" -> previousTool?.let { armTool(it) }
         }
     }
@@ -2088,6 +2090,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         onToolStyleChanged?.invoke()
     }
 
+    /** The host turned light or dark: its other swatches, the same slot armed, so the ink becomes that slot's colour. */
+    fun adoptSwatches(colors: List<Rgba>) {
+        toolbarColors = colors
+        colors.getOrNull(activeColorIndex)?.let { inkColor = it }
+    }
+
     fun setToolConfig(forTool: Tool, config: ToolConfig) {
         toolConfigs[forTool] = config
     }
@@ -2299,7 +2307,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     var onColorRemembered: ((Rgba) -> Unit)? = null
 
     /** The toolbar's swatches and recents, handed over by the host so both surfaces share them. */
-    var toolbarColors by mutableStateOf(InkPalette.presets)
+    var toolbarColors by mutableStateOf(InkPalette.dark)
     var activeColorIndex by mutableStateOf(0)
     var recentColors by mutableStateOf<List<Rgba>>(emptyList())
     var toolbarColorCount by mutableStateOf(5)
@@ -3656,10 +3664,6 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private var meshedAudioLook: com.xnotes.core.model.AudioLook? = null
 
     // --- documents ---
-
-    fun newCanvas() {
-        replaceDocument(InfiniteDocument())
-    }
 
     fun replaceDocument(next: InfiniteDocument) {
         AudioRecording.stopFor(this) // closing the canvas places its recording

@@ -89,6 +89,9 @@ import com.xnotes.core.stroke.RecognizedShape
 import com.xnotes.core.stroke.Scribble
 import com.xnotes.core.stroke.Sample
 import com.xnotes.core.stroke.ShapeRecognizer
+import com.xnotes.core.stroke.Stabilizer
+import com.xnotes.core.stroke.SteadyReadout
+import com.xnotes.core.stroke.SteadyTrace
 import com.xnotes.core.stroke.StrokeFingerprint
 import com.xnotes.core.stroke.StrokeSimplify
 import com.xnotes.core.tools.EraseMode
@@ -98,6 +101,7 @@ import com.xnotes.core.shapes.ShapeKind
 import com.xnotes.core.tools.MarkupMode
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
+import com.xnotes.core.tools.ToolConversions
 import com.xnotes.core.tools.ToolDefaults
 import com.xnotes.handwrite.FlowRow
 import com.xnotes.handwrite.HBlock
@@ -452,6 +456,18 @@ class InteractionController(
 
     /** Event time of the live stroke's first sample; later samples store `eventTime − this` (the speed pen reads it). */
     private var strokeStartTimeMs = 0L
+
+    /** The live stroke's stabilization, or null while its pen draws the nib as is. */
+    private var steadier: Stabilizer? = null
+
+    /** Debug HUD: what stabilization did to the last stroke. */
+    val steadyReadout = SteadyReadout()
+
+    /** Whether strokes are measured for [steadyReadout]; true only while the debug HUD is up. */
+    var measureSteadying: () -> Boolean = { false }
+
+    private val steadyTrace = SteadyTrace()
+    private var tracing = false
     private var drawingPointerId = -1
     private var drawingIsStylus = false
     /** True while the live gesture's down-pointer was a stylus or stylus-eraser tip, so every
@@ -490,6 +506,9 @@ class InteractionController(
     /** Segments the current stroke left behind on pages it has already walked off, so the whole
      *  crossing lifts and re-lays as one undo step. Empty for a stroke that stayed on its page. */
     private val crossedSegments = mutableListOf<Command>()
+
+    /** The pieces a stroke left on the pages it crossed, with their page and whether ephemeral ink holds them. */
+    private val crossedPieces = mutableListOf<Triple<Stroke, Int, Boolean>>()
 
     // PAN + inertial fling
     private var lastPan = Pt.ZERO
@@ -1570,8 +1589,13 @@ class InteractionController(
         snapRunStartEdge = null
         snapCurrentEdge = null
         snapPenViewport = null
-        val first = state.toPageSpace(pageIndex, state.viewportToContent(magnetize(downViewport)))
+        val down = state.viewportToContent(magnetize(downViewport))
+        val first = state.toPageSpace(pageIndex, down)
         stroke.addSample(Sample(first.x, first.y, pressure)) // first sample: t = 0
+        steadier = Stabilizer.forStroke(cfg.stabilize && !straight, cfg.stabilizeTrail, cfg.stabilizeCrossover, speedScale)
+        steadier?.start(down.x, down.y, 0.0)
+        tracing = measureSteadying()
+        if (tracing) steadyTrace.start(down.x, down.y)
         liveStroke = stroke
         strokePageIndex = pageIndex
         mode = PointerMode.DRAW
@@ -1622,7 +1646,23 @@ class InteractionController(
         val pi = strokePageIndex ?: return
         if (state.pageRects.getOrNull(pi) == null) return
         val vp = magnetize(Pt(vx, vy))
-        val content = state.viewportToContent(vp)
+        val nib = state.viewportToContent(vp)
+        var t = (timeMs - strokeStartTimeMs).toDouble()
+        // A steadied stroke takes the point the filter has reached and draws on to the nib as a
+        // tip; the lift lands the nib itself, at the tip's time, so lifting changes nothing.
+        val steady = steadier?.takeIf { !stroke.straight }
+        val content = when {
+            steady == null -> nib
+            force -> {
+                if (steady.moved) t = steady.tipTime
+                nib
+            }
+            else -> {
+                steady.step(nib.x, nib.y, t)
+                Pt(steady.x, steady.y)
+            }
+        }
+        if (tracing && steady != null) steadyTrace.add(nib.x, nib.y, content.x, content.y)
         // Ink starting inside an expanded sticky stays on the note: clamp it to the paper
         // so the live preview never spills onto the page. Committed ink is clipped the
         // same way when it paints, so what the pen shows is what pen-up keeps.
@@ -1633,7 +1673,8 @@ class InteractionController(
         if (!stroke.straight && stickyTarget == null) {
             val onPage = state.pageIndexAtContent(content)
             if (onPage != null && onPage != pi) {
-                handOverStroke(stroke, pi, onPage, content, pressure, timeMs)
+                handOverStroke(stroke, pi, onPage, content, pressure, t)
+                if (steady != null && !force) showTip(nib, pressure, steady.tipTime)
                 return
             }
         }
@@ -1650,7 +1691,7 @@ class InteractionController(
             // it snaps flat like a dragged line, unless the ruler is already steering the angle.
             val start = stroke.samples.firstOrNull()
             val end = if (start != null && !ruler.visible) ResizeMath.snapAxis(Pt(start.x, start.y), local) else local
-            stroke.setStraightEnd(Sample(end.x, end.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()))
+            stroke.setStraightEnd(Sample(end.x, end.y, pressure.coerceIn(0.0, 1.0), t))
             if (stickyDrawTarget == null) onStrokeSample?.invoke(pi, end.x, end.y, pressure.coerceIn(0.0, 1.0))
             return
         }
@@ -1665,9 +1706,10 @@ class InteractionController(
         val farEnough = last == null ||
             kotlin.math.abs(last.x - local.x) + kotlin.math.abs(last.y - local.y) >= gate
         if (force || farEnough) {
-            stroke.addSample(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()))
+            stroke.addSample(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), t))
             if (stickyDrawTarget == null && stickyTarget == null) onStrokeSample?.invoke(pi, local.x, local.y, pressure.coerceIn(0.0, 1.0))
         }
+        if (steady != null && !force) showTip(nib, pressure, steady.tipTime)
         // Real movement restarts the hold-to-snap clock; staying within the slop lets it mature,
         // so the snap fires only once the pen has actually come to rest. (Sub-slop jitter is ignored
         // even when a sample is decimated out above, so a trembling-but-still pen still triggers.)
@@ -1675,6 +1717,14 @@ class InteractionController(
             dwellAnchor = Pt(vx, vy)
             armDwell()
         }
+    }
+
+    /** Draw the live stroke on to the nib at [content], where its steadied samples have not reached yet. */
+    private fun showTip(content: Pt, pressure: Double, t: Double) {
+        val stroke = liveStroke ?: return
+        val pi = strokePageIndex ?: return
+        val local = state.toPageSpace(pi, content)
+        stroke.setTip(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), t))
     }
 
     /**
@@ -1692,7 +1742,7 @@ class InteractionController(
         toPage: Int,
         content: Pt,
         pressure: Double,
-        timeMs: Long,
+        t: Double,
     ) {
         // A stroke long enough to reach the next page is a line, not a held shape.
         cancelDwell()
@@ -1711,9 +1761,7 @@ class InteractionController(
             next.addSample(Sample(bridge.x, bridge.y, last.pressure, last.t))
         }
         val local = state.toPageSpace(toPage, content)
-        next.addSample(
-            Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), (timeMs - strokeStartTimeMs).toDouble()),
-        )
+        next.addSample(Sample(local.x, local.y, pressure.coerceIn(0.0, 1.0), t))
         liveStroke = next
         strokePageIndex = toPage
         requestRender()
@@ -1723,7 +1771,9 @@ class InteractionController(
      *  joins the page it was drawn on and holds its command back for the one composite undo. */
     private fun retireCrossedSegment(stroke: Stroke, pageIndex: Int) {
         stroke.finished = true
-        if (wandMode && stroke.tool.isStroke) {
+        val fading = wandMode && stroke.tool.isStroke
+        crossedPieces.add(Triple(stroke, pageIndex, fading))
+        if (fading) {
             fadingStrokes.add(FadingStroke(stroke, pageIndex))
             frontInk?.holdFading(stroke)
             return
@@ -1731,11 +1781,25 @@ class InteractionController(
         crossedSegments.add(fileStroke(stroke, pageIndex))
     }
 
+    /** Speed pen: once the pen lifts, work the widths out across every page the stroke crossed, so no edge steps. */
+    private fun stitchCrossedSpeedWidths(last: Stroke) {
+        if (crossedPieces.isEmpty() || last.config.speedStrength <= 0.0) return
+        val before = crossedPieces.map { it.first.paintBounds() }
+        Stroke.stitchSpeedWidths(crossedPieces.map { it.first } + last)
+        for ((i, piece) in crossedPieces.withIndex()) {
+            val (stroke, pageIndex, fading) = piece
+            if (fading || frontInk?.holding(stroke) == true) continue
+            val page = state.document.pages.getOrNull(pageIndex) ?: continue
+            repairRegion(page, before[i].union(stroke.paintBounds()))
+        }
+    }
+
     /** Push this stroke's whole edit — every page it crossed plus [last], if any — as one undo
      *  step. A no-op when the stroke neither crossed a page nor committed anything. */
     private fun pushStrokeEdit(last: Command?) {
         val all = if (last == null) crossedSegments.toList() else crossedSegments + last
         crossedSegments.clear()
+        crossedPieces.clear()
         if (all.isEmpty()) return
         history.push(if (all.size == 1) all[0] else CompositeCommand(all))
         onContentChanged()
@@ -1821,9 +1885,11 @@ class InteractionController(
             // frames after the lift instead of already being there. A sticky stroke rides the
             // ordinary path (the pad has no clip), exactly as during the drag.
             if (stickyDrawTarget == null) frontInk?.wet(stroke, pi)
+            if (tracing && !tapCandidate) recordSteadying(stroke)
             // The pen is up: rebuild with lift-time rules on (a dot-sized calligraphy stroke
             // takes the nib's broad face) before the stroke is committed or held for fading.
             stroke.finished = true
+            stitchCrossedSpeedWidths(stroke)
             when {
                 // A bare tap whose only job was to dismiss the selection: drop the dot it would leave.
                 strokeDismissedSelection && tapCandidate -> {
@@ -1885,6 +1951,14 @@ class InteractionController(
         requestRender()
     }
 
+    /** Debug HUD: log what stabilization did to the stroke just lifted, or that it was off. */
+    private fun recordSteadying(stroke: Stroke) {
+        val cfg = stroke.config
+        val effect = if (steadier != null) steadyTrace.measure(stroke.speedScale * SteadyTrace.MM_PER_DP) else null
+        steadyReadout.last =
+            SteadyReadout.Row(ToolConversions.trailToStrength(cfg.stabilizeTrail), ToolConversions.dpPerSToCrossover(cfg.stabilizeCrossover), effect)
+    }
+
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport
      *  px at the draw zoom (÷ zoom → content px), capped so zoomed-out ink keeps content fidelity.
      *  The stroke's just-built geometry supplies the half-width channel, so pressure/speed width
@@ -1892,6 +1966,7 @@ class InteractionController(
      *  per-sample pressure and its grain is page-anchored, so dropping a sample
      *  would move the live texture on pen-up. */
     private fun simplifyForCommit(stroke: Stroke) {
+        stroke.freezeSpeedWidths()
         if (stroke.tool == com.xnotes.core.tools.Tool.PENCIL) {
             stroke.trimToSize()
             return
@@ -1930,8 +2005,10 @@ class InteractionController(
         if (!dwellEligible) return
         val stroke = liveStroke ?: return
         val pi = strokePageIndex ?: return
-        if (stroke.samples.size < SHAPE_MIN_SAMPLES) return // not enough yet; the next move re-arms
-        val rec = ShapeRecognizer.recognize(stroke.samples) ?: return // not a shape; the next move re-arms
+        // A steadied stroke is judged as lifting it now would leave it, out to the nib.
+        val path = stroke.tip?.let { stroke.samples + it } ?: stroke.samples
+        if (path.size < SHAPE_MIN_SAMPLES) return // not enough yet; the next move re-arms
+        val rec = ShapeRecognizer.recognize(path) ?: return // not a shape; the next move re-arms
         commitRecognizedShape(stroke, pi, rec)
     }
 
@@ -6060,6 +6137,7 @@ class InteractionController(
         cancelDwell()
         clearFading()
         crossedSegments.clear() // they belong to the outgoing document, whose history is gone
+        crossedPieces.clear()
         dwellEligible = false
         drawingIsCalibrated = false
         downView = null
@@ -6718,6 +6796,9 @@ class InteractionController(
         /** Vendor key some pens send for a genuinely held side button (OnePlus Pad Go 2 Stylo,
          *  which reports a real down/up pair with auto-repeat rather than a momentary click). */
         const val VENDOR_HELD_BUTTON_KEYCODE = KeyEvent.KEYCODE_F21
+
+        /** The Xiaomi Focus Pen Pro has no button and sends its pinch as a held key with auto-repeat. */
+        const val FOCUS_PEN_PRO_PINCH_KEYCODE = KeyEvent.KEYCODE_BUTTON_7
 
         /** Stylus side-button bits, widened past the S-Pen primary so pens on the secondary/tertiary lines count too. */
         val STYLUS_BUTTON_MASK =

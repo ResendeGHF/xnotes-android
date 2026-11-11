@@ -51,6 +51,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xnotes.R
+import com.xnotes.platform.AppIcons
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.LocalPalette
 import com.xnotes.ui.theme.NotesBrandFont
@@ -76,6 +77,9 @@ fun AboutPane() {
     val palette = LocalPalette.current
     val ctx = LocalContext.current
 
+    var icon by remember { mutableStateOf(AppIcons.current(ctx)) }
+    var picking by remember { mutableStateOf(false) }
+    val openPicker = remember { { picking = true } }
     val version = remember {
         runCatching {
             val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
@@ -98,6 +102,8 @@ fun AboutPane() {
             Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 16.dp, bottom = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            AppIconImage(icon, 72.dp, "Polars", Modifier.holdForIconPicker(openPicker))
+            Spacer(Modifier.height(16.dp))
             Text("Polars", color = palette.text.toComposeColor(), fontFamily = NotesBrandFont, fontWeight = FontWeight.Normal, fontSize = 22.sp, letterSpacing = 1.2.sp)
             Spacer(Modifier.height(5.dp))
             Text(
@@ -164,6 +170,7 @@ fun AboutPane() {
             }
         }
     }
+    if (picking) IconPicker(icon, onPick = { AppIcons.apply(ctx, it); icon = it }, onDismiss = { picking = false })
 }
 
 /** A link button: line glyph above a label. Fills with the selection container while pressed. */

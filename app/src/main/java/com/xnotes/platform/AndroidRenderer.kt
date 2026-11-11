@@ -13,6 +13,7 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.os.Build
 import com.xnotes.core.geometry.Flip
+import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
 import com.xnotes.core.model.ImageData
@@ -30,6 +31,7 @@ import com.xnotes.core.pal.ribbonJoinStations
 import com.xnotes.core.stroke.PencilTexture
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
+import kotlin.math.atan2
 
 /**
  * A [Renderer] backed by an [android.graphics.Canvas]. The same implementation
@@ -205,23 +207,19 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         canvas.drawCircle(center.x.toFloat(), center.y.toFloat(), radius.toFloat(), fillPaint)
     }
 
-    // The whole swept-disc ribbon as one path: every disc and bridging quad is wound the same way
-    // under WINDING, so overlaps union into solid ink (anti-aliased only along the true outer
-    // silhouette, no interior seams, no winding-cancelled gap at a sharp turn). One draw call keeps
-    // the repainted-every-frame live stroke cheap. Built straight from the packed float geometry
-    // (the [Geometry.ribbonQuad] math inlined) so a dense page allocates nothing per point.
+    // The swept-disc ribbon as one WINDING path of capsules (tangent hulls of consecutive discs), so overlaps union and
+    // a sharp turn can't hole. Never flat-ended quads plus discs: Skia's analytic AA (all there is since Android 15)
+    // carves a light pixel row wherever an edge leaves the outline steeply; a capsule meets it tangentially.
     override fun fillDiskRibbon(centers: FloatArray, radii: FloatArray, color: Rgba) =
         fillDiskRibbon(centers, radii, 0, minOf(centers.size / 2, radii.size), color)
 
     override fun fillDiskRibbon(centers: FloatArray, radii: FloatArray, from: Int, count: Int, color: Rgba) {
         if (count <= 0) return
-        val end = from + count
         fillPaint.color = color.toArgb()
         val path = Path().apply { fillType = Path.FillType.WINDING }
-        appendRibbon(path, centers, radii, from, end)
-        for (i in from until end) {
-            val r = radii[i]
-            if (r > 0f) path.addCircle(centers[2 * i], centers[2 * i + 1], r, Path.Direction.CW)
+        if (count == 1 && radii[from] > 0f) path.addCircle(centers[2 * from], centers[2 * from + 1], radii[from], Path.Direction.CW)
+        for (i in from until from + count - 1) {
+            addCapsule(path, centers[2 * i], centers[2 * i + 1], radii[i], centers[2 * i + 2], centers[2 * i + 3], radii[i + 1])
         }
         canvas.drawPath(path, fillPaint)
     }
@@ -357,6 +355,35 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             }
             path.close()
         }
+    }
+
+    private val tangents = DoubleArray(4) // scratch, so a dense page allocates nothing per point
+    private val rimOval = RectF()
+
+    private fun addCapsule(path: Path, x0: Float, y0: Float, r0: Float, x1: Float, y1: Float, r1: Float) {
+        val front = Geometry.capsule(x0.toDouble(), y0.toDouble(), r0.toDouble(), x1.toDouble(), y1.toDouble(), r1.toDouble(), tangents)
+        if (front == Geometry.SWALLOWED) {
+            if (r0 >= r1) {
+                if (r0 > 0f) path.addCircle(x0, y0, r0, Path.Direction.CW)
+            } else {
+                path.addCircle(x1, y1, r1, Path.Direction.CW)
+            }
+            return
+        }
+        val n = tangents
+        path.moveTo((x0 + r0 * n[0]).toFloat(), (y0 + r0 * n[1]).toFloat())
+        path.lineTo((x1 + r1 * n[0]).toFloat(), (y1 + r1 * n[1]).toFloat())
+        addRim(path, x1, y1, r1, n[0], n[1], front)
+        path.lineTo((x0 + r0 * n[2]).toFloat(), (y0 + r0 * n[3]).toFloat())
+        addRim(path, x0, y0, r0, n[2], n[3], 360.0 - front)
+        path.close()
+    }
+
+    /** Continue [path] [sweep] degrees clockwise round the rim of disc ([cx], [cy], [r]) from its point along ([nx], [ny]). */
+    private fun addRim(path: Path, cx: Float, cy: Float, r: Float, nx: Double, ny: Double, sweep: Double) {
+        if (r <= 0f) return
+        rimOval.set(cx - r, cy - r, cx + r, cy + r)
+        path.arcTo(rimOval, Math.toDegrees(atan2(ny, nx)).toFloat(), sweep.toFloat(), false)
     }
 
     // The blur radius is a page-space length: the canvas scale grows it with zoom,
