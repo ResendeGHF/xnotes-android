@@ -2401,14 +2401,41 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
     val sharedGeometry = editor.toolbarWorkspaces.forContext(
         if (useCanvasLayout) ToolbarContext.CANVAS else ToolbarContext.NOTE,
     ).bars.firstOrNull()?.geometry
+    // Full multi-bar workspace for the active document. The legacy single-bar [layout] above
+    // stays the primary bar's content (so mixed pairs keep showing unavailable tools as
+    // disabled), while every further bar renders through the docked/floating workspace below.
+    val sharedCtx = if (useCanvasLayout) ToolbarContext.CANVAS else ToolbarContext.NOTE
+    val sharedWorkspace = editor.toolbarWorkspaces.forContext(sharedCtx)
+    val sharedPrimary = sharedWorkspace.bars.firstOrNull()
     val occlusion = remember { com.xnotes.ui.SharedToolbarOcclusion() }
+    var workspaceBounds by remember { mutableStateOf(Rect.Zero) }
+    // Single-bar legacy content for the workspace primary.
+    val sharedPrimaryBar: @Composable () -> Unit = {
+        WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry)
+    }
+    // Every further bar renders with the same active editor, so taps, ink and popups follow focus.
+    val sharedExtraBar: @Composable (com.xnotes.core.tools.ToolbarBar) -> Unit = { extraBar ->
+        WorkspaceToolbar(active, extraBar.layout, actions, occlusion, extraBar.geometry,
+            reportOcclusion = false)
+    }
+    val sharedBar: @Composable () -> Unit = {
+        val primary = sharedPrimary
+        if (primary != null && !primary.geometry.floating) {
+            com.xnotes.ui.ToolbarDragSurface(
+                primary.id, primary.geometry.anchor, primary.geometry.movable, workspaceBounds,
+                { id, anchor -> editor.moveToolbarBar(sharedCtx, id, anchor) },
+            ) { sharedPrimaryBar() }
+        } else sharedPrimaryBar()
+    }
     Column(Modifier.fillMaxSize().then(SwallowTouches).imePadding()) {
         if (split) {
             com.xnotes.ui.SplitWorkspaceHeader(editor, second, mixed, onClose = actions.onClosePane)
         }
-        val bar: @Composable () -> Unit = { WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry) }
-        OptionalToolbarAround(sharedChrome, bar) { floatingBar ->
-            BoxWithConstraints(Modifier.fillMaxSize()) {
+        OptionalToolbarAround(sharedChrome, sharedBar,
+            suppressBar = sharedPrimary?.geometry?.floating == true,
+            barLayout = sharedPrimary?.layout, barGeometry = sharedPrimary?.geometry,
+            workspace = sharedWorkspace, dockedContent = sharedExtraBar) { floatingBar ->
+            BoxWithConstraints(Modifier.fillMaxSize().onGloballyPositioned { workspaceBounds = it.boundsInRoot() }) {
                 val fullW = maxWidth
                 val fullH = maxHeight
                 val full = if (sideBySide) fullW else fullH
@@ -2461,7 +2488,19 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
                             .then(paneSize(DIVIDER)),
                     )
                 }
-                Box(Modifier.fillMaxSize().zIndex(1f)) { floatingBar() }
+                Box(Modifier.fillMaxSize().zIndex(1f)) {
+                    floatingBar()
+                    WorkspaceFloatingBars(
+                        workspace = sharedWorkspace,
+                        onMoveBar = { id, anchor -> editor.moveToolbarBar(sharedCtx, id, anchor) },
+                        primaryContent = {
+                            WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry,
+                                reportOcclusion = false)
+                        },
+                        content = sharedExtraBar,
+                        colorCount = active.toolbarColorCount,
+                    )
+                }
             }
         }
         if (!active.canvasOpen) com.xnotes.ui.TextFormatBar(active)
@@ -2473,9 +2512,16 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
 private fun ColumnScope.OptionalToolbarAround(
     visible: Boolean,
     bar: @Composable () -> Unit,
+    suppressBar: Boolean = false,
+    barLayout: com.xnotes.core.tools.ToolbarLayout? = null,
+    barGeometry: com.xnotes.core.tools.ToolbarGeometry? = null,
+    workspace: com.xnotes.core.tools.ToolbarWorkspace? = null,
+    dockedContent: (@Composable (com.xnotes.core.tools.ToolbarBar) -> Unit)? = null,
     content: @Composable (floatingBar: @Composable BoxScope.() -> Unit) -> Unit,
 ) {
-    if (visible) ToolbarAround(bar, onCover = { _, _, _, _ -> }, content = content)
+    if (visible) ToolbarAround(bar, onCover = { _, _, _, _ -> },
+        suppressBar = suppressBar, barLayout = barLayout, barGeometry = barGeometry,
+        workspace = workspace, dockedContent = dockedContent, content = content)
     else Box(Modifier.weight(1f).fillMaxWidth()) { content {} }
 }
 
@@ -2486,8 +2532,12 @@ private fun WorkspaceToolbar(
     actions: PaneActions,
     occlusion: com.xnotes.ui.SharedToolbarOcclusion,
     geometry: com.xnotes.core.tools.ToolbarGeometry? = null,
+    reportOcclusion: Boolean = true,
 ) {
-    Box(Modifier.onGloballyPositioned { occlusion.bar = it.boundsInRoot() }
+    val measured = if (reportOcclusion) {
+        Modifier.onGloballyPositioned { occlusion.bar = it.boundsInRoot() }
+    } else Modifier
+    Box(measured
         .then(if (!editor.canvasOpen) Modifier.endsPageSelection(editor) else Modifier)) {
         // The frame (scroll position and tool animation) survives focus changes; popups do not.
         com.xnotes.ui.SharedToolbarFrame(if (editor.canvasOpen) editor.infinite.tool else editor.tool, layout, geometry) {
