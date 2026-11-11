@@ -1478,19 +1478,41 @@ class CanvasState(
     }
 
     /**
-     * Draw-path variant of [highlighterCacheFor]: while a pinch is in flight the stale-resolution
-     * bitmap is reused as-is (scaled at blit) and — critically — a missing entry does NOT build
-     * synchronously on the UI thread. Rasterizing a ribbon mid-pinch is what hitches the gesture;
-     * the caller skips the highlighter for those frames and it appears on settle.
-     * Returns null only when there is nothing reusable yet.
+     * Draw-path entry point for a highlighter ribbon. Never rasterizes on the calling (UI)
+     * thread mid-gesture: a correct-resolution rebuild goes to the worker and the stale
+     * bitmap is blitted scaled meanwhile (like the page caches), so gestures stay smooth
+     * and committed ink never vanishes. Only when nothing was ever baked for this exact
+     * geometry does it fall back to a synchronous build, keeping first paint instant.
      */
-    fun highlighterCacheForDraw(stroke: Stroke, page: Page): HighlighterCacheEntry? {
-        if (!zoomingInProgress) return highlighterCacheFor(stroke, page)
-        val existing = hlCaches[stroke] ?: return null
+    fun highlighterForDraw(stroke: Stroke, page: Page): HighlighterCacheEntry? {
+        val res = clampedRes(page)
         val g = stroke.geometry()
         val opaque = stroke.renderColor.withAlpha(255)
-        if (existing.geom !== g || existing.opaque != opaque || existing.cuts !== stroke.cuts) return null
-        return existing
+        val existing = hlCaches[stroke]
+        val matches = existing != null && existing.geom === g && existing.opaque == opaque &&
+            existing.cuts === stroke.cuts
+        if (matches && (zoomingInProgress || abs(existing.res - res) < 1e-6)) return existing
+        if (!zoomingInProgress && !matches) return highlighterCacheFor(stroke, page)
+        scheduleHighlighter(stroke, page, res, g, opaque)
+        // Show the stale bitmap scaled meanwhile (or skip this frame when nothing
+        // reusable exists yet); the scheduled rebuild lands shortly after.
+        return if (matches) existing else null
+    }
+
+    /** Rebuild queue for highlighter ribbons, so gesture frames never rasterize on the UI thread. */
+    private val pendingHl = HashSet<Stroke>()
+
+    private fun scheduleHighlighter(stroke: Stroke, page: Page, res: Double, g: StrokeGeometry, opaque: Rgba) {
+        if (!pendingHl.add(stroke)) return
+        val gen = cacheGen
+        runAsync {
+            val entry = runBuild { buildHighlighter(stroke, page, res, g, opaque) }
+            postToMain {
+                pendingHl.remove(stroke)
+                if (gen == cacheGen && entry != null) hlCaches[stroke] = entry
+                onCacheReady?.invoke()
+            }
+        }
     }
 
     private fun buildHighlighter(stroke: Stroke, page: Page, res: Double, g: StrokeGeometry, opaque: Rgba): HighlighterCacheEntry {

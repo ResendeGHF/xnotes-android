@@ -551,32 +551,26 @@ class CanvasView @JvmOverloads constructor(
                     r.translate(pr.left, pr.top)
                     st.applyPageTransform(r, page)
                     // During an active pinch the per-frame cover walks (tapes + stickies over every
-                    // highlighter) are O(H*(T+S)) intersects, and a synchronous ribbon raster hitches
-                    // the gesture. Degraded path: reuse the stale-resolution bitmap as-is and skip
-                    // the cut-outs for the gesture's duration; the exact composite lands on settle.
-                    val degraded = st.zoomingInProgress
+                    // highlighter) are O(H*(T+S)) intersects; the ribbon itself is baked off-thread
+                    // and the stale bitmap is reused scaled meanwhile, so gestures stay smooth.
+                    // Cut-outs are always applied: tape over ink must stay cut out even mid-gesture.
                     for ((k, item) in page.items.withIndex()) {
                         if (item is Stroke && item.isHighlighterInk() && !st.isLiftedItem(item) &&
                             item.bounds().intersects(visLocal)
                         ) {
                             // Blit the pre-rendered opaque ribbon at the ink's alpha and blend,
-                            // instead of re-tessellating the ribbon every frame.
-                            // Degraded path: reuse the stale-resolution bitmap as-is and skip
-                            // the cut-outs for the gesture's duration; a highlighter with no
-                            // reusable entry still builds once (then caches) instead of vanishing.
-                            val hc = if (degraded) st.highlighterCacheForDraw(item, page)
-                                ?: st.highlighterCacheFor(item, page)
-                            else st.highlighterCacheFor(item, page)
+                            // instead of re-tessellating the ribbon every frame. Rebuilds go to
+                            // the worker; a highlighter with nothing reusable yet skips frames
+                            // until its first bake lands (cold open builds it synchronously).
+                            val hc = st.highlighterForDraw(item, page) ?: continue
                             val faint = if (st.fade?.fades(item) == true) com.xnotes.core.audio.InkFade.ALPHA else 1.0
                             // Composited over the finished page, so tape laid over it has to be cut out by hand.
-                            val allCovers = if (degraded) null else {
-                                val covers = coveringTapes(st, page.items, k, item.bounds())
-                                val stickyCovers = coveringStickies(st, page, item.bounds())
-                                when {
-                                    covers != null && stickyCovers != null -> covers + stickyCovers
-                                    covers != null -> covers
-                                    else -> stickyCovers
-                                }
+                            val covers = coveringTapes(st, page.items, k, item.bounds())
+                            val stickyCovers = coveringStickies(st, page, item.bounds())
+                            val allCovers = when {
+                                covers != null && stickyCovers != null -> covers + stickyCovers
+                                covers != null -> covers
+                                else -> stickyCovers
                             }
                             r.withSave {
                                 if (allCovers != null) r.clipOutPolygons(allCovers)
@@ -697,7 +691,7 @@ class CanvasView @JvmOverloads constructor(
             st.applyPageTransform(r, page)
             for (item in page.items) {
                 if (item !is Stroke || !item.isHighlighterInk() || st.isLiftedItem(item)) continue
-                val hc = st.highlighterCacheFor(item, page)
+                val hc = st.highlighterForDraw(item, page) ?: continue
                 val faint = if (st.fade?.fades(item) == true) com.xnotes.core.audio.InkFade.ALPHA else 1.0
                 val alpha = item.renderColor.a / 255.0 * faint
                 r.withSave {
