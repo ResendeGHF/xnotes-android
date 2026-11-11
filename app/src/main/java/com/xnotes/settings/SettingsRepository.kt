@@ -5,14 +5,64 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.xnotes.platform.JsonStore
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
-/** Loads/saves [Settings] via the atomic, failure-tolerant [JsonStore]. */
+/** Loads/saves [Settings] via the atomic, failure-tolerant [JsonStore].
+ *
+ * Every save runs off the UI thread on a single background worker and rapid saves
+ * collapse into one write, so tapping through tools, colours and presets never drops
+ * a frame on file I/O. Call [flush] on pause/close paths where the process may die
+ * before a queued write would land.
+ */
 class SettingsRepository(context: Context) {
     private val store = JsonStore.settings(context.applicationContext)
+    private val writer = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "settings").apply { isDaemon = true }
+    }
+    private val lock = Any()
+    private var pending: Settings? = null
+    private var scheduled = false
 
     fun load(): Settings = Settings.fromJson(store.read())
 
-    fun save(settings: Settings) = store.write(settings.toJson())
+    /** Queue a persist; latest wins when several land before the worker drains. */
+    fun save(settings: Settings) {
+        val submit = synchronized(lock) {
+            pending = settings
+            if (!scheduled) {
+                scheduled = true
+                true
+            } else false
+        }
+        if (submit) writer.execute(::drain)
+    }
+
+    /** Block (bounded) until queued writes have landed. Pause/close path only. */
+    fun flush(timeoutMs: Long = 2000L) {
+        val done = CountDownLatch(1)
+        writer.execute { done.countDown() }
+        runCatching { done.await(timeoutMs, TimeUnit.MILLISECONDS) }
+    }
+
+    private fun drain() {
+        while (true) {
+            val next = synchronized(lock) { pending.also { pending = null } }
+            if (next == null) {
+                synchronized(lock) {
+                    // A save may have landed between the drain above and this check;
+                    // only stand down when the queue is still empty.
+                    if (pending == null) {
+                        scheduled = false
+                        return
+                    }
+                }
+                continue
+            }
+            runCatching { store.write(next.toJson()) }
+        }
+    }
 }
 
 /**

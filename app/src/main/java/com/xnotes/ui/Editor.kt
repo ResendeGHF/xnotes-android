@@ -4483,6 +4483,10 @@ class Editor(
         }
         if (noteOpen) saveViewState() // remember this folder note's view for next time
         settingsRepo.save(settings)
+        // The settings and view-state writes above queue off the UI thread; wait for
+        // them here (bounded) since the process may die once pause returns.
+        settingsRepo.flush()
+        viewStates.flush()
         // The note + session writes are heavy for a big note; run them off the main thread so pressing
         // Home never freezes the UI. The process survives to finish them; the debounced autosave during
         // editing bounds any loss on an immediate hard kill.
@@ -4495,7 +4499,11 @@ class Editor(
 
     /** Persist the open canvas, or clear the stored one when a canvas is not what is open.
      *  A canvas from an encrypted folder is never written out: its plaintext must not reach the
-     *  session file, so any previous session is overwritten and removed instead. */
+     *  session file, so any previous session is overwritten and removed instead.
+     *
+     *  Never encodes on the calling thread: the debounced autosave above already carries dirty
+     *  edits, so this only seeds a session file that was never written (opened but unedited
+     *  canvas), off the main thread. */
     private fun saveCanvasSession() {
         val canvas = infiniteOrNull
         if (!canvasOpen || canvas == null || openVaultId != null) {
@@ -4503,7 +4511,16 @@ class Editor(
             canvasSession.clear(secure = openVaultId != null)
             return
         }
-        canvasSession.save(canvas.document, writeDocument = true)
+        flushCanvasAutosave()
+        val doc = canvas.document
+        if (doc.dirty || !canvasSession.exists()) {
+            val uri = canvasAutosaveUri
+            canvasDebounceJob?.cancel()
+            if (uri != null) startCanvasWrite(uri, doc, doc.displayName ?: doc.title)
+            else autosaveScope.launch(Dispatchers.IO) {
+                runCatching { canvasSession.save(doc, writeDocument = true) }
+            }
+        }
     }
 
     /** Persist the working session (open document + zoom/scroll) so the next launch

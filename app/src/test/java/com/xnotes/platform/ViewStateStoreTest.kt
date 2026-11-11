@@ -32,7 +32,10 @@ class ViewStateStoreTest {
             scrollbar = true,
             freeMovement = true,
         )
-        ViewStateStore(json).put("auth|doc1", 1.5, 12.0, 34.0, vo)
+        ViewStateStore(json).let {
+            it.put("auth|doc1", 1.5, 12.0, 34.0, vo)
+            it.flush()
+        }
 
         val v = ViewStateStore(json).get("auth|doc1")!!
         assertEquals(1.5, v.zoom, 1e-9)
@@ -78,7 +81,10 @@ class ViewStateStoreTest {
 
     @Test fun inheritedFieldsAreOmittedFromJson() {
         val json = store()
-        ViewStateStore(json).put("auth|doc", 1.0, 0.0, 0.0, ViewOverrides())
+        ViewStateStore(json).let {
+            it.put("auth|doc", 1.0, 0.0, 0.0, ViewOverrides())
+            it.flush()
+        }
         val entry = json.read().getJSONObject("auth|doc")
         assertEquals(setOf("zoom", "scrollX", "scrollY"), entry.keys().asSequence().toSet())
     }
