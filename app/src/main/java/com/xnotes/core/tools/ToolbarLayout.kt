@@ -20,6 +20,8 @@ enum class ToolbarItem(val id: String) {
     SPEED("speed"),
     TAPER("taper"),
     HIGHLIGHTER("highlighter"),
+    /** Optional shortcut to existing pens; hidden in legacy and default layouts. */
+    UNIFIED_PEN("unified_pen"),
     ERASER("eraser"),
     PAN("pan"),
 
@@ -162,6 +164,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
     companion object {
         /** Later-added items that belong beside an existing one in stored layouts. */
         private val INSERT_AFTER = mapOf(
+            ToolbarItem.UNIFIED_PEN to ToolbarItem.HIGHLIGHTER,
             ToolbarItem.PENCIL to ToolbarItem.PEN,
             ToolbarItem.TEXT_BOX to ToolbarItem.TEXT,
             ToolbarItem.VIEW to ToolbarItem.STYLES,
@@ -185,7 +188,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
         val CANVAS_ITEMS: Set<ToolbarItem> = setOf(
             ToolbarItem.HOME, ToolbarItem.TITLE,
             ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
-            ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
+            ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.WAND,
             ToolbarItem.TAPE, ToolbarItem.SHAPE, ToolbarItem.TEXT_BOX,
             ToolbarItem.IMAGE, ToolbarItem.COLORS, ToolbarItem.UNDO, ToolbarItem.REDO,
@@ -204,7 +207,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
             listOf(ToolbarItem.SIDEBAR),
             listOf(
                 ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
-                ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
+                ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ),
             listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.INSERT_SPACE, ToolbarItem.SCREENSHOT),
             listOf(ToolbarItem.WAND, ToolbarItem.TAPE, ToolbarItem.SHAPE, ToolbarItem.MATH, ToolbarItem.RULER, ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.MARKUP),
@@ -221,7 +224,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
             listOf(ToolbarItem.HOME, ToolbarItem.TITLE),
             listOf(
                 ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
-                ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER,
+                ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ),
             listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO),
             listOf(ToolbarItem.WAND, ToolbarItem.TAPE, ToolbarItem.SHAPE, ToolbarItem.MATH, ToolbarItem.TEXT_BOX),
@@ -233,7 +236,7 @@ data class ToolbarLayout(val sections: List<ToolbarSection>) {
         )
 
         private fun of(vararg groups: List<ToolbarItem>): ToolbarLayout =
-            ToolbarLayout(groups.map { g -> ToolbarSection(g.map { ToolbarEntry(it) }) })
+            ToolbarLayout(groups.map { g -> ToolbarSection(g.map { ToolbarEntry(it, visible = it != ToolbarItem.UNIFIED_PEN) }) })
 
         /**
          * Build from raw (id, visible) pairs per section as read from storage: ids outside [among]

@@ -1701,4 +1701,6 @@
     <string name="policy_no_match">No files match the search.</string>
     <string name="connect">Connect</string>
     <string name="companion_title">Companion</string>
+    <string name="toolbar_unified_pen">Pen group</string>
+    <string name="toolbar_pen_advanced_settings">Advanced settings</string>
 </resources>

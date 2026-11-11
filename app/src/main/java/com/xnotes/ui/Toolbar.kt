@@ -229,6 +229,10 @@ private fun ToolbarItemView(
         // Canvas-only items; a stored paged layout can never hold one, so nothing is drawn.
         ToolbarItem.WAYPOINTS, ToolbarItem.MINIMAP -> Unit
 
+        ToolbarItem.UNIFIED_PEN -> UnifiedPenLauncher(
+            host = editor, armedTool = editor.tool, ink = editor.controller.inkColor.toComposeColor(),
+            onChooseTool = { editor.selectTool(it) }, onSelectColor = { editor.pickColor(it) },
+        )
         ToolbarItem.MATH -> ToolbarIcon(
             icon = Icons.Outlined.Functions,
             contentDescription = stringResource(R.string.math_toolbar),
