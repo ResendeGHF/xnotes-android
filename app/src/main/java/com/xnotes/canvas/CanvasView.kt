@@ -765,10 +765,15 @@ class CanvasView @JvmOverloads constructor(
     }
 
     /** Fires once the view has been still for [SHARP_SETTLE_MS], rendering the sharp viewport.
-     *  Guarded by [sharpPending] so a continuous pan does not churn remove/post per frame. */
+     *  Guarded by [sharpPending] so a continuous pan does not churn remove/post per frame.
+     *  If a build is already in flight the request is parked for its completion instead of
+     *  being dropped: otherwise a settle with no further frames leaves stale soft content
+     *  on screen until the next touch. */
     private val sharpDebounce = Runnable {
         sharpPending = false
-        state?.requestSharpViewport()
+        val st = state
+        if (st != null && st.isSharpBuildPending) st.retrySharpViewport()
+        else st?.requestSharpViewport()
     }
     private var sharpPending = false
 

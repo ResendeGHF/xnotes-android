@@ -590,6 +590,9 @@ class CanvasState(
     private var sharpFrame: SharpFrame? = null
     private var pendingSharp = false
 
+    /** Whether a sharp-viewport build is in flight (read by the view's settle debounce). */
+    internal val isSharpBuildPending: Boolean get() = pendingSharp
+
     /**
      * Edits landed while a sharp render was in flight (its item snapshot predates them):
      * page + page-local dirty rect, replayed onto the fresh frame at publish so ink drawn
@@ -2029,6 +2032,12 @@ class CanvasState(
         sharpFrame = null
     }
 
+    /** A sharp re-render was asked for while a build is already in flight: run another
+     *  pass when it completes, so a settled view never waits for the next touch to sharpen. */
+    internal fun retrySharpViewport() {
+        sharpAgain = true
+    }
+
     /**
      * Render the current viewport — paper + background + ink for the visible pages — at full zoom
      * resolution into one viewport-sized surface, off the UI thread, tagged with the exact view it
@@ -2088,8 +2097,10 @@ class CanvasState(
                     // Replay edits committed during the build; the item snapshot predates them.
                     for ((p, rect) in pendingSharpEdits) repairSharpInk(p, rect)
                     onCacheReady?.invoke()
-                } else if (built == null) {
-                    // A dying build must still settle the frame request below.
+                } else {
+                    // A dying build — or one whose view moved on — must still settle the frame
+                    // request below: without another frame the debounced re-render never runs
+                    // and a settled viewport stays soft until the next touch.
                     onCacheReady?.invoke()
                 }
                 pendingSharpEdits.clear()
