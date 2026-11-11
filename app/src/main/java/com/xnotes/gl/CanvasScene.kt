@@ -12,13 +12,10 @@ import com.xnotes.core.infinite.LiftTransform
 import com.xnotes.core.infinite.MeshData
 import com.xnotes.core.infinite.Minimap
 import com.xnotes.core.infinite.MeshPart
-import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ImageItem
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.StickyNoteItem
-import com.xnotes.core.stroke.PencilStyle
-import com.xnotes.core.stroke.PencilTexture
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.floor
@@ -52,8 +49,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val glow: GlowSpec? = null,
         /** A covered tape's body, which the highlights beneath it are drawn round. */
         val covers: Boolean = false,
-        /** Set on a pencil run: grain phase plus the UI knobs. */
-        val pencil: PencilStyle? = null,
     )
 
     /** A highlight held back to composite last, and the bodies of the covered tape laid over it since. */
@@ -292,7 +287,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     private val visible = ArrayList<Record>()
     private val deferred = ArrayList<Deferred>()
     private val stickyDeferred = ArrayList<Deferred>()
-    private val pencilParts = ArrayList<Triple<GeometryStore, Part, Rect>>()
 
     /** Items currently drawn, for the debug readout. */
     val itemCount: Int get() = records.size
@@ -704,13 +698,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                             runCount = part.slice.indexCount
                         }
                     }
-                    InkPass.PENCIL -> {
-                        flushRun(runStart, runCount)
-                        runStart = -1
-                        runCount = 0
-                        drawPencil(program, store, part, record.bounds, frame)
-                        rebind(program, frame, camChunkX, camChunkY)
-                    }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO -> {
                         flushRun(runStart, runCount)
                         runStart = -1
@@ -851,13 +838,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                             runStart = part.slice.indexOffset
                             runCount = part.slice.indexCount
                         }
-                    }
-                    InkPass.PENCIL -> {
-                        flushRun()
-                        drawPencil(program, store, part, record.bounds, frame)
-                        applyView(program, frame, camChunkX, camChunkY, liftAt)
-                        store.bindForDraw(contextGen)
-                        store.bindAttributes(program)
                     }
                     InkPass.TRANSLUCENT, InkPass.EVEN_ODD, InkPass.NONZERO, InkPass.MULTIPLY, InkPass.SCREEN -> {
                         flushRun()
@@ -1009,8 +989,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             runStart = -1
             runCount = 0
         }
-        // Pencil runs defer their covers to the shared union below.
-        pencilParts.clear()
         for (part in parts) {
             if (part.pass == InkPass.OPAQUE) {
                 if (runStart >= 0 && part.slice.indexOffset == runStart + runCount) {
@@ -1025,8 +1003,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             flush()
             if (part.pass == InkPass.GLOW) {
                 drawGlow(program, buffer, wetRecord(), part, frame, camChunkX, camChunkY)
-            } else if (part.pass == InkPass.PENCIL) {
-                pencilParts.add(Triple(buffer, part, wetBounds))
             } else {
                 drawMasked(
                     buffer, part.slice, wetBounds, part.coverColor, part.coverAlpha,
@@ -1038,22 +1014,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             buffer.bindAttributes(program)
         }
         flush()
-        // The live stroke's runs share one union on purpose: mark every run
-        // first, then cover every run, so a tail crossing its own settled ink
-        // paints once exactly like the committed stroke does. (Committed
-        // strokes keep one mark+cover per part instead, so separate strokes
-        // still layer over each other.)
-        if (pencilParts.isNotEmpty()) {
-            if (grainTexture(program) == 0) {
-                for ((from, part, bounds) in pencilParts) drawPencil(program, from, part, bounds, frame)
-            } else {
-                for ((from, part, bounds) in pencilParts) markPencil(program, from, part, bounds, frame)
-                for ((from, part, _) in pencilParts) coverPencil(program, from, part)
-            }
-            rebind(program, frame, camChunkX, camChunkY)
-            buffer.bindForDraw(contextGen)
-            buffer.bindAttributes(program)
-        }
     }
 
     /** Upload one ready-to-draw text bitmap and reuse its GL texture until the text changes. */
@@ -1248,138 +1208,6 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             }
         }
         glowTarget.unbind(frame.widthPx, frame.heightPx)
-    }
-
-    /** The pencil grain tile as a GL texture, recreated with the GL context. */
-    private var grainTextureId = 0
-    private var grainTextureGen = -1
-
-    private fun grainTexture(program: InkShader): Int {
-        if (grainTextureId != 0 && grainTextureGen == program.contextGen) return grainTextureId
-        if (grainTextureId != 0) {
-            GLES30.glDeleteTextures(1, intArrayOf(grainTextureId), 0)
-            grainTextureId = 0
-        }
-        val ids = IntArray(1)
-        GLES30.glGenTextures(1, ids, 0)
-        if (ids[0] == 0) return 0
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, ids[0])
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR_MIPMAP_LINEAR)
-        // Nearest on magnification: grains stay crisp holes instead of
-        // blurring into smaller-looking smudges at high zoom.
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_REPEAT)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_REPEAT)
-        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, PencilTexture.fieldBitmap(), 0)
-        GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_2D)
-        grainTextureId = ids[0]
-        grainTextureGen = program.contextGen
-        return grainTextureId
-    }
-
-    /** Bind the grain field to unit 0 and point the pencil cover at it. */
-    /** Bind the grain field to unit 0 and point the pencil cover at [style]. */
-    private fun bindGrain(program: InkShader, style: PencilStyle) {
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, grainTextureId)
-        program.setPencilGrain(0, (PencilTexture.TILE_CONTENT_PX * style.grainSize).toFloat())
-        program.setPencilDensity(
-            StrokeTessellator.PENCIL_DENSITY_BASE.toFloat(),
-            StrokeTessellator.PENCIL_DENSITY_SPAN.toFloat(),
-            StrokeTessellator.PENCIL_DENSITY_GAMMA.toFloat(),
-        )
-        program.setPencilShade(
-            StrokeTessellator.PENCIL_SHADE_BASE.toFloat(),
-            StrokeTessellator.PENCIL_SHADE_SPAN.toFloat(),
-            StrokeTessellator.PENCIL_SHADE_GAMMA.toFloat(),
-        )
-        program.setPencilConfig(
-            style.density.toFloat(), style.pressure.toFloat(), style.shadeResponse.toFloat(),
-        )
-        program.setPencilPhase(style.phaseX.toFloat(), style.phaseY.toFloat())
-    }
-
-    /**
-     * A pencil run: stencil the round sweep into a union, then cover it with
-     * textured graphite at pressure tone, consuming the stencil as it goes,
-     * so every pixel paints exactly once no matter how the ribbon folds over
-     * itself, caps or joins. Consecutive parts need no clear between them:
-     * each consumes what it stencils.
-     *
-     * The live stroke's runs share one union on purpose (see [drawWetBuffer]):
-     * mark every run first, then cover every run, so a tail crossing its own
-     * settled ink paints once like the committed stroke does. Committed
-     * strokes keep one mark+cover per part instead, so separate strokes still
-     * layer over each other.
-     *
-     * Without a grain texture (effectively never) the run falls back to a
-     * flat stencil cover instead of vanishing.
-     */
-    private fun drawPencil(
-        program: InkShader,
-        from: GeometryStore,
-        part: Part,
-        bounds: Rect,
-        frame: FrameState,
-    ) {
-        if (!markPencil(program, from, part, bounds, frame)) return
-        coverPencil(program, from, part)
-    }
-
-    /**
-     * Stencil a pencil run's union silhouette. Returns false when there is no
-     * grain texture, after drawing the flat fallback instead.
-     */
-    private fun markPencil(
-        program: InkShader,
-        from: GeometryStore,
-        part: Part,
-        bounds: Rect,
-        frame: FrameState,
-    ): Boolean {
-        if (grainTexture(program) == 0) {
-            drawMasked(from, part.slice, bounds, part.coverColor, 0.55, frame, InkPass.TRANSLUCENT)
-            return false
-        }
-        // The union silhouette. Overlaps collapse to 1; the cover consumes
-        // them, so nothing double-darkens.
-        GLES30.glEnable(GLES30.GL_STENCIL_TEST)
-        GLES30.glStencilFunc(GLES30.GL_ALWAYS, 1, 0xFF)
-        GLES30.glStencilOp(GLES30.GL_KEEP, GLES30.GL_KEEP, GLES30.GL_REPLACE)
-        GLES30.glStencilMask(0xFF)
-        GLES30.glColorMask(false, false, false, false)
-        program.setWidthScale(1.0)
-        program.setPencil(0f)
-        from.drawRange(part.slice.indexOffset, part.slice.indexCount)
-        lastDrawCalls++
-        return true
-    }
-
-    /** Cover a marked pencil run with graphite stipple, consuming the mask. */
-    private fun coverPencil(
-        program: InkShader,
-        from: GeometryStore,
-        part: Part,
-    ) {
-        // Shaded stipple at the stroke's own density, shade, phase and size,
-        // composited normally over whatever is beneath.
-        GLES30.glColorMask(true, true, true, true)
-        GLES30.glStencilFunc(GLES30.GL_EQUAL, 1, 0xFF)
-        GLES30.glStencilOp(GLES30.GL_KEEP, GLES30.GL_KEEP, GLES30.GL_ZERO)
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
-        val style = part.pencil
-        if (style != null) {
-            bindGrain(program, style)
-            program.setWidthScale(1.0)
-            program.setPencil(1f)
-            from.drawRange(part.slice.indexOffset, part.slice.indexCount)
-            lastDrawCalls++
-        }
-        GLES30.glDisable(GLES30.GL_STENCIL_TEST)
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
-        program.setPencil(0f)
-        program.setWidthScale(1.0)
-        lastDrawCalls++
     }
 
     /** Neon's lit body and white core, both from the same triangles the halo came from. */
@@ -1708,7 +1536,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             // which is what stops its own overlaps from compounding.
             val baked = if (part.pass == InkPass.OPAQUE) part.color else part.color.withAlpha(255)
             val slice = store.put(part.mesh, baked) ?: continue
-            parts.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, part.covers, part.pencil))
+            parts.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, part.covers))
         }
         if (parts.isEmpty() && edit.image == null && edit.textBitmap == null) return
         val record = Record(edit.item, parts, edit.bounds, previousZ ?: nextZ++, edit.image,
@@ -1759,7 +1587,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             // which is what stops its own overlaps from compounding.
             val baked = if (part.pass == InkPass.OPAQUE) part.color else part.color.withAlpha(255)
             val slice = into.put(part.mesh, baked) ?: continue
-            built.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow, pencil = part.pencil))
+            built.add(Part(slice, part.pass, part.color.withAlpha(255), part.color.a / 255.0, part.glow))
         }
         return built
     }

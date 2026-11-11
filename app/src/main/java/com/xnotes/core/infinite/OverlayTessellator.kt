@@ -429,7 +429,7 @@ object OverlayTessellator {
                 pos[i] += dx
                 pos[i + 1] += dy
             }
-            MeshPart(MeshData(pos, m.offsets, m.indices, m.colors), part.color, part.pass, part.glow, part.covers, part.pencil)
+            MeshPart(MeshData(pos, m.offsets, m.indices, m.colors), part.color, part.pass, part.glow, part.covers)
         }
     }
 

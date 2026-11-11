@@ -120,18 +120,6 @@ class ToolsTest {
 
     @Test fun toolIdRoundTrip() {
         for (t in Tool.entries) assertEquals(t, Tool.fromId(t.id))
-        assertEquals(17, Tool.wheelOrder.size)
-    }
-
-    @Test fun pencilDefaultsAndRanges() {
-        val p = ToolDefaults.configFor(Tool.PENCIL)
-        assertEquals(2.5, p.baseWidth, 1e-9)
-        // Fixed width: pressure shades graphite tone, never width.
-        assertFalse(p.pressureEnabled)
-        assertEquals(1.0, p.pressureMinFactor, 1e-9)
-        assertEquals(1.0..20.0, ToolConversions.widthRange(Tool.PENCIL))
-        assertTrue(Tool.PENCIL.isStroke)
-        assertTrue(Tool.PENCIL in Tool.wheelOrder && Tool.PENCIL in ToolDefaults.persistedTools)
-        assertEquals(1.0, Tool.PENCIL.alphaScale, 1e-9)
+        assertEquals(16, Tool.wheelOrder.size)
     }
 }

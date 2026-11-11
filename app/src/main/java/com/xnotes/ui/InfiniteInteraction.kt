@@ -2295,13 +2295,8 @@ class InfiniteInteraction(
         onWetStroke(null)
     }
 
-    /** Shed the samples the ribbon does not need, at the tolerance the draw zoom justifies.
-     *  The pencil never reduces, so the committed stroke is the live texture. */
+    /** Shed the samples the ribbon does not need, at the tolerance the draw zoom justifies. */
     private fun simplifyForCommit(stroke: Stroke) {
-        if (stroke.tool == com.xnotes.core.tools.Tool.PENCIL) {
-            stroke.trimToSize()
-            return
-        }
         stroke.freezeSpeedWidths()
         if (StrokeSimplify.enabled && !stroke.straight) {
             val eps = (InteractionController.SIMPLIFY_EPS / viewport.zoom)

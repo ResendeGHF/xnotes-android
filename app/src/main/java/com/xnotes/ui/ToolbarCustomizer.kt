@@ -748,7 +748,6 @@ internal fun toolbarItemIcon(item: ToolbarItem): ImageVector = when (item) {
     ToolbarItem.TITLE -> XnotesIcons.edit
     ToolbarItem.SIDEBAR -> XnotesIcons.sidebar
     ToolbarItem.PEN -> ImageVector.vectorResource(R.drawable.ic_stroke_regular)
-    ToolbarItem.PENCIL -> ImageVector.vectorResource(R.drawable.ic_stroke_pencil)
     ToolbarItem.DASHED -> ImageVector.vectorResource(R.drawable.ic_stroke_dashed)
     ToolbarItem.CALLIGRAPHY -> ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy)
     ToolbarItem.SPEED -> ImageVector.vectorResource(R.drawable.ic_stroke_speed)

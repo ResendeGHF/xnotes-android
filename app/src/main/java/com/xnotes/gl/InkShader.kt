@@ -54,7 +54,6 @@ class InkShader(contextGen: Int) {
         setWidthScale(1.0)
         clearLift()
         clearOverride()
-        setPencil(0f)
     }
 
     /**
@@ -109,49 +108,6 @@ class InkShader(contextGen: Int) {
         program.set("uOverrideMix", 0f)
     }
 
-    /**
-     * Pencil cover mode for the next draws: 0 off (ordinary ink), 1 graphite
-     * stipple. The grain texture unit must be bound before drawing; see
-     * [setPencilGrain].
-     */
-    fun setPencil(mode: Float) {
-        program.set("uPencil", mode)
-    }
-
-    /** Density map matching [com.xnotes.core.infinite.StrokeTessellator.pencilDensityFor]. */
-    fun setPencilDensity(base: Float, span: Float, gamma: Float) {
-        program.set("uDensBase", base)
-        program.set("uDensSpan", span)
-        program.set("uDensGamma", gamma)
-    }
-
-    /** Grain shade map matching [com.xnotes.core.infinite.StrokeTessellator.pencilShadeFor]. */
-    fun setPencilShade(base: Float, span: Float, gamma: Float) {
-        program.set("uShadeBase", base)
-        program.set("uShadeSpan", span)
-        program.set("uShadeGamma", gamma)
-    }
-
-    /**
-     * Per-stroke pencil config: graphite density scale, pressure sensitivity
-     * gain, colour-shade response. The grain size folds into the tile span
-     * ([setPencilGrain]) and the phase into [setPencilPhase].
-     */
-    fun setPencilConfig(densityScale: Float, pressureGain: Float, shadeResponse: Float) {
-        program.set("uPencilCfg", densityScale, pressureGain, shadeResponse, 0f)
-    }
-
-    /** Grain tile phase in tile units: decorrelates strokes so they layer. */
-    fun setPencilPhase(phaseX: Float, phaseY: Float) {
-        program.set("uGrainPhase", phaseX, phaseY)
-    }
-
-    /** Grain sampler unit and the content px one tile spans. */
-    fun setPencilGrain(unit: Int, tilePx: Float) {
-        program.set("uGrain", unit)
-        program.set("uGrainTile", tilePx)
-    }
-
     fun disableAttributes() {
         if (attribLocal >= 0) GLES30.glDisableVertexAttribArray(attribLocal)
         if (attribChunk >= 0) GLES30.glDisableVertexAttribArray(attribChunk)
@@ -191,10 +147,6 @@ class InkShader(contextGen: Int) {
             uniform float uOverrideMix;
 
             out vec4 vColor;
-            // Pencil cover: the page-space position for the grain lookup.
-            // Small magnitudes stay exact, so the tile phase matches the
-            // paged renderer's bitmap shader cell-for-cell up to filtering.
-            out highp vec2 vPage;
 
             void main() {
                 // Rebuild the position relative to the camera's own chunk, so nothing large is ever
@@ -246,7 +198,6 @@ class InkShader(contextGen: Int) {
                     0.0, 1.0);
                 vec4 base = mix(aColor, uOverride, uOverrideMix);
                 vColor = vec4(base.rgb, base.a * fade);
-                vPage = world;
             }
         """.trimIndent()
 
@@ -254,36 +205,9 @@ class InkShader(contextGen: Int) {
             precision highp float;
             precision highp int;
             in vec4 vColor;
-            in highp vec2 vPage;
             out vec4 fragColor;
-            // Pencil cover: 0 off, 1 graphite stipple. The vertex alpha
-            // carries raw stylus pressure (already min-width faded, like
-            // every other vertex alpha); pressure maps to graphite DENSITY
-            // (how many pixels carry ink) and to grain SHADE (light grey to
-            // full ink), and the field texture stipples both into opaque
-            // grains composited normally. The maps match
-            // StrokeTessellator.pencilDensityFor/pencilShadeFor; uGrainTile
-            // matches PencilTexture.TILE_CONTENT_PX times the stroke's grain
-            // size, uGrainPhase its decorrelating offset.
-            uniform float uPencil;
-            uniform sampler2D uGrain;
-            uniform float uDensBase;
-            uniform float uDensSpan;
-            uniform float uDensGamma;
-            uniform float uShadeBase;
-            uniform float uShadeSpan;
-            uniform float uShadeGamma;
-            uniform vec4 uPencilCfg;
-            uniform vec2 uGrainPhase;
-            uniform float uGrainTile;
             void main() {
-                if (uPencil < 0.5) { fragColor = vColor; return; }
-                float pe = uPencilCfg.y <= 0.0 ? 1.0 : clamp(clamp(vColor.a, 0.0, 1.0) * uPencilCfg.y, 0.0, 1.0);
-                float dens = clamp((uDensBase + uDensSpan * pow(pe, uDensGamma)) * uPencilCfg.x, 0.0, 0.97);
-                float shade = clamp(uShadeBase + (uShadeSpan * pow(pe, uShadeGamma)) * uPencilCfg.z, 0.0, 1.0);
-                float f = step(texture(uGrain, vPage / uGrainTile + uGrainPhase).a, dens);
-                vec3 graphite = mix(vec3(1.0), vColor.rgb, shade);
-                fragColor = vec4(graphite, f);
+                fragColor = vColor;
             }
         """.trimIndent()
     }

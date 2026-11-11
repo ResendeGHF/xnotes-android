@@ -30,7 +30,6 @@ import java.time.Month
 val Tool.labelRes: Int
     get() = when (this) {
         Tool.PEN -> R.string.tool_pen
-        Tool.PENCIL -> R.string.tool_pencil
         Tool.DASHED -> R.string.tool_dashed
         Tool.CALLIGRAPHY -> R.string.tool_calligraphy
         Tool.SPEED -> R.string.tool_speed
@@ -86,7 +85,6 @@ val ToolbarItem.labelRes: Int
         ToolbarItem.TITLE -> R.string.toolbar_title
         ToolbarItem.SIDEBAR -> R.string.toolbar_sidebar
         ToolbarItem.PEN -> R.string.tool_pen
-        ToolbarItem.PENCIL -> R.string.tool_pencil
         ToolbarItem.DASHED -> R.string.tool_dashed
         ToolbarItem.CALLIGRAPHY -> R.string.tool_calligraphy
         ToolbarItem.SPEED -> R.string.tool_speed

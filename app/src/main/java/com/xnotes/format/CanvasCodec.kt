@@ -290,12 +290,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             j.name("highlighter_alpha").value(s.config.highlighterAlpha)
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
         }
-        if (s.tool == Tool.PENCIL) {
-            j.name("pencil_pressure").value(s.config.pencilPressure)
-            j.name("pencil_density").value(s.config.pencilDensity)
-            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
-            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
-        }
         j.endObject()
         // Samples are almost all of a dense manifest's bytes, so they go out through [JsonWrite.samplePoint], which rounds them: 0.01
         // content px and 0.001 pressure are far below anything visible. Rounding is idempotent,
@@ -534,12 +528,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         if (s.tool == Tool.HIGHLIGHTER) {
             j.name("highlighter_alpha").value(s.config.highlighterAlpha)
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
-        }
-        if (s.tool == Tool.PENCIL) {
-            j.name("pencil_pressure").value(s.config.pencilPressure)
-            j.name("pencil_density").value(s.config.pencilDensity)
-            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
-            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
         }
         j.endObject()
         j.name("samples").beginArray()
@@ -987,10 +975,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         var dashGap: Double? = null
         var highlighterAlpha: Double? = null
         var highlighterInverse: Boolean? = null
-        var pencilPressure: Double? = null
-        var pencilDensity: Double? = null
-        var pencilGrainSize: Double? = null
-        var pencilShadeResponse: Double? = null
     }
 
     private fun parseItem(p: JsonPull, items: MutableList<CanvasItem>, pending: MutableList<Pending>, glue: GlueRead) {
@@ -1230,10 +1214,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
-            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
-            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
-            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(t, cfg, emptyList(), speedScale, straight, smoothScale)
         samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
@@ -1262,10 +1242,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
-            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
-            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
-            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(tool, config, emptyList(), s.speedScale, s.straight, s.smoothScale)
         s.samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n, it.ws) }
@@ -1480,10 +1456,6 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
                 "dash_gap" -> c.dashGap = doubleOrNull(p)
                 "highlighter_alpha" -> c.highlighterAlpha = doubleOrNull(p)
                 "highlighter_inverse" -> c.highlighterInverse = boolOrNull(p)
-                "pencil_pressure" -> c.pencilPressure = doubleOrNull(p)
-                "pencil_density" -> c.pencilDensity = doubleOrNull(p)
-                "pencil_grain_size" -> c.pencilGrainSize = doubleOrNull(p)
-                "pencil_shade_response" -> c.pencilShadeResponse = doubleOrNull(p)
                 else -> p.skipValue()
             }
         }

@@ -116,7 +116,6 @@ fun Toolbar(
     // tinted at the call site like every other icon; the rest use the built-in line set.
     val toolIcons: Map<Tool, ImageVector> = mapOf(
         Tool.PEN to ImageVector.vectorResource(R.drawable.ic_stroke_regular),
-        Tool.PENCIL to ImageVector.vectorResource(R.drawable.ic_stroke_pencil),
         Tool.DASHED to ImageVector.vectorResource(R.drawable.ic_stroke_dashed),
         Tool.CALLIGRAPHY to ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy),
         Tool.SPEED to ImageVector.vectorResource(R.drawable.ic_stroke_speed),
@@ -266,7 +265,7 @@ private fun ToolbarItemView(
         ToolbarItem.SIDEBAR ->
             ToolbarIcon(XnotesIcons.sidebar, stringResource(R.string.side_panel), active = editor.sidebarVisible, shortcut = Keys.SIDEBAR) { editor.toggleSidebar() }
 
-        ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+        ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
         ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER, ToolbarItem.PAN,
         ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.SCREENSHOT, ToolbarItem.SHAPE,
         ToolbarItem.TEXT, ToolbarItem.TEXT_BOX, ToolbarItem.TABLE, ToolbarItem.TAPE, ToolbarItem.INSERT_SPACE -> {

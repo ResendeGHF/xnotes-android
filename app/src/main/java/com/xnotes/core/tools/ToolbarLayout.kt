@@ -14,7 +14,6 @@ enum class ToolbarItem(val id: String) {
     TITLE("title"),
     SIDEBAR("sidebar"),
     PEN("pen"),
-    PENCIL("pencil"),
     DASHED("dashed"),
     CALLIGRAPHY("calligraphy"),
     SPEED("speed"),
@@ -366,7 +365,6 @@ data class ToolbarLayout(
         /** Later-added items that belong beside an existing one in stored layouts. */
         private val INSERT_AFTER = mapOf(
             ToolbarItem.UNIFIED_PEN to ToolbarItem.HIGHLIGHTER,
-            ToolbarItem.PENCIL to ToolbarItem.PEN,
             ToolbarItem.TEXT_BOX to ToolbarItem.TEXT,
             ToolbarItem.VIEW to ToolbarItem.STYLES,
             ToolbarItem.MARGINS to ToolbarItem.STYLES,
@@ -388,7 +386,7 @@ data class ToolbarLayout(
          */
         val CANVAS_ITEMS: Set<ToolbarItem> = setOf(
             ToolbarItem.HOME, ToolbarItem.TITLE,
-            ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+            ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
             ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.WAND,
             ToolbarItem.TAPE, ToolbarItem.SHAPE, ToolbarItem.TEXT_BOX, ToolbarItem.MATH,
@@ -407,7 +405,7 @@ data class ToolbarLayout(
             listOf(ToolbarItem.HOME, ToolbarItem.TITLE),
             listOf(ToolbarItem.SIDEBAR),
             listOf(
-                ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+                ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ),
             listOf(ToolbarItem.PAN, ToolbarItem.READER, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.INSERT_SPACE, ToolbarItem.SCREENSHOT),
@@ -424,7 +422,7 @@ data class ToolbarLayout(
         val CANVAS_DEFAULT: ToolbarLayout = of(
             listOf(ToolbarItem.HOME, ToolbarItem.TITLE),
             listOf(
-                ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
+                ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ),
             listOf(ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO),

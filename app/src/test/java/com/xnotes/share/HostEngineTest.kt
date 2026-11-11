@@ -612,21 +612,6 @@ class HostEngineTest {
         assertEquals("target1", docB.pages[0].markups.single().link)
     }
 
-    @Test fun strokeStyleRoundTripsPencilTaper() {
-        val tool = com.xnotes.core.tools.Tool.PENCIL
-        val cfg = com.xnotes.core.tools.ToolConfig(baseWidth = 2.5, rgba = com.xnotes.core.model.Rgba(10, 20, 30, 255),
-            pressureEnabled = false, taperEnabled = true, taperMinFactor = 0.5,
-            pencilPressure = 1.2, pencilDensity = 0.8)
-        val stroke = com.xnotes.core.model.Stroke(tool, cfg, listOf(com.xnotes.core.stroke.Sample(1.0, 2.0, 0.5)))
-        val wire = com.xnotes.share.companion.SyncWire.toWire(stroke)
-        assertTrue(wire.has("style"))
-        val back = com.xnotes.share.companion.SyncWire.toNative(wire)!!
-        assertEquals(com.xnotes.core.tools.Tool.PENCIL, back.tool)
-        assertEquals(2.5, back.config.baseWidth, 0.0)
-        assertEquals(true, back.config.taperEnabled)
-        assertEquals(1.2, back.config.pencilPressure, 0.0)
-    }
-
     private val fakeMeasurer = object : com.xnotes.core.pal.TextMeasurer {
         override fun measure(text: String, font: com.xnotes.core.pal.FontSpec, wrapWidth: Double, flags: com.xnotes.core.pal.TextFlags) =
             com.xnotes.core.geometry.Rect(0.0, 0.0, wrapWidth, 20.0)

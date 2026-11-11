@@ -133,10 +133,6 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
     var inverse by remember { mutableStateOf(base.highlighterInverse) }
     var colorOverride by remember { mutableStateOf(base.colorOverride) }
     var snapShapes by remember { mutableStateOf(editor.snapHeldToShapes) }
-    var pencilPressure by remember { mutableStateOf(base.pencilPressure.toFloat()) }
-    var pencilDensity by remember { mutableStateOf(base.pencilDensity.toFloat()) }
-    var pencilGrainSize by remember { mutableStateOf(base.pencilGrainSize.toFloat()) }
-    var pencilShadeResponse by remember { mutableStateOf(base.pencilShadeResponse.toFloat()) }
     var steady by remember { mutableStateOf(base.stabilize) }
     var steadyStrength by remember { mutableStateOf(ToolConversions.trailToStrength(base.stabilizeTrail).toFloat()) }
     var crossover by remember { mutableStateOf(ToolConversions.dpPerSToCrossover(base.stabilizeCrossover).toFloat()) }
@@ -169,14 +165,6 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 highlighterAlpha = ha,
                 highlighterInverse = inverse,
                 colorOverride = colorOverride,
-                pencilPressure = if (tool == Tool.PENCIL) pencilPressure.toDouble()
-                    .coerceIn(ToolConfig.PENCIL_PRESSURE_MIN, ToolConfig.PENCIL_PRESSURE_MAX) else base.pencilPressure,
-                pencilDensity = if (tool == Tool.PENCIL) pencilDensity.toDouble()
-                    .coerceIn(ToolConfig.PENCIL_DENSITY_MIN, ToolConfig.PENCIL_DENSITY_MAX) else base.pencilDensity,
-                pencilGrainSize = if (tool == Tool.PENCIL) pencilGrainSize.toDouble()
-                    .coerceIn(ToolConfig.PENCIL_GRAIN_SIZE_MIN, ToolConfig.PENCIL_GRAIN_SIZE_MAX) else base.pencilGrainSize,
-                pencilShadeResponse = if (tool == Tool.PENCIL) pencilShadeResponse.toDouble()
-                    .coerceIn(ToolConfig.PENCIL_SHADE_RESPONSE_MIN, ToolConfig.PENCIL_SHADE_RESPONSE_MAX) else base.pencilShadeResponse,
                 stabilize = steady,
                 stabilizeTrail = ToolConversions.strengthToTrail(steadyStrength.toDouble()),
                 stabilizeCrossover = ToolConversions.crossoverToDpPerS(crossover.toDouble()),
@@ -244,15 +232,6 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
                 // page instead of darkening it. A multiply has nothing to darken on a dark page.
                 ToggleRow(stringResource(R.string.caption_inverse), inverse) { inverse = it; emit() }
             }
-            if (tool == Tool.PENCIL) {
-                // The pencil's four knobs: pressure sensitivity, graphite
-                // density, grain size and colour-shade response. Width stays
-                // fixed; pressure only moves graphite.
-                SliderRow(stringResource(R.string.caption_pencil_pressure), pencilPressure, ToolConfig.PENCIL_PRESSURE_MIN.toFloat()..ToolConfig.PENCIL_PRESSURE_MAX.toFloat()) { pencilPressure = it; emit() }
-                SliderRow(stringResource(R.string.caption_pencil_density), pencilDensity, ToolConfig.PENCIL_DENSITY_MIN.toFloat()..ToolConfig.PENCIL_DENSITY_MAX.toFloat()) { pencilDensity = it; emit() }
-                SliderRow(stringResource(R.string.caption_pencil_grain_size), pencilGrainSize, ToolConfig.PENCIL_GRAIN_SIZE_MIN.toFloat()..ToolConfig.PENCIL_GRAIN_SIZE_MAX.toFloat()) { pencilGrainSize = it; emit() }
-                SliderRow(stringResource(R.string.caption_pencil_shade), pencilShadeResponse, ToolConfig.PENCIL_SHADE_RESPONSE_MIN.toFloat()..ToolConfig.PENCIL_SHADE_RESPONSE_MAX.toFloat()) { pencilShadeResponse = it; emit() }
-            }
             // STABILIZATION steadies the path while drawing; a straight line has nothing to steady.
             if (tool.isStroke && !(tool == Tool.HIGHLIGHTER && straight)) {
                 ToggleRow(stringResource(R.string.caption_stabilization), steady) { steady = it; emit() }
@@ -263,8 +242,7 @@ fun ToolConfigPopup(editor: ToolPopupHost, tool: Tool, onDismiss: () -> Unit) {
             }
             // Glow is offered on every stroke tool except the highlighter (translucent) and the
             // dashed pen (it draws a line, not a fillable ribbon, so a halo has nothing to hug).
-            // The pencil is excluded too, keeping its graphite look.
-            if (tool.isStroke && tool != Tool.HIGHLIGHTER && tool != Tool.DASHED && tool != Tool.PENCIL) {
+            if (tool.isStroke && tool != Tool.HIGHLIGHTER && tool != Tool.DASHED) {
                 ToggleRow(stringResource(R.string.caption_neon), glow) { glow = it; emit() }
                 if (glow) {
                     SliderRow(stringResource(R.string.caption_glow_intensity), glowIntensity, 0f..100f) { glowIntensity = it; emit() }

@@ -59,7 +59,6 @@ class SdocxDumpTest {
         val page = Page(1440.0, 2036.0)
         page.items.add(stroke(Tool.PEN, Rgba(20, 20, 20, 255), 3.0, 100.0, 100.0, 200.0, 200.0, 300.0, 150.0))
         page.items.add(stroke(Tool.HIGHLIGHTER, Rgba(255, 235, 59, 200), 16.0, 50.0, 500.0, 400.0, 520.0))
-        page.items.add(stroke(Tool.PENCIL, Rgba(60, 60, 60, 255), 4.0, 600.0, 600.0, 700.0, 700.0))
         page.items.add(ImageItem(ImageData(imgFile, 1, 1), Rect(100.0, 100.0, 300.0, 300.0)))
         page.items.add(TextItem(Pt(100.0, 900.0), 600.0, 0.0, "Hello Samsung",
             Rgba(10, 20, 30, 255), 16.0, FontFace.SANS, fakeMeasurer,

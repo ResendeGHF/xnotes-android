@@ -4,7 +4,6 @@
 
     <!-- Tools and toolbar items -->
     <string name="tool_pen">Pen</string>
-    <string name="tool_pencil">Pencil</string>
     <string name="tool_dashed">Dashed</string>
     <string name="tool_calligraphy">Calligraphy</string>
     <string name="tool_speed">Speed</string>
@@ -84,10 +83,6 @@
     <string name="caption_gap">Gap</string>
     <string name="caption_intensity">Intensity</string>
     <string name="caption_grain">Grain</string>
-    <string name="caption_pencil_pressure">Pressure response</string>
-    <string name="caption_pencil_density">Grain density</string>
-    <string name="caption_pencil_grain_size">Grain size</string>
-    <string name="caption_pencil_shade">Colour shade</string>
     <string name="caption_straight_line">Straight line</string>
     <string name="caption_inverse">Inverse</string>
     <string name="caption_stabilization">Stabilization</string>

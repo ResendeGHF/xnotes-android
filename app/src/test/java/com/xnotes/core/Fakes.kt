@@ -36,7 +36,7 @@ class FakeRenderer : Renderer {
     /** Dashed runs as `from to count` paired with the phase they started at. */
     val dashRuns = mutableListOf<Triple<Int, Int, Double>>()
 
-    /** Pencil/graphite union runs as from/count with the tone each band was painted at. */
+    /** Graphite union runs as from/count with the tone each band was painted at. */
     val unionRuns = mutableListOf<UnionRun>()
 
     /** One [Renderer.fillRibbonUnion] call: local slice range plus the band tone. */

@@ -17,7 +17,7 @@ object SdocxMapping {
         return when (short) {
             "FountainPen", "MontblancFountainPen" -> Tool.PEN
             "MontblancCalligraphyPen", "ChineseBrush", "ObliquePen" -> Tool.CALLIGRAPHY
-            "Pencil", "Pencil2", "Pencil3", "ColoredPencil" -> Tool.PENCIL
+            "Pencil", "Pencil2", "Pencil3", "ColoredPencil" -> Tool.PEN
             "Marker", "Marker2", "Marker3", "Marker4", "StraightMarker", "StraightHighlighter" -> Tool.HIGHLIGHTER
             "InkPen", "InkPen2", "StraightInkPen2", "DefaultPen" -> Tool.PEN
             else -> {
@@ -50,7 +50,6 @@ object SdocxMapping {
         Tool.HIGHLIGHTER -> "Marker4"
         Tool.CALLIGRAPHY -> "ObliquePen"
         Tool.TAPER -> "FountainPen"
-        Tool.PENCIL -> "Pencil"
         else -> "InkPen2"
     }
 

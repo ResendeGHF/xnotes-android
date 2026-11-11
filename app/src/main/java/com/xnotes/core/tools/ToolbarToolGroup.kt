@@ -31,7 +31,7 @@ data class ToolbarToolGroup private constructor(
     companion object {
         /** Context-independent choices; all must arm a real drawing tool. */
         val WRITING_TOOLS: Set<ToolbarItem> = setOf(
-            ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY,
+            ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY,
             ToolbarItem.SPEED, ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER,
         )
 

@@ -40,7 +40,7 @@ object SyncWire {
     }
 
     /**
-     * Full stroke style for the wire (pencil/taper/highlighter/dashed/speed/
+     * Full stroke style for the wire (taper/highlighter/dashed/speed/
      * calligraphy/neon). Old peers ignore the `style` object and fall back to
      * tool defaults + width/color/pressure, so this stays backward compatible.
      */
@@ -57,10 +57,6 @@ object SyncWire {
         o.put("dash_g", cfg.dashGap)
         o.put("hl_alpha", cfg.highlighterAlpha)
         if (cfg.highlighterInverse) o.put("hl_inv", true)
-        o.put("pencil_p", cfg.pencilPressure)
-        o.put("pencil_d", cfg.pencilDensity)
-        o.put("pencil_g", cfg.pencilGrainSize)
-        o.put("pencil_s", cfg.pencilShadeResponse)
         // Tool id already travels alongside; defaults below fill anything missing.
         return o
     }
@@ -85,10 +81,6 @@ object SyncWire {
             dashGap = if (o.isNull("dash_g")) base.dashGap else o.optDouble("dash_g", base.dashGap),
             highlighterAlpha = if (o.isNull("hl_alpha")) base.highlighterAlpha else o.optDouble("hl_alpha", base.highlighterAlpha),
             highlighterInverse = if (o.isNull("hl_inv")) base.highlighterInverse else o.optBoolean("hl_inv", base.highlighterInverse),
-            pencilPressure = if (o.isNull("pencil_p")) base.pencilPressure else o.optDouble("pencil_p", base.pencilPressure),
-            pencilDensity = if (o.isNull("pencil_d")) base.pencilDensity else o.optDouble("pencil_d", base.pencilDensity),
-            pencilGrainSize = if (o.isNull("pencil_g")) base.pencilGrainSize else o.optDouble("pencil_g", base.pencilGrainSize),
-            pencilShadeResponse = if (o.isNull("pencil_s")) base.pencilShadeResponse else o.optDouble("pencil_s", base.pencilShadeResponse),
         )
     }
 

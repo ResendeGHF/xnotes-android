@@ -4,12 +4,9 @@ import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.DashPathEffect
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
-import android.graphics.PorterDuffColorFilter
-import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.os.Build
 import com.xnotes.core.geometry.Flip
@@ -24,11 +21,7 @@ import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.RasterSurface
 import com.xnotes.core.pal.Renderer
-import com.xnotes.core.pal.RIBBON_JOIN_DISC_ANGLE
 import com.xnotes.core.pal.TextFlags
-import com.xnotes.core.pal.ribbonJoinTurn
-import com.xnotes.core.pal.ribbonJoinStations
-import com.xnotes.core.stroke.PencilTexture
 import com.xnotes.core.vector.VectorContour
 import com.xnotes.core.vector.VectorSeg
 import kotlin.math.atan2
@@ -49,15 +42,6 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         strokeCap = Paint.Cap.ROUND
     }
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isDither = true }
-    /**
-     * The pencil's own fill paint: grain shader, overwrite xfermode and ink
-     * tint live here so they can never leak into any other draw. Bilinear
-     * sampling so the tooth stays fine instead of chunking at high zoom.
-     */
-    private val pencilPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        isFilterBitmap = true
-    }
     private val animBadgeFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; color = android.graphics.Color.argb(210, 20, 22, 28)
     }
@@ -222,139 +206,6 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             addCapsule(path, centers[2 * i], centers[2 * i + 1], radii[i], centers[2 * i + 2], centers[2 * i + 3], radii[i + 1])
         }
         canvas.drawPath(path, fillPaint)
-    }
-
-    /**
-     * A pencil run as one union path: the pen's swept ribbon (same quad math),
-     * but with discs only where the run truly needs them. One WINDING path
-     * paints every pixel exactly once, so translucent pressure tone never
-     * double-darkens — not at folds, caps or joins. The fill wears the grain
-     * tile (see [PencilTexture]) through a repeating shader aligned to
-     * content coordinates, so committed strokes carry the same tooth as the
-     * live GL cover.
-     */
-    override fun fillRibbonUnion(
-        centers: FloatArray,
-        radii: FloatArray,
-        from: Int,
-        count: Int,
-        color: Rgba,
-        radiusScale: Float,
-        capStart: Boolean,
-        capEnd: Boolean,
-        overwrite: Boolean,
-        endJoin: Boolean,
-        ox: Double,
-        oy: Double,
-        density: Double,
-        shade: Double,
-        grainSize: Double,
-    ) {
-        if (count <= 0) return
-        val end = from + count
-        val path = Path().apply { fillType = Path.FillType.WINDING }
-        appendRibbon(path, centers, radii, from, end, radiusScale)
-        fun disc(i: Int) {
-            val r = radii[i] * radiusScale
-            if (r > 0f) path.addCircle(centers[2 * i], centers[2 * i + 1], r, Path.Direction.CW)
-        }
-        if (count == 1) {
-            if (capStart || capEnd) disc(from)
-        } else {
-            if (capStart) disc(from)
-            if (capEnd) disc(end - 1)
-            for (i in ribbonJoinStations(centers, from, count)) disc(i)
-            // A hard turn exactly on the run's last station (a bake-then-tail
-            // seam): the next run starts past it, so this run owns its disc.
-            if (endJoin && !capEnd) disc(end - 1)
-        }
-        // Opaque graphite stipple at [density]: the pre-thresholded tile
-        // carries the tooth, the tint carries the ink. A dedicated paint so
-        // neither the overwrite xfermode, the shader nor the tint can ever
-        // leak into any other draw. The matrix maps geometry to tile space at
-        // the stroke's grain size, shifted by sticky offset plus grain phase.
-        val span = PencilTexture.TILE_CONTENT_PX * grainSize.coerceIn(0.1, 8.0)
-        val s = 1f / span.toFloat()
-        grainMatrix.setScale(s, s)
-        if (ox != 0.0 || oy != 0.0) grainMatrix.preTranslate(ox.toFloat(), oy.toFloat())
-        val shader = PencilTexture.tileShader(density)
-        shader.setLocalMatrix(grainMatrix)
-        // Opaque tinted stipple: the tile carries the tooth as binary alpha,
-        // the tint carries the pressure shade. Paint colour is ignored under
-        // a shader — the SRC_IN tint is what inks the grains.
-        pencilPaint.color = color.toArgb()
-        pencilPaint.shader = shader
-        pencilPaint.colorFilter = PorterDuffColorFilter(shadedInk(color, shade).toArgb(), PorterDuff.Mode.SRC_IN)
-        if (overwrite) pencilPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC)
-        canvas.drawPath(path, pencilPaint)
-        pencilPaint.shader = null
-        pencilPaint.colorFilter = null
-        pencilPaint.xfermode = null
-    }
-
-    /** Scratch matrix for the grain shader's per-fill alignment. */
-    private val grainMatrix = Matrix()
-
-    /** Ink mixed toward white by [shade]: the pressure-driven grain colour. */
-    private fun shadedInk(color: Rgba, shade: Double): Rgba {
-        val s = shade.coerceIn(0.0, 1.0)
-        return Rgba(
-            (255 + (color.r - 255) * s).toInt(),
-            (255 + (color.g - 255) * s).toInt(),
-            (255 + (color.b - 255) * s).toInt(),
-            255,
-        )
-    }
-
-    /**
-     * The swept-disc ribbon quads over `[from, end)`, wound consistently so
-     * overlapping pieces union under WINDING (the [Geometry.ribbonQuad] math
-     * inlined, so a dense page allocates nothing per point). [radiusScale]
-     * shrinks the ribbon about its centreline (the pencil's inset core).
-     */
-    private fun appendRibbon(
-        path: Path,
-        centers: FloatArray,
-        radii: FloatArray,
-        from: Int,
-        end: Int,
-        radiusScale: Float = 1f,
-    ) {
-        for (i in from until end - 1) {
-            val x0 = centers[2 * i]
-            val y0 = centers[2 * i + 1]
-            val x1 = centers[2 * i + 2]
-            val y1 = centers[2 * i + 3]
-            val dx = x1 - x0
-            val dy = y1 - y0
-            val len = kotlin.math.hypot(dx, dy)
-            if (len < 1e-9f) continue
-            val nx = -dy / len
-            val ny = dx / len
-            val r0 = radii[i] * radiusScale
-            val r1 = radii[i + 1] * radiusScale
-            val ax = x0 + nx * r0
-            val ay = y0 + ny * r0
-            val bx = x1 + nx * r1
-            val by = y1 + ny * r1
-            val cx = x1 - nx * r1
-            val cy = y1 - ny * r1
-            val ex = x0 - nx * r0
-            val ey = y0 - ny * r0
-            // Consistent (positive-area) winding so overlapping quads union rather than cancel.
-            if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) >= 0f) {
-                path.moveTo(ax, ay)
-                path.lineTo(bx, by)
-                path.lineTo(cx, cy)
-                path.lineTo(ex, ey)
-            } else {
-                path.moveTo(ex, ey)
-                path.lineTo(cx, cy)
-                path.lineTo(bx, by)
-                path.lineTo(ax, ay)
-            }
-            path.close()
-        }
     }
 
     private val tangents = DoubleArray(4) // scratch, so a dense page allocates nothing per point

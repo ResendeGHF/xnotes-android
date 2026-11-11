@@ -2,8 +2,6 @@ package com.xnotes.core.infinite
 
 import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Pt
-import com.xnotes.core.model.Rgba
-import com.xnotes.core.stroke.PencilStyle
 import com.xnotes.core.stroke.RibbonPoints
 import kotlin.math.PI
 import kotlin.math.abs
@@ -12,7 +10,6 @@ import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.pow
 import kotlin.math.sin
 
 /**
@@ -199,193 +196,6 @@ object StrokeTessellator {
             b.triangle(frontL[k], backR[k + 1], backL[k + 1])
         }
         return b.build()
-    }
-
-    /**
-     * Graphite DENSITY for smoothed stylus pressure [p] in `[0, 1]`, drawn
-     * with [style]: the fraction of pixels that carry opaque graphite. Never
-     * 1: paper always shows through somewhere, like real graphite. The
-     * [PencilStyle.pressure] gain answers light touches before the map, the
-     * [PencilStyle.density] scale packs more grains after it.
-     *
-     * The GL cover evaluates the same map from uniforms, so the two
-     * renderers cannot drift apart (see InkShader's uDens* + uPencilCfg).
-     */
-    fun pencilDensity(p: Double, style: PencilStyle): Double =
-        pencilDensityFor(pencilEffectivePressure(p, style.pressure), style.density)
-
-    /** Effective pressure: sensitivity gain applied, NaN-proofed, clamped.
-     *  A zero (or negative) gain means "no response": pressure always reads
-     *  maximum, so the stroke keeps its darkest shade and density everywhere. */
-    fun pencilEffectivePressure(p: Double, gain: Double): Double {
-        if (gain <= 0.0) return 1.0
-        val c = if (p.isNaN()) 0.0 else p.coerceIn(0.0, 1.0)
-        return (c * gain).coerceIn(0.0, 1.0)
-    }
-
-    /** Density map over effective pressure, scaled and capped below solid. */
-    fun pencilDensityFor(pe: Double, scale: Double): Double =
-        ((PENCIL_DENSITY_BASE + PENCIL_DENSITY_SPAN * pe.pow(PENCIL_DENSITY_GAMMA)) * scale)
-            .coerceIn(0.0, PENCIL_DENSITY_MAX)
-
-    /** Density map intercept: graphite density at zero pressure. Mirrored in InkShader. */
-    const val PENCIL_DENSITY_BASE = 0.55
-
-    /** Density map slope: additional density at full pressure. Mirrored in InkShader. */
-    const val PENCIL_DENSITY_SPAN = 0.33
-
-    /** Density map gamma: lifts mid pressure toward solid. Mirrored in InkShader. */
-    const val PENCIL_DENSITY_GAMMA = 0.7
-
-    /** Hard ceiling: graphite is never fully solid, always noise. */
-    const val PENCIL_DENSITY_MAX = 0.97
-
-    /**
-     * Grain SHADE for smoothed stylus pressure [p], drawn with [style]: light
-     * pressure leaves light-grey grains, hard pressure dark graphite ones — a
-     * gradient mapping over pressure, never translucency. 0.45 mixes almost
-     * halfway to white; 1.0 is the full ink colour.
-     */
-    fun pencilShade(p: Double, style: PencilStyle): Double =
-        pencilShadeFor(pencilEffectivePressure(p, style.pressure), style.shadeResponse)
-
-    /** Shade map over effective pressure with an explicit response. */
-    fun pencilShadeFor(pe: Double, response: Double): Double =
-        (PENCIL_SHADE_BASE + (PENCIL_SHADE_SPAN * pe.pow(PENCIL_SHADE_GAMMA)) * response)
-            .coerceIn(0.0, 1.0)
-
-    /** Shade map intercept: grain colour mix at zero pressure. Mirrored in InkShader. */
-    const val PENCIL_SHADE_BASE = 0.45
-
-    /** Shade map slope: additional mix at full pressure. Mirrored in InkShader. */
-    const val PENCIL_SHADE_SPAN = 0.55
-
-    /** Shade map gamma: lifts mid pressure toward full ink. Mirrored in InkShader. */
-    const val PENCIL_SHADE_GAMMA = 0.7
-
-    /** Pressure bands: the paged renderer quantizes effective pressure into
-     *  these, so every band fills from one pre-thresholded tile at one shade. */
-    const val PENCIL_BANDS = 12
-
-    fun pencilBandOf(p: Double, gain: Double): Int =
-        (pencilEffectivePressure(p, gain) * PENCIL_BANDS).toInt().coerceIn(0, PENCIL_BANDS - 1)
-
-    fun pencilBandDensity(band: Int, scale: Double): Double =
-        pencilDensityFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, scale)
-
-    fun pencilBandShade(band: Int, response: Double): Double =
-        pencilShadeFor((band.coerceIn(0, PENCIL_BANDS - 1) + 0.5) / PENCIL_BANDS, response)
-
-    /**
-     * The pencil: the pen's swept ribbon — rail quads plus whole discs at the
-     * stroke's ends and at hard turns — carrying real ink colour with raw
-     * stylus pressure in the vertex alpha (see [packPencilPressure]).
-     *
-     * Overlaps are never avoided here; the stencil-consume cover
-     * ([com.xnotes.gl.CanvasScene.drawPencil]) unions every pixel exactly
-     * once, so joins and caps are round by construction: no miters, no
-     * bevels, no fans, nothing that can spike or facet. The single-point
-     * stroke is one whole disc.
-     *
-     * Runs tile the ribbon with one shared station; settled runs bake once
-     * and the tail repaints over the same stations with the same pressures,
-     * so the seam cannot tone-shift.
-     */
-    fun tessellatePencil(
-        g: RibbonPoints,
-        from: Int,
-        count: Int,
-        tolerance: Double,
-        ink: Rgba,
-        pressureAt: (Int) -> Double,
-    ): MeshData {
-        if (count <= 0) return MeshData.EMPTY
-        val end = from + count
-        val b = MeshBuilder(estimatePencilVertices(count), estimateIndices(count) * 2)
-        if (count == 1) {
-            val h = g.hw(from)
-            if (h > MIN_HALF_WIDTH) {
-                b.circleColored(g.cx(from), g.cy(from), h, tolerance, packPencilPressure(ink, pressureAt(from)))
-            }
-            return b.build()
-        }
-        if (!g.hasRails) return b.build()
-        // Body: one quad per segment off the rails, exactly like the pen's
-        // sweep. Consecutive quads share edges; sharp turns and folds overlap
-        // freely — the stencil cover unions them into one silhouette.
-        for (i in from until end - 1) {
-            val h0 = g.hw(i)
-            val h1 = g.hw(i + 1)
-            if (h0 <= MIN_HALF_WIDTH && h1 <= MIN_HALF_WIDTH) continue
-            val p0 = packPencilPressure(ink, pressureAt(i))
-            val p1 = packPencilPressure(ink, pressureAt(i + 1))
-            val cx0 = g.cx(i)
-            val cy0 = g.cy(i)
-            val cx1 = g.cx(i + 1)
-            val cy1 = g.cy(i + 1)
-            val lx0 = g.leftX(i)
-            val ly0 = g.leftY(i)
-            val rx0 = g.rightX(i)
-            val ry0 = g.rightY(i)
-            val lx1 = g.leftX(i + 1)
-            val ly1 = g.leftY(i + 1)
-            val rx1 = g.rightX(i + 1)
-            val ry1 = g.rightY(i + 1)
-            val l0 = b.vertexColored(lx0, ly0, lx0 - cx0, ly0 - cy0, p0)
-            val r0 = b.vertexColored(rx0, ry0, rx0 - cx0, ry0 - cy0, p0)
-            val l1 = b.vertexColored(lx1, ly1, lx1 - cx1, ly1 - cy1, p1)
-            val r1 = b.vertexColored(rx1, ry1, rx1 - cx1, ry1 - cy1, p1)
-            b.triangle(l0, r0, r1)
-            b.triangle(l0, r1, l1)
-        }
-        // Round ends: whole discs, exactly the discs the paged renderer
-        // sweeps. A run caps only at the stroke's own ends.
-        if (from == 0 && g.hw(from) > MIN_HALF_WIDTH) {
-            b.circleColored(g.cx(from), g.cy(from), g.hw(from), tolerance, packPencilPressure(ink, pressureAt(from)))
-        }
-        if (end == g.pointCount && g.hw(end - 1) > MIN_HALF_WIDTH) {
-            b.circleColored(g.cx(end - 1), g.cy(end - 1), g.hw(end - 1), tolerance, packPencilPressure(ink, pressureAt(end - 1)))
-        }
-        // Round joins: discs where the path turns hard, exactly like the pen.
-        // Turns accumulate along the run and reset at every disc, so a long
-        // gentle curve still gets discs before its outer edge can notch.
-        var acc = 0.0
-        for (i in from + 1 until end - 1) {
-            val h = g.hw(i)
-            if (h <= MIN_HALF_WIDTH) {
-                acc = 0.0
-                continue
-            }
-            acc += turnAngle(g, i)
-            if (acc > JOIN_DISC_ANGLE) {
-                b.circleColored(g.cx(i), g.cy(i), h, tolerance, packPencilPressure(ink, pressureAt(i)))
-                acc = 0.0
-            }
-        }
-        // A hard turn exactly on the run's last station (a bake-then-tail
-        // seam): the next run starts past it, so this run owns its disc.
-        if (end != g.pointCount && count >= 2 && turnAngle(g, end - 1) > JOIN_DISC_ANGLE) {
-            val h = g.hw(end - 1)
-            if (h > MIN_HALF_WIDTH) {
-                b.circleColored(g.cx(end - 1), g.cy(end - 1), h, tolerance, packPencilPressure(ink, pressureAt(end - 1)))
-            }
-        }
-        return b.build()
-    }
-
-    /**
-     * Packed ARGB for pencil ink carrying raw stylus pressure `[0, 1]` in the
-     * alpha channel. The cover shader maps pressure to graphite tone and
-     * multiplies the grain; because the stencil guarantees each pixel is
-     * covered once, interpolation across overlapping triangles never compounds.
-     */
-    fun packPencilPressure(ink: Rgba, pressure: Double): Int {
-        val p = if (pressure.isNaN()) 0.0 else pressure.coerceIn(0.0, 1.0)
-        val a = (p * 255.0).toInt().coerceIn(0, 255)
-        return (a shl 24) or
-            (ink.r.coerceIn(0, 255) shl 16) or
-            (ink.g.coerceIn(0, 255) shl 8) or
-            ink.b.coerceIn(0, 255)
     }
 
     /**
@@ -585,25 +395,7 @@ object StrokeTessellator {
     fun circleSegments(radius: Double, tolerance: Double): Int =
         MeshBuilder.circleSegments(radius, tolerance)
 
-    /** Angle between the ribbon's normal before and after sample [i], in radians. */
-    fun turnAngle(g: RibbonPoints, i: Int): Double {
-        val n = g.pointCount
-        if (i <= 0 || i >= n - 1) return 0.0
-        val ax = g.cx(i) - g.cx(i - 1)
-        val ay = g.cy(i) - g.cy(i - 1)
-        val bx = g.cx(i + 1) - g.cx(i)
-        val by = g.cy(i + 1) - g.cy(i)
-        val la = hypot(ax, ay)
-        val lb = hypot(bx, by)
-        if (la < 1e-12 || lb < 1e-12) return 0.0
-        val cross = (ax * by - ay * bx) / (la * lb)
-        val dot = (ax * bx + ay * by) / (la * lb)
-        return kotlin.math.abs(atan2(cross, dot))
-    }
-
     private fun estimateVertices(n: Int): Int = 2 * n + 2 * (MIN_CIRCLE_SEGMENTS + 2) + 16
-
-    private fun estimatePencilVertices(n: Int): Int = 3 * n + 3 * (MIN_CIRCLE_SEGMENTS + 2) + 24
 
     private fun estimateIndices(n: Int): Int = 6 * maxOf(0, n - 1) + 6 * (MIN_CIRCLE_SEGMENTS + 2) + 48
 }

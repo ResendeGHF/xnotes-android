@@ -15,7 +15,6 @@ import com.xnotes.core.model.TapeItem
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TapePattern
 import com.xnotes.core.pal.FontSpec
-import com.xnotes.core.stroke.PencilStyle
 import com.xnotes.core.stroke.RibbonPoints
 import com.xnotes.core.tape.TapeGeometry
 import com.xnotes.core.tools.Tool
@@ -24,17 +23,6 @@ import com.xnotes.core.tools.Tool
 enum class InkPass {
     /** Straight into the batched draw; the colour is baked into the vertices. */
     OPAQUE,
-
-    /**
-     * Stencilled into a union, then covered with textured graphite — the
-     * cover consumes the stencil, so every pixel paints exactly once no
-     * matter how the ribbon folds over itself. Overlaps are therefore free:
-     * the mesh is the pen's round sweep (quads plus whole discs at the ends
-     * and hard turns) with raw stylus pressure in the vertex alpha, and the
-     * cover maps pressure to tone and multiplies the grain tile. Drawn in
-     * its own calls, never in the [OPAQUE] batch.
-     */
-    PENCIL,
 
     /** Stencilled, then covered once at its own alpha, so self-overlap cannot darken. */
     TRANSLUCENT,
@@ -91,8 +79,6 @@ class MeshPart(
     val glow: GlowSpec? = null,
     /** Set on a covered tape's body: a highlight beneath it, composited last, has to be drawn round it. */
     val covers: Boolean = false,
-    /** Set on a [InkPass.PENCIL] part: grain phase plus the UI knobs. */
-    val pencil: PencilStyle? = null,
 )
 
 /** An item turned into triangles, with everything the renderer needs to draw it. */
@@ -310,7 +296,6 @@ object ItemMesher {
     private fun meshStroke(stroke: Stroke, tolerance: Double): MeshedItem? {
         if (stroke.isEmpty) return null
         if (stroke.tool == Tool.DASHED) return meshDashed(stroke, tolerance)
-        if (stroke.tool == Tool.PENCIL) return meshPencil(stroke, tolerance)
         val mesh = MeshClip.clip(StrokeTessellator.tessellate(stroke.geometry(), tolerance), stroke.cuts)
         if (mesh.isEmpty) return null
         if (stroke.config.neon && stroke.tool != Tool.HIGHLIGHTER) {
@@ -345,38 +330,11 @@ object ItemMesher {
                 stroke.config.dashLength, stroke.config.dashGap, stroke.config.baseWidth / 2.0,
                 dashPhase, tolerance,
             )
-        } else if (stroke.tool == Tool.PENCIL) {
-            // Raw pressure per vertex; the stencil-consume cover turns it
-            // into graphite tone. Overlaps union in the stencil, so runs
-            // abut instead of double-darkening.
-            val ink = stroke.renderColor
-            StrokeTessellator.tessellatePencil(ribbon, from, count, tolerance, ink) { i ->
-                ribbon.pw(i)
-            }
         } else {
             StrokeTessellator.tessellate(ribbon, from, count, tolerance)
         }
         if (mesh.isEmpty) return null
-        val pencil = if (stroke.tool == Tool.PENCIL) stroke.pencilStyle() else null
-        return MeshPart(mesh, stroke.renderColor, passFor(stroke), pencil = pencil)
-    }
-
-    /**
-     * The pencil as the pen's round sweep carrying real ink colour with raw
-     * stylus pressure in the vertex alpha (see
-     * [StrokeTessellator.tessellatePencil]). The stencil-consume cover turns
-     * pressure into textured graphite with every pixel painted once, so the
-     * committed stroke is the live texture by construction.
-     */
-    private fun meshPencil(stroke: Stroke, tolerance: Double): MeshedItem? {
-        val g = stroke.geometry()
-        if (g.pointCount == 0) return null
-        val ink = stroke.renderColor
-        val mesh = StrokeTessellator.tessellatePencil(g, 0, g.pointCount, tolerance, ink) { i ->
-            g.pw(i)
-        }
-        if (mesh.isEmpty) return null
-        return MeshedItem(listOf(MeshPart(mesh, stroke.renderColor, passFor(stroke), pencil = stroke.pencilStyle())), stroke.paintBounds(), narrowestHalfWidth(stroke))
+        return MeshPart(mesh, stroke.renderColor, passFor(stroke))
     }
 
     /**
@@ -488,10 +446,6 @@ object ItemMesher {
 
     /** The pass a stroke has to take, from its tool and its resolved ink alpha. */
     fun passFor(stroke: Stroke): InkPass = when {
-        // The pencil's graphite is translucent and self-overlapping, so it
-        // needs the stencil-consume cover to union; a translucent pencil
-        // falls back to the stencil cover (flat).
-        stroke.tool == Tool.PENCIL && stroke.renderColor.a >= 255 -> InkPass.PENCIL
         stroke.tool == Tool.HIGHLIGHTER ->
             if (stroke.config.highlighterInverse) InkPass.SCREEN else InkPass.MULTIPLY
         stroke.renderColor.a >= 255 -> InkPass.OPAQUE

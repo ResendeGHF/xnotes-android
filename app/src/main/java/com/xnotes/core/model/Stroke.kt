@@ -7,15 +7,11 @@ import com.xnotes.core.geometry.Rect
 import com.xnotes.core.pal.BlendMode
 import com.xnotes.core.pal.FillRule
 import com.xnotes.core.pal.Pen
-import com.xnotes.core.pal.RIBBON_JOIN_DISC_ANGLE
 import com.xnotes.core.pal.Renderer
 import com.xnotes.core.stroke.Sample
 import com.xnotes.core.stroke.StrokeEngine
 import com.xnotes.core.stroke.StrokeGeometry
-import com.xnotes.core.stroke.PencilStyle
-import com.xnotes.core.stroke.RibbonPoints
 import com.xnotes.core.stroke.WetRibbon
-import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 import kotlin.math.hypot
@@ -245,18 +241,6 @@ class Stroke(
         if (tool == Tool.HIGHLIGHTER) config.highlighterAlpha else tool.alphaScale,
     )
 
-    /**
-     * This pencil stroke's style: grain phase from the raw first sample plus
-     * the four UI knobs. Stable for the stroke's whole life — live ribbon,
-     * committed geometry, save/load — so separate strokes layer darker while
-     * one stroke never shifts.
-     */
-    fun pencilStyle(): PencilStyle {
-        val s0 = samples.firstOrNull()
-        return if (s0 != null) PencilStyle.of(s0.x, s0.y, config)
-        else PencilStyle.of(0.0, 0.0, config)
-    }
-
     /** How this stroke's translucent ink composites: the highlighter darkens with MULTIPLY, or
      *  lightens with SCREEN when it is the inverse variant; every other ink blends normally. */
     val blendMode: BlendMode get() = when {
@@ -296,23 +280,18 @@ class Stroke(
             else -> null
         }
         val rf = if (tip == null) s.fa?.let { src -> DoubleArray(n) { src[it].toDouble() } } else null
-        // The pencil ignores pressure entirely: constant width and constant
-        // density, never thin/thick or lighter/darker with the hand.
-        // Force the width channel flat here so no setting can shape it.
-        val pe = if (tool == Tool.PENCIL) false else config.pressureEnabled
-        val mm = if (tool == Tool.PENCIL) 1.0 else config.pressureMinFactor
         return StrokeEngine.build(
             rx, ry, rp, rt,
             config.baseWidth,
-            pe,
-            mm,
+            config.pressureEnabled,
+            config.pressureMinFactor,
             config.directionStrength,
             config.speedStrength,
             config.taperEnabled,
             config.taperMinFactor,
             speedScale,
             smooth = !straight,
-            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER || tool == Tool.PENCIL,
+            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER,
             finished = finished,
             smoothScale = smoothScale,
             speedTop = config.speedTop,
@@ -461,18 +440,15 @@ class Stroke(
     private fun wetOrStart(): WetRibbon? {
         wet?.let { return it }
         if (finished || !WetRibbon.supports(config.taperEnabled, straight)) return null
-        // Pencil width is constant (see [geometry]): same flat channel live.
-        val pe = if (tool == Tool.PENCIL) false else config.pressureEnabled
-        val mm = if (tool == Tool.PENCIL) 1.0 else config.pressureMinFactor
         val w = WetRibbon(
             baseWidth = config.baseWidth,
-            pressureEnabled = pe,
-            m = mm,
+            pressureEnabled = config.pressureEnabled,
+            m = config.pressureMinFactor,
             ds = config.directionStrength,
             speedStrength = config.speedStrength,
             speedScale = speedScale,
             smooth = !straight,
-            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER || tool == Tool.PENCIL,
+            holdEnds = tool == Tool.PEN || tool == Tool.HIGHLIGHTER,
             smoothScale = smoothScale,
             speedTop = config.speedTop,
             speedSmoothing = config.speedSmoothing,
@@ -515,15 +491,12 @@ class Stroke(
         val g = geometry()
         val color = renderColor
         when {
-            // The pencil shades graphite tone by pressure at one constant
-            // width — never translucent wash, never stamped dots.
-            tool == Tool.PENCIL -> paintPencil(r, g, color)
             // The dashed pen draws its (uniform-width) centreline as a dashed, round-capped
             // line rather than a solid ribbon; the full ribbon geometry is still used for
             // bounds/hit-testing/erasing, so the whole line stays selectable through the gaps.
             tool == Tool.DASHED -> paintDashed(r, g, color)
             // The highlighter never glows (a translucent marker; glow is meaningless there).
-            config.neon && tool != Tool.HIGHLIGHTER && tool != Tool.PENCIL -> paintNeon(r, g, color)
+            config.neon && tool != Tool.HIGHLIGHTER -> paintNeon(r, g, color)
             color.a >= 255 -> {
                 // Opaque ink: draw ribbon + caps directly.
                 paintFills(r, g, color)
@@ -563,130 +536,6 @@ class Stroke(
     }
 
     /**
-     * The pencil, for the paged renderer and the wet cache: the pen's swept
-     * ribbon at one constant width, toned by pressure in bands of graphite.
-     *
-     * The run paints inside an isolating layer, every fill replacing instead
-     * of compositing: where bands cross at a fold the later band wins instead
-     * of compounding, so folds never darken — the same exact-once rule the
-     * live stencil cover enforces. The layer composites onto the page once.
-     * Band cuts are pure functions of per-station pressure, so baking settled
-     * runs once lands exactly where a full repaint would.
-     */
-    private fun paintPencil(r: Renderer, g: StrokeGeometry, color: Rgba, ox: Double = 0.0, oy: Double = 0.0) {
-        if (color.a < 255) {
-            // Translucent ink: accumulate opaquely in a layer, then composite
-            // once, so self-overlaps don't compound — the same rule as all thin ink.
-            r.saveLayerBlended(bounds().outset(2.0), color.a / 255.0, BlendMode.SRC_OVER)
-            paintPencilRuns(r, g, 0, g.pointCount, color.withAlpha(255), ox, oy)
-            r.restore()
-            return
-        }
-        paintPencilRuns(r, g, 0, g.pointCount, color, ox, oy)
-    }
-
-    /**
-     * Paint note-local ink shifted onto the page. Only the pencil reads
-     * [ox]/[oy]: the grain phase follows the paper offset so a note's
-     * committed ink wears the same tooth as the live page stroke.
-     */
-    fun paintWithFieldOrigin(r: Renderer, ox: Double, oy: Double) {
-        if (tool == Tool.PENCIL) {
-            val g = geometry()
-            paintPencil(r, g, renderColor, ox, oy)
-        } else paint(r)
-    }
-
-    internal fun paintPencilRuns(
-        r: Renderer,
-        ribbon: RibbonPoints,
-        from: Int,
-        count: Int,
-        color: Rgba,
-        ox: Double = 0.0,
-        oy: Double = 0.0,
-    ) {
-        if (count <= 0) return
-        val base = color.withAlpha(255)
-        val capStart = from == 0
-        val capEnd = from + count == ribbon.pointCount
-        // Packed ribbon slice, exactly like the pen's fast path.
-        val centers = FloatArray(2 * count)
-        val radii = FloatArray(count)
-        for (k in 0 until count) {
-            val i = from + k
-            centers[2 * k] = ribbon.cx(i).toFloat()
-            centers[2 * k + 1] = ribbon.cy(i).toFloat()
-            radii[k] = ribbon.hw(i).toFloat()
-        }
-        // Isolate the run so the replacing fills below only ever replace each
-        // other, never the page: the layer composites once at full strength.
-        // Every fill is opaque shaded stipple — grains are ink or paper,
-        // never translucent — so overlaps cannot darken even where runs meet.
-        r.saveLayerBlended(bounds().outset(2.0), 1.0, BlendMode.SRC_OVER)
-        // A hard turn exactly on the run's last station belongs to this run:
-        // the next run starts past it. Measured on the full ribbon, which the
-        // slice alone cannot see past.
-        val runEndJoin = !capEnd && count >= 2 && ribbonTurnAt(ribbon, from + count - 1) > RIBBON_JOIN_DISC_ANGLE
-        // This run's style: grain phase from the raw first sample plus the
-        // four UI knobs. Same values the live cover reads, so pen-up changes
-        // nothing; different strokes phase-shift and layer.
-        val style = pencilStyle()
-        // Split effective pressure into maximal same-band runs. Each call SHARES its
-        // last station with the next call, so every ribbon segment belongs to
-        // exactly one call: with butt-jointed bands the quad bridging two
-        // bands belonged to neither — a full-width cut across the stroke.
-        // A hard turn on a shared station earns its own join disc from the
-        // earlier call; the later call starts past it.
-        fun bandEnd(start: Int): Int {
-            val band = StrokeTessellator.pencilBandOf(ribbon.pw(from + start), style.pressure)
-            var j = start + 1
-            while (j < count && StrokeTessellator.pencilBandOf(ribbon.pw(from + j), style.pressure) == band) j++
-            return j
-        }
-        fun bandJoin(e: Int): Boolean =
-            if (e < count) ribbonTurnAt(ribbon, from + e - 1) > RIBBON_JOIN_DISC_ANGLE
-            else runEndJoin
-        // Graphite in pressure bands, one full-width union path each at its
-        // own density and shade — no width gradient. Band cuts sit on
-        // stations shared verbatim by neighbouring runs, so settled and tail
-        // agree.
-        var k = 0
-        while (k < count) {
-            val band = StrokeTessellator.pencilBandOf(ribbon.pw(from + k), style.pressure)
-            val e = bandEnd(k).let { j -> if (j < count) j + 1 else j }
-            r.fillRibbonUnion(
-                centers, radii, k, e - k, base, 1f,
-                capStart && k == 0, capEnd && e == count, overwrite = true,
-                endJoin = bandJoin(e), ox = ox + style.phaseX * grainSpan(style),
-                oy = oy + style.phaseY * grainSpan(style),
-                density = StrokeTessellator.pencilBandDensity(band, style.density),
-                shade = StrokeTessellator.pencilBandShade(band, style.shadeResponse),
-                grainSize = style.grainSize,
-            )
-            k = if (e < count) e - 1 else e
-        }
-        r.restore()
-    }
-
-    /** Grain tile span for [style]: the base span times the size knob. */
-    private fun grainSpan(style: PencilStyle): Double =
-        com.xnotes.core.stroke.PencilTexture.TILE_CONTENT_PX * style.grainSize
-
-    /**
-     * Turn angle at global ribbon station [i], in radians. The caller must
-     * keep both neighbours inside the ribbon; a stall counts as a full turn.
-     */
-    private fun ribbonTurnAt(ribbon: RibbonPoints, i: Int): Double {
-        val ux = ribbon.cx(i) - ribbon.cx(i - 1)
-        val uy = ribbon.cy(i) - ribbon.cy(i - 1)
-        val vx = ribbon.cx(i + 1) - ribbon.cx(i)
-        val vy = ribbon.cy(i + 1) - ribbon.cy(i)
-        if (kotlin.math.hypot(ux, uy) < 1e-9 || kotlin.math.hypot(vx, vy) < 1e-9) return kotlin.math.PI
-        return kotlin.math.abs(kotlin.math.atan2(ux * vy - uy * vx, ux * vx + uy * vy))
-    }
-
-    /**
      * Paint [count] points of the live ribbon starting at [from]. The wet cache draws a stroke in
      * two runs — the settled one baked into a raster once, the moving one over it every frame — and
      * a growing ribbon's arrays are over-allocated, so neither run is describable by array length.
@@ -713,8 +562,6 @@ class Stroke(
                     dashPhase = dashPhase,
                 ),
             )
-        } else if (tool == Tool.PENCIL) {
-            paintPencilRuns(r, ribbon, from, count, color)
         } else {
             r.fillDiskRibbon(centers, ribbon.halfWidthArray(), from, count, color)
         }
@@ -722,11 +569,9 @@ class Stroke(
 
     /** Whether the wet cache may bake this stroke's settled ink into a raster. Neon stacks blurred
      *  layers composited at an alpha, and translucent ink compounds where it overlaps itself, so
-     *  neither survives being painted in two runs; both keep the plain every-frame redraw.
-     *  The pencil's banded runs tile the ribbon exactly once with deterministic
-     *  per-station tone (neon never applies to it), so they bake exactly as well. */
+     *  neither survives being painted in two runs; both keep the plain every-frame redraw. */
     val wetCacheable: Boolean
-        get() = renderColor.a >= 255 && (!config.neon || tool == Tool.PENCIL)
+        get() = renderColor.a >= 255 && !config.neon
 
     /**
      * The dashed pen: a constant-width, round-capped dashed line traced down the smoothed
@@ -771,7 +616,7 @@ class Stroke(
     }
 
     override fun paintBounds(): Rect =
-        if (config.neon && tool != Tool.HIGHLIGHTER && tool != Tool.PENCIL) bounds().outset(neonGlowRadius() * 2 + 4)
+        if (config.neon && tool != Tool.HIGHLIGHTER) bounds().outset(neonGlowRadius() * 2 + 4)
         else bounds()
 
     private fun paintNeon(r: Renderer, g: StrokeGeometry, color: Rgba) {

@@ -111,10 +111,6 @@ internal fun UnifiedPenDetails(
     var neonIntensity by remember(tool) {
         mutableFloatStateOf(ToolConversions.neonStrengthToIntensity(initial.neonStrength).toFloat())
     }
-    var pencilPressure by remember(tool) { mutableFloatStateOf(initial.pencilPressure.toFloat()) }
-    var pencilDensity by remember(tool) { mutableFloatStateOf(initial.pencilDensity.toFloat()) }
-    var pencilGrainSize by remember(tool) { mutableFloatStateOf(initial.pencilGrainSize.toFloat()) }
-    var pencilShade by remember(tool) { mutableFloatStateOf(initial.pencilShadeResponse.toFloat()) }
 
     DropdownMenu(expanded = true, onDismissRequest = onDismiss) {
         Column(
@@ -246,41 +242,6 @@ internal fun UnifiedPenDetails(
             }
             if (advanced) {
                 // Every change keeps the tool's other fields: no default-value reset.
-                // Downstream pencil keeps its graphite model (not the generic pressure toggle).
-                if (tool == Tool.PENCIL) {
-                    PenDetailSlider(
-                        stringResource(R.string.caption_pencil_pressure),
-                        pencilPressure,
-                        com.xnotes.core.tools.ToolConfig.PENCIL_PRESSURE_MIN.toFloat()..com.xnotes.core.tools.ToolConfig.PENCIL_PRESSURE_MAX.toFloat(),
-                    ) {
-                        pencilPressure = it
-                        host.updateToolConfig(tool, host.toolConfig(tool).copy(pencilPressure = it.toDouble()))
-                    }
-                    PenDetailSlider(
-                        stringResource(R.string.caption_pencil_density),
-                        pencilDensity,
-                        com.xnotes.core.tools.ToolConfig.PENCIL_DENSITY_MIN.toFloat()..com.xnotes.core.tools.ToolConfig.PENCIL_DENSITY_MAX.toFloat(),
-                    ) {
-                        pencilDensity = it
-                        host.updateToolConfig(tool, host.toolConfig(tool).copy(pencilDensity = it.toDouble()))
-                    }
-                    PenDetailSlider(
-                        stringResource(R.string.caption_pencil_grain_size),
-                        pencilGrainSize,
-                        com.xnotes.core.tools.ToolConfig.PENCIL_GRAIN_SIZE_MIN.toFloat()..com.xnotes.core.tools.ToolConfig.PENCIL_GRAIN_SIZE_MAX.toFloat(),
-                    ) {
-                        pencilGrainSize = it
-                        host.updateToolConfig(tool, host.toolConfig(tool).copy(pencilGrainSize = it.toDouble()))
-                    }
-                    PenDetailSlider(
-                        stringResource(R.string.caption_pencil_shade),
-                        pencilShade,
-                        com.xnotes.core.tools.ToolConfig.PENCIL_SHADE_RESPONSE_MIN.toFloat()..com.xnotes.core.tools.ToolConfig.PENCIL_SHADE_RESPONSE_MAX.toFloat(),
-                    ) {
-                        pencilShade = it
-                        host.updateToolConfig(tool, host.toolConfig(tool).copy(pencilShadeResponse = it.toDouble()))
-                    }
-                }
                 PenDetailToggle(stringResource(R.string.caption_scale), scale) {
                     scale = it
                     host.updateToolConfig(tool, host.toolConfig(tool).copy(scale = it))
@@ -382,7 +343,7 @@ internal fun UnifiedPenDetails(
                         }
                     }
                 }
-                if (tool != Tool.HIGHLIGHTER && tool != Tool.DASHED && tool != Tool.PENCIL) {
+                if (tool != Tool.HIGHLIGHTER && tool != Tool.DASHED) {
                     PenDetailToggle(stringResource(R.string.caption_neon), neon) {
                         neon = it
                         host.updateToolConfig(tool, host.toolConfig(tool).copy(neon = it))

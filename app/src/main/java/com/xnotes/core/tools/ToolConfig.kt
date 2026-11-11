@@ -108,20 +108,6 @@ data class ToolConfig(
     val tapeMode: TapeMode = TapeMode.STRAIGHT,
     /** Tape: what is printed on it. Only used by [Tool.TAPE]. */
     val tapePattern: TapePattern = TapePattern.SOLID,
-    /** Pencil: pressure sensitivity — effective pressure is stylus pressure
-     *  times this, clamped to `[0, 1]`. Higher answers lighter touches with
-     *  darker graphite. Only used by [Tool.PENCIL]. */
-    val pencilPressure: Double = DEFAULT_PENCIL_PRESSURE,
-    /** Pencil: graphite density scale applied on top of the pressure map.
-     *  Higher packs more grains at any pressure. Only used by [Tool.PENCIL]. */
-    val pencilDensity: Double = DEFAULT_PENCIL_DENSITY,
-    /** Pencil: grain size scale multiplying the tile span. Higher reads as
-     *  coarser tooth. Only used by [Tool.PENCIL]. */
-    val pencilGrainSize: Double = DEFAULT_PENCIL_GRAIN_SIZE,
-    /** Pencil: colour-shade response — how far grain colour travels from
-     *  light grey toward full ink with pressure. 0 pins every grain light;
-     *  higher darkens hard presses faster. Only used by [Tool.PENCIL]. */
-    val pencilShadeResponse: Double = DEFAULT_PENCIL_SHADE_RESPONSE,
     /** Speed pen: how far along the path its width changes are blurred, in pen widths. Only used by [Tool.SPEED]. */
     val speedSmoothing: Double = StrokeEngine.DEFAULT_SPEED_SMOOTHING,
     /** Speed pen: the speed in dp/ms at which the line reaches its thinnest. Only used by [Tool.SPEED]. */
@@ -136,23 +122,6 @@ data class ToolConfig(
     companion object {
         const val DEFAULT_MARKUP_INTENSITY = 0.9
         const val MARKUP_INTENSITY_MIN = 0.1
-
-        /** Factory defaults for the pencil's four knobs (see the fields). */
-        const val DEFAULT_PENCIL_PRESSURE = 1.0
-        const val DEFAULT_PENCIL_DENSITY = 1.0
-        const val DEFAULT_PENCIL_GRAIN_SIZE = 1.0
-        const val DEFAULT_PENCIL_SHADE_RESPONSE = 1.0
-
-        /** Hard bounds the UI clamps the pencil knobs to. A zero pressure
-         *  response means "always full": darkest shade, densest grains. */
-        const val PENCIL_PRESSURE_MIN = 0.0
-        const val PENCIL_PRESSURE_MAX = 2.0
-        const val PENCIL_DENSITY_MIN = 0.2
-        const val PENCIL_DENSITY_MAX = 1.3
-        const val PENCIL_GRAIN_SIZE_MIN = 0.1
-        const val PENCIL_GRAIN_SIZE_MAX = 4.0
-        const val PENCIL_SHADE_RESPONSE_MIN = 0.0
-        const val PENCIL_SHADE_RESPONSE_MAX = 1.5
     }
 }
 
@@ -167,12 +136,6 @@ object ToolDefaults {
 
     fun configFor(tool: Tool): ToolConfig = when (tool) {
         Tool.PEN -> ToolConfig(baseWidth = 3.0, pressureEnabled = true, pressureMinFactor = 0.35, directionStrength = 0.0)
-        // Pencil: a narrow graphite line at one fixed width — pressure shades
-        // graphite tone, never width. Same width range as the pen.
-        Tool.PENCIL -> ToolConfig(
-            baseWidth = 2.5, pressureEnabled = false, pressureMinFactor = 1.0,
-            directionStrength = 0.0,
-        )
         // Dashed pen: uniform-width (pressure off), so its dashes stay even; dash/gap set the rhythm.
         Tool.DASHED -> ToolConfig(baseWidth = 3.0, pressureEnabled = false, pressureMinFactor = 1.0, directionStrength = 0.0, dashLength = 10.0, dashGap = 8.0)
         Tool.CALLIGRAPHY -> ToolConfig(baseWidth = 6.0, pressureEnabled = true, pressureMinFactor = 0.40, directionStrength = 0.60)
@@ -189,7 +152,7 @@ object ToolDefaults {
     }
 
     /** Tools whose config is persisted in settings (spec 09 §2). */
-    val persistedTools = listOf(Tool.PEN, Tool.PENCIL, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER, Tool.ERASER, Tool.SELECT, Tool.LASSO, Tool.MARKUP, Tool.TAPE)
+    val persistedTools = listOf(Tool.PEN, Tool.DASHED, Tool.CALLIGRAPHY, Tool.SPEED, Tool.TAPER, Tool.HIGHLIGHTER, Tool.ERASER, Tool.SELECT, Tool.LASSO, Tool.MARKUP, Tool.TAPE)
 }
 
 /**
@@ -255,7 +218,6 @@ object ToolConversions {
         Tool.HIGHLIGHTER -> 4.0..120.0
         Tool.ERASER -> 1.0..80.0
         Tool.TAPE -> TapeItem.MIN_WIDTH..TapeItem.MAX_WIDTH
-        Tool.PENCIL -> 1.0..20.0
         else -> 1.0..20.0
     }
 }

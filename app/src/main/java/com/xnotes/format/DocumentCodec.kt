@@ -441,13 +441,6 @@ class DocumentCodec(
             j.name("highlighter_alpha").value(s.config.highlighterAlpha)
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
         }
-        // The pencil's four knobs ride per-stroke too, so a note reopens unchanged.
-        if (s.tool == Tool.PENCIL) {
-            j.name("pencil_pressure").value(s.config.pencilPressure)
-            j.name("pencil_density").value(s.config.pencilDensity)
-            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
-            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
-        }
         j.endObject()
         // Samples are ~97% of a dense manifest's bytes, so they go out through [JsonWrite.samplePoint], which rounds them: 0.01
         // content px (2dp) and 0.001 pressure (3dp) are far below anything visible, and a
@@ -726,12 +719,6 @@ class DocumentCodec(
         if (s.tool == Tool.HIGHLIGHTER) {
             j.name("highlighter_alpha").value(s.config.highlighterAlpha)
             if (s.config.highlighterInverse) j.name("highlighter_inverse").value(true)
-        }
-        if (s.tool == Tool.PENCIL) {
-            j.name("pencil_pressure").value(s.config.pencilPressure)
-            j.name("pencil_density").value(s.config.pencilDensity)
-            j.name("pencil_grain_size").value(s.config.pencilGrainSize)
-            j.name("pencil_shade_response").value(s.config.pencilShadeResponse)
         }
         j.endObject()
         j.name("samples").beginArray()
@@ -1060,10 +1047,6 @@ class DocumentCodec(
             for (page in doc.pages) {
                 for (item in page.items) {
                     if (item !is Stroke || item.straight) continue
-                    if (item.tool == com.xnotes.core.tools.Tool.PENCIL) {
-                        item.invalidate()
-                        continue
-                    }
                     val slim = StrokeSimplify.simplify(
                         item.samples, item.geometry().halfWidths, StrokeSimplify.LEGACY_EPS,
                         item.smoothScale, item.config.directionStrength,
@@ -1398,10 +1381,6 @@ class DocumentCodec(
         var dashGap: Double? = null
         var highlighterAlpha: Double? = null
         var highlighterInverse: Boolean? = null
-        var pencilPressure: Double? = null
-        var pencilDensity: Double? = null
-        var pencilGrainSize: Double? = null
-        var pencilShadeResponse: Double? = null
     }
 
     private fun parseItem(p: JsonPull, items: MutableList<CanvasItem>, pending: MutableList<Pending>, glue: GlueRead) {
@@ -1642,10 +1621,6 @@ class DocumentCodec(
             // Absent on legacy highlighter strokes -> the historical 0.35, so they reload unchanged.
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
-            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
-            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
-            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(tool, config, emptyList(), s.speedScale, s.straight, s.smoothScale)
         s.samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n, it.ws) }
@@ -1923,10 +1898,6 @@ class DocumentCodec(
             dashGap = c?.dashGap ?: def.dashGap,
             highlighterAlpha = c?.highlighterAlpha ?: def.highlighterAlpha,
             highlighterInverse = c?.highlighterInverse ?: def.highlighterInverse,
-            pencilPressure = c?.pencilPressure ?: def.pencilPressure,
-            pencilDensity = c?.pencilDensity ?: def.pencilDensity,
-            pencilGrainSize = c?.pencilGrainSize ?: def.pencilGrainSize,
-            pencilShadeResponse = c?.pencilShadeResponse ?: def.pencilShadeResponse,
         )
         val stroke = Stroke(t, cfg, emptyList(), speedScale, straight, smoothScale)
         samples?.let { stroke.setSamples(it.xs, it.ys, it.ps, it.ts, it.n) }
@@ -1960,10 +1931,6 @@ class DocumentCodec(
                 "dash_gap" -> c.dashGap = doubleOrNull(p)
                 "highlighter_alpha" -> c.highlighterAlpha = doubleOrNull(p)
                 "highlighter_inverse" -> c.highlighterInverse = boolOrNull(p)
-                "pencil_pressure" -> c.pencilPressure = doubleOrNull(p)
-                "pencil_density" -> c.pencilDensity = doubleOrNull(p)
-                "pencil_grain_size" -> c.pencilGrainSize = doubleOrNull(p)
-                "pencil_shade_response" -> c.pencilShadeResponse = doubleOrNull(p)
                 else -> p.skipValue()
             }
         }

@@ -388,7 +388,7 @@ internal fun PenSilhouette(item: ToolbarItem, ink: Color, modifier: Modifier = M
         }
 
         when (item) {
-            ToolbarItem.PEN, ToolbarItem.PENCIL, ToolbarItem.DASHED -> {
+            ToolbarItem.PEN, ToolbarItem.DASHED -> {
                 nib(Path().apply {
                     moveTo(w * .30f, h * .76f)
                     lineTo(w * .22f, h * .36f)

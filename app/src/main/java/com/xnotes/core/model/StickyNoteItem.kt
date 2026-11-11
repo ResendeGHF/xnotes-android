@@ -166,17 +166,12 @@ class StickyNoteItem(
                 r.restore()
             }
         }
-        // Freehand ink, clipped to the paper. Pencil ink samples the grain
-        // tile in page space (paper offset added), so the committed note
-        // wears the same tooth as the live page stroke.
+        // Freehand ink, clipped to the paper.
         if (ink.isNotEmpty()) {
             r.save()
             r.clipRect(b)
             r.translate(b.x, b.y)
-            for (s in ink) {
-                if (s.tool == com.xnotes.core.tools.Tool.PENCIL) s.paintWithFieldOrigin(r, b.x, b.y)
-                else s.paint(r)
-            }
+            for (s in ink) s.paint(r)
             r.restore()
         }
     }

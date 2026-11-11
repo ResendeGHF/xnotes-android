@@ -26,7 +26,6 @@ import com.xnotes.ui.theme.toComposeColor
 /** Which tool a toolbar item arms, for the items that are simply a tool button. */
 private val CANVAS_TOOL_OF: Map<ToolbarItem, Tool> = mapOf(
     ToolbarItem.PEN to Tool.PEN,
-    ToolbarItem.PENCIL to Tool.PENCIL,
     ToolbarItem.DASHED to Tool.DASHED,
     ToolbarItem.CALLIGRAPHY to Tool.CALLIGRAPHY,
     ToolbarItem.SPEED to Tool.SPEED,
@@ -69,7 +68,6 @@ fun InfiniteToolbar(
     // a pen on either canvas rather than like a generic glyph.
     val toolIcons: Map<Tool, ImageVector> = mapOf(
         Tool.PEN to ImageVector.vectorResource(R.drawable.ic_stroke_regular),
-        Tool.PENCIL to ImageVector.vectorResource(R.drawable.ic_stroke_pencil),
         Tool.DASHED to ImageVector.vectorResource(R.drawable.ic_stroke_dashed),
         Tool.CALLIGRAPHY to ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy),
         Tool.SPEED to ImageVector.vectorResource(R.drawable.ic_stroke_speed),

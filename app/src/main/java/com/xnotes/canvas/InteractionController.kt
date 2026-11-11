@@ -334,7 +334,7 @@ class InteractionController(
             }
             // Untouched in place (a preview that settled back): stay quiet.
             // Fingerprint covers tool/width/color/samples; also compare full
-            // config so a pure restyle (taper/pencil/highlighter/dashed)
+            // config so a pure restyle (taper/highlighter/dashed)
             // still propagates as a replacement.
             if (newPage == page && StrokeFingerprint.of(live) == StrokeFingerprint.of(frozen) && live.config == frozen.config) continue
             removed.getOrPut(page to newPage) { ArrayList() } += frozen
@@ -1962,15 +1962,9 @@ class InteractionController(
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport
      *  px at the draw zoom (÷ zoom → content px), capped so zoomed-out ink keeps content fidelity.
      *  The stroke's just-built geometry supplies the half-width channel, so pressure/speed width
-     *  variation survives the reduction. The pencil never reduces: its density is
-     *  per-sample pressure and its grain is page-anchored, so dropping a sample
-     *  would move the live texture on pen-up. */
+     *  variation survives the reduction. */
     private fun simplifyForCommit(stroke: Stroke) {
         stroke.freezeSpeedWidths()
-        if (stroke.tool == com.xnotes.core.tools.Tool.PENCIL) {
-            stroke.trimToSize()
-            return
-        }
         if (StrokeSimplify.enabled && !stroke.straight) {
             val eps = (SIMPLIFY_EPS / state.zoom).coerceAtMost(SIMPLIFY_EPS)
             val slim = StrokeSimplify.simplify(

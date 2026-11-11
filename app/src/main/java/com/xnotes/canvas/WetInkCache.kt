@@ -70,9 +70,9 @@ class WetInkCache(private val surfaceFactory: SurfaceFactory) {
     fun paint(r: Renderer, stroke: Stroke, res: Double, maxPixels: Long): Boolean {
         val ribbon = stroke.wetRibbon ?: return false
         if (!stroke.wetCacheable) return false
-        // Bands split on stations shared verbatim by neighbouring runs (see paintPencilRuns),
-        // so a baked settled run and the live tail over it agree exactly: the pencil bakes
-        // like any other opaque ink instead of refilling its whole ribbon every frame.
+        // Opaque ink bakes exactly, so a baked settled run and the live
+        // tail over it agree: the cache paints every point exactly once,
+        // like a full repaint would.
         if (owner !== stroke || abs(this.res - res) > 1e-9) {
             owner = stroke
             this.res = res
