@@ -8,16 +8,16 @@ package com.xnotes.core.util
  * has to agree on which extensions are documents, and a place that forgets one silently hides the
  * user's files from the explorer.
  *
- * Renamed from `.xnote`/`.xcanvas` to `.pnotes`/`.pcanvas`; the old extensions stay readable
+ * Renamed from `.xnote`/`.xcanvas` to `.pnote`/`.pcanva`; the old extensions stay readable
  * (see [legacyExtensions]) so existing libraries keep opening, but everything the app
  * writes uses the new ones.
  */
 enum class DocumentKind(val extension: String, private val legacyExtensions: List<String> = emptyList()) {
     /** The paged notebook. */
-    NOTE("pnotes", listOf("xnote")),
+    NOTE("pnote", listOf("xnote")),
 
     /** The infinite canvas. */
-    CANVAS("pcanvas", listOf("xcanvas")),
+    CANVAS("pcanva", listOf("xcanvas")),
     ;
 
     /** The extension with its dot, as it appears at the end of a file name. */

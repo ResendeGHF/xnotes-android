@@ -194,10 +194,10 @@ class CanvasCodecTest {
         try {
             val doc = InfiniteDocument(created = 1_789_720_071_123L)
             doc.add(ImageItem(ImageData(imageFile(ByteArray(200_000) { (it % 251).toByte() }), 64, 48), Rect(0.0, 0.0, 64.0, 48.0)))
-            val file = File(dir, "c.pcanvas").apply { writeBytes(bytesOf(doc)) }
+            val file = File(dir, "c.pcanva").apply { writeBytes(bytesOf(doc)) }
             assertEquals(1_789_720_071_123L, java.io.RandomAccessFile(file, "r").use { codec.peek(it.channel) }!!.created)
             assertEquals(1_789_720_071_123L, file.inputStream().use { codec.peek(it) }!!.created)
-            val plain = File(dir, "p.pcanvas").apply { writeBytes(bytesOf(InfiniteDocument())) }
+            val plain = File(dir, "p.pcanva").apply { writeBytes(bytesOf(InfiniteDocument())) }
             assertNull(java.io.RandomAccessFile(plain, "r").use { codec.peek(it.channel) }!!.created)
         } finally {
             dir.deleteRecursively()
@@ -482,7 +482,7 @@ class CanvasCodecTest {
 
     @Test fun theManifestCarriesItsFormatTag() {
         val text = manifestText(InfiniteDocument())
-        assertTrue(text.startsWith("{\"format\":\"pcanvas\",\"version\":1,\"writer\":"))
+        assertTrue(text.startsWith("{\"format\":\"pcanva\",\"version\":1,\"writer\":"))
         assertTrue("no page array belongs in a canvas manifest", !text.contains("\"pages\""))
     }
 

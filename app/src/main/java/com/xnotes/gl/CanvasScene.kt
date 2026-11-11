@@ -195,6 +195,13 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     /** Viewport and revision the visible set was last collected for; a match reuses it. */
     private var lastCullView: Rect? = null
     private var lastCullRevision = -1
+    /**
+     * Expanded cull bounds: the last collection covered this plus a margin, so small pans reuse
+     * the set with only uniforms changing. Re-culls only when the view leaves the margin, the
+     * zoom moves, or the content revision moves.
+     */
+    private var lastCullExpanded: Rect? = null
+    private var lastCullZoom = Double.NaN
 
     /** Frames that reused the visible set, for the debug HUD. */
     private var cullSkippedTotal = 0
@@ -231,6 +238,11 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     private var lastMinimapH = -1
     private var lastMinimapBounds: Rect? = null
 
+    /** Cached minimap dots/panel/extent: recomputed throttled, replayed every frame. */
+    private var minimapDots: List<Rect> = emptyList()
+    private var minimapPanel: Rect = Rect(0.0, 0.0, 0.0, 0.0)
+    private var minimapExtent: Rect? = null
+
     /** The same for the dragged selection's halos, plus the point in the drag they were built at. */
     private var liftHaloKey: String? = null
     private var liftHaloAt = LiftTransform.NONE
@@ -244,6 +256,15 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
     /** Textures for placed images, decoded at the size the current zoom needs. */
     val textures = TextureCache()
+
+    /** Reusable corner/clip scratch: the GL thread draws sequentially, so per-item
+     *  FloatArray allocations per frame (one per visible text/image plus one per masked
+     *  cover) become UI-thread churn during pan. Reused here; never retained by callees. */
+    private val textCornersScratch = FloatArray(8)
+    private val imageCornersScratch = FloatArray(8)
+    private val imageXYScratchX = DoubleArray(4)
+    private val imageXYScratchY = DoubleArray(4)
+    private val clipRectScratch = FloatArray(4)
 
     /** Runs a decode off the render thread; installed by the host. */
     var decodeOn: (Runnable) -> Unit = { it.run() }
@@ -503,13 +524,26 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
 
         // The visible set only depends on the viewport and the records: when neither
         // moved, reusing it skips a full chunk walk, sort and dedupe every static frame.
+        // Hysteresis: the collection covers the view plus a margin, so small pans reuse the
+        // superset with only shader uniforms changing. Re-culls only when the view leaves the
+        // margin, the zoom moves, or the content changed.
         val view = viewRect(frame)
-        if (view == lastCullView && revision == lastCullRevision) {
+        val expanded = lastCullExpanded
+        val zoomSame = frame.zoom == lastCullZoom
+        if (revision == lastCullRevision && zoomSame && expanded != null &&
+            expanded.left <= view.left && expanded.top <= view.top &&
+            expanded.right >= view.right && expanded.bottom >= view.bottom
+        ) {
             cullSkippedTotal++
         } else {
-            collectVisible(view)
+            val marginW = (view.w * CULL_MARGIN_FRACTION).coerceAtLeast(CULL_MARGIN_MIN_PX / frame.zoom)
+            val marginH = (view.h * CULL_MARGIN_FRACTION).coerceAtLeast(CULL_MARGIN_MIN_PX / frame.zoom)
+            val collectRect = Rect(view.x - marginW, view.y - marginH, view.w + marginW * 2, view.h + marginH * 2)
+            collectVisible(collectRect)
             lastCullView = view
+            lastCullExpanded = collectRect
             lastCullRevision = revision
+            lastCullZoom = frame.zoom
             lastVisibleItems = visible.size
             lastCullMs = (System.nanoTime() - frameStartNs) / 1_000_000.0
         }
@@ -557,18 +591,22 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         lastLiftMs = (liftDone - commitDone) / 1_000_000.0
         drawWet(program, frame, camChunkX, camChunkY)
         if (frame.minimapVisible) {
-            // The minimap walks every record, so on a dense note it is a second cull per
-            // frame. Redraw it at most a few times a second while nothing it shows changed.
+            // The minimap must draw *every* frame it is visible: it paints straight into the
+            // framebuffer, so skipping a frame reads as flicker. What is throttled is the
+            // *recomputation* of the cached dots (the O(N) walk over every record): edits
+            // refresh it promptly, camera-only moves at most twice a second. The per-frame
+            // draw replays the cache plus a live viewport outline, so the marker never lags
+            // the fingers even while the dots underneath are a few frames old.
             val nowNs = System.nanoTime()
-            if (nowNs - lastMinimapNs >= MINIMAP_REDRAW_NS ||
-                revision != lastMinimapRevision || frame.zoom != lastMinimapZoom ||
+            val revChanged = revision != lastMinimapRevision || frame.contentBounds != lastMinimapBounds
+            val viewChanged = frame.zoom != lastMinimapZoom ||
                 frame.scrollX != lastMinimapScrollX || frame.scrollY != lastMinimapScrollY ||
                 frame.widthPx != lastMinimapW || frame.heightPx != lastMinimapH ||
                 frame.contentBounds != lastMinimapBounds
+            if (minimapExtent == null || revChanged ||
+                (viewChanged && nowNs - lastMinimapNs >= MINIMAP_REDRAW_NS_PAN)
             ) {
-                val miniStart = System.nanoTime()
-                drawMinimap(frame)
-                lastMinimapMs = (System.nanoTime() - miniStart) / 1_000_000.0
+                refreshMinimapCache(frame)
                 lastMinimapNs = nowNs
                 lastMinimapRevision = revision
                 lastMinimapZoom = frame.zoom
@@ -578,6 +616,9 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
                 lastMinimapH = frame.heightPx
                 lastMinimapBounds = frame.contentBounds
             }
+            val miniStart = System.nanoTime()
+            drawMinimapCached(frame, view)
+            lastMinimapMs = (System.nanoTime() - miniStart) / 1_000_000.0
         }
         lastWetMs = (System.nanoTime() - liftDone) / 1_000_000.0
         lastCommitMs = (commitDone - cullDone) / 1_000_000.0
@@ -702,29 +743,55 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
      * It is drawn from item bounds rather than by running the scene through a second transform,
      * which would cost a second full pass of everything visible. At this scale a stroke is a dot
      * either way, so the cheap version conveys exactly as much.
+     *
+     * Split in two: [refreshMinimapCache] walks every record (throttled by the caller) while
+     * [drawMinimapCached] replays the cache every frame, so the panel never flickers mid-gesture.
      */
-    private fun drawMinimap(frame: FrameState) {
-        val shader = minimapShader ?: return
+    private fun refreshMinimapCache(frame: FrameState) {
         val panel = Minimap.panel(frame.widthPx, frame.heightPx, frame.insetRight, frame.insetBottom)
         val visible = Rect(frame.scrollX, frame.scrollY, frame.widthPx / frame.zoom, frame.heightPx / frame.zoom)
         val extent = Minimap.mappedExtent(frame.contentBounds, visible)
+        // Hoisted out of the per-dot loop: one division per refresh instead of per record.
+        val scale = Minimap.scaleFor(extent, panel)
+        val originX = panel.centerX - extent.centerX * scale
+        val originY = panel.centerY - extent.centerY * scale
+        // Bounded draws per refresh: past the cap every k-th record stands in for its
+        // neighbours (hash order, stable while panning). A thousand overlapping 1.5px dots
+        // read the same as 250 of them at this scale, for a quarter of the draw calls.
+        val total = records.size
+        val stride = if (total > MINIMAP_MAX_DOTS) (total + MINIMAP_MAX_DOTS - 1) / MINIMAP_MAX_DOTS else 1
+        val dots = ArrayList<Rect>(minOf(total, MINIMAP_MAX_DOTS) + 1)
+        var i = 0
+        for (record in records.values) {
+            if ((i++ % stride) != 0) continue
+            val b = record.bounds
+            val w = (b.w * scale).coerceAtLeast(MINIMAP_DOT_PX)
+            val h = (b.h * scale).coerceAtLeast(MINIMAP_DOT_PX)
+            dots.add(Rect(originX + b.left * scale, originY + b.top * scale, w, h))
+        }
+        minimapDots = dots
+        minimapPanel = panel
+        minimapExtent = extent
+    }
+
+    /** Replay the cached panel and dots plus a live viewport outline: cheap enough for every frame. */
+    private fun drawMinimapCached(frame: FrameState, view: Rect) {
+        val shader = minimapShader ?: return
+        val extent = minimapExtent ?: return
+        val panel = minimapPanel
         val paperDim = Rgba(frame.paper.r, frame.paper.g, frame.paper.b, 210)
         shader.fill(panel, paperDim, frame.widthPx, frame.heightPx)
         shader.outline(panel, 1.0, frame.accent.withAlpha(90), frame.widthPx, frame.heightPx)
 
         val dot = frame.accent.withAlpha(150)
-        for (record in records.values) {
-            val mapped = Minimap.toPanel(record.bounds, extent, panel)
-            // Everything reads as at least a dot, so a single thin stroke is not invisible.
-            val w = mapped.w.coerceAtLeast(MINIMAP_DOT_PX)
-            val h = mapped.h.coerceAtLeast(MINIMAP_DOT_PX)
-            shader.fill(Rect(mapped.x, mapped.y, w, h), dot, frame.widthPx, frame.heightPx)
+        for (mapped in minimapDots) {
+            shader.fill(mapped, dot, frame.widthPx, frame.heightPx)
         }
         shader.outline(
-            Minimap.toPanel(visible, extent, panel), 1.5, frame.accent,
+            Minimap.toPanel(view, extent, panel), 1.5, frame.accent,
             frame.widthPx, frame.heightPx,
         )
-        lastDrawCalls += 9
+        lastDrawCalls += minimapDots.size + 6
     }
 
     /**
@@ -1022,7 +1089,7 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val points = record.textCorners ?: return
         val texture = textTexture(record)
         if (texture == 0) return
-        val corners = FloatArray(8)
+        val corners = textCornersScratch
         for (i in 0 until 4) {
             val p = lift.apply(com.xnotes.core.geometry.Pt(points[2 * i], points[2 * i + 1]))
             val dx = (p.x - frame.scrollX) * frame.zoom
@@ -1056,12 +1123,14 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val onScreenEdge = (maxOf(rect.w, rect.h) / share * frame.zoom).toInt().coerceAtLeast(1)
         val texture = textures.textureFor(image.image, onScreenEdge, decodeOn)
         if (texture == 0) return
-        val corners = FloatArray(8)
+        val corners = imageCornersScratch
         // A mirrored picture lays each corner's texels on the opposite corner.
         val (l, r) = if (image.flip.x) rect.right to rect.left else rect.left to rect.right
         val (t, b) = if (image.flip.y) rect.bottom to rect.top else rect.top to rect.bottom
-        val xs = doubleArrayOf(l, r, l, r)
-        val ys = doubleArrayOf(t, t, b, b)
+        val xs = imageXYScratchX
+        val ys = imageXYScratchY
+        xs[0] = l; xs[1] = r; xs[2] = l; xs[3] = r
+        ys[0] = t; ys[1] = t; ys[2] = b; ys[3] = b
         val turn = image.angle
         val co = kotlin.math.cos(turn)
         val sn = kotlin.math.sin(turn)
@@ -1112,19 +1181,29 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
     ) {
         val shader = glowShader ?: return
         if (!glowTarget.ready) return
-        // The glowing set only depends on the records and the revision; the halo pixels
-        // additionally on the view. Compare fields directly: the old string key allocated
-        // every frame to learn the same thing.
-        if (revision != lastGlowRevision) {
+        // Pan slides the shared layer instead of re-blurring it: a blur commutes with a
+        // translation, so the same uvOffset trick the lifted halos use applies here. Re-blur
+        // only on content/zoom/size change, or once the pan drifted far enough that strokes
+        // could have entered from off screen (the layer only holds what was visible at build).
+        val driftX = (frame.scrollX - lastHaloScrollX) * frame.zoom
+        val driftY = (frame.scrollY - lastHaloScrollY) * frame.zoom
+        val driftPx = if (lastHaloScrollX.isNaN()) Double.MAX_VALUE
+            else kotlin.math.hypot(driftX, driftY)
+        val needsRebuild = revision != lastHaloRevision || frame.zoom != lastHaloZoom ||
+            frame.widthPx != lastHaloW || frame.heightPx != lastHaloH ||
+            driftPx > HALO_PAN_REBUILD_PX
+        if (needsRebuild) {
+            lastGlowing = visible.filter { record -> record.parts.any { it.pass == InkPass.GLOW } }
+            lastGlowRevision = revision
+        } else if (revision != lastGlowRevision) {
+            // Content changed but the camera did not move far: refresh the set cheaply from the
+            // reused visible list instead of paying a blur for an unchanged view.
             lastGlowing = visible.filter { record -> record.parts.any { it.pass == InkPass.GLOW } }
             lastGlowRevision = revision
         }
         val glowing = lastGlowing
         if (glowing.isEmpty()) return
-        if (revision != lastHaloRevision || frame.zoom != lastHaloZoom ||
-            frame.scrollX != lastHaloScrollX || frame.scrollY != lastHaloScrollY ||
-            frame.widthPx != lastHaloW || frame.heightPx != lastHaloH
-        ) {
+        if (needsRebuild) {
             buildHaloLayer(program, glowing, frame, camChunkX, camChunkY)
             lastHaloRevision = revision
             lastHaloZoom = frame.zoom
@@ -1135,8 +1214,17 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             rebind(program, frame, camChunkX, camChunkY)
             store.bindForDraw(contextGen)
             store.bindAttributes(program)
+            shader.compositeOver(glowTarget.texture(glowTarget.layerIndex), 1.0)
+        } else {
+            // Slide the previously blurred picture with the pan. Device y runs down while the
+            // buffer's v runs up, hence the sign flip — same convention as the lifted halos.
+            val slideX = ((frame.scrollX - lastHaloScrollX) * frame.zoom / frame.widthPx).toFloat()
+            val slideY = ((frame.scrollY - lastHaloScrollY) * frame.zoom / frame.heightPx).toFloat()
+            shader.compositeOver(
+                glowTarget.texture(glowTarget.layerIndex), 1.0,
+                uvOffsetX = -slideX, uvOffsetY = slideY,
+            )
         }
-        shader.compositeOver(glowTarget.texture(glowTarget.layerIndex), 1.0)
         lastDrawCalls++
         rebind(program, frame, camChunkX, camChunkY)
         store.bindForDraw(contextGen)
@@ -1542,12 +1630,12 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         val y1 = (bounds.bottom - frame.scrollY) * frame.zoom + pad
         val w = frame.widthPx.toDouble()
         val h = frame.heightPx.toDouble()
-        return floatArrayOf(
-            (x0 / w * 2.0 - 1.0).coerceIn(-1.0, 1.0).toFloat(),
-            (1.0 - y0 / h * 2.0).coerceIn(-1.0, 1.0).toFloat(),
-            (x1 / w * 2.0 - 1.0).coerceIn(-1.0, 1.0).toFloat(),
-            (1.0 - y1 / h * 2.0).coerceIn(-1.0, 1.0).toFloat(),
-        )
+        val out = clipRectScratch
+        out[0] = (x0 / w * 2.0 - 1.0).coerceIn(-1.0, 1.0).toFloat()
+        out[1] = (1.0 - y0 / h * 2.0).coerceIn(-1.0, 1.0).toFloat()
+        out[2] = (x1 / w * 2.0 - 1.0).coerceIn(-1.0, 1.0).toFloat()
+        out[3] = (1.0 - y1 / h * 2.0).coerceIn(-1.0, 1.0).toFloat()
+        return out
     }
 
     // --- record bookkeeping ---
@@ -1833,7 +1921,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
             visible[write] = record
             write++
         }
-        while (visible.size > write) visible.removeAt(visible.size - 1)
+        // Bulk-trim the tail: removeAt in a loop is O(n^2) on an ArrayList.
+        if (visible.size > write) visible.subList(write, visible.size).clear()
     }
 
     private fun isLifted(item: CanvasItem): Boolean = liftedSet.containsKey(item)
@@ -1887,11 +1976,24 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         /** Cells a cull will walk before it gives up and scans every record instead. */
         private const val MAX_QUERY_CELLS = 4096L
 
+        /** Cull hysteresis: the collected set covers the view plus this fraction per side, so
+         *  small pans reuse it with only uniforms changing instead of re-walking chunks. */
+        private const val CULL_MARGIN_FRACTION = 0.25
+        /** Floor for the cull margin, in device px, so deep zoom-outs still get room. */
+        private const val CULL_MARGIN_MIN_PX = 256.0
+
         /** Smallest a minimap marker is drawn, so one thin stroke is still visible. */
         private const val MINIMAP_DOT_PX = 1.5
 
         /** Slowest the minimap redraws while nothing it shows changed. */
         private const val MINIMAP_REDRAW_NS = 120_000_000L
+        /** Slower cap while only the camera moves (no edits): the dots refresh at 2Hz, while the
+         *  panel and the viewport outline still draw every frame from the cache. */
+        private const val MINIMAP_REDRAW_NS_PAN = 500_000_000L
+        /** Most dots a minimap refresh keeps: past this every k-th record stands in. */
+        private const val MINIMAP_MAX_DOTS = 250
+        /** Pan distance in device px before a panned halo layer is re-blurred to pick up newcomers. */
+        private const val HALO_PAN_REBUILD_PX = 96.0
 
         /**
          * Device pixels a drag may slide its halo layer before it is blurred again. The layer only

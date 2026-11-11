@@ -101,7 +101,7 @@ class ZipTailTest {
     @Test fun aSplicedNoteReadsBackWithTheNewInk() {
         val bytes = ByteArray(4096) { (it % 251).toByte() }
         val image = imageFile(bytes)
-        val file = File.createTempFile("note", ".pnotes").apply { deleteOnExit() }
+        val file = File.createTempFile("note", ".pnote").apply { deleteOnExit() }
         write(docWith(strokes = 2, image = image), file)
 
         val edited = docWith(strokes = 9, image = image)
@@ -116,7 +116,7 @@ class ZipTailTest {
 
     @Test fun aShorterManifestLeavesNoTrailingRubbish() {
         val image = imageFile(ByteArray(4096) { 3 })
-        val file = File.createTempFile("note", ".pnotes").apply { deleteOnExit() }
+        val file = File.createTempFile("note", ".pnote").apply { deleteOnExit() }
         write(docWith(strokes = 60, image = image), file)
         val long = file.length()
 
@@ -129,7 +129,7 @@ class ZipTailTest {
 
     @Test fun theAssetBytesAreNeverTouched() {
         val image = imageFile(ByteArray(8192) { (it % 97).toByte() })
-        val file = File.createTempFile("note", ".pnotes").apply { deleteOnExit() }
+        val file = File.createTempFile("note", ".pnote").apply { deleteOnExit() }
         write(docWith(strokes = 3, image = image), file)
         val dir = FileInputStream(file).use { ZipTail.read(it.channel) }!!
         val tailStart = dir.entries.sortedBy { it.localOffset }[1].localOffset
@@ -145,7 +145,7 @@ class ZipTailTest {
 
     @Test fun splicingTwiceInARowStaysValid() {
         val image = imageFile(ByteArray(2048) { 9 })
-        val file = File.createTempFile("note", ".pnotes").apply { deleteOnExit() }
+        val file = File.createTempFile("note", ".pnote").apply { deleteOnExit() }
         write(docWith(strokes = 1, image = image), file)
 
         splice(file, docWith(strokes = 20, image = image))
@@ -157,8 +157,8 @@ class ZipTailTest {
 
     @Test fun aSplicedNoteMatchesOneWrittenWhole() {
         val image = imageFile(ByteArray(1024) { 5 })
-        val spliced = File.createTempFile("spliced", ".pnotes").apply { deleteOnExit() }
-        val whole = File.createTempFile("whole", ".pnotes").apply { deleteOnExit() }
+        val spliced = File.createTempFile("spliced", ".pnote").apply { deleteOnExit() }
+        val whole = File.createTempFile("whole", ".pnote").apply { deleteOnExit() }
         write(docWith(strokes = 2, image = image), spliced)
         val edited = docWith(strokes = 7, image = image)
         splice(spliced, edited)

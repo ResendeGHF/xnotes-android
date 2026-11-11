@@ -1434,6 +1434,22 @@ class CanvasState(
         return buildHighlighter(stroke, page, res, g, opaque).also { hlCaches[stroke] = it }
     }
 
+    /**
+     * Draw-path variant of [highlighterCacheFor]: while a pinch is in flight the stale-resolution
+     * bitmap is reused as-is (scaled at blit) and — critically — a missing entry does NOT build
+     * synchronously on the UI thread. Rasterizing a ribbon mid-pinch is what hitches the gesture;
+     * the caller skips the highlighter for those frames and it appears on settle.
+     * Returns null only when there is nothing reusable yet.
+     */
+    fun highlighterCacheForDraw(stroke: Stroke, page: Page): HighlighterCacheEntry? {
+        if (!zoomingInProgress) return highlighterCacheFor(stroke, page)
+        val existing = hlCaches[stroke] ?: return null
+        val g = stroke.geometry()
+        val opaque = stroke.renderColor.withAlpha(255)
+        if (existing.geom !== g || existing.opaque != opaque || existing.cuts !== stroke.cuts) return null
+        return existing
+    }
+
     private fun buildHighlighter(stroke: Stroke, page: Page, res: Double, g: StrokeGeometry, opaque: Rgba): HighlighterCacheEntry {
         val cover = stroke.bounds().outset(HL_PAD)
         val w = ceil(cover.w * res).toInt().coerceAtLeast(1)
@@ -1945,15 +1961,15 @@ class CanvasState(
     /**
      * The pages whose rect intersects the viewport, as a contiguous `first..last` index range
      * (pages stack vertically, so the visible set is always contiguous), or null when none is
-     * visible. Used for the debug readout.
+     * visible. Used for the debug readout. Iterates only the drawable row so a paginated
+     * document with many rows never scans hidden rows per frame.
      */
     fun visiblePageRange(): IntRange? {
         val visible = visibleContentRect()
         val drawable = drawablePageRange()
         var first = -1
         var last = -1
-        for (i in pageRects.indices) {
-            if (i !in drawable) continue
+        for (i in drawable) {
             val pr = pageRects.getOrNull(i) ?: continue
             if (!pr.intersects(visible)) continue
             if (first < 0) first = i
@@ -1964,14 +1980,17 @@ class CanvasState(
 
     // --- sharp viewport ---
 
-    /** True when the current zoom pushes a visible page past [maxCachePx] (its cache is clamped). */
+    /** True when the current zoom pushes a visible page past [maxCachePx] (its cache is clamped).
+     *  Iterates only the drawable row: paginated neighbours never draw, so they must not force
+     *  the sharp path (or its per-frame scan) on. */
     fun isPastResolutionCap(): Boolean {
         val target = zoom * renderScale
+        if (target <= 0.0) return false
         val visible = visibleContentRect()
-        for (i in pageRects.indices) {
+        for (i in drawablePageRange()) {
             val pr = pageRects.getOrNull(i) ?: continue
             if (!pr.intersects(visible)) continue
-            val page = document.pages[i]
+            val page = document.pages.getOrNull(i) ?: continue
             if (target * max(outerW(page), outerH(page)) > maxCachePx) return true
         }
         return false

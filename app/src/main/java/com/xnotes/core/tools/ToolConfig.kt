@@ -97,6 +97,9 @@ data class ToolConfig(
     val eraseMarkups: Boolean = true,
     /** Eraser: a pen scribbled over ink erases what it touches. Only used by [Tool.ERASER]. */
     val scribbleErase: Boolean = false,
+    /** Insert space: keep adding room on fresh pages instead of growing one page past its
+     *  template size, so the note keeps printable pages. Only used by [Tool.INSERT_SPACE]. */
+    val preservePageSize: Boolean = false,
     /** Tape: what a drag lays, a straight strip, a rectangle or a freehand band. Only used by [Tool.TAPE]. */
     val tapeMode: TapeMode = TapeMode.STRAIGHT,
     /** Tape: what is printed on it. Only used by [Tool.TAPE]. */

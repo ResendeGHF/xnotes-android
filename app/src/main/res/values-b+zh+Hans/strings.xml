@@ -128,6 +128,8 @@
     <string name="caption_switch_back">切换回去</string>
     <string name="caption_erase_markups">擦除 PDF 文本标注</string>
     <string name="caption_scribble_erase">涂抹擦除</string>
+    <string name="title_insert_space">插入空白</string>
+    <string name="caption_preserve_page_size">保留页面大小</string>
     <string name="title_select">选择</string>
     <string name="title_shape">形状</string>
     <string name="shape_line">直线</string>
@@ -1014,7 +1016,7 @@
     <string name="name_a_colour">为颜色命名</string>
     <string name="pref_per_folder_views">为每个文件夹记住视图</string>
     <string name="pref_show_folder_counts">在文件夹上显示项目数</string>
-    <string name="pref_show_extensions">显示文件扩展名（.pnotes、.pcanvas）</string>
+    <string name="pref_show_extensions">显示文件扩展名（.pnote、.pcanva）</string>
     <string name="pref_dates">日期</string>
     <string name="kind_read_only_file">只读文件</string>
     <string name="kind_read_only_files">只读文件</string>

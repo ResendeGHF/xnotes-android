@@ -55,7 +55,7 @@ Windows and macOS:
 ```
 desktop (Firefox/pdf.js)            Android device (source of truth)
   xnotes_share.py  <-- TLS 1.2+ -->  ShareService :42317
-  GET /api/pdf?uri=…                ShareBackendImpl: committed .pnotes bytes
+  GET /api/pdf?uri=…                ShareBackendImpl: committed .pnote bytes
   PUT /api/pdf?uri=…&base=…            → DocumentCodec → PdfExporter snapshot
 ```
 
@@ -71,7 +71,7 @@ desktop (Firefox/pdf.js)            Android device (source of truth)
   the lease plus the base version it was fetched at — a stale base gets
   `409`, a missing/foreign lease `423`.
 - **No silent overwrites.** Desktop `PUT` of a note swaps the bundle's
-  embedded source PDF and rewrites the `.pnotes` through the same
+  embedded source PDF and rewrites the `.pnote` through the same
   temp-validate-copy path as local saves. If the device's editor holds the
   same note with unsaved changes, its existing `changedUnderneath` check
   forks instead of overwriting — both copies survive.
@@ -125,7 +125,7 @@ Discovery: the service also announces `_xnoteshare._tcp` via mDNS
   now holds a high-performance Wi-Fi lock while sharing, the client waits up
   to 3 minutes on uploads, and every request is logged to logcat
   (`adb logcat -s xnotes-share`) so a stall shows exactly where it stops.
-- Canvas (`.pcanvas`) notes are listed but `GET /api/pdf` answers 404 —
+- Canvas (`.pcanva`) notes are listed but `GET /api/pdf` answers 404 —
   `CanvasPdfExporter` wiring is a separate change.
 - `PUT` replaces whole PDFs (what pdf.js saves); per-annotation merge
   (desktop Ink → editable strokes) is future work — nothing is lost, the

@@ -18,15 +18,15 @@ class DocKeysTest {
 
     @Test
     fun `documents under a moved folder follow it`() {
-        assertEquals("$to/Robotics/kinematics.pnotes", DocKeys.moved("$from/Robotics/kinematics.pnotes", from, to))
+        assertEquals("$to/Robotics/kinematics.pnote", DocKeys.moved("$from/Robotics/kinematics.pnote", from, to))
     }
 
     @Test
     fun `a sibling sharing the name prefix is left alone`() {
-        assertNull(DocKeys.moved("$from 2/old.pnotes", from, to))
+        assertNull(DocKeys.moved("$from 2/old.pnote", from, to))
         assertNull(DocKeys.moved("${from}2", from, to))
         assertFalse(DocKeys.within("${from}2", from))
-        assertTrue(DocKeys.within("$from/a.pnotes", from))
+        assertTrue(DocKeys.within("$from/a.pnote", from))
     }
 
     @Test

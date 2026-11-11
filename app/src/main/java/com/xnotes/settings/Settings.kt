@@ -377,6 +377,7 @@ data class Settings(
             .put("switch_back_after_erase", c.switchBackAfterErase)
             .put("erase_markups", c.eraseMarkups)
             .put("scribble_erase", c.scribbleErase)
+            .put("preserve_page_size", c.preservePageSize)
             .put("switch_back_after_select", c.switchBackAfterSelect)
             .put("select_whole_items", c.selectWholeItems)
             .put("straight_line", c.straightLine)
@@ -413,6 +414,7 @@ data class Settings(
                 switchBackAfterErase = o.optBoolean("switch_back_after_erase", d.switchBackAfterErase),
                 eraseMarkups = o.optBoolean("erase_markups", d.eraseMarkups),
                 scribbleErase = o.optBoolean("scribble_erase", d.scribbleErase),
+                preservePageSize = o.optBoolean("preserve_page_size", d.preservePageSize),
                 switchBackAfterSelect = o.optBoolean("switch_back_after_select", d.switchBackAfterSelect),
                 selectWholeItems = o.optBoolean("select_whole_items", d.selectWholeItems),
                 straightLine = o.optBoolean("straight_line", d.straightLine),

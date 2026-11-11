@@ -86,7 +86,7 @@ class VectorPath(
 /**
  * A parsed vector document: its paths in paint order, in the coordinate space of its viewBox.
  *
- * A derived render artifact and never persisted: the `.pnotes` bundle keeps the SVG file itself, and
+ * A derived render artifact and never persisted: the `.pnote` bundle keeps the SVG file itself, and
  * [com.xnotes.format.SvgReader] builds one of these when the infinite canvas needs triangles.
  */
 class VectorScene(

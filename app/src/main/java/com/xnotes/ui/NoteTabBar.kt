@@ -127,7 +127,7 @@ fun NoteTabBar(
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        tab.title.replace(Regex("(?i)\\.(pnotes|pcanvas|xnote|xcanvas)$"), ""),
+                        tab.title.replace(Regex("(?i)\\.(pnote|pcanva|xnote|xcanvas)$"), ""),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         fontSize = 12.sp,

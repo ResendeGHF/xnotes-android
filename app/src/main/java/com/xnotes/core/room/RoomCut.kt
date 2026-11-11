@@ -2,6 +2,7 @@ package com.xnotes.core.room
 
 import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Pt
+import com.xnotes.core.history.AddPage
 import com.xnotes.core.history.Command
 import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.MoveItems
@@ -22,6 +23,8 @@ import com.xnotes.core.model.Room
 import com.xnotes.core.model.Rooms
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.insets
+import com.xnotes.core.model.sourceHeight
+import com.xnotes.core.model.sourceWidth
 import java.util.IdentityHashMap
 
 /**
@@ -40,6 +43,12 @@ object RoomCut {
 
     /** The page height a PDF can take: 200 in. */
     private const val MAX_POINTS = 14_400.0
+
+    /** Paginate at most this many fresh pages per gesture, a pathological bound that always terminates. */
+    private const val MAX_PAGINATE_PAGES = 64
+
+    /** Content past the nominal height by less than this stays put: slivers never earn a fresh page. */
+    private const val SPLIT_EPS = 1.0
 
     /** How much room [page] of [doc] can still take before it outgrows a PDF page. */
     fun maxOpen(page: Page, doc: Document): Double {
@@ -61,6 +70,174 @@ object RoomCut {
         if (b - a <= Rooms.EPS) return null
         return apply(page, room.sideways, a, b, a - b, Rooms.closed(page.rooms, room, a, b))
     }
+
+    /** Content moved off a page by [splitOff], to land on a fresh page after it. */
+    class SplitOff(val items: List<CanvasItem>, val rooms: List<Room>)
+
+    /**
+     * Move everything showing at or below [h] (content px from the top) off [page] onto a fresh
+     * page after it: items fully below move whole, items crossing [h] are cut there (the far piece
+     * moves), anything else crossing stays whole on the side holding its centre, and rooms crossing
+     * [h] split. The page's paper is truncated to [h]. Returns the moved content plus the commands
+     * undoing the source-side change, or null when nothing lies at or below [h]. The caller inserts
+     * the fresh page, translates nothing itself (pieces already land at new-page coordinates), and
+     * records the insertion plus these commands as one step.
+     */
+    fun splitOff(page: Page, h: Double): Pair<SplitOff, List<Command>>? {
+        val beforeItems = page.items.toList()
+        val shapeBefore = PageShape.bare(page)
+        // Phase one, routing only: nothing moves yet, so the glue below snapshots the
+        // untranslated geometry, exactly as [apply] does.
+        val route = IdentityHashMap<CanvasItem, Int>()
+        val toMove = ArrayList<CanvasItem>()
+        val toCut = ArrayList<CanvasItem>()
+        for (unit in units(page.items)) {
+            val (lo, hi) = extent(unit, false)
+            val r = when {
+                hi <= h + EPS -> 0 // stays
+                lo >= h - EPS -> 1 // moves whole
+                unit.size == 1 && cuttable(unit[0], false) -> 2 // cut at h
+                // A group, a shape, a tape or anything else uncuttable stays whole on the
+                // side holding its centre, so nothing is ever sliced that cannot be.
+                else -> if ((lo + hi) / 2.0 <= h) 0 else 1
+            }
+            for (item in unit) route[item] = r
+            if (r == 1) toMove += unit
+            if (r == 2) toCut += unit[0]
+        }
+        // Rooms crossing [h] split; ones fully below move, still in order.
+        val keptRooms = ArrayList<Room>()
+        val movedRooms = ArrayList<Room>()
+        for (r in page.rooms) {
+            if (r.sideways) {
+                keptRooms += r
+                continue
+            }
+            when {
+                r.end <= h + EPS -> keptRooms += r
+                r.at >= h - EPS -> movedRooms += r.copy(at = r.at - h, size = r.size)
+                else -> {
+                    keptRooms += r.copy(size = h - r.at)
+                    movedRooms += Room(0.0, r.end - h)
+                }
+            }
+        }
+        keptRooms.sortWith(compareBy<Room>({ it.sideways }, { it.at }))
+        movedRooms.sortWith(compareBy<Room>({ it.sideways }, { it.at }))
+        if (toCut.isEmpty() && movedRooms.isEmpty() && toMove.isEmpty()) {
+            // Nothing below [h] (nor any room crossing it): the page already fits.
+            return null
+        }
+        // Phase two: cut, then move, then let whatever the cut displaced follow, as in [apply].
+        val moved = ArrayList<CanvasItem>(toMove.size + toCut.size)
+        val after = ArrayList<CanvasItem>(beforeItems.size)
+        val changed = ArrayList<CanvasItem>()
+        val changedBefore = ArrayList<GeometrySnapshot>()
+        val glue = GlueFollow.of(toMove + toCut, beforeItems, { it in page.items }, rigid = false)
+        for (item in beforeItems) {
+            when (route[item]) {
+                0 -> after += item
+                2 -> {
+                    val snap = item.snapshotGeometry()
+                    val kept = when (item) {
+                        is Stroke -> cutStroke(item, false, h, h, 0.0, 0.0)
+                        is ImageItem -> cutPicture(item, false, h, h, 0.0, 0.0)
+                        else -> Kept(null, null)
+                    }
+                    if (kept.self == null && kept.piece == null) {
+                        // The cut refused despite the extent check (e.g. a rotated picture that
+                        // only splits at its centre): keep it whole on the centre's side instead
+                        // of dropping it.
+                        val (lo2, hi2) = extent(listOf(item), false)
+                        if ((lo2 + hi2) / 2.0 <= h) after += item
+                        else {
+                            item.translate(0.0, -h)
+                            moved += item
+                        }
+                    } else {
+                        kept.self?.let {
+                            changed += it
+                            changedBefore += snap
+                            after += it
+                        }
+                        kept.piece?.let {
+                            it.translate(0.0, -h)
+                            moved += it
+                        }
+                    }
+                }
+                else -> {
+                    item.translate(0.0, -h)
+                    moved += item
+                }
+            }
+        }
+        page.items.clear()
+        page.items.addAll(after)
+        glue.follow(Affine.translateBy(0.0, -h))
+        val translated = moved.filter { it !in glue.items }
+        changed += glue.items
+        changedBefore += glue.startSnapshots
+        if (page.height > h) page.height = h
+        page.rooms = keptRooms
+        val commands = ArrayList<Command>()
+        commands += ReplacePageItems(page, beforeItems, after)
+        if (changed.isNotEmpty()) commands += TransformItems(changed, changedBefore, changed.map { it.snapshotGeometry() })
+        if (translated.isNotEmpty()) commands += MoveItems(translated, 0.0, -h)
+        commands += ReshapePages(listOf(page), listOf(shapeBefore), listOf(PageShape.bare(page)))
+        return SplitOff(moved.toList(), movedRooms) to commands
+    }
+
+    /** The content a page holds below its top edge: items plus room bands, in content px. Cut ink
+     *  counts only where it shows, like the cull does, so a clipped-away far side never forces a page. */
+    private fun contentHeight(page: Page): Double {
+        var hi = 0.0
+        for (item in page.items) hi = maxOf(hi, extent(listOf(item), false).second)
+        for (room in page.rooms) hi = maxOf(hi, room.end)
+        return hi
+    }
+
+    /**
+     * Open [size] of room at [at] on the page at [pageIndex] of [doc], then paginate any overflow:
+     * while a page's content passes its nominal height, the excess moves to a fresh template-sized
+     * page inserted right after it, until every page fits. The new pages keep the source page's
+     * width, style and margins; only vertical room paginates. Returns every command as one
+     * undoable step, or null when nothing opened.
+     *
+     * The nominal height is the document's chosen page size when set, else the page's own height
+     * without room: the template the page was created from.
+     */
+    fun openPreservingSize(doc: Document, pageIndex: Int, at: Double, size: Double): List<Command>? {
+        val first = doc.pages.getOrNull(pageIndex) ?: return null
+        if (size <= Rooms.EPS) return null
+        val out = ArrayList<Command>()
+        open(first, at, size)?.let { out += it } ?: return null
+        var cur = first
+        var guard = 0
+        while (guard++ < MAX_PAGINATE_PAGES) {
+            val h = nominalHeight(cur, doc)
+            if (contentHeight(cur) <= h + SPLIT_EPS) break
+            val (moved, cmds) = splitOff(cur, h) ?: break
+            val idx = doc.pages.indexOfFirst { it === cur }
+            if (idx < 0) break
+            val size = doc.newPageSize?.pixels(doc.dpi)
+            val fresh = Page(size?.first ?: cur.sourceWidth, h, style = cur.style.copy(), margins = cur.margins.copy())
+            fresh.items.addAll(moved.items)
+            fresh.rooms = moved.rooms
+            doc.insertPage(fresh, idx + 1)
+            out += AddPage(doc, fresh, idx + 1)
+            out += cmds
+            cur = fresh
+        }
+        return out
+    }
+
+    /**
+     * The paper height [page] must keep: the document's chosen page size when the user set one,
+     * else the page's own height without room (the template it was created from).
+     */
+    internal fun nominalHeight(page: Page, doc: Document): Double =
+        doc.newPageSize?.pixels(doc.dpi)?.second ?: page.sourceHeight
 
     /** What happens to one item, or one group whose members go together. */
     enum class Fate { STAYS, MOVES, CUT, GOES }

@@ -33,7 +33,7 @@ class NoteLinkCodecTest {
             rect = Rect(12.0, 34.0, 220.0, 64.0),
             displayName = "Chapter 2",
             targetUri = "content://notes/abc",
-            targetName = "Physics.pnotes",
+            targetName = "Physics.pnote",
             pages = listOf(0, 2, 3),
             color = Rgba(244, 67, 54),
             rounded = true,
@@ -45,7 +45,7 @@ class NoteLinkCodecTest {
         assertEquals(link.rect, item.rect)
         assertEquals("Chapter 2", item.displayName)
         assertEquals("content://notes/abc", item.targetUri)
-        assertEquals("Physics.pnotes", item.targetName)
+        assertEquals("Physics.pnote", item.targetName)
         assertEquals(listOf(0, 2, 3), item.pages)
         assertEquals(Rgba(244, 67, 54), item.color)
         assertEquals(true, item.rounded)

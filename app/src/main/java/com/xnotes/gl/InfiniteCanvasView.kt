@@ -209,6 +209,24 @@ class InfiniteCanvasView @JvmOverloads constructor(
         if (linger) postDelayed(idleRunnable, IDLE_LINGER_MS) else stopInteractive()
     }
 
+    /**
+     * Stay hot after real work, so the next gesture never pays a cold start. A gesture that
+     * actually moved content or laid ink is usually followed by another within a moment
+     * (stroke, pan, stroke, pan); keeping the vsync heartbeat up for this long holds the
+     * render thread out of deep sleep and the CPU/GPU clocks off their floor, which is what
+     * makes the first instants of the next gesture run at full frame rate instead of
+     * stumbling while everything ramps. Static frames are cheap (cull-skipped), so this is
+     * a small battery cost for never showing a cold-start hitch.
+     */
+    fun keepWarm() {
+        removeCallbacks(idleRunnable)
+        if (!interactive) {
+            interactive = true
+            renderMode = RENDERMODE_CONTINUOUSLY
+        }
+        postDelayed(idleRunnable, WARM_LINGER_MS)
+    }
+
     /** Stop drawing every refresh. Called by [idleRunnable] once the canvas has been still. */
     private fun stopInteractive() {
         if (!interactive) return
@@ -391,5 +409,8 @@ class InfiniteCanvasView @JvmOverloads constructor(
 
         /** How long the render thread keeps running after a gesture ends. */
         private const val IDLE_LINGER_MS = 250L
+
+        /** How long it stays up after a gesture that did real work (moved content or inked). */
+        private const val WARM_LINGER_MS = 2000L
     }
 }

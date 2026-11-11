@@ -96,8 +96,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.airbnb.lottie.LottieAnimationView
-import com.airbnb.lottie.LottieDrawable
 import com.xnotes.R
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.platform.PdfOpenError
@@ -115,15 +113,11 @@ import com.xnotes.ui.theme.toComposeColor
 import com.xnotes.core.workspace.NoteTabs
 import com.xnotes.platform.NoteTabsStore
 import kotlin.math.roundToInt
-import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** How long the maths waits for the font bytes it measures with before going without. */
 private const val MATH_FONT_WAIT_MS = 1500L
-
-/** Minimum time the branded launch loader stays up, about one loop of the animation. */
-private const val LAUNCH_HOLD_MS = 1000L
 
 /** Whether the display has a camera cutout (notch/hole-punch). False below API 29, which has no
  *  cutout API; such devices fall back to fullscreen by default. Also false for a context with no
@@ -203,19 +197,13 @@ class MainActivity : ComponentActivity() {
             var ready by remember { mutableStateOf(false) }
 
             LaunchedEffect(Unit) {
-                // Branded launch: the loader is a placeholder until the first
-                // folder is actually ready, so the user never sees a "Loading"
-                // flash or late metadata pop-in after the animation.
-                // Session restores while the loader plays, with a minimum hold
-                // of one loop so it never just flashes by, and the first
-                // listing (names + vault gate + metadata/counts for the first
-                // page) is awaited synchronously before the editor appears.
-                val started = System.currentTimeMillis()
+                // Session restores before the editor appears, so the user never sees a
+                // "Loading" flash or late metadata pop-in: the first listing (names +
+                // vault gate + metadata/counts for the first page) is awaited
+                // synchronously before the first real frame. No branded hold or
+                // animation: the system splash (app icon) hands straight to content.
                 ed.restoreSession()
-                val listing = async(kotlinx.coroutines.Dispatchers.IO) { ed.awaitInitialListing() }
-                val elapsed = System.currentTimeMillis() - started
-                if (elapsed < LAUNCH_HOLD_MS) delay(LAUNCH_HOLD_MS - elapsed)
-                listing.await()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { ed.awaitInitialListing() }
                 ready = true
                 ed.prewarmBackstage()
             }
@@ -239,7 +227,9 @@ class MainActivity : ComponentActivity() {
                                 onImportConsumed = { pendingPdfImport = null },
                             )
                         } else {
-                            LaunchLoader()
+                            // Not ready yet: plain black stage (the splash theme's
+                            // windowBackground already covers this). No animation.
+                            Box(modifier = Modifier.fillMaxSize().background(Color.Black))
                         }
                         com.xnotes.ui.EyedropperOverlay()
                     }
@@ -379,25 +369,6 @@ class MainActivity : ComponentActivity() {
          * live session is never torn down by a config change.
          */
         private val bootSharingReset = java.util.concurrent.atomic.AtomicBoolean(false)
-    }
-}
-
-@Composable
-private fun LaunchLoader() {
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black),
-        contentAlignment = Alignment.Center,
-    ) {
-        AndroidView<LottieAnimationView>(
-            factory = { context ->
-                LottieAnimationView(context).apply {
-                    setAnimation("polars.json")
-                    repeatCount = LottieDrawable.INFINITE
-                    playAnimation()
-                }
-            },
-            modifier = Modifier.size(220.dp),
-        )
     }
 }
 
@@ -1074,7 +1045,7 @@ private fun EditorScreen(
         /** Open the "Save as" picker for [target], remembering which pane its result belongs to. */
         fun launchSaveAs(target: Editor) {
             savePane = target
-            createLauncher.launch("${target.title}.pnotes")
+            createLauncher.launch("${target.title}.pnote")
         }
 
         fun saveOrPrompt() {
@@ -1510,7 +1481,7 @@ private fun EditorScreen(
                     onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
             } else if (withLinks && note) {
                 // A self-contained bundle: linked pages inlined below their link, links rewired.
-                runSdocxExport(stem, ext = "pnotes", shareDir = true, titleRes = R.string.exporting_note, errorRes = R.string.err_share_note,
+                runSdocxExport(stem, ext = "pnote", shareDir = true, titleRes = R.string.exporting_note, errorRes = R.string.err_share_note,
                     render = { o, _, cancel -> editor.exportFileToXnote(uriStr, o, withLinks = true) { cancel() } },
                     onReady = { temp -> runCatching { launchShare(temp, stem, "application/octet-stream") }.onFailure { editor.message = context.getString(R.string.err_share_note) } })
             } else {
@@ -2844,7 +2815,7 @@ private fun SavingDialog() {
 }
 
 /**
- * Indeterminate "Importing PDF…"/"Importing note…" dialog shown while a picked PDF (or `.pnotes`) is
+ * Indeterminate "Importing PDF…"/"Importing note…" dialog shown while a picked PDF (or `.pnote`) is
  * streamed into a new note off the main thread. Import has no natural page-by-page progress — the
  * cost is copying the (possibly large) source bytes — so it shows an animated spinner.
  */
@@ -3094,7 +3065,7 @@ private suspend fun openInto(
     val expected = if (name.endsWith(".pdf", ignoreCase = true)) {
         val newUri = target.importPdfDirectly(uriStr, name)
         if (newUri != null) {
-            target.openAsync(newUri, "${com.xnotes.core.util.Paths.stem(name)}.pnotes")
+            target.openAsync(newUri, "${com.xnotes.core.util.Paths.stem(name)}.pnote")
         } else {
             target.message = context.getString(R.string.err_insert_pdf)
         }

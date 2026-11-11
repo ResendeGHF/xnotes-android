@@ -68,7 +68,7 @@ class SaveSafetyTest {
         val doc = Document(dpi = 150)
         doc.pages.add(Page(1240.0, 1754.0).also { it.items.addAll(lineStrokes()) })
         doc.pages.add(Page(1240.0, 1754.0).also { it.items.addAll(lineStrokes()) })
-        val tmp = File.createTempFile("save-safety", ".pnotes").apply { deleteOnExit() }
+        val tmp = File.createTempFile("save-safety", ".pnote").apply { deleteOnExit() }
         File(tmp.path).outputStream().use { codec.write(doc, it) }
         val peeked = FileInputStream(tmp).use { codec.peek(it.channel) }
         assertEquals(2, peeked?.pages)

@@ -47,7 +47,7 @@ Three Android instrumentation tests passed on the connected Redmi Pad 2:
   ligatures, Arabic and mixed Hebrew/Latin, plus unchanged-line identity reuse.
 
 The original note is not included in the repository and is never modified by the
-fixture test. Supply a copy in the debug app's cache as `reflow-fixture.pcanvas` to
+fixture test. Supply a copy in the debug app's cache as `reflow-fixture.pcanva` to
 run that optional measurement; without it the test logs that it was skipped.
 
 ```sh

@@ -127,10 +127,10 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         requestRender = { view.publish() },
         onViewChanged = { onViewChanged() },
         setInteractive = { active, linger -> view.setInteractive(active, linger) },
+        keepWarm = { view.keepWarm() },
         configFor = { configFor(it) },
         onWetStroke = { publishWetStroke(it) },
         onCommitStroke = { commitStroke(it) },
-        presentedTip = { lastPresentedTip },
         onScribbleErase = { stroke, taken -> commitScribbleErase(stroke, taken) },
         onEraseBegin = { EraseSession(document) },
         onEraseEnd = { commitErase(it) },
@@ -323,14 +323,26 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Refine only after camera movement settles: the current bitmap remains on the GPU
      * throughout every pinch and pan, and the worker never recalculates line breaks on input. */
-    private val textZoomRefinement = Runnable { refineVisibleTextResolution() }
+    private val textZoomRefinement = Runnable {
+        textRefinePending = false
+        refineVisibleTextResolution()
+    }
+    private var textRefinePending = false
 
     /** Lod level each committed stroke was meshed at. Strokes are the only items meshed through
      * the Lod budget on the direct path (labelled shapes go through the text worker, images and
      * text boxes through their own raster paths). */
     private val strokeLodLevel = java.util.IdentityHashMap<Stroke, Int>()
     private var lodLastNeeded = -1
-    private val lodRefineRunnable = Runnable { refineStrokeLod() }
+    private val lodRefineRunnable = Runnable {
+        lodRefinePending = false
+        refineStrokeLod()
+    }
+    private var lodRefinePending = false
+    /** Last zoom % pushed to Compose; avoids recomposing the readout per MOVE for the same value. */
+    private var lastZoomPercentSent = -1
+    /** Items revision the minimap/contentBounds was last published for; pan without edits skips it. */
+    private var lastBoundsRevision = -1
 
     /**
      * One low-priority thread that decimates lifted strokes while a drag runs, so a thousand
@@ -349,7 +361,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     @Volatile private var liftGen = 0L
 
     private fun scheduleTextZoomRefinement() {
-        view.removeCallbacks(textZoomRefinement)
+        if (textRefinePending) return
+        textRefinePending = true
         view.postDelayed(textZoomRefinement, 190L)
     }
 
@@ -357,25 +370,33 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
      * Downgrades for settled zoom-outs land here, debounced like the text refinement: the fine
      * meshes stay on screen while refining, so a wrong (too coarse) mesh is never shown, only a
      * too-fine one for a few frames longer. Upgrades past a threshold (zooming in) cannot wait
-     * and go through [upgradeVisibleStrokes] instead.
+     * and go through [upgradeVisibleStrokes] instead. Coalesced: a continuous gesture schedules
+     * once, the pending run sees the settled zoom.
      */
     private fun scheduleLodRefine() {
-        view.removeCallbacks(lodRefineRunnable)
+        if (lodRefinePending) return
+        lodRefinePending = true
         view.postDelayed(lodRefineRunnable, LOD_REFINE_DELAY_MS)
     }
 
-    /** Re-mesh settled visible strokes at the settled zoom's Lod level, a few per frame. */
+    /** Re-mesh settled visible strokes at the settled zoom's Lod level, a few per frame.
+     *  Skipped when zoomed so far out the cull would fall back to a full scan: refining
+     *  thousands of tiny strokes the user cannot see is pure settle jank. */
     private fun refineStrokeLod() {
         if (textResizeState != null || editingLabel != null) return
         if (interaction.mode != CanvasPointerMode.IDLE) {
             scheduleLodRefine()
             return
         }
+        if (isCullHuge()) return
         val needed = Lod.levelFor(viewport.zoom)
         val pending = ArrayList<Stroke>()
         for (item in document.itemsInUnsorted(viewport.cullRect(96.0))) {
             val s = item as? Stroke ?: continue
-            if ((strokeLodLevel[s] ?: 0) != needed) pending.add(s)
+            if ((strokeLodLevel[s] ?: 0) != needed) {
+                pending.add(s)
+                if (pending.size >= REFINE_SCAN_CAP) break
+            }
         }
         if (pending.isEmpty()) return
         refineStrokeLodBatch(pending, needed, 0)
@@ -472,9 +493,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     private fun refineVisibleTextResolution() {
         if (textResizeState != null || editingLabel != null) return
+        if (isCullHuge()) return
         val detail = textRasterZoomTier(viewport.zoom)
+        var scanned = 0
         // Order-independent: each text box refines against its own presented raster.
         for (item in document.itemsInUnsorted(viewport.cullRect(96.0))) {
+            if (scanned++ >= REFINE_SCAN_CAP) break
             val shape = item as? ShapeItem ?: continue
             if (!shape.isTextOnlyBox() || shape.labelHidden) continue
             val current = presentedText[shape] ?: continue
@@ -486,6 +510,17 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
                 pushTextOnlyBox(shape, forceRaster = true)
             }
         }
+    }
+
+    /** True when the current cull would span so many spatial cells the index falls back to a
+     *  full scan: refining there means walking the whole document on the main thread for
+     *  thumbnails the user cannot read at this zoom. */
+    private fun isCullHuge(): Boolean {
+        val r = viewport.cullRect(96.0)
+        if (!r.w.isFinite() || !r.h.isFinite()) return true
+        val cellsW = r.w / 512.0 + 1.0
+        val cellsH = r.h / 512.0 + 1.0
+        return cellsW * cellsH > REFINE_MAX_CELLS.toDouble()
     }
 
     /** Where inserted images are written; supplied by the host so both editors share one dir. */
@@ -953,7 +988,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     private val vectorMeshSeq = java.util.concurrent.atomic.AtomicLong()
 
     /**
-     * Building every stroke synchronously here blocked the UI while a dense .pcanvas opened.
+     * Building every stroke synchronously here blocked the UI while a dense .pcanva opened.
      * Publish the first few items immediately, then yield a frame between later batches.
      * A document switch invalidates the old callbacks, and removals cannot resurrect items.
      */
@@ -2112,145 +2147,12 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         val parts = if (tail == null) emptyList() else listOf(if (invertInk) tail.inverted() else tail)
         if (!frontDecided) decideFrontInk(stroke, parts)
         wetTail = parts
-        // Pixels-only lookahead past the nib: the predicted segment rides the real tail and
-        // is corrected by the next sample, so it can never corrupt the stroke.
-        val predicted = predictedTailPart(stroke, ribbon, wetTol)
-        val tailed = if (predicted == null) parts else parts + predicted
-        if (predicted == null) lastPresentedTip = null
-        val tailedBounds = if (predicted == null) bounds else bounds.outset(predictLeadContent())
-        if (frontInk) pad.setTail(tailed) else scene.setWetTail(tailed, tailedBounds)
+        if (frontInk) pad.setTail(parts) else scene.setWetTail(parts, bounds)
         scene.noteWetMesh((System.nanoTime() - meshStartNs) / 1_000_000.0)
-        // A prediction with no follow-up samples is stale ink: shrink it back onto
-        // the nib a step at a time so a held pen never keeps showing a tip the
-        // commit would take away. Any new sample re-arms with the full lead.
-        mainHandler.removeCallbacks(dropPrediction)
-        if (predicted != null) {
-            predictArmGen = predictGen
-            predictStroke = stroke
-            predictLeadLeft = predictLeadContent()
-            mainHandler.postDelayed(dropPrediction, PREDICT_TICK_MS)
-        }
     }
 
-    /** Content units the prediction may reach: a fixed on-screen distance whatever the zoom. */
-    private fun predictLeadContent(): Double {
-        val z = viewport.zoom
-        return if (!z.isFinite() || z <= 0.0) 0.0
-        else com.xnotes.canvas.StrokePredictor.MAX_LEAD_SCREEN_PX / z
-    }
-
-    /**
-     * The tip the last presented tail showed past the nib, or null when the tail
-     * went out plain. Read back at pen-up so the commit keeps shown ink: what
-     * you saw is what the stroke keeps. Set wherever a predicted tail presents;
-     * cleared wherever a plain tail presents.
-     */
-    var lastPresentedTip: com.xnotes.core.geometry.Pt? = null
-        private set
-
-    /**
-     * A one-segment mesh from the nib toward where it is heading, for plain opaque
-     * ink only: pencil tone, dash rhythm and neon blooms cannot be faked for a frame
-     * without showing, so those tools keep the un-predicted tail. The lead shrinks
-     * with deceleration, so a stopping pen converges onto its real position instead
-     * of overshooting into ink that vanishes on commit.
-     */
-    private fun predictedTailPart(
-        stroke: Stroke,
-        ribbon: com.xnotes.core.stroke.RibbonPoints,
-        tolerance: Double,
-    ): com.xnotes.core.infinite.MeshPart? {
-        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
-        if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
-        return predictedTailPart(stroke, ribbon, tolerance, predictLeadContent())
-    }
-
-    /**
-     * A one-segment mesh from the nib toward where it is heading, capped at
-     * [maxLead] content units, for plain opaque ink only: pencil tone, dash
-     * rhythm and neon blooms cannot be faked for a frame without showing, so
-     * those tools keep the un-predicted tail. The lead shrinks with
-     * deceleration and with turning, so a stopping or turning pen converges
-     * onto its real position instead of overshooting into ink that vanishes
-     * on commit.
-     */
-    private fun predictedTailPart(
-        stroke: Stroke,
-        ribbon: com.xnotes.core.stroke.RibbonPoints,
-        tolerance: Double,
-        maxLead: Double,
-    ): com.xnotes.core.infinite.MeshPart? {
-        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
-        if (ItemMesher.passFor(stroke) != com.xnotes.core.infinite.InkPass.OPAQUE) return null
-        lastPresentedTip = null
-        val n = ribbon.pointCount
-        if (n < 2) return null
-        if (maxLead <= 0.0) return null
-        val head = if (n >= 3) {
-            com.xnotes.canvas.StrokePredictor.predict(
-                stroke.xAt(n - 3), stroke.yAt(n - 3), stroke.tAt(n - 3),
-                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                maxLead,
-            )
-        } else {
-            com.xnotes.canvas.StrokePredictor.predict(
-                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                maxLead,
-            )
-        } ?: return null
-        val hw = ribbon.hw(n - 1)
-        if (!hw.isFinite() || hw <= 0.0) return null
-        val builder = com.xnotes.core.infinite.MeshBuilder()
-        builder.polylineRibbon(listOf(Pt(stroke.xAt(n - 1), stroke.yAt(n - 1)), head), hw, false, tolerance)
-        val mesh = builder.build()
-        if (mesh.isEmpty) return null
-        lastPresentedTip = head
-        val part = com.xnotes.core.infinite.MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
-        return if (invertInk) part.inverted() else part
-    }
-
-    /**
-     * Shrink a stale prediction back onto the nib a step at a time, so a held
-     * pen shows its tip visibly settle instead of keeping ink that would snap
-     * back on commit. Armed only while a prediction is on screen; any new
-     * sample, stroke change or commit disarms it.
-     */
-    private var predictGen = 0
-    private var predictArmGen = -1
-    private var predictStroke: Stroke? = null
-    private var predictLeadLeft = 0.0
-    private val dropPrediction: Runnable = Runnable {
-        val stroke = predictStroke
-        if (stroke == null || predictArmGen != predictGen || wetOwner !== stroke) return@Runnable
-        predictLeadLeft *= PREDICT_DECAY
-        if (predictLeadLeft < com.xnotes.canvas.StrokePredictor.MIN_LEAD_UNITS || !republishPredictedTail(stroke, predictLeadLeft)) {
-            refreshWetTail(stroke)
-        } else {
-            mainHandler.postDelayed(dropPrediction, PREDICT_TICK_MS)
-        }
-    }
-
-    /** Re-mesh the live tail with a shrunken prediction cap and present it; false when there is nothing to show. */
-    private fun republishPredictedTail(stroke: Stroke, maxLead: Double): Boolean {
-        val ribbon = stroke.wetRibbon ?: return false
-        if (wetOwner !== stroke || maxLead <= 0.0) return false
-        val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
-        val tailFrom = (wetMeshed - 1).coerceAtLeast(0)
-        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, wetArc, wetTol) ?: return false
-        val parts = listOf(if (invertInk) tail.inverted() else tail)
-        wetTail = parts
-        val predicted = predictedTailPart(stroke, ribbon, wetTol, maxLead) ?: return false
-        val tailedBounds = stroke.paintBounds().outset(maxLead)
-        if (frontInk) pad.setTail(parts + predicted) else scene.setWetTail(parts + predicted, tailedBounds)
-        requestRender()
-        return true
-    }
-
-    /** Re-mesh the live tail without prediction and present it. */
+    /** Re-mesh the live tail and present it. */
     private fun refreshWetTail(stroke: Stroke) {
-        lastPresentedTip = null
         val ribbon = stroke.wetRibbon ?: return
         if (wetOwner !== stroke) return
         val wetTol = ItemMesher.toleranceForZoom(viewport.zoom)
@@ -2410,10 +2312,6 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         wetArc = 0.0
         wetTail = emptyList()
         wholeMeshStroke = null
-        predictGen++
-        predictStroke = null
-        lastPresentedTip = null
-        mainHandler.removeCallbacks(dropPrediction)
     }
 
     /** A whole wet mesh at most this often; closer events reuse the mesh in flight. */
@@ -3085,9 +2983,6 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
             }
         }
         // The commit message releases the wet buffers on the GL thread, so forget what was in them.
-        // The last presented prediction was committed into the stroke itself (see
-        // commitPresentedTip), so the mesh arriving here already ends where the wet
-        // tail did: nothing shown vanishes.
         val tail = wetTail
         val front = frontInk
         forgetWetStroke()
@@ -3626,7 +3521,11 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         // The connection marks are sized for the screen and only cover what is on it.
         if (interaction.marking) publishOverlay()
         document.lastView = viewport.toWaypoint()
-        zoomPercent = Math.round(viewport.zoom * 100).toInt()
+        val zp = Math.round(viewport.zoom * 100).toInt()
+        if (zp != lastZoomPercentSent) {
+            lastZoomPercentSent = zp
+            zoomPercent = zp
+        }
         // Strokes meshed coarser than the zoom now needs come back up at once; coarser-than-
         // needed ones wait for the settle refinement, which only ever swaps in cheaper meshes.
         // Strokes meshed coarser than the zoom now needs come back up, but never mid-gesture:
@@ -3636,10 +3535,16 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         if (needed < lodLastNeeded && interaction.mode == CanvasPointerMode.IDLE) upgradeVisibleStrokes(needed)
         lodLastNeeded = needed
         scheduleLodRefine()
-        // The menu is anchored in viewport pixels, so a pan or a zoom moves it.
-        refreshSelectionMenu()
+        // The menu is anchored in viewport pixels, so a pan or a zoom moves it — but only while
+        // something is selected. Clearing a null menu per MOVE recomposes Compose for nothing.
+        if (!selection.isEmpty || selectionMenuRect != null) refreshSelectionMenu()
         // The minimap maps everything drawn, so its extent moves with the content, not the view.
-        view.contentBounds = document.contentBounds()
+        // Content bounds are cached in the document and only change on edits: skip the publish
+        // (which itself publishes a FrameState) while panning over unchanged content.
+        if (itemsRevision != lastBoundsRevision) {
+            lastBoundsRevision = itemsRevision
+            view.contentBounds = document.contentBounds()
+        }
         scheduleTextZoomRefinement()
     }
 
@@ -3648,12 +3553,19 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         canUndo = history.canUndo
         canRedo = history.canRedo
         waypoints = document.waypoints.toList()
+        lastBoundsRevision = itemsRevision
         view.contentBounds = document.contentBounds()
     }
 
     companion object {
         /** Zoom step for the keyboard, matching a comfortable notch of a pinch. */
         const val ZOOM_STEP = 1.25
+
+        /** Settle refinements stop scanning after this many items: zoomed out, the rest are
+         *  sub-pixel and refining them is pure main-thread jank. */
+        const val REFINE_SCAN_CAP = 2000
+        /** ... and skip entirely when the cull spans more spatial cells than this. */
+        const val REFINE_MAX_CELLS = 2048
 
         /** An arrow key moves the view by this fraction of itself, as a divisor. */
         const val PAN_STEPS = 8.0
@@ -3692,12 +3604,6 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
          * flat whatever the digitizer rate.
          */
         const val WHOLE_MESH_MIN_NS = 8_000_000L
-
-        /** How often a stale prediction shrinks back onto the nib while the pen holds still. */
-        const val PREDICT_TICK_MS = 32L
-
-        /** Each hold tick keeps this fraction of the prediction's reach. */
-        const val PREDICT_DECAY = 0.5
 
         /** Strokes re-meshed per frame by the settle refinement, to never stall a frame. */
         const val LOD_REFINE_BATCH = 12

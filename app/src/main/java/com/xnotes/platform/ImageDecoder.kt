@@ -79,18 +79,35 @@ object ImageDecoder {
      * or mutate. Decoded at the power-of-two sample-size bucket for the box (the renderer scales it
      * into place), so a selected image being dragged or resized reuses one decode across frames
      * instead of re-reading the file every frame. Raster only; vectors fall back to the plain decode.
+     *
+     * Hot path: called once per visible image per frame during pan/zoom. The native bounds probe
+     * (`decodeFile` with `inJustDecodeBounds`) opens and parses the file header, so doing it on
+     * every frame is file I/O on the UI thread. Native dimensions are cached by path+mtime and
+     * reused while the file is unchanged.
      */
+    private data class RasterDim(val mtime: Long, val w: Int, val h: Int)
+    private val dimCache = LruCache<String, RasterDim>(256)
+
     fun decodeSharedForDraw(path: String, maxWidth: Int, maxHeight: Int): Bitmap? {
         val mw = maxWidth.coerceAtLeast(1)
         val mh = maxHeight.coerceAtLeast(1)
         if (isVector(path)) return decodeSampledFile(path, mw, mh)
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(path, bounds)
-        val sw = bounds.outWidth
-        val sh = bounds.outHeight
+        val mtime = runCatching { File(path).lastModified() }.getOrDefault(0L)
+        val cachedDim = synchronized(dimCache) { dimCache.get(path) }?.takeIf { it.mtime == mtime }
+        val (sw, sh) = if (cachedDim != null) {
+            cachedDim.w to cachedDim.h
+        } else {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            val w = bounds.outWidth
+            val h = bounds.outHeight
+            if (w <= 0 || h <= 0) return null
+            synchronized(dimCache) { dimCache.put(path, RasterDim(mtime, w, h)) }
+            w to h
+        }
         if (sw <= 0 || sh <= 0) return null
         val ss = sampleSize(sw, sh, mw, mh)
-        val key = "$path|${runCatching { File(path).lastModified() }.getOrDefault(0L)}|$ss"
+        val key = "$path|$mtime|$ss"
         rasterCache.get(key)?.let { if (!it.isRecycled) return it }
         val opts = BitmapFactory.Options().apply {
             inSampleSize = ss

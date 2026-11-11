@@ -187,4 +187,87 @@ class RoomCutTest {
         doc.pages += p
         assertEquals(14_400.0 * doc.dpi / 72.0 - 600.0, RoomCut.maxOpen(p, doc), eps)
     }
+
+    @Test fun splitOffMovesTrailingContentToANewPage() {
+        val above = line(50.0, 10.0, 80.0)
+        val crossing = line(50.0, 200.0, 400.0)
+        val below = line(60.0, 450.0, 500.0)
+        val p = page(above, crossing, below)
+        val (moved, cmds) = RoomCut.splitOff(p, 300.0)!!
+        // Above stays; the crossing stroke is cut at 300 (near stays, far moves up by 300);
+        // below moves whole. The paper truncates to the split.
+        assertEquals(600.0 - 300.0, p.height, eps)
+        assertEquals(2, p.items.size)
+        assertSame(above, p.items[0])
+        val near = p.items[1] as Stroke
+        assertTrue(near.bounds().bottom <= 300.0 + eps)
+        assertEquals(2, moved.items.size)
+        val far = moved.items[0] as Stroke
+        assertTrue(far.bounds().top >= 0.0 - eps)
+        assertTrue(far.bounds().bottom <= 100.0 + 3.0)
+        val movedBelow = moved.items[1] as Stroke
+        assertEquals(150.0, firstY(movedBelow), eps)
+        // Undo restores the single page exactly.
+        cmds.asReversed().forEach { it.undo() }
+        assertEquals(listOf<CanvasItem>(above, crossing, below), p.items)
+        assertEquals(600.0, p.height, eps)
+        cmds.forEach { it.redo() }
+        assertEquals(2, p.items.size)
+        assertEquals(300.0, p.height, eps)
+    }
+
+    @Test fun splitOffSplitsRoomsAcrossTheBoundary() {
+        val p = page(line(50.0, 650.0, 700.0))
+        RoomCut.open(p, 500.0, 300.0)
+        assertEquals(listOf(Room(500.0, 300.0)), p.rooms)
+        val (moved, _) = RoomCut.splitOff(p, 600.0)!!
+        assertEquals(listOf(Room(500.0, 100.0)), p.rooms)
+        assertEquals(listOf(Room(0.0, 200.0)), moved.rooms)
+        assertEquals(600.0, p.height, eps)
+    }
+
+    @Test fun openPreservingSizePaginatesOverflowOntoFreshPages() {
+        val doc = Document(dpi = 150)
+        val p = Page(400.0, 600.0)
+        val top = line(50.0, 10.0, 80.0)
+        val bottom = line(50.0, 400.0, 550.0)
+        p.items.addAll(listOf(top, bottom))
+        doc.pages.add(p)
+        val cmds = RoomCut.openPreservingSize(doc, 0, 100.0, 400.0)!!
+        // Room opens whole (400 at 100), then content past the 600 template height flows on.
+        assertEquals(2, doc.pages.size)
+        val first = doc.pages[0]
+        val second = doc.pages[1]
+        assertEquals(600.0, first.height, eps)
+        assertEquals(listOf(Room(100.0, 400.0)), first.rooms)
+        assertEquals(listOf<CanvasItem>(top), first.items)
+        assertEquals(listOf<CanvasItem>(bottom), second.items)
+        assertEquals(200.0, firstY(bottom), eps)
+        assertEquals(600.0, second.height, eps)
+        // One undo step takes the whole cascade back.
+        cmds.asReversed().forEach { it.undo() }
+        assertEquals(1, doc.pages.size)
+        assertEquals(listOf<CanvasItem>(top, bottom), doc.pages[0].items)
+        assertEquals(600.0, doc.pages[0].height, eps)
+        assertEquals(10.0, firstY(top), eps)
+        assertEquals(400.0, firstY(bottom), eps)
+        cmds.forEach { it.redo() }
+        assertEquals(2, doc.pages.size)
+        assertEquals(600.0, doc.pages[0].height, eps)
+    }
+
+    @Test fun openPreservingSizeKeepsFittingRoomInPlace() {
+        val doc = Document(dpi = 150)
+        val p = Page(400.0, 600.0)
+        val top = line(50.0, 10.0, 80.0)
+        p.items.add(top)
+        doc.pages.add(p)
+        val cmds = RoomCut.openPreservingSize(doc, 0, 100.0, 100.0)!!
+        assertEquals(1, doc.pages.size)
+        assertEquals(700.0, p.height, eps)
+        assertEquals(listOf(Room(100.0, 100.0)), p.rooms)
+        cmds.asReversed().forEach { it.undo() }
+        assertEquals(600.0, p.height, eps)
+        assertTrue(p.rooms.isEmpty())
+    }
 }

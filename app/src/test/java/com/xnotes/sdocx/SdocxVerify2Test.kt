@@ -132,7 +132,7 @@ class SdocxVerify2Test {
         val tmp = File.createTempFile("expxx", null).let { f -> f.delete(); f.mkdirs(); f }
         try {
             val doc = Document(dpi=150)
-            doc.displayName = "MyTitle.pnotes"
+            doc.displayName = "MyTitle.pnote"
             val page = Page(1440.0, 2036.0)
             val s = Stroke(Tool.PEN, com.xnotes.core.tools.ToolDefaults.configFor(Tool.PEN).copy(baseWidth=3.0, rgba=Rgba(20,20,20,255)))
             s.setSamples(listOf(com.xnotes.core.stroke.Sample(100.0,100.0,0.8), com.xnotes.core.stroke.Sample(200.0,200.0,0.8)))

@@ -9,8 +9,8 @@ class PolicySortTest {
 
     @Test fun sharedFirstThenFoldersThenName() {
         val rows = listOf(
-            row("u3", "zebra.pnotes"),
-            row("u1", "apple.pnotes"),
+            row("u3", "zebra.pnote"),
+            row("u1", "apple.pnote"),
             row("u2", " Mango"),
             row("d9", "docs", isDir = true),
             row("d1", "archive", isDir = true),
@@ -20,7 +20,7 @@ class PolicySortTest {
     }
 
     @Test fun emptySharedKeepsFoldersFirst() {
-        val rows = listOf(row("u2", "b.pnotes"), row("d1", "a"), row("u1", "a.pnotes"))
+        val rows = listOf(row("u2", "b.pnote"), row("d1", "a"), row("u1", "a.pnote"))
         // folders ("a" dir) sort before files when nothing is shared
         val sorted = rows.sortedWith(sharedFirst(emptySet()))
         assertEquals(listOf("d1", "u1", "u2"), sorted.map { it.uri })
@@ -29,7 +29,7 @@ class PolicySortTest {
     @Test fun orderDoesNotDependOnToggleTime() {
         // Toggles flip checkboxes in place; the order snapshot is fixed per
         // picker/load, so assert the comparator is a pure function of its input.
-        val rows = listOf(row("u1", "a.pnotes"), row("u2", "b.pnotes"))
+        val rows = listOf(row("u1", "a.pnote"), row("u2", "b.pnote"))
         val a = rows.sortedWith(sharedFirst(setOf("u1"))).map { it.uri }
         val b = rows.sortedWith(sharedFirst(setOf("u1", "u2"))).map { it.uri }
         assertEquals(listOf("u1", "u2"), a)

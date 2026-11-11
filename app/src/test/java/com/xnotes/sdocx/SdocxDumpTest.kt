@@ -55,7 +55,7 @@ class SdocxDumpTest {
         dir.mkdirs()
         val imgFile = File(dir, "src.png").apply { writeBytes(png) }
         val doc = Document(dpi = 150)
-        doc.displayName = "MyTitle.pnotes"
+        doc.displayName = "MyTitle.pnote"
         val page = Page(1440.0, 2036.0)
         page.items.add(stroke(Tool.PEN, Rgba(20, 20, 20, 255), 3.0, 100.0, 100.0, 200.0, 200.0, 300.0, 150.0))
         page.items.add(stroke(Tool.HIGHLIGHTER, Rgba(255, 235, 59, 200), 16.0, 50.0, 500.0, 400.0, 520.0))

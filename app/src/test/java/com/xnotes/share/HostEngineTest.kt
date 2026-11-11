@@ -171,7 +171,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("f1", "todo.pnote", bytes = ByteArray(100))
             f.policy.setShared("f1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -201,7 +201,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("f1", "todo.pnote", bytes = ByteArray(100))
             f.policy.setShared("f1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -253,7 +253,7 @@ class HostEngineTest {
 
     @Test fun linkRequestGrantsAndAnswers() {        val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         // Already shared: ok at once, no popup.
@@ -269,7 +269,7 @@ class HostEngineTest {
         assertEquals(false, h.lastOfType("link_result").optBoolean("ok"))
         assertEquals(false, asked)
         // Unshared but real: approval grants, pushes the index, answers ok.
-        b.addFile("f2", "secret.pnotes", bytes = ByteArray(100))
+        b.addFile("f2", "secret.pnote", bytes = ByteArray(100))
         e.onMessage(JSONObject().put("t", "link_request").put("seq", 3).put("id", "f2").put("device", "Phone"))
         assertEquals(true, asked)
         assertEquals(true, h.lastOfType("link_result").optBoolean("ok"))
@@ -281,11 +281,11 @@ class HostEngineTest {
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
         b.addDir("d1", "notes")
-        b.addFile("f1", "todo.pnotes", parent = "d1", bytes = ByteArray(100))
-        b.addFile("f2", "other.pnotes", bytes = ByteArray(50))
+        b.addFile("f1", "todo.pnote", parent = "d1", bytes = ByteArray(100))
+        b.addFile("f2", "other.pnote", bytes = ByteArray(50))
         policy.setShared("d1", true)
         val idx = e.buildIndex()
-        assertEquals(listOf("notes", "notes/todo.pnotes"), idx.map { it.path })
+        assertEquals(listOf("notes", "notes/todo.pnote"), idx.map { it.path })
         assertEquals(0, idx.first { it.id == "f1" }.kind)
         assertEquals(1, idx.first { it.id == "d1" }.kind)
     }
@@ -294,7 +294,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
@@ -314,7 +314,7 @@ class HostEngineTest {
     @Test fun pageOpsApplyAndFanSameDedupe() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
@@ -338,7 +338,7 @@ class HostEngineTest {
     @Test fun opFinishesLiveRunAndLiveRepaintsPartial() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
@@ -363,7 +363,7 @@ class HostEngineTest {
     @Test fun roomOpsApplyAndPreviewStreams() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.docs["f1"] = Document(mutableListOf(Page(300.0, 200.0)))
@@ -388,7 +388,7 @@ class HostEngineTest {
     @Test fun imageBytesThenOpAppliesToOpenDoc() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
@@ -413,7 +413,7 @@ class HostEngineTest {
     @Test fun imageOpBeforeBytesWaitsForThem() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
@@ -437,7 +437,7 @@ class HostEngineTest {
         // drawable run (page, samples, style all present).
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         e.liveSample("f1", 0, "s-1", "pen", 3.0, "#00e676", 10.0, 20.0, 0.5)
@@ -462,8 +462,8 @@ class HostEngineTest {
     @Test fun refreshPolicyCoversImmediatelyAndIndexesAsync() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "a.pnotes", bytes = ByteArray(10))
-        b.addFile("f2", "b.pnotes", bytes = ByteArray(10))
+        b.addFile("f1", "a.pnote", bytes = ByteArray(10))
+        b.addFile("f2", "b.pnote", bytes = ByteArray(10))
         f.policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.sent.clear()
@@ -495,7 +495,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         e.onMessage(JSONObject().put("t", "op").put("seq", 1).put("file", "f1").put("base_version", 99).put("dedupe", "a").put("ops", org.json.JSONArray()))
@@ -507,7 +507,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         val doc = Document(mutableListOf(Page(300.0, 200.0, mutableListOf(stroke()))))
@@ -523,7 +523,7 @@ class HostEngineTest {
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
         val big = ByteArray(HostEngine.CHUNK.toInt() + 100) { it.toByte() }
-        b.addFile("f1", "todo.pnotes", bytes = big)
+        b.addFile("f1", "todo.pnote", bytes = big)
         policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.sent.clear()
@@ -541,7 +541,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val policy = f.policy
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         policy.setShared("f1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         var asked: Triple<String, String, String>? = null
@@ -551,7 +551,7 @@ class HostEngineTest {
         }
         h.waitForIndex()
         e.onMessage(JSONObject().put("t", "delete_request").put("seq", 1).put("id", "f1").put("device", "Desktop"))
-        assertEquals(Triple("delete", "Desktop", "todo.pnotes"), asked)
+        assertEquals(Triple("delete", "Desktop", "todo.pnote"), asked)
         assertEquals(true, h.lastOfType("delete_result").optBoolean("ok"))
     }
 
@@ -559,7 +559,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("f1", "todo.pnote", bytes = ByteArray(100))
             f.policy.setShared("f1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -589,7 +589,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -654,7 +654,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -677,7 +677,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -695,7 +695,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -725,7 +725,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -753,7 +753,7 @@ class HostEngineTest {
         val fa = engine()
         val fb = engine()
         for (f in listOf(fa, fb)) {
-            f.backend.addFile("u1", "n.pnotes", bytes = ByteArray(100))
+            f.backend.addFile("u1", "n.pnote", bytes = ByteArray(100))
             f.policy.setShared("u1", true)
             f.engine.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         }
@@ -771,8 +771,8 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         b.addDir("d1", "notes")
-        b.addFile("f1", "todo.pnotes", parent = "d1", bytes = ByteArray(100))
-        b.addFile("f2", "other.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", parent = "d1", bytes = ByteArray(100))
+        b.addFile("f2", "other.pnote", bytes = ByteArray(100))
         b.files["d1"] = ByteArray(10)
         f.policy.setShared("d1", true)
         f.policy.setShared("f1", true)
@@ -795,7 +795,7 @@ class HostEngineTest {
     @Test fun refreshPolicyPushesGrantChangesWithoutResubscribe() {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
-        b.addFile("f1", "todo.pnotes", bytes = ByteArray(100))
+        b.addFile("f1", "todo.pnote", bytes = ByteArray(100))
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
         assertEquals(0, h.lastOfType("index").optJSONArray("files")!!.length())
@@ -857,7 +857,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val pdf = byteArrayOf(37, 80, 68, 70, 10) + ByteArray(5000) { it.toByte() }
-        b.addFile("n1", "plan.pnotes", bytes = pdfNote(pdf, invert = true))
+        b.addFile("n1", "plan.pnote", bytes = pdfNote(pdf, invert = true))
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
@@ -878,7 +878,7 @@ class HostEngineTest {
         val f = engine()
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         val pdf = byteArrayOf(37, 80, 68, 70, 10) + ByteArray(1000) { it.toByte() }
-        b.addFile("n1", "plan.pnotes", bytes = pdfNote(pdf, invert = false))
+        b.addFile("n1", "plan.pnote", bytes = pdfNote(pdf, invert = false))
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
@@ -904,7 +904,7 @@ class HostEngineTest {
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
         val out = ByteArrayOutputStream()
         fetchCodec.write(doc, out)
-        b.addFile("n1", "plan.pnotes", bytes = out.toByteArray())
+        b.addFile("n1", "plan.pnote", bytes = out.toByteArray())
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
@@ -917,7 +917,7 @@ class HostEngineTest {
         }
         val head = synchronized(h.sent) { h.sent.first { it.optString("t") == "file_head" } }
         assertEquals("n1", head.optString("id"))
-        assertTrue(head.optString("manifest").contains("\"format\":\"pnotes\""))
+        assertTrue(head.optString("manifest").contains("\"format\":\"pnote\""))
         // The chunks still carry the whole file afterwards.
         val chunks = waitForFile(h, "n1")
         assertTrue(reassemble(chunks).contentEquals(out.toByteArray()))
@@ -929,7 +929,7 @@ class HostEngineTest {
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
         val out = ByteArrayOutputStream()
         fetchCodec.write(doc, out)
-        b.addFile("n1", "plan.pnotes", bytes = out.toByteArray())
+        b.addFile("n1", "plan.pnote", bytes = out.toByteArray())
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
@@ -977,7 +977,7 @@ class HostEngineTest {
         val doc = Document(mutableListOf(Page(300.0, 200.0)))
         val out = ByteArrayOutputStream()
         fetchCodec.write(doc, out)
-        b.addFile("n1", "plan.pnotes", bytes = out.toByteArray())
+        b.addFile("n1", "plan.pnote", bytes = out.toByteArray())
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()
@@ -1008,7 +1008,7 @@ class HostEngineTest {
         val (e, h, b) = Triple(f.engine, f.host, f.backend)
         // 2.5 MiB: three 1 MiB chunks (pins the bigger window); must stay under the frame cap.
         val note = ByteArray(2 * 1024 * 1024 + 512 * 1024) { (it % 251).toByte() }
-        b.addFile("n1", "big.pnotes", bytes = note)
+        b.addFile("n1", "big.pnote", bytes = note)
         f.policy.setShared("n1", true)
         e.onMessage(JSONObject().put("t", "index_subscribe").put("seq", 0))
         h.waitForIndex()

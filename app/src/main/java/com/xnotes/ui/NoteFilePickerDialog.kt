@@ -44,7 +44,7 @@ import kotlinx.coroutines.withContext
 
 /**
  * Pick a note from the app's own storage as a link target: folder navigation
- * with breadcrumbs, search within the folder, and note rows to tap. Only `.pnotes`
+ * with breadcrumbs, search within the folder, and note rows to tap. Only `.pnote`
  * files are offered (links point at note pages); the note the link is created
  * from is left out via [excludeUri].
  */

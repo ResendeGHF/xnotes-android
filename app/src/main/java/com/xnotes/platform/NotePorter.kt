@@ -102,7 +102,7 @@ class NotePorter(
             val doc = read { backup.inputStream() } ?: return false
             if (codec.forkShapesRead == 0) return false
             val want = noteFingerprint(doc)
-            val tmp = File(dir, "new.pnotes")
+            val tmp = File(dir, "new.pnote")
             tmp.outputStream().use { codec.write(doc, it) }
             val again = read { tmp.inputStream() } ?: return false
             if (codec.forkShapesRead != 0 || !same(want, noteFingerprint(again))) return false
@@ -118,7 +118,7 @@ class NotePorter(
         val doc = read { backup.inputStream() } ?: return false
         if (codec.forkShapesRead == 0) return false
         val want = canvasFingerprint(doc)
-        val tmp = File(dir, "new.pcanvas")
+        val tmp = File(dir, "new.pcanva")
         tmp.outputStream().use { codec.write(doc, it) }
         val again = read { tmp.inputStream() } ?: return false
         if (codec.forkShapesRead != 0 || !same(want, canvasFingerprint(again))) return false
@@ -145,7 +145,7 @@ class NotePorter(
 
     private fun open(uri: String) = context.contentResolver.openInputStream(Uri.parse(uri))
 
-    private fun isCanvas(entry: SafTree.LocalEntry) = entry.relativePath.endsWith(".pcanvas", ignoreCase = true) ||
+    private fun isCanvas(entry: SafTree.LocalEntry) = entry.relativePath.endsWith(".pcanva", ignoreCase = true) ||
         entry.relativePath.endsWith(".xcanvas", ignoreCase = true)
 
     /** One PDF reader per extracted source, for the markups' page geometry; closed together. */

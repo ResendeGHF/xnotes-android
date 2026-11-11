@@ -228,8 +228,8 @@ class InfiniteDocumentTest {
 
     @Test fun titleFallsBackThroughDisplayNameThenPath() {
         assertEquals("Untitled", InfiniteDocument().title)
-        assertEquals("plan", InfiniteDocument(path = "/x/plan.pcanvas").title)
-        assertEquals("real", InfiniteDocument(path = "/x/plan.pcanvas", displayName = "real.pcanvas").title)
+        assertEquals("plan", InfiniteDocument(path = "/x/plan.pcanva").title)
+        assertEquals("real", InfiniteDocument(path = "/x/plan.pcanva", displayName = "real.pcanva").title)
     }
 
     @Test fun theCanvasHandlesFarFlungContent() {

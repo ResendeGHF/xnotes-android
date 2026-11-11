@@ -166,115 +166,7 @@ class FrontInk(
         val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, arc)
         tailPart = tail
         val tailParts = if (tail == null) emptyList() else listOf(if (invert) tail.inverted() else tail)
-        // Pixels-only lookahead past the nib, corrected by the next sample; plain opaque
-        // ink only, so dash rhythm is never faked (the pad only hosts opaque runs anyway).
-        val predicted = predictedTailPart(stroke, ribbon, pageIndex)
-        if (predicted == null) lastPresentedTip = null
-        pad.setTail(if (predicted == null) tailParts else tailParts + predicted)
-        // A prediction with no follow-up samples is stale ink: shrink it back onto
-        // the nib a step at a time so a held pen never keeps showing a tip the
-        // commit would take away. Any new sample re-arms with the full lead.
-        handler.removeCallbacks(dropPrediction)
-        if (predicted != null) {
-            predictArmGen = predictGen
-            predictStroke = stroke
-            predictPage = pageIndex
-            predictLeadLeft = leadForPage(pageIndex)
-            handler.postDelayed(dropPrediction, PREDICT_TICK_MS)
-        }
-    }
-
-    /** Shrink a stale prediction back onto the nib a step at a time, then retract it. */
-    private var predictGen = 0
-    private var predictArmGen = -1
-    private var predictStroke: Stroke? = null
-    private var predictPage = -1
-    private var predictLeadLeft = 0.0
-    private val dropPrediction: Runnable = Runnable {
-        val stroke = predictStroke
-        if (stroke == null || predictArmGen != predictGen || owner !== stroke) return@Runnable
-        predictLeadLeft *= PREDICT_DECAY
-        val ribbon = stroke.wetRibbon ?: return@Runnable
-        val page = state.document.pages.getOrNull(predictPage)
-        val invert = page?.resolvedInvertColors(state.document) == true
-        val tailFrom = (meshed - 1).coerceAtLeast(0)
-        val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, arc) ?: return@Runnable
-        tailPart = tail
-        val tailParts = listOf(if (invert) tail.inverted() else tail)
-        val predicted = predictedTailPart(stroke, ribbon, predictPage, predictLeadLeft)
-        if (predicted == null) lastPresentedTip = null
-        pad.setTail(if (predicted == null) tailParts else tailParts + predicted)
-        view.requestRender()
-        if (predicted != null) handler.postDelayed(dropPrediction, PREDICT_TICK_MS)
-    }
-
-    /** Content units the prediction may reach on [pageIndex]: a fixed on-screen distance. */
-    private fun leadForPage(pageIndex: Int): Double {
-        if (state.document.pages.getOrNull(pageIndex) == null) return 0.0
-        val zoom = state.zoom
-        return if (!zoom.isFinite() || zoom <= 0.0) 0.0
-        else StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
-    }
-
-    /**
-     * A one-segment mesh from the nib toward where it is heading, capped at
-     * [maxLead] content units. Never enters the stroke: the next sample's tail
-     * replaces it, so a wrong guess lasts one frame. The lead shrinks with
-     * deceleration and with turning, so a stopping or turning pen converges
-     * instead of overshooting into ink that vanishes on commit.
-     */
-    /** The tip the last presented tail showed past the nib, or null when it went out plain. */
-    var lastPresentedTip: Pt? = null
-        private set
-
-    private fun predictedTailPart(stroke: Stroke, ribbon: com.xnotes.core.stroke.RibbonPoints, pageIndex: Int): MeshPart? {
-        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
-        return predictedTailPart(stroke, ribbon, pageIndex, leadForPage(pageIndex))
-    }
-
-    private fun predictedTailPart(stroke: Stroke, ribbon: com.xnotes.core.stroke.RibbonPoints, pageIndex: Int, maxLead: Double): MeshPart? {
-        if (stroke.tool == com.xnotes.core.tools.Tool.DASHED) return null
-        val n = ribbon.pointCount
-        if (n < 2) return null
-        if (maxLead <= 0.0) return null
-        val head = if (n >= 3) {
-            StrokePredictor.predict(
-                stroke.xAt(n - 3), stroke.yAt(n - 3), stroke.tAt(n - 3),
-                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                maxLead,
-            )
-        } else {
-            StrokePredictor.predict(
-                stroke.xAt(n - 2), stroke.yAt(n - 2), stroke.tAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1), stroke.tAt(n - 1),
-                maxLead,
-            )
-        } ?: return null
-        val hw = ribbon.hw(n - 1)
-        if (!hw.isFinite() || hw <= 0.0) return null
-        val page = state.document.pages.getOrNull(pageIndex)
-        val invert = page?.resolvedInvertColors(state.document) == true
-        // The pad paint path re-derives res from the view each present (see GlWetPad); the
-        // ribbon tolerance here matches the settled runs meshed just above.
-        val builder = com.xnotes.core.infinite.MeshBuilder()
-        builder.polylineRibbon(
-            listOf(Pt(stroke.xAt(n - 1), stroke.yAt(n - 1)), head),
-            hw, false, com.xnotes.core.infinite.StrokeTessellator.DEFAULT_TOLERANCE,
-        )
-        val mesh = builder.build()
-        if (mesh.isEmpty) return null
-        lastPresentedTip = head
-        val part = MeshPart(mesh, stroke.renderColor, com.xnotes.core.infinite.InkPass.OPAQUE)
-        return if (invert) part.inverted() else part
-    }
-
-    /** Disarm a pending prediction retraction (commit, hold, or a new stroke). */
-    private fun disarmPrediction() {
-        predictGen++
-        predictStroke = null
-        lastPresentedTip = null
-        handler.removeCallbacks(dropPrediction)
+        pad.setTail(tailParts)
     }
 
     /** lightness-invert a meshed run for color inversion (alpha untouched, glow with it). */
@@ -300,7 +192,6 @@ class FrontInk(
 
     /** Give the pad back with nothing to hand over: a stroke abandoned, snapped to a shape, or gone. */
     fun abandon() {
-        disarmPrediction()
         owner = null
         meshed = 0
         arc = 0.0
@@ -479,7 +370,6 @@ class FrontInk(
 
     /** Stop drawing but keep the pixels: they are the only copy of the stroke until the canvas has it. */
     private fun abandonToHold() {
-        disarmPrediction()
         owner = null
         meshed = 0
         arc = 0.0
@@ -593,11 +483,5 @@ class FrontInk(
 
         /** How long the handover waits for the capture before giving the stroke back anyway (ms). */
         const val CAPTURE_TIMEOUT_MS = 120L
-
-        /** How often a stale prediction shrinks back onto the nib while the pen holds still. */
-        const val PREDICT_TICK_MS = 32L
-
-        /** Each hold tick keeps this fraction of the prediction's reach. */
-        const val PREDICT_DECAY = 0.5
     }
 }

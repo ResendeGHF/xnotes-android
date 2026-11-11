@@ -372,7 +372,7 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             return
         }
         glowPaint.color = color.toArgb()
-        glowPaint.maskFilter = BlurMaskFilter(blurRadius.toFloat().coerceAtLeast(0.1f), blurStyle(inner))
+        glowPaint.maskFilter = cachedBlur(blurRadius.toFloat(), inner)
         canvas.drawPath(path, glowPaint)
         glowPaint.maskFilter = null
     }
@@ -380,7 +380,7 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
     override fun fillCircleGlow(center: Pt, radius: Double, color: Rgba, blurRadius: Double, inner: Boolean) {
         if (blurRadius <= 0.0) return fillCircle(center, radius, color)
         glowPaint.color = color.toArgb()
-        glowPaint.maskFilter = BlurMaskFilter(blurRadius.toFloat().coerceAtLeast(0.1f), blurStyle(inner))
+        glowPaint.maskFilter = cachedBlur(blurRadius.toFloat(), inner)
         canvas.drawCircle(center.x.toFloat(), center.y.toFloat(), radius.toFloat(), glowPaint)
         glowPaint.maskFilter = null
     }
@@ -515,7 +515,11 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         canvas.restore()
         // Math Studio animation filmstrips carry their setup in the PNG itself: badge them so a
         // tap on the badge can reopen the animation. Page-space coords still apply here.
-        if (MathAnimPng.hasSpec(image.file.path)) {
+        // hasSpec stats the file (mtime) per call, so gate it to PNGs first: photos (JPG/WebP)
+        // can never carry the spec and skip the syscall entirely during pan/zoom.
+        val imgPath = image.file.path
+        if ((imgPath.endsWith(".png", ignoreCase = true) || imgPath.endsWith(".PNG")) &&
+            MathAnimPng.hasSpec(imgPath)) {
             val pxPerUnit = minOf(scaleX, scaleY).toDouble().coerceAtLeast(1e-9)
             val (bx, by, br) = MathAnimPng.badge(dest.w, dest.h, pxPerUnit)
             val cx = (dest.left + bx).toFloat()
@@ -646,8 +650,9 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
         val width = if (pen.cosmetic) (pen.width / avgScale) else pen.width
         strokePaint.strokeWidth = width.toFloat()
         // A page-space outward blur for the neon halo on shape outlines (NORMAL = both sides).
+        // Cached: allocating a BlurMaskFilter per stroke per frame is UI-thread churn in pan/zoom.
         strokePaint.maskFilter = if (pen.glowRadius > 0.0) {
-            BlurMaskFilter(pen.glowRadius.toFloat().coerceAtLeast(0.1f), BlurMaskFilter.Blur.NORMAL)
+            cachedBlur(pen.glowRadius.toFloat(), false)
         } else {
             null
         }
@@ -657,7 +662,7 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
             val s = if (pen.cosmetic) 1.0 / avgScale else 1.0
             val on = (pen.dashOn * s).toFloat().coerceAtLeast(0.1f)
             val off = (pen.dashGap * s).toFloat().coerceAtLeast(0.1f)
-            DashPathEffect(floatArrayOf(on, off), (pen.dashPhase * s).toFloat())
+            cachedDash(on, off, (pen.dashPhase * s).toFloat())
         } else {
             null
         }
@@ -701,6 +706,38 @@ class AndroidRenderer(private val canvas: Canvas) : Renderer {
     companion object {
         /** Long-edge cap (device px) for an on-screen image decode, so extreme zoom can't OOM. */
         private const val DECODE_CAP_PX = 4096
+
+        /** BlurMaskFilter cache: one entry per quantized radius + style. `applyPen` and the
+         *  neon glow path run per stroke per frame during pan/zoom; allocating a filter per
+         *  draw is GC churn on the UI thread. Quantized to 0.5px so nearby zooms share. */
+        private val blurCache = android.util.LruCache<Long, BlurMaskFilter>(64)
+        private fun cachedBlur(radiusPx: Float, inner: Boolean): BlurMaskFilter {
+            val q = (radiusPx.coerceAtLeast(0.1f) * 2f).toInt()
+            val key = (q.toLong() shl 1) or (if (inner) 1L else 0L)
+            synchronized(blurCache) {
+                blurCache.get(key)?.let { return it }
+                val f = BlurMaskFilter(
+                    (q.toFloat() / 2f).coerceAtLeast(0.1f),
+                    if (inner) BlurMaskFilter.Blur.INNER else BlurMaskFilter.Blur.NORMAL,
+                )
+                blurCache.put(key, f)
+                return f
+            }
+        }
+        /** DashPathEffect cache: quantized on/off/phase in device px. Same hot path as above. */
+        private val dashCache = android.util.LruCache<Long, DashPathEffect>(64)
+        private fun cachedDash(onPx: Float, offPx: Float, phasePx: Float): DashPathEffect {
+            val onQ = (onPx.coerceAtLeast(0.1f) * 4f).toInt().coerceIn(1, 8192)
+            val offQ = (offPx.coerceAtLeast(0.1f) * 4f).toInt().coerceIn(1, 8192)
+            val phQ = (phasePx * 4f).toInt()
+            val key = (onQ.toLong() shl 32) or (offQ.toLong() shl 16) or (phQ.toLong() and 0xFFFF)
+            synchronized(dashCache) {
+                dashCache.get(key)?.let { return it }
+                val e = DashPathEffect(floatArrayOf(onQ / 4f, offQ / 4f), phQ / 4f)
+                dashCache.put(key, e)
+                return e
+            }
+        }
     }
 }
 

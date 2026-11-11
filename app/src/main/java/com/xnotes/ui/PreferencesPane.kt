@@ -426,7 +426,7 @@ fun PreferencesPane(
                 }
             }
             Text(
-                stringResource(R.string.pref_next_note_named, "${editor.newNoteStem(emptySet())}.pnotes"),
+                stringResource(R.string.pref_next_note_named, "${editor.newNoteStem(emptySet())}.pnote"),
                 color = palette.textDim.toComposeColor(),
                 fontSize = 12.sp,
             )
@@ -696,8 +696,8 @@ fun PreferencesPane(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Chip("pnotes", selected = !canvasTab) { showTab(false) }
-                Chip("pcanvas", selected = canvasTab) { showTab(true) }
+                Chip("pnote", selected = !canvasTab) { showTab(false) }
+                Chip("pcanva", selected = canvasTab) { showTab(true) }
                 Spacer(Modifier.weight(1f))
                 TextButton(
                     onClick = {

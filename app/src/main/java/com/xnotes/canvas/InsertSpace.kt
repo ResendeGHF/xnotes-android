@@ -3,12 +3,15 @@ package com.xnotes.canvas
 import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Pt
 import com.xnotes.core.geometry.Rect
+import com.xnotes.core.history.Command
+import com.xnotes.core.history.CompositeCommand
 import com.xnotes.core.history.History
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.GlueFollow
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Room
 import com.xnotes.core.model.Rooms
+import com.xnotes.core.model.sourceHeight
 import com.xnotes.core.pal.FontSpec
 import com.xnotes.core.pal.Pen
 import com.xnotes.core.pal.Renderer
@@ -45,6 +48,13 @@ internal class InsertSpaceGesture(
 
     /** A remote preview is showing: cleared by the next local press, commit or explicit hide. */
     private var remotePreview = false
+
+    /**
+     * When set, opening room never grows a page past its template size ([Page.sourceHeight]):
+     * whatever no longer fits paginates onto fresh template-sized pages after the gesture lifts.
+     * Closing room is unaffected, and with it off a page grows without bound, as before.
+     */
+    var preservePageSize: Boolean = false
 
     private enum class Kind { WAITING, OPEN, CLOSE, NOTHING }
 
@@ -185,29 +195,54 @@ internal class InsertSpaceGesture(
             drop(page)
             return false
         }
-        val command = when (k) {
-            Kind.OPEN -> if (openSize() >= minRoom()) RoomCut.open(page, press.y, openSize()) else null
-            else -> room?.let { r -> closeStrip(r)?.let { (a, b) -> if (b - a >= MIN_CLOSE_MM * mm()) RoomCut.close(page, r, a, b) else null } }
+        val commands = when (k) {
+            Kind.OPEN -> openCommit(page)
+            else -> room?.let { r ->
+                closeStrip(r)?.let { (a, b) ->
+                    if (b - a >= MIN_CLOSE_MM * mm()) listOf(RoomCut.close(page, r, a, b)!!) else null
+                }
+            }
         }
-        if (command == null) {
+        if (commands.isNullOrEmpty()) {
             drop(page)
             return false
         }
-        history.push(command)
+        history.push(if (commands.size == 1) commands[0] else CompositeCommand(commands))
         state.document.dirty = true
         lifted.clear()
         follow = GlueFollow.NONE
-        state.settleRoom(RoomView(page, view.sideways, view.split, view.resume, view.shift, keep, view.cover))
+        state.settleRoom(RoomView(page, view.sideways, view.split, view.resume, view.shift, keep, state.footprint(page)))
         state.clampScroll()
         requestRender()
         val edit = when (k) {
-            Kind.OPEN -> com.xnotes.canvas.RoomEdit(pageIndex, false, open = true, press.y, press.y + openSize())
+            Kind.OPEN -> {
+                // Peers apply a plain uncapped open, so emit what fits this page: their page
+                // lands identical, and the overflow pages converge through file sync.
+                val cap = RoomCut.nominalHeight(page, state.document)
+                val end = if (preservePageSize) minOf(press.y + openSize(), cap) else press.y + openSize()
+                if (end - press.y > Rooms.EPS) com.xnotes.canvas.RoomEdit(pageIndex, false, open = true, press.y, end) else null
+            }
             else -> room?.let { r ->
                 closeStrip(r)?.let { (a, b) -> com.xnotes.canvas.RoomEdit(pageIndex, r.sideways, open = false, a, b) }
             }
         }
         edit?.let { onLocalCommit?.invoke(it) }
         return true
+    }
+
+    /**
+     * Commit an OPEN drag: normally one [RoomCut.open], or, with [preservePageSize], one open
+     * plus pagination of whatever no longer fits the page's template size onto fresh pages.
+     * Either way a single undo step; the returned commands already ran.
+     */
+    private fun openCommit(page: Page): List<com.xnotes.core.history.Command>? {
+        val size = openSize()
+        if (size < minRoom()) return null
+        if (!preservePageSize) return listOfNotNull(RoomCut.open(page, press.y, size))
+        val doc = state.document
+        val idx = doc.pages.indexOfFirst { it === page }
+        if (idx < 0) return null
+        return RoomCut.openPreservingSize(doc, idx, press.y, size)
     }
 
     /** Give up the drag: nothing changes. */

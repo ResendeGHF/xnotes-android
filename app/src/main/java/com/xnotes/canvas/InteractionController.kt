@@ -112,6 +112,7 @@ import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 import com.xnotes.core.model.sourcePoint
 
 /** The pointer state machine modes (spec 06 §1). */
@@ -1270,6 +1271,7 @@ class InteractionController(
     /** Insert space's press: room opens or closes from here as the pen drags. */
     private fun beginInsertSpace(content: Pt) {
         clearSelection()
+        insertSpace.preservePageSize = configFor(Tool.INSERT_SPACE).preservePageSize
         if (insertSpace.press(content)) mode = PointerMode.ROOM
         requestRender()
     }
@@ -1787,6 +1789,22 @@ class InteractionController(
         cancelDwell()
         dwellEligible = false
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
+        // The UP batch carries the hand's last samples: replay its history like a MOVE so the
+        // committed stroke ends where the pen actually lifted, not where the previous event
+        // left it. At high zoom that last stretch is many device pixels wide and clearly visible.
+        for (h in 0 until e.historySize) {
+            val hp = calLive(
+                e.getHistoricalX(idx, h).toDouble(),
+                e.getHistoricalY(idx, h).toDouble(),
+            )
+            addStrokePoint(
+                hp.x,
+                hp.y,
+                if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0,
+                e.getHistoricalEventTime(h),
+                force = false,
+            )
+        }
         val up = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
             up.x, up.y,
@@ -1797,6 +1815,12 @@ class InteractionController(
         val stroke = liveStroke
         val pi = strokePageIndex
         if (stroke != null && pi != null && !stroke.isEmpty) {
+            // Present the final tail — including the UP samples just added — before the hold
+            // freezes the pad. The front buffer would otherwise hold the stroke without its
+            // last segment through the whole handover, and the tip would visibly pop in a few
+            // frames after the lift instead of already being there. A sticky stroke rides the
+            // ordinary path (the pad has no clip), exactly as during the drag.
+            if (stickyDrawTarget == null) frontInk?.wet(stroke, pi)
             // The pen is up: rebuild with lift-time rules on (a dot-sized calligraphy stroke
             // takes the nib's broad face) before the stroke is committed or held for fading.
             stroke.finished = true
@@ -1832,11 +1856,9 @@ class InteractionController(
                     stickyDrawBefore = null
                 }
                 stickyDrawTarget != null && pi == stickyDrawPage -> {
-                    commitPresentedTip(stroke, e.eventTime)
                     fileStickyStroke(stroke, stickyDrawTarget!!, stickyDrawPage, stickyDrawBefore ?: emptyList())
                 }
                 else -> {
-                    commitPresentedTip(stroke, e.eventTime)
                     pushStrokeEdit(fileStroke(stroke, pi))
                 }
             }
@@ -1861,30 +1883,6 @@ class InteractionController(
             refreshSelectionMenu()
         }
         requestRender()
-    }
-
-    /**
-     * Commit the last presented prediction tip as a real final sample, so ink
-     * shown live never vanishes on commit. Only a forward continuation within
-     * reach is kept: a tip behind the nib (the hand outran an old prediction)
-     * or off to the side is dropped, and the showing frame already covers it.
-     * The tip carries the last real sample's pressure, not the lifting pen's:
-     * that is the width it was shown with.
-     */
-    private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
-        val tip = frontInk?.lastPresentedTip ?: return
-        val n = stroke.sampleCount
-        if (n < 2 || stroke.tool == com.xnotes.core.tools.Tool.DASHED) return
-        val zoom = state.zoom
-        if (!zoom.isFinite() || zoom <= 0.0) return
-        val maxLead = com.xnotes.canvas.StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
-        if (!com.xnotes.canvas.StrokePredictor.shouldCommitTip(
-                stroke.xAt(n - 2), stroke.yAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1),
-                tip.x, tip.y, maxLead,
-            )
-        ) return
-        stroke.addSample(Sample(tip.x, tip.y, stroke.pAt(n - 2), (upTimeMs - strokeStartTimeMs).toDouble()))
     }
 
     /** Pen-up sample reduction: like the capture gate, the tolerance is screen-space — viewport
@@ -5909,8 +5907,10 @@ class InteractionController(
     private fun trackVelocity(vx: Double, vy: Double) {
         val now = System.nanoTime() / 1_000_000L
         val dt = ((now - lastMoveMs).coerceAtLeast(1L)) / 1000.0
-        val inst = Pt((vx - lastPan.x) / dt, (vy - lastPan.y) / dt)
-        panVel = Pt(panVel.x * VEL_SMOOTH + inst.x * (1 - VEL_SMOOTH), panVel.y * VEL_SMOOTH + inst.y * (1 - VEL_SMOOTH))
+        // Single Pt allocation: the instantaneous velocity is folded inline instead of
+        // allocating a throwaway Pt for it. Runs per pointer event during pan/pinch.
+        panVel = Pt(panVel.x * VEL_SMOOTH + ((vx - lastPan.x) / dt) * (1 - VEL_SMOOTH),
+            panVel.y * VEL_SMOOTH + ((vy - lastPan.y) / dt) * (1 - VEL_SMOOTH))
         lastMoveMs = now
     }
 
@@ -6102,24 +6102,34 @@ class InteractionController(
         clearFlipPull() // ...and any paginated edge-pull folds back into the scroll
         pinchStartView = state.snapshotView()
         mode = PointerMode.PINCH
-        val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
-        val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
-        val mid = (a + b) * 0.5
-        pinchInitDist = a.distanceTo(b).coerceAtLeast(1.0)
+        val ax = e.getX(0).toDouble()
+        val ay = e.getY(0).toDouble()
+        val bx = e.getX(1).toDouble()
+        val by = e.getY(1).toDouble()
+        val midX = (ax + bx) * 0.5
+        val midY = (ay + by) * 0.5
+        val dx = ax - bx
+        val dy = ay - by
+        pinchInitDist = sqrt(dx * dx + dy * dy).coerceAtLeast(1.0)
         pinchInitZoom = state.zoom
-        pinchAnchorContent = state.viewportToContent(mid)
-        startTrackingVelocity(mid.x, mid.y)
+        pinchAnchorContent = state.viewportToContent(Pt(midX, midY))
+        startTrackingVelocity(midX, midY)
     }
 
     private fun updatePinch(e: MotionEvent) {
         if (e.pointerCount < 2) return
         onUserMovedView?.invoke()
-        val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
-        val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
-        val dist = a.distanceTo(b)
+        val ax = e.getX(0).toDouble()
+        val ay = e.getY(0).toDouble()
+        val bx = e.getX(1).toDouble()
+        val by = e.getY(1).toDouble()
+        val dx = ax - bx
+        val dy = ay - by
+        val dist = sqrt(dx * dx + dy * dy)
         if (dist < 1e-3) return
-        val mid = (a + b) * 0.5
-        trackVelocity(mid.x, mid.y)
+        val midX = (ax + bx) * 0.5
+        val midY = (ay + by) * 0.5
+        trackVelocity(midX, midY)
         // Zoom lock: pan only (keep the initial zoom).
         val raw = (pinchInitZoom * (dist / pinchInitDist)).coerceIn(state.minZoom, state.maxZoom)
         val wasFit = state.fitWidthActive || state.fitHeightActive
@@ -6137,8 +6147,8 @@ class InteractionController(
             else if (wasFit && !nowFit) onFitWidthReleased()
         }
         if (pinchPanAllowed()) {
-            val targetX = pinchAnchorContent.x * z - mid.x
-            val targetY = pinchAnchorContent.y * z - mid.y
+            val targetX = pinchAnchorContent.x * z - midX
+            val targetY = pinchAnchorContent.y * z - midY
             state.scrollX = targetX
             state.scrollY = targetY
             state.clampScroll()
@@ -6146,7 +6156,7 @@ class InteractionController(
             // clamp rejects scroll for reasons that have nothing to do with reaching past the end.
             if (state.zoomLocked) applyPinchElastic(targetX - state.scrollX, targetY - state.scrollY)
         }
-        lastPan = mid
+        lastPan = Pt(midX, midY)
         onViewChanged() // live zoom %: refresh the toolbar each pinch frame, not just at the end
         requestRender()
     }

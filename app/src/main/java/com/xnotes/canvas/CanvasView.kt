@@ -161,6 +161,9 @@ class CanvasView @JvmOverloads constructor(
 
     @Suppress("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // Warm the frame pipeline on contact: the first MOVE after idle otherwise pays the
+        // Choreographer wake + CPU clock ramp and reads as a hitch. Coalesced to one frame.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) requestRender()
         if (sideButton.onTouch(event)) return true
         if (trackScrollbar(event)) return true
         if (trackFourFingerTap(event)) return true
@@ -515,16 +518,14 @@ class CanvasView @JvmOverloads constructor(
                     }
                 }
                 r.drawRaster(blit.ink, Rect(blit.dx, blit.dy, dw, dh))
-                mainHandler.removeCallbacks(sharpDebounce)
                 // Off the exact rendered view (panned or zoomed): re-render for where we settle.
                 val exact = blit.scale == 1.0 && blit.dx == 0.0 && blit.dy == 0.0
-                if (!exact) mainHandler.postDelayed(sharpDebounce, SHARP_SETTLE_MS)
+                if (!exact) scheduleSharp() else cancelSharp()
             } else {
-                mainHandler.removeCallbacks(sharpDebounce)
-                mainHandler.postDelayed(sharpDebounce, SHARP_SETTLE_MS)
+                scheduleSharp()
             }
         } else if (!st.pageFlipAnimating && st.flipOffsetX == 0.0) {
-            mainHandler.removeCallbacks(sharpDebounce)
+            cancelSharp()
             st.clearSharpViewport()
         }
 
@@ -549,21 +550,29 @@ class CanvasView @JvmOverloads constructor(
                     r.clipRect(pr)
                     r.translate(pr.left, pr.top)
                     st.applyPageTransform(r, page)
+                    // During an active pinch the per-frame cover walks (tapes + stickies over every
+                    // highlighter) are O(H*(T+S)) intersects, and a synchronous ribbon raster hitches
+                    // the gesture. Degraded path: reuse the stale-resolution bitmap as-is and skip
+                    // the cut-outs for the gesture's duration; the exact composite lands on settle.
+                    val degraded = st.zoomingInProgress
                     for ((k, item) in page.items.withIndex()) {
                         if (item is Stroke && item.isHighlighterInk() && !st.isLiftedItem(item) &&
                             item.bounds().intersects(visLocal)
                         ) {
                             // Blit the pre-rendered opaque ribbon at the ink's alpha and blend,
                             // instead of re-tessellating the ribbon every frame.
-                            val hc = st.highlighterCacheFor(item, page)
+                            val hc = if (degraded) st.highlighterCacheForDraw(item, page) ?: continue
+                            else st.highlighterCacheFor(item, page)
                             val faint = if (st.fade?.fades(item) == true) com.xnotes.core.audio.InkFade.ALPHA else 1.0
                             // Composited over the finished page, so tape laid over it has to be cut out by hand.
-                            val covers = coveringTapes(st, page.items, k, item.bounds())
-                            val stickyCovers = coveringStickies(st, page, item.bounds())
-                            val allCovers = when {
-                                covers != null && stickyCovers != null -> covers + stickyCovers
-                                covers != null -> covers
-                                else -> stickyCovers
+                            val allCovers = if (degraded) null else {
+                                val covers = coveringTapes(st, page.items, k, item.bounds())
+                                val stickyCovers = coveringStickies(st, page, item.bounds())
+                                when {
+                                    covers != null && stickyCovers != null -> covers + stickyCovers
+                                    covers != null -> covers
+                                    else -> stickyCovers
+                                }
                             }
                             r.withSave {
                                 if (allCovers != null) r.clipOutPolygons(allCovers)
@@ -755,8 +764,25 @@ class CanvasView @JvmOverloads constructor(
         }
     }
 
-    /** Fires once the view has been still for [SHARP_SETTLE_MS], rendering the sharp viewport. */
-    private val sharpDebounce = Runnable { state?.requestSharpViewport() }
+    /** Fires once the view has been still for [SHARP_SETTLE_MS], rendering the sharp viewport.
+     *  Guarded by [sharpPending] so a continuous pan does not churn remove/post per frame. */
+    private val sharpDebounce = Runnable {
+        sharpPending = false
+        state?.requestSharpViewport()
+    }
+    private var sharpPending = false
+
+    private fun scheduleSharp() {
+        if (sharpPending) return
+        sharpPending = true
+        mainHandler.postDelayed(sharpDebounce, SHARP_SETTLE_MS)
+    }
+
+    private fun cancelSharp() {
+        if (!sharpPending) return
+        mainHandler.removeCallbacks(sharpDebounce)
+        sharpPending = false
+    }
 
     /** Outline [pr] in the device pixel row or column each edge falls in, so zooming never smears or splits it. */
     private fun drawPageBorder(canvas: Canvas, pr: Rect, zoom: Double, origin: Pt) {

@@ -69,11 +69,11 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-/** Thrown when a file is not a valid `.pnotes` bundle. */
+/** Thrown when a file is not a valid `.pnote` bundle. */
 class XNoteFormatException(message: String) : Exception(message)
 
 /**
- * Reads and writes the native `.pnotes` bundle (spec 08): a ZIP with a deflated
+ * Reads and writes the native `.pnote` bundle (spec 08): a ZIP with a deflated
  * `manifest.json` plus stored binary assets (`assets/image-NNN.png`,
  * `assets/source.pdf`). Strokes are kept as editable vector samples; nothing is
  * flattened. Loading is forgiving — unknown item kinds are skipped and missing
@@ -904,7 +904,7 @@ class DocumentCodec(
     }
 
     /**
-     * Read a `.pnotes` from [input]. When [pdfDir] is non-null an embedded source PDF, and when
+     * Read a `.pnote` from [input]. When [pdfDir] is non-null an embedded source PDF, and when
      * [imageDir] is non-null the inserted images, are streamed out to fresh temp files in those dirs
      * (so neither is ever held in RAM) and the caller owns those files' lifetime. When a dir is null
      * that asset is skipped, which is what validation-only reads want.
@@ -2381,7 +2381,7 @@ class DocumentCodec(
     }
 
     companion object {
-        const val FORMAT = "pnotes"
+        const val FORMAT = "pnote"
         /** Manifest formats this build reads: what it writes, plus the legacy `.xnote` mark. */
         private val NOTE_FORMATS = setOf(FORMAT, "xnote")
         const val VERSION = 1

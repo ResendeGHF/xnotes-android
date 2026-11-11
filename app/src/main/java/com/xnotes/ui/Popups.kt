@@ -1278,6 +1278,26 @@ fun MarkupToolPopup(editor: ToolPopupHost, onDismiss: () -> Unit) {
     }
 }
 
+/**
+ * Insert space popup: whether added room may grow the page, or new pages keep its print size.
+ * With the toggle on, a page never grows past its template height ([Page.sourceHeight]): the
+ * overflow paginates onto fresh template-sized pages when the gesture lifts.
+ */
+@Composable
+fun InsertSpaceConfigPopup(editor: ToolPopupHost, onDismiss: () -> Unit) {
+    val base = remember { editor.toolConfig(Tool.INSERT_SPACE) }
+    var preserve by remember { mutableStateOf(base.preservePageSize) }
+
+    fun emit() = editor.updateToolConfig(Tool.INSERT_SPACE, base.copy(preservePageSize = preserve))
+
+    DropdownMenu(expanded = true, onDismissRequest = onDismiss) {
+        Column(Modifier.width(250.dp).padding(horizontal = 14.dp, vertical = 8.dp)) {
+            PopupTitle(stringResource(R.string.title_insert_space))
+            ToggleRow(stringResource(R.string.caption_preserve_page_size), preserve) { preserve = it; emit() }
+        }
+    }
+}
+
 /** A −/value/+ integer stepper row, used by [TableConfigPopup]. */
 @Composable
 private fun TableStepperRow(label: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit) {

@@ -351,7 +351,7 @@ private fun ToolButton(
 ) {
     if (icon == null) return
     val armed = editor.tool == tool
-    val configurable = tool.isStroke || tool == Tool.SHAPE || tool == Tool.ERASER || tool == Tool.SELECT || tool == Tool.LASSO || tool == Tool.TEXT || tool == Tool.TABLE || tool == Tool.MARKUP || tool == Tool.TAPE
+    val configurable = tool.isStroke || tool == Tool.SHAPE || tool == Tool.ERASER || tool == Tool.SELECT || tool == Tool.LASSO || tool == Tool.TEXT || tool == Tool.TABLE || tool == Tool.MARKUP || tool == Tool.TAPE || tool == Tool.INSERT_SPACE
     Box {
         ToolbarIcon(
             icon,
@@ -377,6 +377,7 @@ private fun ToolButton(
                 tool == Tool.TEXT -> TextToolConfigPopup(editor) { setConfigForTool(null) }
                 tool == Tool.MARKUP -> MarkupToolPopup(editor) { setConfigForTool(null) }
                 tool == Tool.TAPE -> TapeConfigPopup(editor) { setConfigForTool(null) }
+                tool == Tool.INSERT_SPACE -> InsertSpaceConfigPopup(editor) { setConfigForTool(null) }
                 else -> ToolConfigPopup(editor, tool) { setConfigForTool(null) }
             }
         }
@@ -395,7 +396,7 @@ private val PAGED_TOOL_KEYS = mapOf(
     Tool.TEXT to "T",
 )
 
-/** Renames the open note: a small prefilled text field; the ".pnotes" suffix is implicit. */
+/** Renames the open note: a small prefilled text field; the ".pnote" suffix is implicit. */
 @Composable
 private fun RenameDialog(initial: String, onConfirm: (String) -> Boolean, onDismiss: () -> Unit) {
     var text by remember { mutableStateOf(initial) }

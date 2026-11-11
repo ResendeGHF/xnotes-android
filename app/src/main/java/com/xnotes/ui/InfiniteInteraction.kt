@@ -9,7 +9,6 @@ import com.xnotes.canvas.HandleId
 import com.xnotes.canvas.InteractionController
 import com.xnotes.canvas.ResizeMath
 import com.xnotes.canvas.SelectionMath
-import com.xnotes.canvas.StrokePredictor
 import com.xnotes.canvas.StylusButtonLatch
 import com.xnotes.core.geometry.Affine
 import com.xnotes.core.geometry.Pt
@@ -46,6 +45,7 @@ import com.xnotes.core.tools.ShapeConfig
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolConfig
 import kotlin.math.exp
+import kotlin.math.sqrt
 
 /** What the current gesture is doing. */
 enum class CanvasPointerMode { IDLE, PAN, PINCH, DRAW, ERASE, SHAPE, TEXT_BOX, BAND, LASSO, MOVE, RESIZE, ROTATE, VERTEX, POLYGON, CONNECT, JOINT, SLIDE, TAPE }
@@ -69,17 +69,14 @@ class InfiniteInteraction(
     private val onViewChanged: () -> Unit = {},
     /** True while a gesture or a glide is live, so the renderer can keep drawing every refresh. */
     private val setInteractive: (Boolean, Boolean) -> Unit = { _, _ -> },
+    /** Real work just ended: keep the engines hot longer, so the next gesture starts at full rate. */
+    private val keepWarm: () -> Unit = {},
     /** The style the armed tool draws with, including the toolbar's active ink colour. */
     private val configFor: (Tool) -> ToolConfig = { ToolConfig() },
     /** The wet stroke changed: re-tessellate it into the dynamic buffer, or clear it when null. */
     private val onWetStroke: (Stroke?) -> Unit = {},
     /** Pen up on a finished stroke: add it to the document and push the undo command. */
     private val onCommitStroke: (Stroke) -> Unit = {},
-    /**
-     * The tip the live feedback last showed past the nib, if any. Read back at
-     * pen-up so the commit keeps shown ink: what you saw is what the stroke keeps.
-     */
-    private val presentedTip: () -> Pt? = { null },
     /** Pen up on a scribble over ink: take what it touched off, the scribble with it. */
     private val onScribbleErase: (Stroke, List<CanvasItem>) -> Unit = { _, _ -> },
     /** Begin an eraser drag; the host owns the document and the undo stack. */
@@ -395,6 +392,11 @@ class InfiniteInteraction(
                 tapDownAt = calDown(e.x.toDouble(), e.y.toDouble(), e.getToolType(0))
                 tapDownTime = e.eventTime
                 tapDownSelected = selection()?.items?.toHashSet() ?: emptySet()
+                // Contact warms the engines before the gesture is even classified: waking the
+                // render thread and ramping clocks overlaps the touch-slop window, so the first
+                // MOVE already runs hot. A tap that becomes ink stops this at once in beginDraw;
+                // anything else keeps it through the gesture.
+                setInteractive(true, true)
                 handleDown(e)
                 downScroll = Pt(viewport.scrollX, viewport.scrollY)
                 downZoom = viewport.zoom
@@ -843,8 +845,12 @@ class InfiniteInteraction(
             }
             else -> Unit
         }
+        val endedTap = mode == CanvasPointerMode.IDLE ||
+            (mode == CanvasPointerMode.PAN && !wasMoving && panWasTap(uv.x, uv.y))
         mode = CanvasPointerMode.IDLE
-        setInteractive(false, true)
+        // A gesture that did real work leaves the engines hot: the next contact usually lands
+        // within a moment and must not pay a cold start. A quiet tap keeps the short linger.
+        if (endedTap) setInteractive(false, true) else keepWarm()
         if (wasMoving) startFling(panVel)
         onViewChanged()
         // Once more now the gesture has settled, so chrome that only shows on a still selection
@@ -1000,6 +1006,22 @@ class InfiniteInteraction(
         cancelDwell()
         dwellEligible = false
         val idx = e.findPointerIndex(drawingPointerId).coerceAtLeast(0)
+        // The UP batch carries the hand's last samples: replay its history like a MOVE so the
+        // committed stroke ends where the pen actually lifted, not where the previous event left
+        // it. At high zoom that last stretch is many device pixels wide and clearly visible.
+        for (h in 0 until e.historySize) {
+            val hp = calLive(
+                e.getHistoricalX(idx, h).toDouble(),
+                e.getHistoricalY(idx, h).toDouble(),
+            )
+            addStrokePoint(
+                hp.x,
+                hp.y,
+                if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0,
+                e.getHistoricalEventTime(h),
+                force = false,
+            )
+        }
         val up = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
         addStrokePoint(
             up.x, up.y,
@@ -1024,40 +1046,18 @@ class InfiniteInteraction(
             onWetStroke(null)
             return
         }
+        // Present the final tail — including the UP samples just added — before the commit
+        // freezes it. The front buffer would otherwise hold the stroke without its last
+        // segment through the whole handover (capture, cover, release), and the tip would
+        // visibly pop in a few frames after the lift instead of already being there.
+        onWetStroke(stroke)
         // The pen is up: rebuild with lift-time rules on before the stroke is committed. The wet
         // buffer is deliberately not cleared here: the commit releases it in the same step, so no
         // frame can land between the two and blink.
         stroke.finished = true
         simplifyForCommit(stroke)
         if (scribbleErase(stroke)) return
-        commitPresentedTip(stroke, e.eventTime)
         onCommitStroke(stroke)
-    }
-
-    /**
-     * Commit the last presented prediction tip as a real final sample, so ink
-     * shown live never vanishes on commit. Only a forward continuation within
-     * reach is kept: a tip behind the nib (the hand outran an old prediction)
-     * or off to the side is dropped, and the showing frame already covers it.
-     * The tip carries the last real sample's pressure, not the lifting pen's:
-     * that is the width it was shown with.
-     */
-    private fun commitPresentedTip(stroke: Stroke, upTimeMs: Long) {
-        val tip = presentedTip() ?: return
-        val n = stroke.sampleCount
-        if (n < 2 || stroke.tool == Tool.DASHED) return
-        val zoom = viewport.zoom
-        if (!zoom.isFinite() || zoom <= 0.0) return
-        val maxLead = StrokePredictor.MAX_LEAD_SCREEN_PX / zoom
-        if (!StrokePredictor.shouldCommitTip(
-                stroke.xAt(n - 2), stroke.yAt(n - 2),
-                stroke.xAt(n - 1), stroke.yAt(n - 1),
-                tip.x, tip.y, maxLead,
-            )
-        ) return
-        stroke.addSample(
-            com.xnotes.core.stroke.Sample(tip.x, tip.y, stroke.pAt(n - 2), (upTimeMs - strokeStartTimeMs).toDouble()),
-        )
     }
 
     /** Scribble to erase: when [stroke] reads as a scribble over ink, erase that instead of committing it. */
@@ -2266,33 +2266,43 @@ class InfiniteInteraction(
         setInteractive(true, true)
         pinchStartScroll = Pt(viewport.scrollX, viewport.scrollY)
         pinchStartZoom = viewport.zoom
-        val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
-        val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
-        val mid = (a + b) * 0.5
-        pinchInitDist = a.distanceTo(b).coerceAtLeast(1.0)
+        val ax = e.getX(0).toDouble()
+        val ay = e.getY(0).toDouble()
+        val bx = e.getX(1).toDouble()
+        val by = e.getY(1).toDouble()
+        val midX = (ax + bx) * 0.5
+        val midY = (ay + by) * 0.5
+        val dx = ax - bx
+        val dy = ay - by
+        pinchInitDist = sqrt(dx * dx + dy * dy).coerceAtLeast(1.0)
         pinchInitZoom = viewport.zoom
-        pinchAnchorContent = viewport.viewportToContent(mid)
-        startTrackingVelocity(mid.x, mid.y)
+        pinchAnchorContent = viewport.viewportToContent(Pt(midX, midY))
+        startTrackingVelocity(midX, midY)
     }
 
     private fun updatePinch(e: MotionEvent) {
         if (e.pointerCount < 2) return
         onUserMovedView()
-        val a = Pt(e.getX(0).toDouble(), e.getY(0).toDouble())
-        val b = Pt(e.getX(1).toDouble(), e.getY(1).toDouble())
-        val dist = a.distanceTo(b)
+        val ax = e.getX(0).toDouble()
+        val ay = e.getY(0).toDouble()
+        val bx = e.getX(1).toDouble()
+        val by = e.getY(1).toDouble()
+        val dx = ax - bx
+        val dy = ay - by
+        val dist = sqrt(dx * dx + dy * dy)
         if (dist < 1e-3) return
-        val mid = (a + b) * 0.5
-        trackVelocity(mid.x, mid.y)
+        val midX = (ax + bx) * 0.5
+        val midY = (ay + by) * 0.5
+        trackVelocity(midX, midY)
         // Zoom about the pinch's own midpoint, and let that midpoint drag the canvas at the same
         // time: the content under the fingers stays under the fingers whether they spread or slide.
         // A locked zoom keeps the zoom it started at, so the pinch is a pan and nothing else.
         viewport.zoom = if (zoomLocked) pinchInitZoom else pinchInitZoom * (dist / pinchInitDist)
         if (pinchPanAllowed()) {
-            viewport.scrollX = pinchAnchorContent.x - mid.x / viewport.zoom
-            viewport.scrollY = pinchAnchorContent.y - mid.y / viewport.zoom
+            viewport.scrollX = pinchAnchorContent.x - midX / viewport.zoom
+            viewport.scrollY = pinchAnchorContent.y - midY / viewport.zoom
         }
-        lastPan = mid
+        lastPan = Pt(midX, midY)
         onViewChanged()
         requestRender()
     }
@@ -2309,9 +2319,9 @@ class InfiniteInteraction(
     private fun trackVelocity(vx: Double, vy: Double) {
         val now = System.nanoTime() / 1_000_000L
         val dt = ((now - lastMoveMs).coerceAtLeast(1L)) / 1000.0
-        val inst = Pt((vx - lastPan.x) / dt, (vy - lastPan.y) / dt)
-        val k = InteractionController.VEL_SMOOTH
-        panVel = Pt(panVel.x * k + inst.x * (1 - k), panVel.y * k + inst.y * (1 - k))
+        // One Pt per event instead of two (no throwaway instantaneous Pt).
+        panVel = Pt(panVel.x * InteractionController.VEL_SMOOTH + ((vx - lastPan.x) / dt) * (1 - InteractionController.VEL_SMOOTH),
+            panVel.y * InteractionController.VEL_SMOOTH + ((vy - lastPan.y) / dt) * (1 - InteractionController.VEL_SMOOTH))
         lastMoveMs = now
     }
 
@@ -2339,9 +2349,10 @@ class InfiniteInteraction(
         onViewChanged()
         requestRender()
         // Nothing bounds an infinite canvas, so a glide only ever ends by running out of speed.
+        // It moved content, so leave the engines hot for the touch that usually follows.
         if (flingVel.length() < InteractionController.FLING_MIN_STOP) {
             flinging = false
-            setInteractive(false, true)
+            keepWarm()
         } else {
             choreographer.postFrameCallback(flingFrame)
         }

@@ -27,7 +27,7 @@ class Document(
     /**
      * Embedded source PDF (for PDF-imported notes), so the note stays self-contained. Held as a
      * **file** on disk, not bytes in RAM: the file is memory-mapped by the renderer and streamed
-     * into/out of the `.pnotes` bundle, so even a very large PDF never has to fit in the heap. The
+     * into/out of the `.pnote` bundle, so even a very large PDF never has to fit in the heap. The
      * file lives in a private cache dir owned by the platform layer (which manages its lifetime).
      */
     var pdfFile: java.io.File? = null,

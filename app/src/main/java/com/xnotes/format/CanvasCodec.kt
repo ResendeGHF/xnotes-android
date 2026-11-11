@@ -59,11 +59,11 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-/** Thrown when a file is not a valid `.pcanvas` bundle. */
+/** Thrown when a file is not a valid `.pcanva` bundle. */
 class XCanvasFormatException(message: String) : Exception(message)
 
 /**
- * Reads and writes the `.pcanvas` bundle: the same shape as `.pnotes` (a ZIP with a deflated
+ * Reads and writes the `.pcanva` bundle: the same shape as `.pnote` (a ZIP with a deflated
  * `manifest.json` plus stored binary assets under `assets/`), but with no page array. The manifest
  * holds one flat item list in content space plus the canvas metadata a page has no place for: the
  * background ruling, the view the canvas was left at, and the named waypoints.
@@ -71,10 +71,10 @@ class XCanvasFormatException(message: String) : Exception(message)
  * This is a sibling of [DocumentCodec], not a mode of it. The two document models are different
  * enough that one codec serving both would branch in every method, and `DocumentCodec`'s emitted
  * bytes are pinned by a test, so its writers must not be refactored into shared helpers. The item
- * serialization here is deliberately identical to `.pnotes`'s, so ink written by either format reads
+ * serialization here is deliberately identical to `.pnote`'s, so ink written by either format reads
  * the same way and a converter would be a straight copy.
  *
- * Loading is forgiving, exactly like `.pnotes`: unknown item kinds are skipped, missing fields take
+ * Loading is forgiving, exactly like `.pnote`: unknown item kinds are skipped, missing fields take
  * model defaults, and new optional fields are written only when set so older readers stay
  * compatible. Strokes stay editable vector samples; nothing is flattened.
  */
@@ -602,7 +602,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
         private set
 
     /**
-     * Read a `.pcanvas` from [input]. When [imageDir] is non-null the inserted images are streamed
+     * Read a `.pcanva` from [input]. When [imageDir] is non-null the inserted images are streamed
      * out to fresh temp files there (never held in RAM) and the caller owns their lifetime; a null
      * dir skips them, which is what a validation-only read wants.
      */
@@ -1631,7 +1631,7 @@ class CanvasCodec(private val imageCodec: ImageCodec, private val textMeasurer: 
     }
 
     companion object {
-        const val FORMAT = "pcanvas"
+        const val FORMAT = "pcanva"
         /** Manifest formats this build reads: what it writes, plus the legacy `.xcanvas` mark. */
         private val CANVAS_FORMATS = setOf(FORMAT, "xcanvas")
         const val VERSION = 1
