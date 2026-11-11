@@ -10,6 +10,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Functions
+import androidx.compose.material.icons.outlined.Tab
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
@@ -63,6 +64,8 @@ fun InfiniteToolbar(
     onConfigureToolbars: () -> Unit = {},
     layout: ToolbarLayout = editor.toolbarLayout,
     geometry: ToolbarGeometry? = null,
+    tabsVisible: Boolean = true,
+    onToggleTabs: () -> Unit = {},
 ) {
     // The stroke tools use the same designed drawables the paged toolbar does, so a pen looks like
     // a pen on either canvas rather than like a generic glyph.
@@ -102,6 +105,7 @@ fun InfiniteToolbar(
                         onChooseTool = { editor.armTool(it) }, onSelectColor = { editor.pickColor(it) },
                     )
                     ToolbarItem.SPACER -> ToolbarSpacer(entry)
+                    ToolbarItem.TABS -> ToolbarIcon(Icons.Outlined.Tab, stringResource(R.string.toolbar_tabs), active = tabsVisible) { onToggleTabs() }
                     ToolbarItem.HOME -> ToolbarIcon(XnotesIcons.prev, stringResource(R.string.toolbar_home)) { onOpenBackstage() }
 
                     // A name has no room down a side rail.

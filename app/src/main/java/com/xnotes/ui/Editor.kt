@@ -909,6 +909,8 @@ class Editor(
     var renderScale by mutableStateOf(1.0)
         private set
     var sidebarVisible by mutableStateOf(false)
+    /** Whether the workspace tab strip is shown; hiding it frees a row for focused work. */
+    var tabsVisible by mutableStateOf(true)
     /** Granted explorer root (a SAF tree URI), or null until the user picks a folder. Shared by
      *  every tab through [LiveSettings], so picking a folder moves the whole app to it. */
     val browseRoot: String? get() = LiveSettings.browseRoot(settingsRepo)
@@ -4127,6 +4129,7 @@ class Editor(
         renderScale = 1.0
         state.renderScale = 1.0
         sidebarVisible = settings.sidebarVisible
+        tabsVisible = settings.tabsVisible
         shapeConfig = settings.shapeConfig
         controller.shapeConfig = settings.shapeConfig
         controller.tableToolDefaults = { com.xnotes.canvas.TableToolDefaults(tableToolCols, tableToolRows, tableToolWidth) }
@@ -11682,6 +11685,12 @@ class Editor(
     fun toggleSidebar() {
         if (!sidebarVisible) sidePanelTab = SidePanelTab.PAGES
         sidebarVisible = !sidebarVisible
+    }
+
+    fun toggleTabs() {
+        tabsVisible = !tabsVisible
+        settings = settings.copy(tabsVisible = tabsVisible)
+        settingsRepo.save(settings)
     }
 
     // --- keyboard shortcuts (spec 11 §2) ---

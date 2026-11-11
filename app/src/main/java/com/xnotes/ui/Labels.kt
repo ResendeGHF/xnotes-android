@@ -84,6 +84,7 @@ val ToolbarItem.labelRes: Int
         ToolbarItem.HOME -> R.string.toolbar_home
         ToolbarItem.TITLE -> R.string.toolbar_title
         ToolbarItem.SIDEBAR -> R.string.toolbar_sidebar
+        ToolbarItem.TABS -> R.string.toolbar_tabs
         ToolbarItem.PEN -> R.string.tool_pen
         ToolbarItem.DASHED -> R.string.tool_dashed
         ToolbarItem.CALLIGRAPHY -> R.string.tool_calligraphy

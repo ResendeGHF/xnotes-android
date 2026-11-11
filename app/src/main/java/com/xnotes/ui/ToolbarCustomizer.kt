@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Functions
+import androidx.compose.material.icons.outlined.Tab
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -747,6 +748,7 @@ internal fun toolbarItemIcon(item: ToolbarItem): ImageVector = when (item) {
     ToolbarItem.HOME -> XnotesIcons.home
     ToolbarItem.TITLE -> XnotesIcons.edit
     ToolbarItem.SIDEBAR -> XnotesIcons.sidebar
+    ToolbarItem.TABS -> Icons.Outlined.Tab
     ToolbarItem.PEN -> ImageVector.vectorResource(R.drawable.ic_stroke_regular)
     ToolbarItem.DASHED -> ImageVector.vectorResource(R.drawable.ic_stroke_dashed)
     ToolbarItem.CALLIGRAPHY -> ImageVector.vectorResource(R.drawable.ic_stroke_calligraphy)

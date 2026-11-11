@@ -74,6 +74,8 @@ data class Settings(
     /** Whether the next launch opens the home screen (true) or the last-open note (false). */
     val startOnHome: Boolean = true,
     val sidebarVisible: Boolean = false,
+    /** Whether the workspace tab strip above the panes is shown (focus mode hides it). */
+    val tabsVisible: Boolean = true,
     /** On wide screens, whether the home sidebar is collapsed to its icon rail. */
     val backstageRail: Boolean = false,
     /** Folders pinned to the home sidebar on this device, in pin order. */
@@ -180,6 +182,7 @@ data class Settings(
             .apply { browseRoot?.let { put("browse_root", it) } }
             .put("start_on_home", startOnHome)
             .put("sidebar_visible", sidebarVisible)
+            .put("tabs_visible", tabsVisible)
             .put("backstage_rail", backstageRail)
             .put("pinned_folders", JSONArray().apply { pinnedFolders.forEach { put(JSONObject().put("uri", it.uri).put("name", it.name)) } })
             .put("explorer_view", explorerView.toJson())
@@ -248,6 +251,7 @@ data class Settings(
                 browseRoot = o.optString("browse_root", "").ifEmpty { null },
                 startOnHome = o.optBoolean("start_on_home", true),
                 sidebarVisible = o.optBoolean("sidebar_visible", false),
+                tabsVisible = o.optBoolean("tabs_visible", true),
                 backstageRail = o.optBoolean("backstage_rail", false),
                 pinnedFolders = pinnedFolders(o.optJSONArray("pinned_folders")),
                 explorerView = o.optJSONObject("explorer_view")?.let { ExplorerView.fromJson(it) } ?: ExplorerView(

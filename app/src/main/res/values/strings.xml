@@ -37,6 +37,7 @@
     <string name="toolbar_home">Home</string>
     <string name="toolbar_title">Title</string>
     <string name="toolbar_sidebar">Sidebar</string>
+    <string name="toolbar_tabs">Tabs</string>
     <string name="undo">Undo</string>
     <string name="redo">Redo</string>
     <string name="toolbar_page_nav">Page nav</string>

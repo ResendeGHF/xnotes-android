@@ -1666,10 +1666,10 @@ private fun EditorScreen(
             contentWindowInsets = contentInsets,
         ) { inner ->
             Column(modifier = Modifier.fillMaxSize().padding(inner).consumeWindowInsets(contentInsets)) {
-                // Keep the bar mounted for as long as a pane is open, even before the first tab
+                // Keep the bar mounted as long as a pane is open, even before the first tab
                 // metadata lands. Adding or removing it later would resize the editor under the
                 // pointer and shift the page/canvas viewport mid-gesture.
-                if (editor.openPanes.isNotEmpty()) {
+                if (editor.openPanes.isNotEmpty() && editor.tabsVisible) {
                     com.xnotes.ui.NoteTabBar(
                         tabs = noteTabs,
                         // Selection follows workspace state immediately on close, even while
@@ -2411,12 +2411,13 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
     var workspaceBounds by remember { mutableStateOf(Rect.Zero) }
     // Single-bar legacy content for the workspace primary.
     val sharedPrimaryBar: @Composable () -> Unit = {
-        WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry)
+        WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry,
+            tabsVisible = editor.tabsVisible, onToggleTabs = editor::toggleTabs)
     }
     // Every further bar renders with the same active editor, so taps, ink and popups follow focus.
     val sharedExtraBar: @Composable (com.xnotes.core.tools.ToolbarBar) -> Unit = { extraBar ->
         WorkspaceToolbar(active, extraBar.layout, actions, occlusion, extraBar.geometry,
-            reportOcclusion = false)
+            reportOcclusion = false, tabsVisible = editor.tabsVisible, onToggleTabs = editor::toggleTabs)
     }
     val sharedBar: @Composable () -> Unit = {
         val primary = sharedPrimary
@@ -2495,7 +2496,8 @@ private fun SplitHost(editor: Editor, actions: PaneActions) {
                         onMoveBar = { id, anchor -> editor.moveToolbarBar(sharedCtx, id, anchor) },
                         primaryContent = {
                             WorkspaceToolbar(active, layout, actions, occlusion, sharedGeometry,
-                                reportOcclusion = false)
+                                reportOcclusion = false,
+                                tabsVisible = editor.tabsVisible, onToggleTabs = editor::toggleTabs)
                         },
                         content = sharedExtraBar,
                         colorCount = active.toolbarColorCount,
@@ -2533,6 +2535,8 @@ private fun WorkspaceToolbar(
     occlusion: com.xnotes.ui.SharedToolbarOcclusion,
     geometry: com.xnotes.core.tools.ToolbarGeometry? = null,
     reportOcclusion: Boolean = true,
+    tabsVisible: Boolean = true,
+    onToggleTabs: () -> Unit = {},
 ) {
     val measured = if (reportOcclusion) {
         Modifier.onGloballyPositioned { occlusion.bar = it.boundsInRoot() }
@@ -2553,7 +2557,10 @@ private fun WorkspaceToolbar(
                         onInsertAudio = { actions.onInsertAudio(editor) },
                         onRecordAudio = { actions.onRecordAudio(editor) },
                         layout = layout,
-                        geometry = geometry)
+                        geometry = geometry,
+                        tabsVisible = tabsVisible,
+                        onToggleTabs = onToggleTabs,
+                    )
                 } else {
                     Toolbar(editor, actions.onToggleFullscreen, actions.onOpenBackstage,
                         onConfigureToolbars = actions.onConfigureToolbars,
@@ -2568,7 +2575,9 @@ private fun WorkspaceToolbar(
                         onRecordAudio = { actions.onRecordAudio(editor) },
                         onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
                         layout = layout,
-                        geometry = geometry)
+                        geometry = geometry,
+                        tabsVisible = tabsVisible,
+                        onToggleTabs = onToggleTabs)
                 }
             }
         }
@@ -2695,6 +2704,8 @@ private fun EditorPane(
                         onOpenMathStudio = actions.onOpenMathStudio,
                         layout = primary?.layout ?: nativeLayout,
                         geometry = primary?.geometry,
+                        tabsVisible = app.tabsVisible,
+                        onToggleTabs = app::toggleTabs,
                     )
                 }
                 val bar: @Composable () -> Unit = {
@@ -2719,6 +2730,8 @@ private fun EditorPane(
                         onOpenMathStudio = actions.onOpenMathStudio,
                         layout = extraBar.layout,
                         geometry = extraBar.geometry,
+                        tabsVisible = app.tabsVisible,
+                        onToggleTabs = app::toggleTabs,
                     )
                 }
                 ToolbarAround(bar, onCover = canvas::setToolbarCover, suppressBar = primary?.geometry?.floating == true, barLayout = primary?.layout, barGeometry = primary?.geometry, workspace = activeWorkspace, dockedContent = secondaryBar) { floatingBar ->
@@ -2831,6 +2844,8 @@ private fun EditorPane(
                         onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
                         layout = primary?.layout ?: nativeLayout,
                         geometry = primary?.geometry,
+                        tabsVisible = app.tabsVisible,
+                        onToggleTabs = app::toggleTabs,
                     ) }
                 }
                 val bar: @Composable () -> Unit = {
@@ -2860,6 +2875,8 @@ private fun EditorPane(
                         onInsertNoteLink = { actions.onInsertNoteLink(editor, null) },
                         layout = extraBar.layout,
                         geometry = extraBar.geometry,
+                        tabsVisible = app.tabsVisible,
+                        onToggleTabs = app::toggleTabs,
                     )
                 }
                 ToolbarAround(bar, onCover = editor::setToolbarCover, suppressBar = primary?.geometry?.floating == true, barLayout = primary?.layout, barGeometry = primary?.geometry, workspace = activeWorkspace, dockedContent = secondaryBar) { floatingBar ->

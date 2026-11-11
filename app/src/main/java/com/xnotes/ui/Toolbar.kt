@@ -32,6 +32,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Functions
+import androidx.compose.material.icons.outlined.Tab
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -111,6 +112,8 @@ fun Toolbar(
     onConfigureToolbars: () -> Unit = {},
     layout: ToolbarLayout = editor.toolbarLayout,
     geometry: ToolbarGeometry? = null,
+    tabsVisible: Boolean = true,
+    onToggleTabs: () -> Unit = {},
 ) {
     // The five stroke tools use the designed vector drawables (res/drawable/ic_stroke_*),
     // tinted at the call site like every other icon; the rest use the built-in line set.
@@ -160,6 +163,8 @@ fun Toolbar(
         onInsertAudio = onInsertAudio,
         onRecordAudio = onRecordAudio,
         onInsertNoteLink = onInsertNoteLink,
+        tabsVisible = tabsVisible,
+        onToggleTabs = onToggleTabs,
     )
     if (editor.readerMode) {
         // The file reader's bar for a note: where you are and how you see it, and the way back to editing.
@@ -232,6 +237,8 @@ private fun ToolbarItemView(
     onInsertAudio: () -> Unit,
     onRecordAudio: () -> Unit,
     onInsertNoteLink: () -> Unit = {},
+    tabsVisible: Boolean = true,
+    onToggleTabs: () -> Unit = {},
 ) {
     when (val item = entry.item) {
         // Canvas-only items; a stored paged layout can never hold one, so nothing is drawn.
@@ -264,6 +271,8 @@ private fun ToolbarItemView(
             ToolbarIcon(Icons.Outlined.AutoStories, stringResource(R.string.tool_reader)) { editor.enterReader() }
         ToolbarItem.SIDEBAR ->
             ToolbarIcon(XnotesIcons.sidebar, stringResource(R.string.side_panel), active = editor.sidebarVisible, shortcut = Keys.SIDEBAR) { editor.toggleSidebar() }
+        ToolbarItem.TABS ->
+            ToolbarIcon(Icons.Outlined.Tab, stringResource(R.string.toolbar_tabs), active = tabsVisible) { onToggleTabs() }
 
         ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
         ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.ERASER, ToolbarItem.PAN,

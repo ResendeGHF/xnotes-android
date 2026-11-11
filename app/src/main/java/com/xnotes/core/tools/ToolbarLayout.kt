@@ -13,6 +13,8 @@ enum class ToolbarItem(val id: String) {
     HOME("home"),
     TITLE("title"),
     SIDEBAR("sidebar"),
+    /** Toggles the workspace tab strip above the panes (focus mode hides it). */
+    TABS("tabs"),
     PEN("pen"),
     DASHED("dashed"),
     CALLIGRAPHY("calligraphy"),
@@ -365,6 +367,7 @@ data class ToolbarLayout(
         /** Later-added items that belong beside an existing one in stored layouts. */
         private val INSERT_AFTER = mapOf(
             ToolbarItem.UNIFIED_PEN to ToolbarItem.HIGHLIGHTER,
+            ToolbarItem.TABS to ToolbarItem.SIDEBAR,
             ToolbarItem.TEXT_BOX to ToolbarItem.TEXT,
             ToolbarItem.VIEW to ToolbarItem.STYLES,
             ToolbarItem.MARGINS to ToolbarItem.STYLES,
@@ -385,7 +388,7 @@ data class ToolbarLayout(
          * drawn as a dead chip.
          */
         val CANVAS_ITEMS: Set<ToolbarItem> = setOf(
-            ToolbarItem.HOME, ToolbarItem.TITLE,
+            ToolbarItem.HOME, ToolbarItem.TITLE, ToolbarItem.TABS,
             ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
             ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
             ToolbarItem.PAN, ToolbarItem.SELECT, ToolbarItem.LASSO, ToolbarItem.WAND,
@@ -403,7 +406,7 @@ data class ToolbarLayout(
         /** Mirrors the hardcoded bar exactly (see Toolbar.kt) so existing users see no change. */
         val DEFAULT: ToolbarLayout = of(
             listOf(ToolbarItem.HOME, ToolbarItem.TITLE),
-            listOf(ToolbarItem.SIDEBAR),
+            listOf(ToolbarItem.SIDEBAR, ToolbarItem.TABS),
             listOf(
                 ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
@@ -420,7 +423,7 @@ data class ToolbarLayout(
 
         /** Mirrors the hardcoded canvas bar (see InfiniteToolbar.kt). */
         val CANVAS_DEFAULT: ToolbarLayout = of(
-            listOf(ToolbarItem.HOME, ToolbarItem.TITLE),
+            listOf(ToolbarItem.HOME, ToolbarItem.TITLE, ToolbarItem.TABS),
             listOf(
                 ToolbarItem.PEN, ToolbarItem.DASHED, ToolbarItem.CALLIGRAPHY, ToolbarItem.SPEED,
                 ToolbarItem.TAPER, ToolbarItem.HIGHLIGHTER, ToolbarItem.UNIFIED_PEN, ToolbarItem.ERASER,
@@ -435,7 +438,11 @@ data class ToolbarLayout(
         )
 
         private fun of(vararg groups: List<ToolbarItem>): ToolbarLayout =
-            ToolbarLayout(groups.map { g -> ToolbarSection(g.map { ToolbarEntry(it, visible = it != ToolbarItem.UNIFIED_PEN) }) })
+            ToolbarLayout(groups.map { g ->
+                ToolbarSection(g.map {
+                    ToolbarEntry(it, visible = it != ToolbarItem.UNIFIED_PEN && it != ToolbarItem.TABS)
+                })
+            })
 
         /**
          * Build from raw (id, visible) pairs per section as read from storage: ids outside [among]
