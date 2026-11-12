@@ -613,6 +613,7 @@ private fun EditorScreen(
             val inst = mathInstanceItem
             val host = mathInstanceHost
             if (inst != null && host != null) {
+                if (!host.holdsMathInstance(inst)) return
                 if (host.noteOpen && host.openDocumentUri == mathStudioUri) {
                     host.storeMathInstanceJson(inst, json)
                 } else if (mathStudioUri == null && host === mathStudioPane && host.state.document === mathStudioDoc) {
@@ -649,6 +650,13 @@ private fun EditorScreen(
         // A Math instance icon opens its private workspace.
         editor.onMathInstanceOpen = { item -> openMathInstanceStudio(item, editor) }
         editor.secondary?.onMathInstanceOpen = { item -> openMathInstanceStudio(item, editor.secondary!!) }
+        fun checkStaleInstance() {
+            val inst = mathInstanceItem
+            val host = mathInstanceHost
+            if (inst != null && host != null && !host.holdsMathInstance(inst)) closeMathStudio()
+        }
+        editor.onMathInstanceStale = { checkStaleInstance() }
+        editor.secondary?.onMathInstanceStale = { checkStaleInstance() }
 
         // Which pane a "Save as" writes: the focused one at the moment the picker opened.
         var savePane by remember { mutableStateOf(editor) }

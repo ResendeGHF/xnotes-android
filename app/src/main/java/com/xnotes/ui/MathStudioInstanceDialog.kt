@@ -32,6 +32,10 @@ import com.xnotes.core.model.Rgba
 @Composable
 fun MathStudioInstanceDialog(editor: Editor) {
     val target = editor.mathInstanceEditTarget ?: return
+    if (!editor.holdsMathInstance(target)) {
+        androidx.compose.runtime.LaunchedEffect(target) { editor.dismissMathInstanceEdit() }
+        return
+    }
     var name by remember(target) { mutableStateOf(target.name) }
     var color by remember(target) { mutableStateOf(target.color) }
     AlertDialog(

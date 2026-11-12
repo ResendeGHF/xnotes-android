@@ -108,6 +108,17 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     val history = History()
 
+    /** Host hook to clear a stale Math instance edit dialog that pointed at a now-deleted icon. */
+    var onCheckStaleMathInstance: (() -> Unit)? = null
+
+    private fun commandTouchesMathInstance(cmd: Command): Boolean {
+        if (cmd.added().any { it is com.xnotes.core.model.MathStudioInstanceItem }) return true
+        val touched = runCatching { cmd.touched { null } }.getOrNull()
+        if (touched?.any { it.second is com.xnotes.core.model.MathStudioInstanceItem } == true) return true
+        if (cmd is CompositeCommand && cmd.commands.any { commandTouchesMathInstance(it) }) return true
+        return false
+    }
+
     val view = InfiniteCanvasView(appContext)
 
     /** The front buffer wet ink goes into, above [view] and transparent whenever no pen is down. */
@@ -653,7 +664,10 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         scene.onOutOfMemory = { short -> view.post { outOfMemory = short } }
         document.listener = modelListener
         // Whatever is added while this canvas records takes the recording's moment.
-        history.onPush = { command -> AudioRecording.stamp(this, command.added()) }
+        history.onPush = { command ->
+            AudioRecording.stamp(this, command.added())
+            if (commandTouchesMathInstance(command)) onCheckStaleMathInstance?.invoke()
+        }
     }
 
     /**
@@ -3109,6 +3123,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     }
 
     fun storeMathInstanceJson(item: com.xnotes.core.model.MathStudioInstanceItem, json: String) {
+        if (!document.containsRef(item)) return
         if (item.studioJson == json) return
         item.studioJson = json
         markDirty()
@@ -3860,20 +3875,24 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
     // reason, so both surfaces behave alike.
     fun undo() {
         commitText() // a label being typed is the first thing undo takes back
+        val cmd = history.nextUndo
         history.undo()
         interaction.clearSelection()
         markDirty()
         refresh()
         view.publish()
+        if (cmd != null && commandTouchesMathInstance(cmd)) onCheckStaleMathInstance?.invoke()
     }
 
     fun redo() {
         commitText()
+        val cmd = history.nextRedo
         history.redo()
         interaction.clearSelection()
         markDirty()
         refresh()
         view.publish()
+        if (cmd != null && commandTouchesMathInstance(cmd)) onCheckStaleMathInstance?.invoke()
     }
 
     private fun onViewChanged() {

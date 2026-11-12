@@ -37,7 +37,13 @@ import com.xnotes.core.history.DeletePage
 import com.xnotes.core.history.EraseItems
 import com.xnotes.core.history.History
 import com.xnotes.core.history.InsertItem
+import com.xnotes.core.history.MoveItems
 import com.xnotes.core.history.MovePages
+import com.xnotes.core.history.ReorderItems
+import com.xnotes.core.history.ReplacePageItems
+import com.xnotes.core.history.TransferItems
+import com.xnotes.core.history.TransformItems
+import com.xnotes.core.model.NoteLinkItem
 import com.xnotes.core.history.ReshapePages
 import com.xnotes.core.history.RefillShapes
 import com.xnotes.core.history.RestyleItems
@@ -1537,6 +1543,7 @@ class Editor(
                 requestStickyColor(item, anchor, onCanvas = true)
             }
             it.onMathInstanceOpen = { item -> openMathInstance(item) }
+            it.onCheckStaleMathInstance = { clearStaleMathInstanceTargets() }
             it.view.onTwoFingerTap = { dispatchTapGesture(preferences.twoFingerTap) }
             it.view.onThreeFingerTap = { dispatchTapGesture(preferences.threeFingerTap) }
             it.view.sideButton.onClick = { at -> dispatchTapGesture(preferences.stylusButtonTap, at) }
@@ -2124,6 +2131,7 @@ class Editor(
     }
 
     fun storeMathInstanceJson(item: com.xnotes.core.model.MathStudioInstanceItem, json: String) {
+        if (!holdsMathInstance(item)) return
         if (onCanvasMathInstance(item)) {
             infiniteOrNull?.storeMathInstanceJson(item, json)
         } else {
@@ -2135,6 +2143,14 @@ class Editor(
     fun holdsMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem): Boolean =
         if (canvasOpen) infiniteOrNull?.document?.items?.any { it === item } == true
         else state.document.pages.any { p -> p.items.any { it === item } }
+
+    private fun clearStaleMathInstanceTargets() {
+        mathInstanceEditTarget?.let { if (!holdsMathInstance(it)) mathInstanceEditTarget = null }
+        onMathInstanceStale?.invoke()
+    }
+
+    /** Host hook to immediately close an open instance studio whose icon was just deleted. */
+    var onMathInstanceStale: (() -> Unit)? = null
 
     /** What a tap lands on: [markup] on note page [page], and the tap in its page space when it is on the markup itself. */
     private class MarkupHit(val page: Int, val markup: TextMarkup, val local: Pt?)
@@ -2749,7 +2765,11 @@ class Editor(
         }
         controller.onUserMovedView = { AudioPlayback.userMoved(this) }
         // Whatever is added while this note records takes the recording's moment.
-        history.onPush = { command -> AudioRecording.stamp(this, command.added()) }
+        history.onPush = { command ->
+            AudioRecording.stamp(this, command.added())
+            reindexLinksIfNeeded(command)
+            clearStaleMathInstanceTargets()
+        }
         controller.onLinkTap = onLinkTap@{ pageIndex, pageLocal ->
             flowLinkAt(pageIndex, pageLocal)?.let {
                 openUrl(it)
@@ -8308,6 +8328,30 @@ class Editor(
         }
     }
 
+    /** Immediately reindex when a link is added/removed/moved so deletion clears its graph edge without waiting for autosave. */
+    private fun reindexLinksIfNeeded(cmd: Command?) {
+        if (cmd == null) return
+        val uri = state.document.path ?: return
+        if (openVaultId != null) return
+        if (!commandTouchesLinks(cmd)) return
+        indexLinks(uri, state.document)
+    }
+
+    private fun commandTouchesLinks(cmd: Command): Boolean {
+        if (cmd.added().any { it is NoteLinkItem }) return true
+        // EraseItems etc. expose removed items via touched; try both locate strategies.
+        val touchedViaCurrent = runCatching {
+            cmd.touched { item -> state.document.pages.firstOrNull { p -> p.items.any { it === item } } }
+        }.getOrNull()
+        if (touchedViaCurrent?.any { it.second is NoteLinkItem } == true) return true
+        val touchedRaw = runCatching { cmd.touched { null } }.getOrNull()
+        if (touchedRaw?.any { it.second is NoteLinkItem } == true) return true
+        // Page-level edits can shift sourcePage indices or remove pages that held links.
+        if (cmd is AddPage || cmd is DeletePage || cmd is MovePages || cmd is ReplacePageItems || cmd is ReorderItems || cmd is MoveItems || cmd is TransferItems || cmd is TransformItems) return true
+        if (cmd is CompositeCommand && cmd.commands.any { commandTouchesLinks(it) }) return true
+        return false
+    }
+
     /**
      * Best-effort memory-only vault check for a link target (safe on any thread): unknown
      * cache entries stay visible here, and the lock-time purge removes any rows that slipped in.
@@ -10590,6 +10634,8 @@ class Editor(
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
         if (syncing) emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
+        reindexLinksIfNeeded(command)
+        clearStaleMathInstanceTargets()
     }
 
     fun redo() {
@@ -10607,6 +10653,8 @@ class Editor(
         bakeMarkups(command)
         afterHistory(pagesBefore, viewed, regions = spanning(was, touchedRegions(command)), reshaped = command?.reshaped().orEmpty())
         if (syncing) emitUndoRedoSync(itemsBefore, markupsBefore, pagesBefore, command)
+        reindexLinksIfNeeded(command)
+        clearStaleMathInstanceTargets()
     }
 
     /**
