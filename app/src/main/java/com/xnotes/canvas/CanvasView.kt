@@ -414,14 +414,13 @@ class CanvasView @JvmOverloads constructor(
         val room = st.roomView
 
         val r = AndroidRenderer(canvas).apply { mathPace = MathRendering.Pace.LIVE }
-        val hasPrediction = st.predictedPanX != 0.0 || st.predictedPanY != 0.0 || st.predictedZoomFactor != 1.0
-        val origin = if (hasPrediction) st.predictedOrigin() else st.origin()
-        val effZoom = if (hasPrediction) st.zoom * st.predictedZoomFactor else st.zoom
+        val origin = st.origin()
+        val effZoom = st.zoom
         r.save()
         r.translate(origin.x, origin.y)
         r.scale(effZoom, effZoom)
 
-        val visible = if (hasPrediction) st.predictedVisibleContentRect() else st.visibleContentRect()
+        val visible = st.visibleContentRect()
         // Paginated mode shows only the current row; neighbours never draw. Iterate the range
         // directly instead of scanning every page on every animation frame in a large document.
         val drawable = st.drawablePageRange()
