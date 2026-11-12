@@ -1702,7 +1702,7 @@ class Editor(
                         }
                     }
                     backup?.delete()
-                    rememberStamp(uri, java.io.FileInputStream(tmp).use { com.xnotes.format.ZipTail.read(it.channel) })
+                    rememberStamp(uri, entriesIn(tmp))
                     true
                 } finally {
                     tmp.delete()
@@ -8082,6 +8082,10 @@ class Editor(
         }
     }.getOrNull()
 
+    /** The zip directory of [temp], the file a save was just copied from, or null when it cannot be read. */
+    private fun entriesIn(temp: java.io.File): com.xnotes.format.ZipTail.Directory? =
+        runCatching { java.io.FileInputStream(temp).use { com.xnotes.format.ZipTail.read(it.channel) } }.getOrNull()
+
     /**
      * Keep what [uri] holds now as the file this editor knows: the stamp its provider reports, and
      * its zip directory, which is [entries] when the caller has just written the file and is read
@@ -8278,7 +8282,7 @@ class Editor(
                 state.lastSaveManifestBytes = timing.manifestBytes
                 state.lastSaveBytes = tmp.length() // live file size for the debug overlay
                 // The stamp is read back from the provider; the directory is the temp's, whose bytes the file now is.
-                rememberStamp(uri, java.io.FileInputStream(tmp).use { com.xnotes.format.ZipTail.read(it.channel) })
+                rememberStamp(uri, entriesIn(tmp))
                 indexLinks(uri, doc)
                 true
             } finally {
@@ -8335,13 +8339,14 @@ class Editor(
         return copyFileToUri(backup, uri)
     }
 
-    /** Copy a fully-written temp over [uri] ("wt" truncates first); false when it cannot be opened or copied. */
-    private fun copyFileToUri(file: java.io.File, uri: String): Boolean = runCatching {
-        val out = appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")
-            ?: return false
-        out.use { java.io.FileInputStream(file).use { input -> input.copyTo(it, copyBuffer) } }
-        true
-    }.getOrDefault(false)
+    /**
+     * Copy a fully-written temp over [uri]. Opening the destination truncates it, so the temp is
+     * opened first; a missing temp leaves the note untouched. See [com.xnotes.core.util.copyOver].
+     */
+    private fun copyFileToUri(file: java.io.File, uri: String): Boolean =
+        com.xnotes.core.util.copyOver(file, copyBuffer) {
+            appContext.contentResolver.openOutputStream(android.net.Uri.parse(uri), "wt")
+        }
 
     /**
      * Refresh the graph index for a note just saved: its outgoing links, in page
