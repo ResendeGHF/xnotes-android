@@ -15,6 +15,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.lifecycle.lifecycleScope
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -198,6 +199,15 @@ class MainActivity : ComponentActivity() {
         // or from Recents after the process died or the app was updated; it was handled the first time.
         val rebuilt = savedInstanceState != null || (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
         if (!rebuilt) pendingPdfImport = pdfImportUri(intent)
+        // An editor that a destroyed activity left behind may still be saving. This activity's is
+        // built once that is done; on a cold start nothing is pending and the content is set at once.
+        lifecycleScope.launch {
+            com.xnotes.ui.RetiredEditors.inProcess.await()
+            compose()
+        }
+    }
+
+    private fun compose() {
         setContent {
             val context = LocalContext.current
             // One editor now hosts every tab; switching a tab swaps the document in its active pane.
@@ -320,6 +330,11 @@ class MainActivity : ComponentActivity() {
         super.onConfigurationChanged(newConfig)
         val night = newConfig.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK
         editor?.onSystemDarkModeChanged(night == android.content.res.Configuration.UI_MODE_NIGHT_YES)
+    }
+
+    override fun onDestroy() {
+        editor?.retire() // the next activity waits for the saves this one began on pause
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

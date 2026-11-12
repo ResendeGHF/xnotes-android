@@ -453,9 +453,10 @@ class Editor(
         private set
 
     /** Prepares one of the shared temp dirs. The launch purge drops temps orphaned by a crash, which
-     *  is safe for the primary editor because no real note is open yet at construction. A secondary
-     *  pane is built mid-session, with the primary's note already live in these dirs, so it only
-     *  takes the handle. */
+     *  is safe for the primary editor because no real note is open yet at construction: an activity
+     *  rebuilt in a living process waits out the editor it replaces first ([RetiredEditors]). A
+     *  secondary pane is built mid-session, with the primary's note already live in these dirs, so
+     *  it only takes the handle. */
     private fun tempDir(name: String): java.io.File =
         java.io.File(appContext.filesDir, name).apply {
             mkdirs()
@@ -827,8 +828,10 @@ class Editor(
     /** When non-null, the current note lives in the granted folder and autosaves to this URI. */
     var autosaveUri: String? = null
         private set
-    private val autosaveScope = kotlinx.coroutines.MainScope()
-    private val purgeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+    /** Parent of everything this editor runs in the background; [RetiredEditors] completes it once the editor is retired. */
+    private val background = kotlinx.coroutines.SupervisorJob()
+    private val autosaveScope = kotlinx.coroutines.CoroutineScope(background + kotlinx.coroutines.Dispatchers.Main)
+    private val purgeScope = kotlinx.coroutines.CoroutineScope(background + kotlinx.coroutines.Dispatchers.IO)
 
     /** The note autosave's debounce timer. Cancelled freely: nothing has been written yet. */
     private var noteDebounceJob: kotlinx.coroutines.Job? = null
@@ -4616,6 +4619,16 @@ class Editor(
         saveSession()
         saveCanvasSession()
         secondary?.persist() // the other pane's note has to be flushed on pause too
+    }
+
+    /**
+     * The activity that owned this editor is gone. Its background work, the save and the session
+     * write from its pause among it, is handed to [RetiredEditors]: the next activity lets it run
+     * to its end, closes it to anything new, and only then builds its own editor.
+     */
+    fun retire() {
+        secondary?.retire()
+        RetiredEditors.inProcess.add(background)
     }
 
     /** Persist the open canvas, or clear the stored one when a canvas is not what is open.
