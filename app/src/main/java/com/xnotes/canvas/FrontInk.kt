@@ -76,6 +76,10 @@ class FrontInk(
     /** The tail as it was last meshed, which a stroke joining this one has to settle first. */
     private var tailPart: MeshPart? = null
 
+    /** Point count the current [tailPart] was meshed from; guards against clearing the tail
+     *  when a degenerate end segment meshes to nothing while the stroke only grew. */
+    private var tailPointCount = 0
+
     /** [tailPart] of the stroke just committed, waiting for a joiner or for the handover. */
     private var handoverTail: MeshPart? = null
 
@@ -164,9 +168,21 @@ class FrontInk(
         }
         val tailFrom = (meshed - 1).coerceAtLeast(0)
         val tail = ItemMesher.meshRun(stroke, ribbon, tailFrom, ribbon.pointCount - tailFrom, arc)
-        tailPart = tail
-        val tailParts = if (tail == null) emptyList() else listOf(if (invert) tail.inverted() else tail)
-        pad.setTail(tailParts)
+        if (tail != null) {
+            tailPart = tail
+            tailPointCount = ribbon.pointCount
+            val tailParts = listOf(if (invert) tail.inverted() else tail)
+            pad.setTail(tailParts)
+        } else if (ribbon.pointCount < tailPointCount) {
+            // The stroke shrank under its last present (edit/undo mid-gesture): the old tail
+            // no longer belongs to it and must go. Otherwise keep showing the last good
+            // tail: a degenerate end segment (identical points, zero pressure on lift)
+            // meshes to nothing, and clearing would blink the tip out until the canvas
+            // rebuild lands, which is exactly the end-of-stroke lag.
+            tailPart = null
+            tailPointCount = 0
+            pad.setTail(emptyList())
+        }
     }
 
     /** lightness-invert a meshed run for color inversion (alpha untouched, glow with it). */
@@ -198,6 +214,7 @@ class FrontInk(
         decided = false
         runPoints = WET_RUN_POINTS
         tailPart = null
+        tailPointCount = 0
         // Called on the way into every stroke as well, where the pad is not live and a tail may be
         // waiting for this one to join it. Only a stroke actually being dropped goes further.
         if (!live) return
@@ -379,6 +396,11 @@ class FrontInk(
         // The tail was never settled into a run, so a stroke that joins this one has to do it.
         handoverTail = tailPart
         tailPart = null
+        tailPointCount = 0
+        // Present anything still queued before ending the session: the final UP present is
+        // posted right before this end, so without a flush it loses the race and the tip
+        // only appears with the canvas rebuild. Bounded; the canvas path covers a timeout.
+        pad.flushTail()
         pad.freeze()
         view.setUnbufferedStylus(false)
     }

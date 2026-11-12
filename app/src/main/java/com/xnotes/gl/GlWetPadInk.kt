@@ -55,6 +55,9 @@ class GlWetPadInk {
 
     private val pending = ConcurrentLinkedQueue<Batch>()
 
+    /** Whether a tail or run batch is still waiting for a present (main thread). */
+    val hasPending: Boolean get() = !pending.isEmpty()
+
     @Volatile
     private var session: Session? = null
 

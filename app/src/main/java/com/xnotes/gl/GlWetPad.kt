@@ -452,6 +452,27 @@ class GlWetPad(context: Context, onTop: Boolean = false) : SurfaceView(context),
         if (dirty.compareAndSet(false, true)) post { render() }
     }
 
+    /**
+     * Present anything still queued, waiting boundedly for the pad thread to run it.
+     * Called at lift before the session ends: the final tail's present is posted right
+     * before the end, so without this it loses the race and is dropped, and the tip
+     * only appears when the canvas rebuild lands. A timeout keeps a wedged pad thread
+     * from ever blocking the UI thread; the canvas path covers that case as before.
+     */
+    fun flushTail(timeoutMs: Long = 50L) {
+        val h = handler ?: return
+        if (!ink.hasPending) return
+        val done = java.util.concurrent.CountDownLatch(1)
+        h.post {
+            try {
+                render()
+            } finally {
+                done.countDown()
+            }
+        }
+        runCatching { done.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) }
+    }
+
     private fun post(work: () -> Unit) {
         handler?.post(work)
     }
