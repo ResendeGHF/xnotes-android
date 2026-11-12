@@ -1436,6 +1436,7 @@ class InteractionController(
             PointerMode.DRAW -> endDraw(e)
             PointerMode.PAN -> {
                 mode = PointerMode.IDLE
+                state.clearPredictedPan()
                 val upViewport = up
                 val tap = !downStoppedFling && upViewport.distanceTo(panDownViewport) <= TAP_SLOP
                 if (tap) onTap?.invoke(upViewport)
@@ -1651,8 +1652,13 @@ class InteractionController(
         tipPredictor.record(cp.x, cp.y, cPressure, e.eventTime.toDouble())
         if (stickyDrawTarget == null) {
             // Display-only lookahead: replaced by the next real sample, never committed.
-            val tip = if (liveStroke?.tool == Tool.DASHED) null
-            else tipPredictor.predict(TIP_MAX_LEAD_PX)?.let { state.viewportToContent(Pt(it.x, it.y)) }
+            // TipPredictor works in view pixels; the front pad tail is in page-local
+            // coordinates, so convert view→content→pageLocal to stay contiguous.
+            val tip = if (liveStroke?.tool == Tool.DASHED) null else tipPredictor
+                .predict(TIP_MAX_LEAD_PX)?.let { p ->
+                    val pi = strokePageIndex ?: return@let null
+                    state.toPageSpace(pi, state.viewportToContent(Pt(p.x, p.y)))
+                }
             frontInk?.wet(liveStroke, strokePageIndex, tip)
         }
         requestRender()
@@ -5787,6 +5793,7 @@ class InteractionController(
         panDownViewport = Pt(vx, vy)
         panFromPenButton = fromPenButton
         startTrackingVelocity(vx, vy)
+        state.clearPredictedPan()
     }
 
     private fun extendPan(vx: Double, vy: Double) {
@@ -5797,6 +5804,7 @@ class InteractionController(
         if (!state.verticalScroll) {
             extendPanPaginated(dx, dy)
             lastPan = Pt(vx, vy)
+            updateGesturePrediction()
             onViewChanged()
             requestRender()
             return
@@ -5827,6 +5835,7 @@ class InteractionController(
             updateOverscrollArmed()
         }
         lastPan = Pt(vx, vy)
+        updateGesturePrediction()
         onViewChanged()
         requestRender()
     }
@@ -5888,6 +5897,7 @@ class InteractionController(
 
     /** Release a paginated drag without changing the vertical-scrolling gesture path. */
     private fun endPanPaginated() {
+        state.clearPredictedPan()
         val rows = state.rowRanges().size
         val pull = state.flipOffsetX
         // A finger that stopped before lifting has no flick left, however fast it moved earlier.
@@ -5993,6 +6003,42 @@ class InteractionController(
         panVel = Pt.ZERO
     }
 
+    private fun updateGesturePrediction() {
+        // View-px scroll leads one frame ahead, gated by speed so a still finger
+        // does not creep and slow pans don't overshoot.
+        val speedPxPerMs = kotlin.math.hypot(panVel.x, panVel.y) / 1000.0
+        if (!speedPxPerMs.isFinite() || speedPxPerMs < 0.08) {
+            state.clearPredictedPan()
+            return
+        }
+        val density = state.devicePxPerDp
+        val speedDpPerMs = if (density.isFinite() && density > 0) speedPxPerMs / density else speedPxPerMs
+        // Finger speed 0..2 dp/ms maps to 0..1 confidence (same tuning as TipPredictor).
+        val confidence = ((speedDpPerMs - 0.0) / 2.0).coerceIn(0.0, 1.0)
+        if (confidence <= 0.0) {
+            state.clearPredictedPan()
+            return
+        }
+        val horizonSec = GESTURE_PREDICT_HORIZON_MS / 1000.0
+        var dx = -panVel.x * horizonSec * confidence
+        var dy = -panVel.y * horizonSec * confidence
+        val dist = kotlin.math.hypot(dx, dy)
+        if (dist > GESTURE_PREDICT_MAX_LEAD_PX) {
+            val s = GESTURE_PREDICT_MAX_LEAD_PX / dist
+            dx *= s
+            dy *= s
+        }
+        if (!dx.isFinite() || !dy.isFinite()) {
+            state.clearPredictedPan()
+            return
+        }
+        state.predictedPanX = dx
+        state.predictedPanY = dy
+        // Zoom prediction is intentionally omitted for now: a wrong zoom would
+        // rebuild caches at the wrong resolution and cause the very blur we want
+        // to avoid. Pan prediction alone gives the fluidity win.
+    }
+
     private fun trackVelocity(vx: Double, vy: Double) {
         val now = System.nanoTime() / 1_000_000L
         val dt = ((now - lastMoveMs).coerceAtLeast(1L)) / 1000.0
@@ -6009,7 +6055,11 @@ class InteractionController(
     }
 
     private fun startFling(fingerVel: Pt) {
-        if (fingerVel.length() < FLING_MIN_START) return
+        if (fingerVel.length() < FLING_MIN_START) {
+            state.clearPredictedPan()
+            return
+        }
+        state.clearPredictedPan()
         flingVel = Pt(-fingerVel.x, -fingerVel.y) // scroll moves opposite the finger
         flinging = true
         lastFlingMs = System.nanoTime() / 1_000_000L
@@ -6204,6 +6254,7 @@ class InteractionController(
         pinchInitZoom = state.zoom
         pinchAnchorContent = state.viewportToContent(Pt(midX, midY))
         startTrackingVelocity(midX, midY)
+        state.clearPredictedPan()
     }
 
     private fun updatePinch(e: MotionEvent) {
@@ -6247,6 +6298,7 @@ class InteractionController(
             if (state.zoomLocked) applyPinchElastic(targetX - state.scrollX, targetY - state.scrollY)
         }
         lastPan = Pt(midX, midY)
+        updateGesturePrediction()
         onViewChanged() // live zoom %: refresh the toolbar each pinch frame, not just at the end
         requestRender()
     }
@@ -6277,6 +6329,7 @@ class InteractionController(
     private fun endPinch() {
         mode = PointerMode.IDLE
         pinchStartView = null
+        state.clearPredictedPan()
         if (state.zoomingInProgress) {
             state.zoomingInProgress = false
             state.invalidateCachesForZoom() // keep stale surfaces to blit until the sharp rebuild lands
@@ -6296,6 +6349,7 @@ class InteractionController(
         cancelDwell()
         dwellEligible = false
         tipPredictor.reset()
+        state.clearPredictedPan()
         drawingIsCalibrated = false
         snappedSelectionPendingMenu = false
         strokeDismissedSelection = false
@@ -6795,6 +6849,11 @@ class InteractionController(
 
         /** Pen-up reduction tolerance, viewport px at the draw zoom (see [simplifyForCommit]). */
         const val SIMPLIFY_EPS = 0.2
+
+        /** Gesture prediction: one frame ahead, so the viewport leads input latency instead of trailing it.
+         *  Only for pan/scroll/zoom gestures — stroke ink has its own TipPredictor. Display-only. */
+        const val GESTURE_PREDICT_HORIZON_MS = 16.0
+        const val GESTURE_PREDICT_MAX_LEAD_PX = 32.0
 
         /** Lookahead cap for the live tip prediction, in view px. */
         const val TIP_MAX_LEAD_PX = 8.0
