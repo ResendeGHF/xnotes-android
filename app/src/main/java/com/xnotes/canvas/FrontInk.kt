@@ -11,8 +11,10 @@ import com.xnotes.core.geometry.Rect
 import com.xnotes.core.infinite.InkPass
 import com.xnotes.core.infinite.ItemMesher
 import com.xnotes.core.infinite.GlowSpec
+import com.xnotes.core.infinite.MeshBuilder
 import com.xnotes.core.infinite.MeshPart
 import com.xnotes.core.infinite.PixelRect
+import com.xnotes.core.infinite.StrokeTessellator
 import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.Page
 import com.xnotes.core.model.Stroke
@@ -138,8 +140,11 @@ class FrontInk(
      * The run that has stopped moving is uploaded once and never again; only the few points still
      * in play are rebuilt each present. The two overlap by a point so the quad bridging them
      * belongs to the later one and no gap can open on the join.
+     *
+     * [predicted] is an optional display-only lookahead tip in content space: it is meshed on
+     * top of the tail and replaced by the next real sample, never committed.
      */
-    fun wet(stroke: Stroke?, pageIndex: Int?) {
+    fun wet(stroke: Stroke?, pageIndex: Int?, predicted: Pt? = null) {
         if (stroke == null || pageIndex == null) return abandon()
         val ribbon = stroke.wetRibbon
         // Ink whose runs cannot simply be laid over each other keeps the ordinary path, which
@@ -171,7 +176,15 @@ class FrontInk(
         if (tail != null) {
             tailPart = tail
             tailPointCount = ribbon.pointCount
-            val tailParts = listOf(if (invert) tail.inverted() else tail)
+            val tailParts = ArrayList<MeshPart>(2)
+            tailParts.add(if (invert) tail.inverted() else tail)
+            // Display-only lookahead: a short ribbon from the last real sample to the
+            // predicted tip. Replaced wholesale on the next present; never committed.
+            if (predicted != null) {
+                meshPrediction(stroke, ribbon, predicted, tail)?.let {
+                    tailParts.add(if (invert) it.inverted() else it)
+                }
+            }
             pad.setTail(tailParts)
         } else if (ribbon.pointCount < tailPointCount) {
             // The stroke shrank under its last present (edit/undo mid-gesture): the old tail
@@ -194,6 +207,34 @@ class FrontInk(
         },
         covers,
     )
+
+    /**
+     * Mesh a display-only ribbon from the last committed sample to the predicted tip.
+     * Returns null when there is nothing sensible to draw (degenerate or zero-width).
+     */
+    private fun meshPrediction(
+        stroke: Stroke,
+        ribbon: com.xnotes.core.stroke.RibbonPoints,
+        predicted: Pt,
+        tail: MeshPart,
+    ): MeshPart? {
+        val n = ribbon.pointCount
+        if (n <= 0) return null
+        val hw = ribbon.hw(n - 1)
+        if (!hw.isFinite() || hw <= 0.0) return null
+        val tipX = ribbon.cx(n - 1)
+        val tipY = ribbon.cy(n - 1)
+        if (!tipX.isFinite() || !tipY.isFinite()) return null
+        if (hypot(predicted.x - tipX, predicted.y - tipY) < 1e-6) return null
+        val builder = MeshBuilder()
+        builder.polylineRibbon(
+            listOf(Pt(tipX, tipY), predicted), hw, false,
+            StrokeTessellator.DEFAULT_TOLERANCE,
+        )
+        val mesh = builder.build()
+        if (mesh.isEmpty) return null
+        return MeshPart(mesh, tail.color, tail.pass)
+    }
 
     /**
      * The pad's pixels have gone, under the stroke being drawn or under ink it was still holding.

@@ -94,6 +94,7 @@ import com.xnotes.core.stroke.SteadyReadout
 import com.xnotes.core.stroke.SteadyTrace
 import com.xnotes.core.stroke.StrokeFingerprint
 import com.xnotes.core.stroke.StrokeSimplify
+import com.xnotes.core.stroke.TipPredictor
 import com.xnotes.core.tools.EraseMode
 import com.xnotes.core.tools.InkPalette
 import com.xnotes.core.tools.ShapeConfig
@@ -468,6 +469,8 @@ class InteractionController(
 
     private val steadyTrace = SteadyTrace()
     private var tracing = false
+    /** One-frame lookahead for the nib; display-only, never committed. Reset per stroke. */
+    private val tipPredictor = TipPredictor()
     private var drawingPointerId = -1
     private var drawingIsStylus = false
     /** True while the live gesture's down-pointer was a stylus or stylus-eraser tip, so every
@@ -1599,6 +1602,11 @@ class InteractionController(
         liveStroke = stroke
         strokePageIndex = pageIndex
         mode = PointerMode.DRAW
+        // A fresh Kalman horizon per stroke: old velocity would fling the new tip.
+        tipPredictor.start(
+            downViewport.x, downViewport.y, pressure, timeMs.toDouble(),
+            state.devicePxPerDp, drawingIsStylus,
+        )
         // Note-local sticky ink does not sync in v1: keep it off the wire entirely.
         if (drawTool.isStroke && stickyDrawTarget == null) onStrokeStarted?.invoke(pageIndex)
         // Shape snap: only solid ink pens (not the highlighter or its straight-line mode) arm the
@@ -1624,20 +1632,29 @@ class InteractionController(
                 e.getHistoricalX(idx, h).toDouble(),
                 e.getHistoricalY(idx, h).toDouble(),
             )
+            val hPressure = if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0
             addStrokePoint(
                 hp.x,
                 hp.y,
-                if (drawingIsStylus) e.getHistoricalPressure(idx, h).toDouble() else 1.0,
+                hPressure,
                 e.getHistoricalEventTime(h),
                 force = false,
             )
+            tipPredictor.record(hp.x, hp.y, hPressure, e.getHistoricalEventTime(h).toDouble())
         }
         val cp = calLive(e.getX(idx).toDouble(), e.getY(idx).toDouble())
+        val cPressure = if (drawingIsStylus) e.getPressure(idx).toDouble() else 1.0
         addStrokePoint(
             cp.x, cp.y,
-            if (drawingIsStylus) e.getPressure(idx).toDouble() else 1.0, e.eventTime, force = false,
+            cPressure, e.eventTime, force = false,
         )
-        if (stickyDrawTarget == null) frontInk?.wet(liveStroke, strokePageIndex)
+        tipPredictor.record(cp.x, cp.y, cPressure, e.eventTime.toDouble())
+        if (stickyDrawTarget == null) {
+            // Display-only lookahead: replaced by the next real sample, never committed.
+            val tip = if (liveStroke?.tool == Tool.DASHED) null
+            else tipPredictor.predict(TIP_MAX_LEAD_PX)?.let { state.viewportToContent(Pt(it.x, it.y)) }
+            frontInk?.wet(liveStroke, strokePageIndex, tip)
+        }
         requestRender()
     }
 
@@ -1932,6 +1949,7 @@ class InteractionController(
         // Nothing was committed here (a dismissing tap, or ephemeral ink), but a crossing may
         // still have filed segments that need their undo step.
         pushStrokeEdit(null)
+        tipPredictor.reset()
         strokeDismissedSelection = false
         liveStroke = null
         strokePageIndex = null
@@ -6277,6 +6295,7 @@ class InteractionController(
         cancelLongPress()
         cancelDwell()
         dwellEligible = false
+        tipPredictor.reset()
         drawingIsCalibrated = false
         snappedSelectionPendingMenu = false
         strokeDismissedSelection = false
@@ -6776,6 +6795,12 @@ class InteractionController(
 
         /** Pen-up reduction tolerance, viewport px at the draw zoom (see [simplifyForCommit]). */
         const val SIMPLIFY_EPS = 0.2
+
+        /** Lookahead cap for the live tip prediction, in view px. */
+        const val TIP_MAX_LEAD_PX = 8.0
+
+        /** Frames ahead the tip predictor renders (matches the ~8 ms present cadence). */
+        const val TIP_HORIZON_MS = 8.0
 
         /** Scale on the ink low-pass lengths for a stroke drawn at [zoom], captured at pen-down
          *  and carried on the stroke. Screen-space like the capture gate and the pen-up tolerance:
