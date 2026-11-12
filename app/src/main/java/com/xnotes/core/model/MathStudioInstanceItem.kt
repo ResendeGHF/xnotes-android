@@ -113,13 +113,22 @@ class MathStudioInstanceItem(
             }
         }
 
-        // Name label below icon — inside paintBounds so creation/move/rescale shows immediately.
+        // Name label below icon — inverse of page colour (dark on light, light on dark via inversion).
+        // Draw with halo for contrast on any page colour, and keep inside paintBounds for immediate show.
         labelRect()?.let { lb ->
             val label = name.take(18)
-            r.drawText(
-                label, lb, FontSpec(7.0, FontFace.SANS, bold = false), fg,
-                TextFlags(wordWrap = false, alignLeft = false, alignTop = true, hAlign = HAlign.CENTER),
-            )
+            val font = FontSpec(7.0, FontFace.SANS, bold = false)
+            val flags = TextFlags(wordWrap = false, alignLeft = false, alignTop = true, hAlign = HAlign.CENTER)
+            val labelColor = Rgba(35, 35, 35, 255)
+            val haloColor = Rgba(255, 255, 255, 220)
+            for (dx in -1..1) {
+                for (dy in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val haloBox = Rect(lb.x + dx * 0.6, lb.y + dy * 0.6, lb.w, lb.h)
+                    r.drawText(label, haloBox, font, haloColor, flags)
+                }
+            }
+            r.drawText(label, lb, font, labelColor, flags)
         }
     }
 

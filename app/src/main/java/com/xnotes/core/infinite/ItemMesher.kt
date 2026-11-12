@@ -329,8 +329,19 @@ object ItemMesher {
             val font = FontSpec(7.0, FontFace.SANS)
             val flags = TextFlags(wordWrap = false, alignLeft = false, alignTop = true, hAlign = HAlign.CENTER)
             val labelBox = com.xnotes.core.geometry.Rect(b.left - 12, b.bottom + 2, b.w + 24, 12.0)
+            val labelColor = Rgba(35, 35, 35, 255)
+            val haloColor = Rgba(255, 255, 255, 220)
+            // Halo for contrast (inverse of page colour effect via dark/light)
+            for (dx in -1..1) {
+                for (dy in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    for (line in labelMeasurer.outlineLines(label, font, labelBox.w, flags)) {
+                        ShapeTessellator.textPart(line.contours, haloColor) { Pt(labelBox.x + line.origin.x + it.x + dx * 0.6, labelBox.y + line.origin.y + it.y + dy * 0.6) }?.let { parts.add(it) }
+                    }
+                }
+            }
             for (line in labelMeasurer.outlineLines(label, font, labelBox.w, flags)) {
-                ShapeTessellator.textPart(line.contours, item.textColor()) { Pt(labelBox.x + line.origin.x + it.x, labelBox.y + line.origin.y + it.y) }?.let { parts.add(it) }
+                ShapeTessellator.textPart(line.contours, labelColor) { Pt(labelBox.x + line.origin.x + it.x, labelBox.y + line.origin.y + it.y) }?.let { parts.add(it) }
             }
         }
         return if (parts.isEmpty()) null else MeshedItem(parts, item.paintBounds())
