@@ -15,7 +15,11 @@ import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TapeItem
 import com.xnotes.core.model.TextItem
 import com.xnotes.core.model.TapePattern
+import com.xnotes.core.pal.FontFace
 import com.xnotes.core.pal.FontSpec
+import com.xnotes.core.pal.HAlign
+import com.xnotes.core.pal.TextFlags
+import com.xnotes.core.pal.TextMeasurer
 import com.xnotes.core.stroke.RibbonPoints
 import com.xnotes.core.tape.TapeGeometry
 import com.xnotes.core.tools.Tool
@@ -111,6 +115,8 @@ class MeshedItem(
  * is drawn opaque, so both composite correctly drawn straight.
  */
 object ItemMesher {
+
+    private val labelMeasurer: TextMeasurer by lazy { com.xnotes.platform.AndroidTextMeasurer() }
 
     /**
      * Tessellation tolerance for vector ink at [zoom]: the finest geometry that stays within the
@@ -272,52 +278,99 @@ object ItemMesher {
             fold.polygon(listOf(Pt(b.right - f, b.top), Pt(b.right, b.top + f), Pt(b.right - f, b.top + f)))
             if (!fold.isEmpty) parts.add(MeshPart(fold.build(), item.foldColor(), InkPass.OPAQUE))
         }
-        // Calculator glyph: display bar + button grid
-        val fg = item.textColor()
+        // Modern minimalist calculator — inset card darker than paper.
+        val calcBody = item.calcBodyColor()
+        val calcContent = item.calcContentColor()
         val cx = b.center.x
         val cy = b.center.y
-        val s = MathStudioInstanceItem.ICON_SIZE * 0.62
-        val half = s / 2.0
-        val calcRect = com.xnotes.core.geometry.Rect(cx - half, cy - half + 2.0, s, s * 0.92)
+        val calcW = MathStudioInstanceItem.ICON_SIZE * 0.56
+        val calcH = MathStudioInstanceItem.ICON_SIZE * 0.60
+        val calcRect = com.xnotes.core.geometry.Rect(cx - calcW / 2.0, cy - calcH / 2.0 + 0.5, calcW, calcH)
+        val calcOutline = roundedRect(calcRect, 5.0)
+        MeshBuilder().also { calc ->
+            calc.polygon(calcOutline)
+            if (!calc.isEmpty) parts.add(MeshPart(calc.build(), calcBody, InkPass.OPAQUE))
+        }
+        MeshBuilder().also { calcEdge ->
+            calcEdge.polylineRibbon(calcOutline, 0.9 / 2.0, true, tolerance)
+            if (!calcEdge.isEmpty) parts.add(MeshPart(calcEdge.build(), shade(calcBody, 0.12), InkPass.OPAQUE))
+        }
+        val displayRect = com.xnotes.core.geometry.Rect(calcRect.left + 3.5, calcRect.top + 4.5, calcRect.w - 7.0, 7.0)
+        val displayOutline = roundedRect(displayRect, 1.8)
         MeshBuilder().also { disp ->
-            disp.polygon(
-                listOf(
-                    Pt(calcRect.left + 3, calcRect.top + 4),
-                    Pt(calcRect.right - 3, calcRect.top + 4),
-                    Pt(calcRect.right - 3, calcRect.top + 10),
-                    Pt(calcRect.left + 3, calcRect.top + 10),
-                ),
-            )
-            if (!disp.isEmpty) parts.add(MeshPart(disp.build(), fg.withAlpha(18), InkPass.OPAQUE))
+            disp.polygon(displayOutline)
+            if (!disp.isEmpty) parts.add(MeshPart(disp.build(), calcContent.withAlpha(14), InkPass.OPAQUE))
         }
         MeshBuilder().also { dispBorder ->
-            dispBorder.polylineRibbon(
-                listOf(
-                    Pt(calcRect.left + 3, calcRect.top + 4),
-                    Pt(calcRect.right - 3, calcRect.top + 4),
-                    Pt(calcRect.right - 3, calcRect.top + 10),
-                    Pt(calcRect.left + 3, calcRect.top + 10),
-                ),
-                0.5, true, tolerance,
-            )
-            if (!dispBorder.isEmpty) parts.add(MeshPart(dispBorder.build(), fg.withAlpha(90), InkPass.OPAQUE))
+            dispBorder.polylineRibbon(displayOutline, 0.85 / 2.0, true, tolerance)
+            if (!dispBorder.isEmpty) parts.add(MeshPart(dispBorder.build(), calcContent.withAlpha(70), InkPass.OPAQUE))
         }
-        val btnSize = 4.5
-        val gapX = (calcRect.w - 6 - btnSize * 3) / 2.0
-        val gapY = 4.0
-        val startX = calcRect.left + 3
-        val startY = calcRect.top + 14
-        for (row in 0 until 3) {
+        val btnW = 5.2
+        val btnH = 5.0
+        val gapX = (calcRect.w - 7.0 - btnW * 3) / 2.0
+        val gapY = 3.8
+        val startX = calcRect.left + 3.5
+        val startY = calcRect.top + 14.5
+        for (row in 0 until 2) {
             for (col in 0 until 3) {
-                val bx = startX + col * (btnSize + gapX)
-                val by = startY + row * (btnSize + gapY)
+                val bx = startX + col * (btnW + gapX)
+                val by = startY + row * (btnH + gapY)
+                val btnRect = com.xnotes.core.geometry.Rect(bx, by, btnW, btnH)
+                val btnOutline = roundedRect(btnRect, 1.2)
                 MeshBuilder().also { btn ->
-                    btn.polygon(listOf(Pt(bx, by), Pt(bx + btnSize, by), Pt(bx + btnSize, by + btnSize), Pt(bx, by + btnSize)))
-                    if (!btn.isEmpty) parts.add(MeshPart(btn.build(), fg.withAlpha(85), InkPass.OPAQUE))
+                    btn.polygon(btnOutline)
+                    if (!btn.isEmpty) parts.add(MeshPart(btn.build(), calcContent.withAlpha(72), InkPass.OPAQUE))
                 }
             }
         }
+        val wideRect = com.xnotes.core.geometry.Rect(calcRect.left + 3.5, startY + 2 * (btnH + gapY) - 0.5, calcRect.w - 7.0, 4.2)
+        val wideOutline = roundedRect(wideRect, 1.4)
+        MeshBuilder().also { wide ->
+            wide.polygon(wideOutline)
+            if (!wide.isEmpty) parts.add(MeshPart(wide.build(), calcContent.withAlpha(92), InkPass.OPAQUE))
+        }
+        // Label under icon — meshed for GL so infinite canvas shows it without needing a zoom.
+        if (item.name.isNotBlank() && item.name != MathStudioInstanceItem.DEFAULT_NAME) {
+            val label = item.name.take(18)
+            val font = FontSpec(7.0, FontFace.SANS)
+            val flags = TextFlags(wordWrap = false, alignLeft = false, alignTop = true, hAlign = HAlign.CENTER)
+            val labelBox = com.xnotes.core.geometry.Rect(b.left - 12, b.bottom + 2, b.w + 24, 12.0)
+            for (line in labelMeasurer.outlineLines(label, font, labelBox.w, flags)) {
+                ShapeTessellator.textPart(line.contours, item.textColor()) { Pt(labelBox.x + line.origin.x + it.x, labelBox.y + line.origin.y + it.y) }?.let { parts.add(it) }
+            }
+        }
         return if (parts.isEmpty()) null else MeshedItem(parts, item.paintBounds())
+    }
+
+    private fun roundedRect(r: Rect, radius: Double): List<Pt> {
+        val rad = radius.coerceIn(0.0, minOf(r.w, r.h) / 2.0)
+        if (rad <= 0.25) return listOf(r.topLeft, Pt(r.right, r.top), Pt(r.right, r.bottom), Pt(r.left, r.bottom))
+        val seg = 3
+        val out = ArrayList<Pt>(4 * seg + 8)
+        fun arc(cx: Double, cy: Double, from: Double, to: Double) {
+            for (i in 0..seg) {
+                val a = from + (to - from) * i / seg
+                out.add(Pt(cx + rad * kotlin.math.cos(a), cy + rad * kotlin.math.sin(a)))
+            }
+        }
+        out.add(Pt(r.left + rad, r.top))
+        out.add(Pt(r.right - rad, r.top))
+        arc(r.right - rad, r.top + rad, -Math.PI / 2.0, 0.0)
+        out.add(Pt(r.right, r.top + rad))
+        out.add(Pt(r.right, r.bottom - rad))
+        arc(r.right - rad, r.bottom - rad, 0.0, Math.PI / 2.0)
+        out.add(Pt(r.right - rad, r.bottom))
+        out.add(Pt(r.left + rad, r.bottom))
+        arc(r.left + rad, r.bottom - rad, Math.PI / 2.0, Math.PI)
+        out.add(Pt(r.left, r.bottom - rad))
+        out.add(Pt(r.left, r.top + rad))
+        arc(r.left + rad, r.top + rad, Math.PI, 3.0 * Math.PI / 2.0)
+        return out
+    }
+
+    private fun shade(c: Rgba, toBlack: Double): Rgba {
+        val f = toBlack.coerceIn(0.0, 1.0)
+        return Rgba((c.r * (1.0 - f)).toInt().coerceIn(0, 255), (c.g * (1.0 - f)).toInt().coerceIn(0, 255), (c.b * (1.0 - f)).toInt().coerceIn(0, 255), 255)
     }
 
     /** [part] shifted by a paper offset, for note-local ink meshed at the origin. */
