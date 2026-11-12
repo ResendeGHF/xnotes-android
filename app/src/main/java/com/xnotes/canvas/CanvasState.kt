@@ -116,13 +116,6 @@ class CanvasState(
     var scrollX: Double = 0.0
     var scrollY: Double = 0.0
 
-    /** Transient gesture prediction offset (view px), applied only for rendering.
-     *  Never persisted, never feeds back into scroll logic: the next real sample
-     *  corrects it. Keeps the viewport visually ahead of input latency without
-     *  committing. */
-    var predictedPanX: Double = 0.0
-    var predictedPanY: Double = 0.0
-    var predictedZoomFactor: Double = 1.0
     var viewportW: Int = 0
     var viewportH: Int = 0
     var renderScale: Double = 1.0
@@ -787,21 +780,6 @@ class CanvasState(
         return Pt(ox, oy)
     }
 
-    /** Like [origin] but includes the transient gesture-prediction offset, if any.
-     *  Used only for rendering: input hit-testing must stay on the real viewport
-     *  so committed ink lands where the finger really was. */
-    fun predictedOrigin(): Pt {
-        if (predictedPanX == 0.0 && predictedPanY == 0.0 && predictedZoomFactor == 1.0) return origin()
-        val effZoom = zoom * predictedZoomFactor
-        val effScrollX = scrollX + predictedPanX
-        val effScrollY = scrollY + predictedPanY
-        val cw = contentW * effZoom
-        val ch = contentH * effZoom
-        val ox = (if (!verticalScroll || cw >= clearW) -effScrollX else insetLeft + (clearW - cw) / 2.0) - flipOffsetX
-        val oy = (if (!verticalScroll || ch >= clearH) -effScrollY else insetTop + (clearH - ch) / 2.0) - overscrollY
-        return Pt(ox, oy)
-    }
-
     fun contentToViewport(p: Pt): Pt {
         val o = origin()
         return Pt(p.x * zoom + o.x, p.y * zoom + o.y)
@@ -812,29 +790,8 @@ class CanvasState(
         return Pt((p.x - o.x) / zoom, (p.y - o.y) / zoom)
     }
 
-    fun predictedContentToViewport(p: Pt): Pt {
-        val o = predictedOrigin()
-        val effZoom = zoom * predictedZoomFactor
-        return Pt(p.x * effZoom + o.x, p.y * effZoom + o.y)
-    }
-
-    fun predictedViewportToContent(p: Pt): Pt {
-        val o = predictedOrigin()
-        val effZoom = zoom * predictedZoomFactor
-        return Pt((p.x - o.x) / effZoom, (p.y - o.y) / effZoom)
-    }
-
     fun visibleContentRect(): Rect =
         Rect.fromPoints(viewportToContent(Pt(0.0, 0.0)), viewportToContent(Pt(viewportW.toDouble(), viewportH.toDouble())))
-
-    fun predictedVisibleContentRect(): Rect =
-        Rect.fromPoints(predictedViewportToContent(Pt(0.0, 0.0)), predictedViewportToContent(Pt(viewportW.toDouble(), viewportH.toDouble())))
-
-    fun clearPredictedPan() {
-        predictedPanX = 0.0
-        predictedPanY = 0.0
-        predictedZoomFactor = 1.0
-    }
 
     // A floating bar lets the scroll run past the content's edges by as much as it covers.
     fun minScrollX(): Double = -insetLeft
