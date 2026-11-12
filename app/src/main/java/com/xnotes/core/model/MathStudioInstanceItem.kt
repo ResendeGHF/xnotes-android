@@ -66,49 +66,58 @@ class MathStudioInstanceItem(
             listOf(Pt(b.right - f, b.top), Pt(b.right, b.top + f), Pt(b.right - f, b.top + f)),
             foldColor(),
         )
-        // Modern minimalist calculator — inset card darker than paper, centered.
-        val calcBody = calcBodyColor()
-        val calcContent = calcContentColor()
+        // Calculator glyph — simple centered rectangle with display and buttons.
+        val fg = textColor()
         val cx = b.center.x
         val cy = b.center.y
-        // Slightly smaller, vertically centered, with breathing room from paper edges.
-        val calcW = ICON_SIZE * 0.56 // 27.0
-        val calcH = ICON_SIZE * 0.60 // 29.0
-        val calcRect = Rect(cx - calcW / 2.0, cy - calcH / 2.0 + 0.5, calcW, calcH)
-        val calcOutline = roundedRect(calcRect, 5.0)
-        r.fillPolygon(calcOutline, calcBody)
-        r.strokePolygon(calcOutline, com.xnotes.core.pal.Pen(shade(calcBody, 0.12), 0.9, cosmetic = false))
-        // Display — inset, light overlay on dark calc, dark overlay on light calc.
-        val displayRect = Rect(calcRect.left + 3.5, calcRect.top + 4.5, calcRect.w - 7.0, 7.0)
-        val displayOutline = roundedRect(displayRect, 1.8)
-        r.fillPolygon(displayOutline, calcContent.withAlpha(14))
-        r.strokePolygon(displayOutline, com.xnotes.core.pal.Pen(calcContent.withAlpha(70), 0.85, cosmetic = false))
-        // Minimal button grid: 2 rows × 3 cols = 6 pill-like keys, more breathing room.
-        val btnW = 5.2
-        val btnH = 5.0
-        val gapX = (calcRect.w - 7.0 - btnW * 3) / 2.0
-        val gapY = 3.8
-        val startX = calcRect.left + 3.5
-        val startY = calcRect.top + 14.5
-        for (row in 0 until 2) {
+        val s = ICON_SIZE * 0.62
+        val half = s / 2.0
+        // Outer calculator body (inset)
+        val calcRect = Rect(cx - half, cy - half + 2.0, s, s * 0.92)
+        // Display bar
+        r.fillPolygon(
+            listOf(
+                Pt(calcRect.left + 3, calcRect.top + 4),
+                Pt(calcRect.right - 3, calcRect.top + 4),
+                Pt(calcRect.right - 3, calcRect.top + 10),
+                Pt(calcRect.left + 3, calcRect.top + 10),
+            ),
+            fg.withAlpha(18),
+        )
+        r.strokePolygon(
+            listOf(
+                Pt(calcRect.left + 3, calcRect.top + 4),
+                Pt(calcRect.right - 3, calcRect.top + 4),
+                Pt(calcRect.right - 3, calcRect.top + 10),
+                Pt(calcRect.left + 3, calcRect.top + 10),
+            ),
+            com.xnotes.core.pal.Pen(fg.withAlpha(90), 1.0, cosmetic = false),
+        )
+        // Button grid 3x3
+        val btnSize = 4.5
+        val gapX = (calcRect.w - 6 - btnSize * 3) / 2.0
+        val gapY = 4.0
+        val startX = calcRect.left + 3
+        val startY = calcRect.top + 14
+        for (row in 0 until 3) {
             for (col in 0 until 3) {
-                val bx = startX + col * (btnW + gapX)
-                val by = startY + row * (btnH + gapY)
-                val btnRect = Rect(bx, by, btnW, btnH)
-                val btnOutline = roundedRect(btnRect, 1.2)
-                r.fillPolygon(btnOutline, calcContent.withAlpha(72))
+                val bx = startX + col * (btnSize + gapX)
+                val by = startY + row * (btnSize + gapY)
+                r.fillPolygon(
+                    listOf(
+                        Pt(bx, by), Pt(bx + btnSize, by),
+                        Pt(bx + btnSize, by + btnSize), Pt(bx, by + btnSize),
+                    ),
+                    fg.withAlpha(85),
+                )
             }
         }
-        // Wide bottom key (equals / enter) — single pill, visually heavier.
-        val wideRect = Rect(calcRect.left + 3.5, startY + 2 * (btnH + gapY) - 0.5, calcRect.w - 7.0, 4.2)
-        val wideOutline = roundedRect(wideRect, 1.4)
-        r.fillPolygon(wideOutline, calcContent.withAlpha(92))
 
-        // Name label below icon — always drawn when not default, now inside paintBounds.
+        // Name label below icon — inside paintBounds so creation/move/rescale shows immediately.
         labelRect()?.let { lb ->
             val label = name.take(18)
             r.drawText(
-                label, lb, FontSpec(7.0, FontFace.SANS, bold = false), textColor(),
+                label, lb, FontSpec(7.0, FontFace.SANS, bold = false), fg,
                 TextFlags(wordWrap = false, alignLeft = false, alignTop = true, hAlign = HAlign.CENTER),
             )
         }
@@ -118,8 +127,6 @@ class MathStudioInstanceItem(
     fun edgeColor(): Rgba = paperColor()
     fun foldColor(): Rgba = shade(color, 0.16)
     fun textColor(): Rgba = if (color.luminance() > 0.45) INK_ON_LIGHT else INK_ON_DARK
-    fun calcBodyColor(): Rgba = shade(color, 0.26)
-    fun calcContentColor(): Rgba = if (calcBodyColor().luminance() > 0.45) INK_ON_LIGHT else INK_ON_DARK
 
     private fun shade(c: Rgba, toBlack: Double): Rgba {
         val f = toBlack.coerceIn(0.0, 1.0)
@@ -129,33 +136,6 @@ class MathStudioInstanceItem(
             (c.b * (1.0 - f)).roundToInt().coerceIn(0, 255),
             255,
         )
-    }
-
-    private fun roundedRect(r: Rect, radius: Double): List<Pt> {
-        val rad = radius.coerceIn(0.0, minOf(r.w, r.h) / 2.0)
-        if (rad <= 0.25) return listOf(r.topLeft, Pt(r.right, r.top), Pt(r.right, r.bottom), Pt(r.left, r.bottom))
-        val seg = 3
-        val out = ArrayList<Pt>(4 * seg + 4)
-        fun arc(cx: Double, cy: Double, from: Double, to: Double) {
-            for (i in 0..seg) {
-                val a = from + (to - from) * i / seg
-                out.add(Pt(cx + rad * kotlin.math.cos(a), cy + rad * kotlin.math.sin(a)))
-            }
-        }
-        // Top edge
-        out.add(Pt(r.left + rad, r.top))
-        out.add(Pt(r.right - rad, r.top))
-        arc(r.right - rad, r.top + rad, -Math.PI / 2.0, 0.0)
-        out.add(Pt(r.right, r.top + rad))
-        out.add(Pt(r.right, r.bottom - rad))
-        arc(r.right - rad, r.bottom - rad, 0.0, Math.PI / 2.0)
-        out.add(Pt(r.right - rad, r.bottom))
-        out.add(Pt(r.left + rad, r.bottom))
-        arc(r.left + rad, r.bottom - rad, Math.PI / 2.0, Math.PI)
-        out.add(Pt(r.left, r.bottom - rad))
-        out.add(Pt(r.left, r.top + rad))
-        arc(r.left + rad, r.top + rad, Math.PI, 3.0 * Math.PI / 2.0)
-        return out
     }
 
     override fun translate(dx: Double, dy: Double) {
