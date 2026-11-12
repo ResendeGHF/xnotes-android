@@ -253,6 +253,8 @@ class PdfSource private constructor(
 
     /** Every page the canvas wants held (visible pages + tapped ones); only ids, so unbounded scrolling stays cheap. */
     private val desiredLinkPages: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    private val pendingRequests: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    private val pendingCallbacks = ConcurrentHashMap<Int, MutableList<() -> Unit>>()
 
     /** True when [index]'s links are held (possibly an empty list). */
     fun hasLinks(index: Int): Boolean = linkCache.containsKey(index) || current?.index == index
@@ -284,10 +286,13 @@ class PdfSource private constructor(
     /** Warm every page in [indices] (the visible pages, for boxes), coalesced like [warmLinks]. */
     fun warmLinks(indices: Iterable<Int>) {
         if (closed) return
+        val newSet = indices.filter { it >= 0 }.toSet()
+        // Keep pending tap requests so a fast scroll does not drop a tapped page before its parse lands.
+        val keep = pendingRequests.toSet() + pendingCallbacks.keys
+        desiredLinkPages.clear()
+        desiredLinkPages.addAll(newSet + keep)
         var missing = false
-        for (i in indices) {
-            if (i < 0) continue
-            desiredLinkPages.add(i)
+        for (i in newSet) {
             if (!linkCache.containsKey(i) && current?.index != i) missing = true
         }
         if (missing) pumpLinks()
@@ -325,14 +330,41 @@ class PdfSource private constructor(
     fun requestLinks(index: Int, onReady: () -> Unit) {
         if (closed) return
         if (linkCache.containsKey(index) || current?.index == index) { onReady(); return }
+        // Coalesce frequent taps on the same page: queue callbacks, single parse.
+        val list = pendingCallbacks.computeIfAbsent(index) { mutableListOf() }
+        var isFirst = false
+        synchronized(list) {
+            list.add(onReady)
+            isFirst = pendingRequests.add(index)
+        }
+        if (!isFirst) return
         desiredLinkPages.add(index)
-        val executor = linksWorker() ?: return
+        val executor = linksWorker() ?: run {
+            pendingRequests.remove(index)
+            synchronized(list) { pendingCallbacks.remove(index) }
+            return
+        }
         runCatching {
             executor.execute {
-                if (closed) return@execute
+                if (closed) {
+                    pendingRequests.remove(index)
+                    synchronized(list) { pendingCallbacks.remove(index) }
+                    return@execute
+                }
                 runCatching { setCurrentLinks(index) }
-                if (!closed) onReady()
+                val cbs = synchronized(list) { pendingCallbacks.remove(index) } ?: emptyList()
+                pendingRequests.remove(index)
+                if (!closed) {
+                    for (cb in cbs) runCatching { cb() }
+                }
+                // If warm pump was starved, kick it now that tap is done.
+                if (!closed && desiredLinkPages.any { !linkCache.containsKey(it) && current?.index != it }) {
+                    pumpLinks()
+                }
             }
+        }.onFailure {
+            pendingRequests.remove(index)
+            synchronized(list) { pendingCallbacks.remove(index) }
         }
     }
 
@@ -365,7 +397,8 @@ class PdfSource private constructor(
      *  accumulate link rects without bound. Pages still wanted are dropped last. */
     private fun evictLinks(except: Int) {
         while (linkCache.size > MAX_CACHED_LINK_PAGES) {
-            val victim = linkCache.keys.firstOrNull { it != except && !desiredLinkPages.contains(it) }
+            val victim = linkCache.keys.firstOrNull { it != except && !desiredLinkPages.contains(it) && !pendingRequests.contains(it) && !pendingCallbacks.containsKey(it) }
+                ?: linkCache.keys.firstOrNull { it != except && !pendingRequests.contains(it) && !pendingCallbacks.containsKey(it) }
                 ?: linkCache.keys.firstOrNull { it != except }
                 ?: break
             linkCache.remove(victim)
@@ -377,6 +410,8 @@ class PdfSource private constructor(
         onLinksChanged = null
         linkCache.clear()
         desiredLinkPages.clear()
+        pendingRequests.clear()
+        pendingCallbacks.clear()
         current = null
         synchronized(executorLock) {
             runCatching { linksExecutor?.shutdownNow() }
