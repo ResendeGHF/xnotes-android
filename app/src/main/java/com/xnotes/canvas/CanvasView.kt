@@ -414,14 +414,12 @@ class CanvasView @JvmOverloads constructor(
         val room = st.roomView
 
         val r = AndroidRenderer(canvas).apply { mathPace = MathRendering.Pace.LIVE }
-        val hasPrediction = st.predictedPanX != 0.0 || st.predictedPanY != 0.0 || st.predictedZoomFactor != 1.0
-        val origin = if (hasPrediction) st.predictedOrigin() else st.origin()
-        val effZoom = if (hasPrediction) st.zoom * st.predictedZoomFactor else st.zoom
+        val origin = st.origin()
         r.save()
         r.translate(origin.x, origin.y)
-        r.scale(effZoom, effZoom)
+        r.scale(st.zoom, st.zoom)
 
-        val visible = if (hasPrediction) st.predictedVisibleContentRect() else st.visibleContentRect()
+        val visible = st.visibleContentRect()
         // Paginated mode shows only the current row; neighbours never draw. Iterate the range
         // directly instead of scanning every page on every animation frame in a large document.
         val drawable = st.drawablePageRange()
@@ -460,12 +458,12 @@ class CanvasView @JvmOverloads constructor(
             canvas.clipRect(0f, 0f, st.viewportW.toFloat(), st.viewportH.toFloat())
             r.save()
                 r.translate(origin.x + offset.x, origin.y + offset.y)
-                r.scale(effZoom, effZoom)
+                r.scale(st.zoom, st.zoom)
                 val neighbourOriginX = origin.x + offset.x
                 val neighbourOriginY = origin.y + offset.y
                 val neighbourVisible = Rect.fromPoints(
-                    Pt(-neighbourOriginX / effZoom, -neighbourOriginY / effZoom),
-                    Pt((st.viewportW - neighbourOriginX) / effZoom, (st.viewportH - neighbourOriginY) / effZoom),
+                    Pt(-neighbourOriginX / st.zoom, -neighbourOriginY / st.zoom),
+                    Pt((st.viewportW - neighbourOriginX) / st.zoom, (st.viewportH - neighbourOriginY) / st.zoom),
                 )
                 for (i in st.rowRanges()[neighbourRow]) {
                     val pr = st.pageRects.getOrNull(i) ?: continue

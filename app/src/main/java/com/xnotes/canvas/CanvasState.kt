@@ -560,32 +560,6 @@ class CanvasState(
     private val pendingInk = HashSet<Page>()
     private val pendingBg = HashSet<Page>()
 
-    /** Last math-prefetch sweep, so a fast fling re-warms at most twice a second instead of per frame. */
-    private var lastPrefetchMathNs = 0L
-
-    /**
-     * Latest keep set published by [dropCachesExcept] (visible + prefetch rows). A queued
-     * build that is still waiting when its page leaves the set skips its encode: the draw
-     * loop reschedules if the page comes back, so the settled view still builds exactly
-     * once, but a fast fling no longer waits behind obsolete encodes. Empty until the
-     * first prune runs; while empty only the generation check applies.
-     */
-    @Volatile
-    private var keepSnapshot: Set<Page> = emptySet()
-
-    /**
-     * True when a queued build must not pay for its encode: an edit (or zoom) has already
-     * invalidated its snapshot, or its page scrolled out of the keep band while waiting
-     * behind earlier encodes. The draw loop reschedules on the next frame if the page is
-     * still needed — with a fresh snapshot — so skipping only drops wasted work, and the
-     * worker stays on the pages the viewport actually shows, even mid-fling.
-     */
-    private fun isBuildObsolete(page: Page, gen: Int): Boolean {
-        if (gen != cacheGen) return true
-        val keep = keepSnapshot
-        return keep.isNotEmpty() && page !in keep
-    }
-
     /** Where [repairRegion] repainted a page while its build was in flight, to paint again on what the build brings. */
     private val repairedMeanwhile = HashMap<Page, Rect>()
 
@@ -1354,14 +1328,6 @@ class CanvasState(
         val items = cacheItems(page) // snapshot on the UI thread
         val withFlow = !flowLifted // snapshot too; the generation guard discards stale builds
         runAsync {
-            if (isBuildObsolete(page, gen)) {
-                postToMain {
-                    pendingInk.remove(page)
-                    repairedMeanwhile.remove(page)
-                    onCacheReady?.invoke()
-                }
-                return@runAsync
-            }
             val entry = runBuild { renderInk(page, res, items, withFlow) }
             postToMain {
                 pendingInk.remove(page)
@@ -1522,11 +1488,12 @@ class CanvasState(
     }
 
     /**
-     * Draw-path entry point for a highlighter ribbon. Never rasterizes on the calling (UI)
-     * thread mid-gesture: a correct-resolution rebuild goes to the worker and the stale
-     * bitmap is blitted scaled meanwhile (like the page caches), so gestures stay smooth
-     * and committed ink never vanishes. Only when nothing was ever baked for this exact
-     * geometry does it fall back to a synchronous build, keeping first paint instant.
+     * Draw-path entry point for a highlighter ribbon. Mirrors upstream's
+     * [highlighterCacheFor] quality: when nothing was ever baked for this exact
+     * geometry, build synchronously at the correct resolution so entering content
+     * is sharp even mid-gesture. When a stale bitmap exists, reuse it scaled
+     * while the correct-resolution rebuild goes to the worker, so gestures stay
+     * smooth without the blur of missing highlighters.
      */
     fun highlighterForDraw(stroke: Stroke, page: Page): HighlighterCacheEntry? {
         val res = clampedRes(page)
@@ -1536,11 +1503,9 @@ class CanvasState(
         val matches = existing != null && existing.geom === g && existing.opaque == opaque &&
             existing.cuts === stroke.cuts
         if (matches && (zoomingInProgress || abs(existing.res - res) < 1e-6)) return existing
-        if (!zoomingInProgress && !matches) return highlighterCacheFor(stroke, page)
+        if (!matches) return highlighterCacheFor(stroke, page)
         scheduleHighlighter(stroke, page, res, g, opaque)
-        // Show the stale bitmap scaled meanwhile (or skip this frame when nothing
-        // reusable exists yet); the scheduled rebuild lands shortly after.
-        return if (matches) existing else null
+        return existing
     }
 
     /** Rebuild queue for highlighter ribbons, so gesture frames never rasterize on the UI thread. */
@@ -1610,13 +1575,6 @@ class CanvasState(
         val gen = cacheGen
         val seq = markupSeq // the build reads the markups after this, so it holds every edit up to here
         runAsync {
-            if (isBuildObsolete(page, gen)) {
-                postToMain {
-                    pendingBg.remove(page)
-                    onCacheReady?.invoke()
-                }
-                return@runAsync
-            }
             val entry = runBuild { buildBackground(page, res) }
             postToMain {
                 pendingBg.remove(page)
@@ -2002,11 +1960,6 @@ class CanvasState(
     }
 
     fun dropCachesExcept(visible: Set<Page>) {
-        // Publish the keep set for queued builds: work waiting behind earlier encodes
-        // skips itself when its page has since scrolled away, instead of blocking the
-        // fresh builds the viewport needs right now. Reference swap is atomic; pages
-        // compare by identity, like the cache maps below.
-        keepSnapshot = visible
         caches.keys.retainAll(visible)
         staleInk.retainAll(visible)
         bgCaches.keys.retainAll(visible)
@@ -2070,16 +2023,10 @@ class CanvasState(
     fun prefetchAndPrune() {
         val band = cacheBand()
         if (!zoomingInProgress) {
-            // Formula setup walks every formula on the page: throttle it so a fling does not
-            // re-run it every frame. Cache builds below still run per frame (they self-skip
-            // when usable), and the draw path wants anything missing immediately anyway.
-            val nowNs = System.nanoTime()
-            val wantMath = nowNs - lastPrefetchMathNs >= PREFETCH_MATH_NS
-            if (wantMath) lastPrefetchMathNs = nowNs
             for (page in band.prefetch) {
                 backgroundForOrSchedule(page)
                 cacheForOrSchedule(page)
-                if (wantMath) prefetchMath?.invoke(page, zoom)
+                prefetchMath?.invoke(page, zoom)
             }
         }
         dropCachesExcept(band.keep)
