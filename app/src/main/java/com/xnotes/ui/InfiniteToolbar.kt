@@ -9,6 +9,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Calculate
 import androidx.compose.material.icons.outlined.Functions
 import androidx.compose.material.icons.outlined.Tab
 import androidx.compose.ui.Modifier
@@ -159,6 +160,7 @@ fun InfiniteToolbar(
                             InsertRow(XnotesIcons.camera, stringResource(R.string.take_photo)) { onTakePhoto() },
                             InsertRow(XnotesIcons.traceScan, stringResource(R.string.scan_pages)) { onScanPages() },
                             InsertRow(XnotesIcons.note, stringResource(R.string.sticky_note)) { editor.insertStickyNote() },
+                            InsertRow(Icons.Outlined.Calculate, stringResource(R.string.math_instance_insert)) { editor.insertMathInstance() },
                         ),
                         onAudioFromFile = onInsertAudio,
                         onRecord = onRecordAudio,

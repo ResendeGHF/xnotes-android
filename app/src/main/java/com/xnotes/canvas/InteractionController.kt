@@ -694,6 +694,9 @@ class InteractionController(
     /** Host hook for the sticky's color dot: open the swatch picker at [anchorViewport]. */
     var onStickyColorDot: ((item: StickyNoteItem, pageIndex: Int, anchorViewport: Rect) -> Unit)? = null
 
+    // MATH STUDIO INSTANCE (floating calculator icon holding a per-instance workspace)
+    var onMathInstanceTap: ((item: com.xnotes.core.model.MathStudioInstanceItem, pageIndex: Int) -> Boolean)? = null
+
     // RESIZE
     private var resizeItem: CanvasItem? = null
     private var resizeHandle: HandleId? = null
@@ -1531,6 +1534,8 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content)
         val local = pageIndex?.let { state.toPageSpace(it, content) }
         if (pageIndex != null && local != null) {
+            // Math Studio instance icon opens its private workspace.
+            if (mathInstanceTapAt(pageIndex, local)) return true
             // A collapsed sticky's icon (or an expanded one's ×) toggles before anything else.
             if (stickyToggleAt(pageIndex, local)) return true
             // The expanded paper's color dot cycles the paper before links do.
@@ -1552,6 +1557,8 @@ class InteractionController(
 
     private fun beginDraw(content: Pt, pressure: Double, drawTool: Tool, timeMs: Long, downViewport: Pt) {
         val pageIndex = state.pageIndexAtContent(content) ?: return
+        // A pen press on a Math instance icon opens its studio instead of starting a stroke.
+        if (mathInstanceTapAt(pageIndex, state.toPageSpace(pageIndex, content))) return
         // A pen press on a collapsed icon expands it (or on an expanded × collapses it)
         // instead of starting a stroke.
         if (stickyToggleAt(pageIndex, state.toPageSpace(pageIndex, content))) return
@@ -2539,6 +2546,7 @@ class InteractionController(
         val pageIndex = state.pageIndexAtContent(content)
         if (pageIndex != null) {
             val local = state.toPageSpace(pageIndex, content)
+            if (mathInstanceTapAt(pageIndex, local)) return
             // A sticky's × collapses it; a collapsed icon expands on tap.
             if (stickyToggleAt(pageIndex, local)) return
             // The expanded paper's color dot cycles the paper.
@@ -3698,6 +3706,60 @@ class InteractionController(
         onContentChanged()
         requestRender()
         return item
+    }
+
+    // --- MATH STUDIO INSTANCE ---
+
+    private fun mathInstanceAt(pi: Int, local: Pt): com.xnotes.core.model.MathStudioInstanceItem? =
+        state.document.pages.getOrNull(pi)?.items?.lastOrNull {
+            it is com.xnotes.core.model.MathStudioInstanceItem && !it.locked && it.contains(local)
+        } as? com.xnotes.core.model.MathStudioInstanceItem
+
+    private fun mathInstanceTapAt(pi: Int, local: Pt): Boolean {
+        val item = mathInstanceAt(pi, local) ?: return false
+        val cb = onMathInstanceTap ?: return false
+        return cb(item, pi)
+    }
+
+    fun placeMathInstanceAt(
+        content: Pt,
+        name: String = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME,
+        color: Rgba = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_COLOR,
+        studioJson: String = "",
+    ): com.xnotes.core.model.MathStudioInstanceItem? {
+        val (pi, local) = state.pagePointAt(content) ?: return null
+        val page = state.document.pages.getOrNull(pi) ?: return null
+        val rect = com.xnotes.core.model.MathStudioInstanceItem.boxAt(local, name, color, studioJson)
+        val item = com.xnotes.core.model.MathStudioInstanceItem(rect, name, color, studioJson)
+        page.items.add(item)
+        history.push(AddItem(page, item))
+        state.document.dirty = true
+        state.invalidatePage(page)
+        setSelection(listOf(Selected(pi, item)))
+        refreshSelectionMenu()
+        onContentChanged()
+        requestRender()
+        return item
+    }
+
+    fun renameMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem, name: String, color: Rgba) {
+        if (item.name == name && item.color == color) return
+        val before = item.snapshotGeometry()
+        item.name = name
+        item.color = color
+        val after = item.snapshotGeometry()
+        history.push(TransformItems(listOf(item), listOf(before), listOf(after)))
+        state.document.dirty = true
+        state.document.pages.firstOrNull { p -> p.items.any { it === item } }?.let { state.invalidatePage(it) }
+        onContentChanged()
+        requestRender()
+    }
+
+    fun storeMathInstanceJson(item: com.xnotes.core.model.MathStudioInstanceItem, json: String) {
+        if (item.studioJson == json) return
+        item.studioJson = json
+        state.document.dirty = true
+        // No invalidation needed: icon appearance does not depend on json, but dirty triggers save
     }
 
     /** Collapse or expand [item], wherever it sits, as one undo step. */

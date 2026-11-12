@@ -31,6 +31,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoStories
+import androidx.compose.material.icons.outlined.Calculate
 import androidx.compose.material.icons.outlined.Functions
 import androidx.compose.material.icons.outlined.Tab
 import androidx.compose.material3.DropdownMenuItem
@@ -744,6 +745,7 @@ private fun NoteInsertMenu(
             InsertRow(XnotesIcons.page, stringResource(R.string.image_as_page)) { onImagePage() },
             InsertRow(XnotesIcons.link, stringResource(R.string.insert_note_link)) { onInsertNoteLink() },
             InsertRow(XnotesIcons.note, stringResource(R.string.sticky_note)) { editor.insertStickyNote() },
+            InsertRow(Icons.Outlined.Calculate, stringResource(R.string.math_instance_insert)) { editor.insertMathInstance() },
             InsertRow(XnotesIcons.fontFace, stringResource(R.string.handwrite_menu)) { handwriteOpen = true },
             InsertRow(XnotesIcons.sticker, stringResource(R.string.stickers), more = true) { stickersOpen = true },
         ),

@@ -1681,6 +1681,11 @@
     <string name="sticky_note_edit">Edit sticky note</string>
     <string name="sticky_note_collapse">Collapse</string>
     <string name="sticky_note_expand">Expand</string>
+    <string name="math_instance_insert">Math Studio instance</string>
+    <string name="math_instance_edit">Edit Math Studio instance</string>
+    <string name="math_instance_edit_title">Edit Math Studio instance</string>
+    <string name="math_instance_name_hint">Instance name</string>
+    <string name="math_instance_open">Open Math Studio</string>
     <string name="note_link_display_name">Label shown on canvas</string>
     <string name="note_link_target">Linked note</string>
     <string name="note_link_this_note">Link within this note</string>

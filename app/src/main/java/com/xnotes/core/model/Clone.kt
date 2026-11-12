@@ -38,6 +38,8 @@ fun CanvasItem.deepCopy(measurer: TextMeasurer): CanvasItem = when (this) {
         TableItem(rect, colFractions.toList(), rowFractions.toList(), strokeRgba, strokeWidth, cellGrid())
     is StickyNoteItem ->
         StickyNoteItem(Rect(rect.x, rect.y, rect.w, rect.h), color, collapsed, text, ink.mapTo(mutableListOf()) { Stroke(it) }, measurer)
+    is MathStudioInstanceItem ->
+        MathStudioInstanceItem(Rect(rect.x, rect.y, rect.w, rect.h), name, color, studioJson)
     else -> this
     // Carried, not reset: autosave snapshots the document through this, so dropping the lock here
     // would quietly unlock everything on the next save.

@@ -1239,6 +1239,23 @@ class Editor(
         if (canvasOpen) infiniteOrNull?.toggleStickyCollapsed(item) else controller.toggleStickyCollapsed(item)
     }
 
+    override val singleSelectedMathInstance: com.xnotes.core.model.MathStudioInstanceItem?
+        get() = if (canvasOpen) {
+            infiniteOrNull?.selection?.items?.singleOrNull() as? com.xnotes.core.model.MathStudioInstanceItem
+        } else {
+            controller.selectedItems().singleOrNull() as? com.xnotes.core.model.MathStudioInstanceItem
+        }
+
+    override fun editSelectedMathInstance() {
+        val item = singleSelectedMathInstance ?: return
+        requestMathInstanceEdit(item)
+    }
+
+    override fun openSelectedMathInstance() {
+        val item = singleSelectedMathInstance ?: return
+        openMathInstance(item)
+    }
+
     override fun setSelectedTableCells(cells: List<List<String>>) = controller.setSelectedTableCells(cells)
 
     override fun sendSelectedTableToData() {
@@ -1519,6 +1536,7 @@ class Editor(
             it.onStickyColorDot = { item, anchor ->
                 requestStickyColor(item, anchor, onCanvas = true)
             }
+            it.onMathInstanceOpen = { item -> openMathInstance(item) }
             it.view.onTwoFingerTap = { dispatchTapGesture(preferences.twoFingerTap) }
             it.view.onThreeFingerTap = { dispatchTapGesture(preferences.threeFingerTap) }
             it.view.sideButton.onClick = { at -> dispatchTapGesture(preferences.stylusButtonTap, at) }
@@ -2015,6 +2033,12 @@ class Editor(
     var stickyColorTarget by mutableStateOf<StickyColorTarget?>(null)
         private set
 
+    /** The Math Studio instance whose name/color is being edited. */
+    var mathInstanceEditTarget by mutableStateOf<com.xnotes.core.model.MathStudioInstanceItem?>(null)
+        private set
+
+    var onMathInstanceOpen: ((item: com.xnotes.core.model.MathStudioInstanceItem) -> Unit)? = null
+
     /** A sticky color pick in flight: the note, where its dot sits (viewport px), and which canvas. */
     class StickyColorTarget(
         val item: com.xnotes.core.model.StickyNoteItem,
@@ -2071,6 +2095,46 @@ class Editor(
         controller.commitStickyText(item, text)
         view.requestRender()
     }
+
+    fun requestMathInstanceEdit(item: com.xnotes.core.model.MathStudioInstanceItem) {
+        mathInstanceEditTarget = item
+    }
+
+    fun dismissMathInstanceEdit() {
+        mathInstanceEditTarget = null
+    }
+
+    fun saveMathInstanceEdit(name: String, color: com.xnotes.core.model.Rgba) {
+        val item = mathInstanceEditTarget ?: return
+        mathInstanceEditTarget = null
+        val n = name.trim().takeIf { it.isNotEmpty() } ?: com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME
+        if (onCanvasMathInstance(item)) {
+            infiniteOrNull?.renameMathInstance(item, n, color)
+        } else {
+            controller.renameMathInstance(item, n, color)
+        }
+        view.requestRender()
+    }
+
+    private fun onCanvasMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem): Boolean =
+        infiniteOrNull?.document?.items?.any { it === item } == true
+
+    fun openMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem) {
+        onMathInstanceOpen?.invoke(item)
+    }
+
+    fun storeMathInstanceJson(item: com.xnotes.core.model.MathStudioInstanceItem, json: String) {
+        if (onCanvasMathInstance(item)) {
+            infiniteOrNull?.storeMathInstanceJson(item, json)
+        } else {
+            controller.storeMathInstanceJson(item, json)
+        }
+        // Mark dirty already done in controller; ensure view state if needed
+    }
+
+    fun holdsMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem): Boolean =
+        if (canvasOpen) infiniteOrNull?.document?.items?.any { it === item } == true
+        else state.document.pages.any { p -> p.items.any { it === item } }
 
     /** What a tap lands on: [markup] on note page [page], and the tap in its page space when it is on the markup itself. */
     private class MarkupHit(val page: Int, val markup: TextMarkup, val local: Pt?)
@@ -2678,6 +2742,10 @@ class Editor(
         }
         controller.onStickyColorDot = { item, _, anchor ->
             requestStickyColor(item, anchor, onCanvas = false)
+        }
+        controller.onMathInstanceTap = { item, _ ->
+            openMathInstance(item)
+            true
         }
         controller.onUserMovedView = { AudioPlayback.userMoved(this) }
         // Whatever is added while this note records takes the recording's moment.
@@ -3764,6 +3832,36 @@ class Editor(
             com.xnotes.core.geometry.Rect(x, y, w, h), color, collapsed = false,
             measurer = textMeasurer,
         )
+        page.items.add(item)
+        state.appendToCache(page, item)
+        history.push(AddItem(page, item))
+        doc.dirty = true
+        refreshContent()
+        controller.selectPlaced(index, listOf(item))
+        view.requestRender()
+        return item
+    }
+
+    fun insertMathInstance(
+        atContent: com.xnotes.core.geometry.Pt? = null,
+        name: String = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME,
+        color: com.xnotes.core.model.Rgba = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_COLOR,
+        studioJson: String = "",
+    ): com.xnotes.core.model.MathStudioInstanceItem? {
+        if (canvasOpen) return infinite.insertMathInstance(atContent, name, color, studioJson)
+        val doc = state.document
+        if (doc.pages.isEmpty()) return null
+        val centre = atContent ?: state.viewportToContent(com.xnotes.core.geometry.Pt(state.viewportW / 2.0, state.viewportH / 2.0))
+        val index = (state.pageIndexAtContent(centre) ?: state.currentPageIndex()).coerceIn(0, doc.pages.lastIndex)
+        val page = doc.pages[index]
+        val cover = state.footprint(page)
+        val local = state.toPageSpace(index, centre)
+        // Keep the icon fully inside the page footprint.
+        val size = com.xnotes.core.model.MathStudioInstanceItem.ICON_SIZE
+        val x = (local.x - size / 2.0).coerceIn(cover.left, (cover.right - size).coerceAtLeast(cover.left))
+        val y = (local.y - size / 2.0).coerceIn(cover.top, (cover.bottom - size).coerceAtLeast(cover.top))
+        val rect = com.xnotes.core.geometry.Rect(x, y, size, size)
+        val item = com.xnotes.core.model.MathStudioInstanceItem(rect, name, color, studioJson)
         page.items.add(item)
         state.appendToCache(page, item)
         history.push(AddItem(page, item))

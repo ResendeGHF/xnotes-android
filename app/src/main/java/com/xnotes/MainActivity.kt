@@ -540,13 +540,30 @@ private fun EditorScreen(
         var mathStudioCanvas by remember(editor) { mutableStateOf(false) }
         // Each note's workspace snapshot, keyed by note URI.
         var mathStudioData by remember(editor) { mutableStateOf<Map<String?, String>>(emptyMap()) }
+        var mathInstanceItem by remember(editor) { mutableStateOf<com.xnotes.core.model.MathStudioInstanceItem?>(null) }
+        var mathInstanceHost by remember(editor) { mutableStateOf<Editor?>(null) }
+
         fun openMathStudio() {
             val pane = editor.active
+            mathInstanceItem = null
+            mathInstanceHost = null
             mathStudioPane = pane
             mathStudioUri = pane.openDocumentUri
             mathStudioDoc = pane.state.document
             mathStudioCanvas = pane.canvasOpen
             mathStudioOpen = true
+        }
+        fun openMathInstanceStudio(item: com.xnotes.core.model.MathStudioInstanceItem, host: Editor) {
+            mathInstanceItem = item
+            mathInstanceHost = host
+            // Reuse the same open tracking so tab switching still closes it correctly.
+            mathStudioPane = host
+            mathStudioUri = host.openDocumentUri
+            mathStudioDoc = host.state.document
+            mathStudioCanvas = host.canvasOpen
+            mathStudioOpen = true
+            mathAnimSpec = null
+            mathStudioRequest = null
         }
         fun closeMathStudio() {
             if (!mathStudioOpen) return
@@ -557,6 +574,8 @@ private fun EditorScreen(
             mathStudioPane = null
             mathStudioDoc = null
             mathStudioCanvas = false
+            mathInstanceItem = null
+            mathInstanceHost = null
         }
         /** Whether the note the studio was opened from is still the open note in its pane. */
         fun isStudioNoteOpen(): Boolean {
@@ -566,6 +585,12 @@ private fun EditorScreen(
             if (pane.openDocumentUri != uri) return false
             // A blank replacement keeps a null URI too: only the same document counts.
             if (uri == null && (pane.canvasOpen != mathStudioCanvas || pane.state.document !== mathStudioDoc)) return false
+            // An instance's icon may have been deleted while its studio was open.
+            val inst = mathInstanceItem
+            val host = mathInstanceHost
+            if (inst != null && host != null) {
+                if (!host.holdsMathInstance(inst)) return false
+            }
             return true
         }
         /** This note's stored workspace: the session map is freshest, then the live document. */
@@ -584,6 +609,17 @@ private fun EditorScreen(
         }
         /** Keeps the snapshot for [mathStudioUri] in the session map and in the open document. */
         fun persistMathStudio(json: String) {
+            // Instance studio: keep the snapshot on the item itself, not the note's global slot.
+            val inst = mathInstanceItem
+            val host = mathInstanceHost
+            if (inst != null && host != null) {
+                if (host.noteOpen && host.openDocumentUri == mathStudioUri) {
+                    host.storeMathInstanceJson(inst, json)
+                } else if (mathStudioUri == null && host === mathStudioPane && host.state.document === mathStudioDoc) {
+                    host.storeMathInstanceJson(inst, json)
+                }
+                return
+            }
             val uri = mathStudioUri
             if (uri == null) {
                 // No URI to key the session map on: keep it in the note's own live buffer,
@@ -605,11 +641,14 @@ private fun EditorScreen(
             }
         }
         // Tapping a play badge on an inserted animation frame reopens Studio with it restored.
-        editor.onMathAnimSpec = { spec -> mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
-        editor.secondary?.onMathAnimSpec = { spec -> mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
+        editor.onMathAnimSpec = { spec -> mathInstanceItem = null; mathInstanceHost = null; mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
+        editor.secondary?.onMathAnimSpec = { spec -> mathInstanceItem = null; mathInstanceHost = null; mathAnimSpec = spec; mathStudioRequest = null; openMathStudio() }
         // Sending a selection to Math Studio opens it on the requested tab with the expression set.
-        editor.onMathStudioRequest = { req -> mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
-        editor.secondary?.onMathStudioRequest = { req -> mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
+        editor.onMathStudioRequest = { req -> mathInstanceItem = null; mathInstanceHost = null; mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
+        editor.secondary?.onMathStudioRequest = { req -> mathInstanceItem = null; mathInstanceHost = null; mathStudioRequest = req; mathAnimSpec = null; openMathStudio() }
+        // A Math instance icon opens its private workspace.
+        editor.onMathInstanceOpen = { item -> openMathInstanceStudio(item, editor) }
+        editor.secondary?.onMathInstanceOpen = { item -> openMathInstanceStudio(item, editor.secondary!!) }
 
         // Which pane a "Save as" writes: the focused one at the moment the picker opened.
         var savePane by remember { mutableStateOf(editor) }
@@ -1924,7 +1963,9 @@ private fun EditorScreen(
                         }
                         // Resolved once per opening: live snapshots flow back through onPersist,
                         // so recomputing this on every persist would restore echoes of our own writes.
-                        val initialStudioData = remember(mathStudioOpen, mathStudioUri) { studioJsonFor(mathStudioUri) }
+                        val initialStudioData = remember(mathStudioOpen, mathStudioUri, mathInstanceItem) {
+                            mathInstanceItem?.studioJson?.takeIf { it.isNotEmpty() } ?: studioJsonFor(mathStudioUri)
+                        }
                         com.xnotes.ui.MathStudioScreen(
                             onClose = { closeMathStudio() },
                             initialAnim = mathAnimSpec,
@@ -2685,6 +2726,7 @@ private fun EditorPane(
                     com.xnotes.ui.PenMenu(canvas)
                     com.xnotes.ui.CanvasDebugOverlay(canvas)
                     com.xnotes.ui.StickyColorPopup(editor)
+                    com.xnotes.ui.MathStudioInstanceDialog(editor)
                     CanvasToastPill(canvas)
                 }
             } else {
@@ -2766,6 +2808,7 @@ private fun EditorPane(
                         com.xnotes.ui.PenMenu(canvas)
                         com.xnotes.ui.CanvasDebugOverlay(canvas)
                         com.xnotes.ui.StickyColorPopup(editor)
+                        com.xnotes.ui.MathStudioInstanceDialog(editor)
                         CanvasToastPill(canvas)
                     }
                 }
@@ -2814,6 +2857,7 @@ private fun EditorPane(
                         com.xnotes.ui.MarkupNoteDialog(editor)
                         com.xnotes.ui.StickyNoteDialog(editor)
                         com.xnotes.ui.StickyColorPopup(editor)
+                        com.xnotes.ui.MathStudioInstanceDialog(editor)
                         com.xnotes.ui.SlashMenu(editor)
                         com.xnotes.ui.FlowTableMenu(editor)
                         com.xnotes.ui.TableChrome(editor)
@@ -2929,6 +2973,7 @@ private fun EditorPane(
                             com.xnotes.ui.MarkupNoteDialog(editor)
                             com.xnotes.ui.StickyNoteDialog(editor)
                             com.xnotes.ui.StickyColorPopup(editor)
+                            com.xnotes.ui.MathStudioInstanceDialog(editor)
                             com.xnotes.ui.SlashMenu(editor)
                             com.xnotes.ui.FlowTableMenu(editor)
                             com.xnotes.ui.TableChrome(editor)

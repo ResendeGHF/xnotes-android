@@ -228,6 +228,7 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         onToggleSticky = { toggleStickyCollapsed(it) },
         onStickyColorDot = { item, anchor -> onStickyColorDot?.invoke(item, anchor) },
         onStickyEditText = { onStickyEditText?.invoke(it) == true },
+        onMathInstanceTap = { tapMathInstance(it) },
         onUserMovedView = { AudioPlayback.userMoved(this) },
     )
 
@@ -3076,6 +3077,48 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
         publishOverlay()
     }
 
+    fun insertMathInstance(
+        atContent: Pt? = null,
+        name: String = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME,
+        color: com.xnotes.core.model.Rgba = com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_COLOR,
+        studioJson: String = "",
+    ): com.xnotes.core.model.MathStudioInstanceItem {
+        val centre = atContent ?: viewport.centerContent
+        val size = com.xnotes.core.model.MathStudioInstanceItem.ICON_SIZE / viewport.zoom.coerceAtLeast(0.5)
+        val rect = com.xnotes.core.geometry.Rect(centre.x - size / 2.0, centre.y - size / 2.0, size, size)
+        val item = com.xnotes.core.model.MathStudioInstanceItem(rect, name, color, studioJson)
+        commitItem(item)
+        selection.select(listOf(item))
+        publishOverlay()
+        return item
+    }
+
+    fun renameMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem, name: String, color: com.xnotes.core.model.Rgba) {
+        if (item.name == name && item.color == color) return
+        val before = item.snapshotGeometry()
+        item.name = name
+        item.color = color
+        val after = item.snapshotGeometry()
+        val cmd = com.xnotes.core.history.TransformItems(listOf(item), listOf(before), listOf(after))
+        cmd.redo()
+        document.itemsChanged(listOf(item))
+        history.push(com.xnotes.core.infinite.OnCanvas(document, cmd, listOf(item)))
+        markDirty()
+        refresh()
+        publishOverlay()
+    }
+
+    fun storeMathInstanceJson(item: com.xnotes.core.model.MathStudioInstanceItem, json: String) {
+        if (item.studioJson == json) return
+        item.studioJson = json
+        markDirty()
+    }
+
+    fun tapMathInstance(item: com.xnotes.core.model.MathStudioInstanceItem): Boolean {
+        onMathInstanceOpen?.invoke(item)
+        return onMathInstanceOpen != null
+    }
+
     /** Shows a message to the user, with an optional button; the paged editor that owns this canvas sets it. */
     var onMessage: ((String, Pair<String, () -> Unit>?) -> Unit)? = null
 
@@ -3084,6 +3127,8 @@ class InfiniteEditor(context: Context) : ToolPopupHost, PenMenuHost, SelectionMe
 
     /** Host hook for a sticky note's color dot: open the swatch picker at [anchorViewport]. */
     var onStickyColorDot: ((com.xnotes.core.model.StickyNoteItem, com.xnotes.core.geometry.Rect) -> Unit)? = null
+
+    var onMathInstanceOpen: ((com.xnotes.core.model.MathStudioInstanceItem) -> Unit)? = null
 
     override fun audioRepaint(item: com.xnotes.core.model.AudioItem) = audioChanged(item, save = false)
 

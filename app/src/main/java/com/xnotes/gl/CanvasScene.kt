@@ -545,15 +545,15 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         // refresh rate, while none of them had actually changed.
         drawCommittedHalos(program, frame, camChunkX, camChunkY)
 
-        // Sticky notes always sit in front of canvas ink, whatever the document order says:
-        // everything else first, then the notes (with their own ink) over it.
+        // Sticky notes and Math Studio instances always sit in front of canvas ink, whatever the document order says:
+        // everything else first, then the notes/instances (with their own ink) over it.
         val fade = fade
         deferred.clear()
         stickyDeferred.clear()
         drawCommittedBatch(program, frame, camChunkX, camChunkY, fade, stickyOnly = false, deferred)
         // A sticky's paper covers the plain highlighters beneath it, like a tape does.
         for (record in visible) {
-            if (record.item !is StickyNoteItem) continue
+            if (record.item !is StickyNoteItem && record.item !is com.xnotes.core.model.MathStudioInstanceItem) continue
             for (part in record.parts) {
                 if (!part.covers) continue
                 for (d in deferred) {
@@ -637,7 +637,8 @@ class CanvasScene(private val store: GeometryStore = GeometryStore()) : GlScene 
         var runStart = -1
         var runCount = 0
         for (record in visible) {
-            if ((record.item is StickyNoteItem) != stickyOnly) continue
+            val isStickyLike = record.item is StickyNoteItem || record.item is com.xnotes.core.model.MathStudioInstanceItem
+            if (isStickyLike != stickyOnly) continue
             val faded = fade != null && fade.fades(record.item)
             if (record.textBitmap != null) {
                 flushRun(runStart, runCount)

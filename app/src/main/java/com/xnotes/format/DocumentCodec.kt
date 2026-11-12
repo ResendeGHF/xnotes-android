@@ -368,6 +368,7 @@ class DocumentCodec(
                 is TapeItem -> writeTape(j, item)
                 is NoteLinkItem -> writeNoteLink(j, item, ids[item])
                 is StickyNoteItem -> writeSticky(j, item, ids[item])
+                is com.xnotes.core.model.MathStudioInstanceItem -> writeMathInstance(j, item, ids[item])
                 else -> {} // unrecognized kind: not written
             }
         }
@@ -684,6 +685,22 @@ class DocumentCodec(
             for (s in item.ink) writeStickyStroke(j, s)
             j.endArray()
         }
+        if (item.locked) j.name("locked").value(true)
+        item.link?.let { j.name("link").value(it) }
+        item.group?.let { j.name("group").value(it) }
+        item.sync?.let { writeSync(j, it) }
+        j.endObject()
+    }
+
+    private fun writeMathInstance(j: JsonWrite, item: com.xnotes.core.model.MathStudioInstanceItem, id: Int?) {
+        j.beginObject()
+        j.name("kind").value(com.xnotes.core.model.MathStudioInstanceItem.KIND)
+        id?.let { j.name("id").value(it) }
+        j.name("rect").beginArray().value(item.rect.x).value(item.rect.y).value(item.rect.w).value(item.rect.h).endArray()
+        j.name("color")
+        writeRgba(j, item.color)
+        if (item.name.isNotEmpty() && item.name != com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME) j.name("math_name").value(item.name)
+        if (item.studioJson.isNotEmpty()) j.name("math_json").value(item.studioJson)
         if (item.locked) j.name("locked").value(true)
         item.link?.let { j.name("link").value(it) }
         item.group?.let { j.name("group").value(it) }
@@ -1358,6 +1375,8 @@ class DocumentCodec(
         var tapeWidth: Double? = null
         var collapsed = false
         var stickyInk: MutableList<Stroke>? = null
+        var mathInstanceName: String? = null
+        var mathInstanceJson: String? = null
         var cuts: List<CutEdge> = emptyList()
         var part: Rect? = null
     }
@@ -1466,6 +1485,8 @@ class DocumentCodec(
                 "pattern" -> s.pattern = stringOrNull(p)
                 "collapsed" -> s.collapsed = boolOr(p, false)
                 "ink" -> s.stickyInk = parseStickyInk(p)
+                "math_json" -> s.mathInstanceJson = stringOr(p, "")
+                "math_name" -> s.mathInstanceName = stringOr(p, "")
                 "cuts" -> s.cuts = parseCuts(p)
                 "part" -> s.part = rectOrNull(p)?.let { partWithin(it) }
                 else -> p.skipValue()
@@ -1531,6 +1552,7 @@ class DocumentCodec(
             TapeItem.KIND -> buildTape(s)?.let { items.add(it) }
             NoteLinkItem.KIND -> buildNoteLink(s)?.let { items.add(it) }
             StickyNoteItem.KIND -> buildSticky(s)?.let { items.add(it) }
+            com.xnotes.core.model.MathStudioInstanceItem.KIND -> buildMathInstance(s)?.let { items.add(it) }
             else -> {} // unrecognized kind: skipped (forgiving)
         }
         if (items.size > before) glue.named(items[before], s.id)
@@ -1840,6 +1862,18 @@ class DocumentCodec(
             text = s.text,
             ink = (s.stickyInk ?: mutableListOf()).mapTo(mutableListOf()) { Stroke(it) },
             measurer = textMeasurer,
+        )
+    }
+
+    private fun buildMathInstance(s: ItemScratch): com.xnotes.core.model.MathStudioInstanceItem? {
+        val rect = s.rect ?: return null
+        if (!(rect.w.isFinite() && rect.h.isFinite() && rect.w > 0.0 && rect.h > 0.0)) return null
+        val name = s.mathInstanceName?.takeIf { it.isNotEmpty() } ?: s.name.takeIf { it.isNotEmpty() } ?: com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_NAME
+        return com.xnotes.core.model.MathStudioInstanceItem(
+            rect = rect,
+            name = name,
+            color = s.linkColor ?: com.xnotes.core.model.MathStudioInstanceItem.DEFAULT_COLOR,
+            studioJson = s.mathInstanceJson ?: "",
         )
     }
 

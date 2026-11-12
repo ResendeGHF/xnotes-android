@@ -164,6 +164,7 @@ class InfiniteInteraction(
     private val onStickyColorDot: (StickyNoteItem, Rect) -> Unit = { _, _ -> },
     /** Edit this sticky note's text (a dialog); true when handled. */
     private val onStickyEditText: (StickyNoteItem) -> Boolean = { false },
+    private val onMathInstanceTap: (com.xnotes.core.model.MathStudioInstanceItem) -> Boolean = { false },
     /** The view was panned or pinched by hand, as distinct from moved by the app. */
     private val onUserMovedView: () -> Unit = {},
 ) {
@@ -832,13 +833,14 @@ class InfiniteInteraction(
             (mode == CanvasPointerMode.PINCH && pinchPanAllowed())
         // A pan that never moved is a tap, and a tap on a pill plays it, as a finger opens links on a note.
         val panTap = mode == CanvasPointerMode.PAN && !panFromPenButton && panWasTap(uv.x, uv.y)
+        val mathInstanceTapped = panTap && mathInstanceTapAt(viewport.viewportToContent(Pt(uv.x, uv.y)))
         // A tape lies over whatever else the tap could reach, so it takes the tap first.
-        val tapeTapped = panTap && peelTapeAt(viewport.viewportToContent(Pt(uv.x, uv.y)))
-        val animTapped = !tapeTapped && panTap && onMathAnimTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
-        val audioTapped = !tapeTapped && !animTapped && panTap && onAudioTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
+        val tapeTapped = !mathInstanceTapped && panTap && peelTapeAt(viewport.viewportToContent(Pt(uv.x, uv.y)))
+        val animTapped = !tapeTapped && !mathInstanceTapped && panTap && onMathAnimTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
+        val audioTapped = !tapeTapped && !animTapped && !mathInstanceTapped && panTap && onAudioTap(viewport.viewportToContent(Pt(uv.x, uv.y)))
         // A finger tap off the selection puts it away; a tap is the only way to say so with a
         // finger, since a drag there is a pan.
-        if (!audioTapped && !animTapped && !tapeTapped && mode == CanvasPointerMode.PAN && panMayDismiss &&
+        if (!mathInstanceTapped && !audioTapped && !animTapped && !tapeTapped && mode == CanvasPointerMode.PAN && panMayDismiss &&
             panWasTap(uv.x, uv.y)
         ) {
             val picked = tool == Tool.SELECT && tapSelect(viewport.viewportToContent(Pt(uv.x, uv.y)))
@@ -929,6 +931,7 @@ class InfiniteInteraction(
 
     private fun beginDraw(vx: Double, vy: Double, drawTool: Tool, e: MotionEvent) {
         val at = viewport.viewportToContent(Pt(vx, vy))
+        if (mathInstanceTapAt(at)) return
         // A pen press on a collapsed icon expands it (or on an expanded × collapses it).
         if (stickyToggleAt(at)) return
         // Ink starting inside an expanded sticky belongs to the note: clamp it to the paper
@@ -2058,6 +2061,17 @@ class InfiniteInteraction(
         val tl = viewport.contentToViewport(Pt(hit.x, hit.y))
         onStickyColorDot(item, Rect(tl.x, tl.y, hit.w * viewport.zoom, hit.h * viewport.zoom))
         return true
+    }
+
+    private fun mathInstanceAt(at: Pt): com.xnotes.core.model.MathStudioInstanceItem? {
+        val pad = TAP_SLOP_PX / viewport.zoom
+        return itemsIn(Rect(at.x - pad, at.y - pad, pad * 2, pad * 2))
+            .lastOrNull { it is com.xnotes.core.model.MathStudioInstanceItem && !it.locked && it.contains(at) } as? com.xnotes.core.model.MathStudioInstanceItem
+    }
+
+    private fun mathInstanceTapAt(at: Pt): Boolean {
+        val item = mathInstanceAt(at) ?: return false
+        return onMathInstanceTap(item)
     }
 
     /** Select the topmost shape whose outline or fill is under [at], if any. */

@@ -276,6 +276,10 @@ interface SelectionMenuHost : SwatchHost {
 
     /** Collapse or expand the selected sticky note. */
     fun toggleSelectedStickyCollapsed() {}
+
+    val singleSelectedMathInstance: com.xnotes.core.model.MathStudioInstanceItem? get() = null
+    fun editSelectedMathInstance() {}
+    fun openSelectedMathInstance() {}
 }
 
 /**
@@ -449,6 +453,16 @@ fun SelectionMenu(
                         DropdownMenuItem(
                             text = { Text(stringResource(if (sticky.collapsed) R.string.sticky_note_expand else R.string.sticky_note_collapse)) },
                             onClick = { overflowOpen = false; host.toggleSelectedStickyCollapsed() },
+                        )
+                    }
+                    host.singleSelectedMathInstance?.let { inst ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.math_instance_open)) },
+                            onClick = { overflowOpen = false; host.openSelectedMathInstance() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.math_instance_edit)) },
+                            onClick = { overflowOpen = false; host.editSelectedMathInstance() },
                         )
                     }
                     if (host.selectionCanLink) {

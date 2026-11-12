@@ -1439,10 +1439,11 @@ class CanvasState(
      */
     private fun cacheItems(page: Page): InkItems {
         val n = PageLayers.underText(page.items)
-        val under = if (flowLifted) emptyList() else page.items.subList(0, n).filter { !isLiftedItem(it) && it !is com.xnotes.core.model.StickyNoteItem }
-        val overNonSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && it !is com.xnotes.core.model.StickyNoteItem }
-        // Sticky notes always sit in front of page ink, whatever the document order says.
-        val overSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && it is com.xnotes.core.model.StickyNoteItem }
+        val isFrontIcon = { it: CanvasItem -> it is com.xnotes.core.model.StickyNoteItem || it is com.xnotes.core.model.MathStudioInstanceItem }
+        val under = if (flowLifted) emptyList() else page.items.subList(0, n).filter { !isLiftedItem(it) && !isFrontIcon(it) }
+        val overNonSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && !isFrontIcon(it) }
+        // Sticky notes and Math Studio instances always sit in front of page ink, whatever the document order says.
+        val overSticky = page.items.subList(n, page.items.size).filter { !isLiftedItem(it) && !it.isHighlighterInk() && isFrontIcon(it) }
         return InkItems(under, overNonSticky + overSticky)
     }
 
@@ -1703,12 +1704,13 @@ class CanvasState(
         r.scale(res, res)
         r.translate(-cover.left, -cover.top)
         paintItem(item, r)
-        if (item !is com.xnotes.core.model.StickyNoteItem) {
-            // The new ink landed over the whole cache, including any sticky note it overlaps:
+        val isFrontIcon = { it: CanvasItem -> it is com.xnotes.core.model.StickyNoteItem || it is com.xnotes.core.model.MathStudioInstanceItem }
+        if (!isFrontIcon(item)) {
+            // The new ink landed over the whole cache, including any sticky note / instance it overlaps:
             // repaint those notes so they stay in front.
             val bounds = item.paintBounds()
             for (other in page.items) {
-                if (other is com.xnotes.core.model.StickyNoteItem && !isLiftedItem(other) &&
+                if (isFrontIcon(other) && !isLiftedItem(other) &&
                     !other.isHighlighterInk() && other.paintBounds().intersects(bounds)
                 ) {
                     paintItem(other, r)
@@ -1754,16 +1756,17 @@ class CanvasState(
         val rr = contentRenderer(r, page)
         val n = PageLayers.underText(page.items)
         val f = fade
+        val isFrontIcon = { it: CanvasItem -> it is com.xnotes.core.model.StickyNoteItem || it is com.xnotes.core.model.MathStudioInstanceItem }
         if (!flowLifted) {
-            InkFade.paint(page.items.subList(0, n), rr, f, { !isLiftedItem(it) && it !is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region) }) { it.paint(rr) }
+            InkFade.paint(page.items.subList(0, n), rr, f, { !isLiftedItem(it) && !isFrontIcon(it) && it.paintBounds().intersects(region) }) { it.paint(rr) }
             paintFlow?.invoke(page, rr, region)
         }
         InkFade.paint(page.items.subList(n, page.items.size), rr, f, {
-            !isLiftedItem(it) && !it.isHighlighterInk() && it !is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region)
+            !isLiftedItem(it) && !it.isHighlighterInk() && !isFrontIcon(it) && it.paintBounds().intersects(region)
         }) { it.paint(rr) }
-        // Sticky notes always sit in front of page ink, whatever the document order says.
+        // Sticky notes and Math Studio instances always sit in front of page ink, whatever the document order says.
         InkFade.paint(page.items.subList(n, page.items.size), rr, f, {
-            !isLiftedItem(it) && !it.isHighlighterInk() && it is com.xnotes.core.model.StickyNoteItem && it.paintBounds().intersects(region)
+            !isLiftedItem(it) && !it.isHighlighterInk() && isFrontIcon(it) && it.paintBounds().intersects(region)
         }) { it.paint(rr) }
         // Exported linked pages carry their link's color as a frame.
         if (page.linkBorder != null) com.xnotes.core.links.LinkBorder.paint(page, rr)
@@ -2266,11 +2269,13 @@ class CanvasState(
         r.translate(pr.left, pr.top)
         applyPageTransform(r, page)
         paintItem(item, r)
-        if (item !is com.xnotes.core.model.StickyNoteItem) {
-            // Keep sticky notes in front of the fresh ink they overlap.
+        val isFrontIcon2 = item is com.xnotes.core.model.StickyNoteItem || item is com.xnotes.core.model.MathStudioInstanceItem
+        if (!isFrontIcon2) {
+            // Keep sticky notes and Math instances in front of the fresh ink they overlap.
             val bounds = item.paintBounds()
             for (other in page.items) {
-                if (other is com.xnotes.core.model.StickyNoteItem && !isLiftedItem(other) &&
+                val isFrontOther = other is com.xnotes.core.model.StickyNoteItem || other is com.xnotes.core.model.MathStudioInstanceItem
+                if (isFrontOther && !isLiftedItem(other) &&
                     !other.isHighlighterInk() && other.paintBounds().intersects(bounds)
                 ) {
                     paintItem(other, r)

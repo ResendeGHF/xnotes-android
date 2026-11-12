@@ -9,6 +9,7 @@ import com.xnotes.core.model.CanvasItem
 import com.xnotes.core.model.ConnectorItem
 import com.xnotes.core.model.Rgba
 import com.xnotes.core.model.ShapeItem
+import com.xnotes.core.model.MathStudioInstanceItem
 import com.xnotes.core.model.StickyNoteItem
 import com.xnotes.core.model.Stroke
 import com.xnotes.core.model.TapeItem
@@ -127,6 +128,7 @@ object ItemMesher {
             is AudioItem -> meshAudio(item, tolerance)
             is TapeItem -> meshTape(item, tolerance)
             is StickyNoteItem -> meshSticky(item, tolerance)
+            is MathStudioInstanceItem -> meshMathInstance(item, tolerance)
             is TextItem -> meshText(item)
             else -> null // images carry a texture rather than a colour, and take their own path
         }
@@ -251,6 +253,71 @@ object ItemMesher {
         }
         if (parts.isEmpty()) return null
         return MeshedItem(parts, item.paintBounds(), if (minHalfWidth == Double.MAX_VALUE) 0.0 else minHalfWidth)
+    }
+
+    private fun meshMathInstance(item: MathStudioInstanceItem, tolerance: Double): MeshedItem? {
+        val parts = ArrayList<MeshPart>()
+        val b = item.iconRect()
+        val outline = MathStudioInstanceItem.iconOutline(b)
+        MeshBuilder().also { body ->
+            body.polygon(outline)
+            if (!body.isEmpty) parts.add(MeshPart(body.build(), item.paperColor(), InkPass.OPAQUE, covers = true))
+        }
+        MeshBuilder().also { edge ->
+            edge.polylineRibbon(outline, MathStudioInstanceItem.ICON_EDGE_WIDTH / 2.0, true, tolerance)
+            if (!edge.isEmpty) parts.add(MeshPart(edge.build(), item.edgeColor(), InkPass.OPAQUE))
+        }
+        val f = MathStudioInstanceItem.ICON_FOLD
+        MeshBuilder().also { fold ->
+            fold.polygon(listOf(Pt(b.right - f, b.top), Pt(b.right, b.top + f), Pt(b.right - f, b.top + f)))
+            if (!fold.isEmpty) parts.add(MeshPart(fold.build(), item.foldColor(), InkPass.OPAQUE))
+        }
+        // Calculator glyph: display bar + button grid
+        val fg = item.textColor()
+        val cx = b.center.x
+        val cy = b.center.y
+        val s = MathStudioInstanceItem.ICON_SIZE * 0.62
+        val half = s / 2.0
+        val calcRect = com.xnotes.core.geometry.Rect(cx - half, cy - half + 2.0, s, s * 0.92)
+        MeshBuilder().also { disp ->
+            disp.polygon(
+                listOf(
+                    Pt(calcRect.left + 3, calcRect.top + 4),
+                    Pt(calcRect.right - 3, calcRect.top + 4),
+                    Pt(calcRect.right - 3, calcRect.top + 10),
+                    Pt(calcRect.left + 3, calcRect.top + 10),
+                ),
+            )
+            if (!disp.isEmpty) parts.add(MeshPart(disp.build(), fg.withAlpha(18), InkPass.OPAQUE))
+        }
+        MeshBuilder().also { dispBorder ->
+            dispBorder.polylineRibbon(
+                listOf(
+                    Pt(calcRect.left + 3, calcRect.top + 4),
+                    Pt(calcRect.right - 3, calcRect.top + 4),
+                    Pt(calcRect.right - 3, calcRect.top + 10),
+                    Pt(calcRect.left + 3, calcRect.top + 10),
+                ),
+                0.5, true, tolerance,
+            )
+            if (!dispBorder.isEmpty) parts.add(MeshPart(dispBorder.build(), fg.withAlpha(90), InkPass.OPAQUE))
+        }
+        val btnSize = 4.5
+        val gapX = (calcRect.w - 6 - btnSize * 3) / 2.0
+        val gapY = 4.0
+        val startX = calcRect.left + 3
+        val startY = calcRect.top + 14
+        for (row in 0 until 3) {
+            for (col in 0 until 3) {
+                val bx = startX + col * (btnSize + gapX)
+                val by = startY + row * (btnSize + gapY)
+                MeshBuilder().also { btn ->
+                    btn.polygon(listOf(Pt(bx, by), Pt(bx + btnSize, by), Pt(bx + btnSize, by + btnSize), Pt(bx, by + btnSize)))
+                    if (!btn.isEmpty) parts.add(MeshPart(btn.build(), fg.withAlpha(85), InkPass.OPAQUE))
+                }
+            }
+        }
+        return if (parts.isEmpty()) null else MeshedItem(parts, item.paintBounds())
     }
 
     /** [part] shifted by a paper offset, for note-local ink meshed at the origin. */
