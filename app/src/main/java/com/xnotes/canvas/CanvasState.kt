@@ -116,6 +116,14 @@ class CanvasState(
     var scrollX: Double = 0.0
     var scrollY: Double = 0.0
 
+    /** Transient gesture prediction offset (view px), applied only for rendering when safe.
+     *  Never persisted, never feeds back into scroll logic. The next real sample corrects it.
+     *  Only set when the predicted viewport's caches are ready and the predicted scroll is
+     *  within valid bounds (no invalid moves, no un-rebaked content). */
+    var predictedPanX: Double = 0.0
+    var predictedPanY: Double = 0.0
+    var predictedZoomFactor: Double = 1.0
+
     var viewportW: Int = 0
     var viewportH: Int = 0
     var renderScale: Double = 1.0
@@ -792,6 +800,67 @@ class CanvasState(
 
     fun visibleContentRect(): Rect =
         Rect.fromPoints(viewportToContent(Pt(0.0, 0.0)), viewportToContent(Pt(viewportW.toDouble(), viewportH.toDouble())))
+
+    /** Like [origin] but includes the transient gesture-prediction offset, if any.
+     *  Used only for rendering: input hit-testing stays on the real viewport. */
+    fun predictedOrigin(): Pt {
+        if (predictedPanX == 0.0 && predictedPanY == 0.0 && predictedZoomFactor == 1.0) return origin()
+        val effZoom = zoom * predictedZoomFactor
+        val effScrollX = scrollX + predictedPanX
+        val effScrollY = scrollY + predictedPanY
+        val cw = contentW * effZoom
+        val ch = contentH * effZoom
+        val ox = (if (!verticalScroll || cw >= clearW) -effScrollX else insetLeft + (clearW - cw) / 2.0) - flipOffsetX
+        val oy = (if (!verticalScroll || ch >= clearH) -effScrollY else insetTop + (clearH - ch) / 2.0) - overscrollY
+        return Pt(ox, oy)
+    }
+
+    fun predictedVisibleContentRect(): Rect {
+        val o = predictedOrigin()
+        val effZoom = zoom * predictedZoomFactor
+        return Rect.fromPoints(
+            Pt((0.0 - o.x) / effZoom, (0.0 - o.y) / effZoom),
+            Pt((viewportW.toDouble() - o.x) / effZoom, (viewportH.toDouble() - o.y) / effZoom),
+        )
+    }
+
+    fun clearPredictedPan() {
+        predictedPanX = 0.0
+        predictedPanY = 0.0
+        predictedZoomFactor = 1.0
+    }
+
+    /** True if the predicted viewport's visible pages all have usable caches at the
+     *  predicted resolution (no rebake pending, no low-res entering content). */
+    fun isPredictedCacheReady(): Boolean {
+        if (predictedPanX == 0.0 && predictedPanY == 0.0 && predictedZoomFactor == 1.0) return true
+        val rect = predictedVisibleContentRect()
+        val effZoom = zoom * predictedZoomFactor
+        val effRes = (effZoom * renderScale).coerceAtLeast(0.01)
+        for (i in drawablePageRange()) {
+            val pr = pageRects.getOrNull(i) ?: continue
+            if (!pr.intersects(rect)) continue
+            val page = document.pages.getOrNull(i) ?: continue
+            // Check ink cache readiness at the predicted resolution.
+            val existing = caches[page]
+            val targetRes = effRes.let {
+                val f = footprint(page)
+                val longEdge = max(f.w, f.h)
+                if (longEdge * it > maxCachePx) maxCachePx / longEdge else it
+            }.coerceAtLeast(0.01)
+            if (existing == null || existing.cover != footprint(page) || page in staleInk) return false
+            if (kotlin.math.abs(existing.res - targetRes) > 1e-6) return false
+            if (hasPageBackground(page)) {
+                val bg = bgCaches[page] ?: return false
+                if (bg.cover != footprint(page) || kotlin.math.abs(bg.res - targetRes) > 1e-6) return false
+            }
+        }
+        // For high zoom past the cap, the sharp viewport slides with content; a 16px
+        // predicted shift stays mostly within the previous sharp frame, and the thin
+        // entering strip outside it shows soft low-res for one frame — same as without
+        // prediction, so not worse. Don't gate prediction on sharp coverage.
+        return true
+    }
 
     // A floating bar lets the scroll run past the content's edges by as much as it covers.
     fun minScrollX(): Double = -insetLeft
