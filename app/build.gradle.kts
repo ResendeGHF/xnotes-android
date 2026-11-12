@@ -29,9 +29,9 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
-        versionCode = 100
+        versionCode = 101
         // <upstream xnotes version>-<notes fork version>
-        versionName = "0.9.7-0.47"
+        versionName = "0.9.9-0.48"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
