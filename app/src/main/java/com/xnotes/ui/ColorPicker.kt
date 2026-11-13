@@ -58,7 +58,6 @@ import com.xnotes.core.model.Rgba
 import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.ColorMath
 import com.xnotes.ui.theme.LocalPalette
-import com.xnotes.ui.icons.XnotesIcons
 import com.xnotes.ui.theme.toComposeColor
 import kotlin.math.atan2
 import kotlin.math.cos
