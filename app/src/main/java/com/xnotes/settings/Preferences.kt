@@ -46,8 +46,10 @@ data class Preferences(
     val detectShapes: Boolean = true,
     /** Whether rotating a selection snaps to the nearest 90 degrees. */
     val snapRotation90: Boolean = false,
-    /** Language for handwriting-to-text (Convert to text): BCP-47 tag, "pt-BR" (Brazilian Portuguese) | "en" (English). */
+    /** Language for handwriting-to-text (Convert to text): a BCP-47 tag ML Kit can recognize. */
     val ocrLanguage: String = "pt-BR",
+    /** Settings opens as a list of categories. Off keeps every setting in one long list. */
+    val prefsCategories: Boolean = true,
     /** Vision-model provider for whole-note LaTeX export: "gemini" | "openai" (any OpenAI-compatible endpoint) | "anthropic". */
     val latexAiProvider: String = "gemini",
     /** Model name sent to the provider; blank falls back to that provider's default. */
@@ -170,6 +172,7 @@ data class Preferences(
         .put("detect_shapes", detectShapes)
         .put("snap_rotation_90", snapRotation90)
         .put("ocr_language", ocrLanguage)
+        .put("prefs_categories", prefsCategories)
         .put("latex_ai_provider", latexAiProvider)
         .put("latex_ai_model", latexAiModel)
         .put("latex_ai_base_url", latexAiBaseUrl)
@@ -325,7 +328,10 @@ data class Preferences(
                 zoomLockPan = zoomLockPan,
                 detectShapes = o.optBoolean("detect_shapes", true),
                 snapRotation90 = o.optBoolean("snap_rotation_90", false),
-                ocrLanguage = o.optString("ocr_language", "pt-BR").takeIf { it == "en" || it == "pt-BR" } ?: "pt-BR",
+                ocrLanguage = o.optString("ocr_language", "pt-BR").takeIf { tag ->
+                    tag.length in 2..16 && tag.all { it.isLetter() || it == '-' }
+                } ?: "pt-BR",
+                prefsCategories = o.optBoolean("prefs_categories", true),
                 latexAiProvider = o.optString("latex_ai_provider", "gemini").takeIf { it == "gemini" || it == "openai" || it == "anthropic" || it == "custom" } ?: "gemini",
                 latexAiModel = o.optString("latex_ai_model", ""),
                 latexAiBaseUrl = o.optString("latex_ai_base_url", ""),

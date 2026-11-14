@@ -7,6 +7,8 @@ import android.view.Choreographer
 import android.view.KeyEvent
 import android.view.MotionEvent
 import com.xnotes.core.geometry.Affine
+import com.xnotes.core.text.FlowLayout
+import com.xnotes.core.text.PageBox
 import com.xnotes.core.geometry.Geometry
 import com.xnotes.core.geometry.Obb
 import com.xnotes.core.geometry.Pt
@@ -728,6 +730,8 @@ class InteractionController(
 
     // GENERIC TRANSFORM (resize + rotate for any single non-line / multi / mixed selection)
     private var selObb: Obb? = null // the tilting selection box; null when nothing is selected
+    /** Margin and centre lines a move snapped onto, in content space. */
+    private var snapGuides: List<Pair<Pt, Pt>> = emptyList()
     private var txItems: List<Selected> = emptyList()
     private var txSnaps: List<GeometrySnapshot> = emptyList()
     private var txStartObb: Obb? = null
@@ -2575,7 +2579,7 @@ class InteractionController(
         bandRect?.let { band ->
             val drawable = state.drawablePageRange()
             setSelection(
-                SelectionMath.bandMembers(state.document.pages, state.pageRects, band, configFor(Tool.SELECT).selectWholeItems) { i, p ->
+                SelectionMath.bandMembers(state.document.pages, state.pageRects, band, configFor(Tool.SELECT).selectWholeItems, configFor(Tool.SELECT).selectKinds) { i, p ->
                     state.toPageSpace(i, p)
                 }.filter { it.pageIndex in drawable }, // hidden paginated neighbours don't select
             )
@@ -2612,7 +2616,7 @@ class InteractionController(
     private fun endLasso() {
         if (lassoPoints.size >= 3) {
             val drawable = state.drawablePageRange()
-            val members = SelectionMath.lassoMembers(state.document.pages, state.pageRects, lassoPoints, configFor(Tool.LASSO).selectWholeItems) { i, p ->
+            val members = SelectionMath.lassoMembers(state.document.pages, state.pageRects, lassoPoints, configFor(Tool.LASSO).selectWholeItems, configFor(Tool.SELECT).selectKinds) { i, p ->
                 state.toPageSpace(i, p)
             }.filter { it.pageIndex in drawable } // hidden paginated neighbours don't select
             if (members.isEmpty()) {
@@ -2693,7 +2697,7 @@ class InteractionController(
     }
 
     private fun extendMove(content: Pt) {
-        moveOffset = content - moveOrigin
+        moveOffset = snapMove(content - moveOrigin)
         if (follows.isNotEmpty()) {
             val local = state.vectorToPageSpace(moveOffset)
             val shift = Affine.translateBy(local.x, local.y)
@@ -2702,8 +2706,39 @@ class InteractionController(
         requestRender()
     }
 
+    /**
+     * [raw] nudged so the moved box's sides or centre land on the text margins or centre lines
+     * of the page under it, when one is within [MARGIN_SNAP_PX] on screen. Sets [snapGuides].
+     */
+    private fun snapMove(raw: Pt): Pt {
+        snapGuides = emptyList()
+        if (!configFor(Tool.SELECT).snapToMargins) return raw
+        val box = selObb?.let { Rect.bounding(it.corners()) }?.translate(raw.x, raw.y) ?: return raw
+        val pi = state.pageIndexAtContent(box.center) ?: return raw
+        val m = marginRect(pi) ?: return raw
+        val paper = state.pageRects.getOrNull(pi) ?: return raw
+        val reach = MARGIN_SNAP_PX / state.zoom
+        fun pull(sides: List<Double>, targets: List<Double>): Pair<Double, Double>? =
+            sides.flatMap { s -> targets.map { t -> (t - s) to t } }.filter { abs(it.first) <= reach }.minByOrNull { abs(it.first) }
+        val dx = pull(listOf(box.left, box.centerX, box.right), listOf(m.left, m.centerX, m.right))
+        val dy = pull(listOf(box.top, box.centerY, box.bottom), listOf(m.top, m.centerY, m.bottom))
+        snapGuides = listOfNotNull(
+            dx?.let { Pt(it.second, paper.top) to Pt(it.second, paper.bottom) },
+            dy?.let { Pt(paper.left, it.second) to Pt(paper.right, it.second) },
+        )
+        return Pt(raw.x + (dx?.first ?: 0.0), raw.y + (dy?.first ?: 0.0))
+    }
+
+    /** Page [pi]'s text margins (the box flow text is held to) in content space. */
+    private fun marginRect(pi: Int): Rect? {
+        val page = state.document.pages.getOrNull(pi) ?: return null
+        val text = FlowLayout.contentRectOf(PageBox(page.width, page.height), state.document.flow.margins, state.document.dpi)
+        return state.fromPageSpaceRect(pi, text)
+    }
+
     private fun endMove(content: Pt) {
-        moveOffset = content - moveOrigin
+        moveOffset = snapMove(content - moveOrigin)
+        snapGuides = emptyList()
         val moved = abs(moveOffset.x) > MOVE_EPS || abs(moveOffset.y) > MOVE_EPS
         if (moved) {
             val items = selection.map { it.item }
@@ -6386,7 +6421,7 @@ class InteractionController(
         if (mode == PointerMode.POLYGON) showPolygonDraft(null)
         if (mode == PointerMode.ROOM) insertSpace.abort()
         roomButton = null
-        if (mode == PointerMode.MOVE) moveOffset = Pt.ZERO
+        if (mode == PointerMode.MOVE) { moveOffset = Pt.ZERO; snapGuides = emptyList() }
         if (mode == PointerMode.MOVE || mode == PointerMode.TRANSFORM || mode == PointerMode.VERTEX || mode == PointerMode.JOINT) {
             for ((_, f) in follows) f.restore()
         }
@@ -6502,6 +6537,8 @@ class InteractionController(
 
             // Screenshot capture region: the live drag rect, kept frozen until "copy as image" is used.
             screenshotRect?.let { r.strokeRect(it, chromePen(1.6)) }
+
+            for ((a, b) in snapGuides) r.strokePolyline(listOf(a, b), chromePen(1.0))
 
             // Selection chrome.
             val accent = chromePen(1.3)
@@ -6883,6 +6920,9 @@ class InteractionController(
             if (zoom.isFinite() && zoom > 0.0) (1.0 / zoom).coerceAtMost(1.0) else 1.0
 
         const val MOVE_EPS = 0.01
+
+        /** How close a moved edge must be, on screen, before it snaps to a margin or centre line. */
+        const val MARGIN_SNAP_PX = 8.0
 
         /** Vendor key some pens send for a genuinely held side button (OnePlus Pad Go 2 Stylo,
          *  which reports a real down/up pair with auto-repeat rather than a momentary click). */

@@ -140,7 +140,10 @@ fun InfiniteToolbar(
                                 // controls, same wording, same ranges, and they cannot drift apart.
                                 if (tool == Tool.ERASER && eraserOpen) EraserConfigPopup(editor) { eraserOpen = false }
                                 if (tool == Tool.SHAPE && shapeOpen) ShapeConfigPopup(editor) { shapeOpen = false }
-                                if (selectOpen == tool) SelectConfigPopup(editor, tool) { selectOpen = null }
+                                if (selectOpen == tool) SelectConfigPopup(editor, tool, onPick = { next ->
+                                    editor.armTool(next)
+                                    selectOpen = next
+                                }) { selectOpen = null }
                                 if (tool == Tool.TAPE && tapeOpen) TapeConfigPopup(editor) { tapeOpen = false }
                                 if (penOpen == tool) ToolConfigPopup(editor, tool) { penOpen = null }
                             }

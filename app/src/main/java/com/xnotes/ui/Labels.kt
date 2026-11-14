@@ -15,6 +15,7 @@ import com.xnotes.core.model.TapePattern
 import com.xnotes.core.pal.FontFace
 import com.xnotes.core.text.TableBorders
 import com.xnotes.core.tools.MarkupMode
+import com.xnotes.core.tools.SelectKind
 import com.xnotes.core.tools.Tool
 import com.xnotes.core.tools.ToolbarItem
 import com.xnotes.platform.FontCatalog
@@ -190,6 +191,21 @@ val GroupBy.chipRes: Int
         GroupBy.DATE -> R.string.grouped_by_date
         GroupBy.KIND -> R.string.grouped_by_kind
         GroupBy.COLOUR -> R.string.grouped_by_colour
+    }
+
+@get:StringRes
+val SelectKind.labelRes: Int
+    get() = when (this) {
+        SelectKind.INK -> R.string.select_kind_lines
+        SelectKind.HIGHLIGHTER -> R.string.select_kind_highlighter
+        SelectKind.SHAPES -> R.string.select_kind_shapes
+        SelectKind.TEXT -> R.string.select_kind_text_boxes
+        SelectKind.IMAGES -> R.string.select_kind_images
+        SelectKind.TABLES -> R.string.select_kind_tables
+        SelectKind.TAPE -> R.string.select_kind_tape
+        SelectKind.AUDIO -> R.string.select_kind_audio
+        SelectKind.STICKY -> R.string.select_kind_sticky
+        SelectKind.MATH -> R.string.select_kind_math
     }
 
 @get:StringRes

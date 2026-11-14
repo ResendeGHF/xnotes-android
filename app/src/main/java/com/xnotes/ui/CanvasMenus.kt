@@ -308,30 +308,34 @@ fun SelectionMenu(
     var mathSendOpen by remember { mutableStateOf(false) }
     var tableCellsOpen by remember { mutableStateOf(false) }
     var renamingAudio by remember { mutableStateOf<com.xnotes.core.model.AudioItem?>(null) }
+    var mirrorOpen by remember { mutableStateOf(false) }
 
     val audio = host.selectedAudio()
     val crops = host.canCropSelection()
+    val mirrors = host.canMirrorSelection()
     val barHeightPx = with(density) { 48.dp.toPx() }
-    val barWidthPx = with(density) { ((6 + (if (audio != null) 1 else 0) + (if (crops) 1 else 0)) * 46).dp.toPx() }
     val gap = with(density) { 10.dp.toPx() }
     val centerX = ((rect.left + rect.right) / 2.0).toFloat()
-    val xPx = (centerX - barWidthPx / 2f).coerceAtLeast(with(density) { 8.dp.toPx() })
     val barAbove = rect.top.toFloat() - barHeightPx - gap > 0f
     val yPx = if (barAbove) {
         rect.top.toFloat() - barHeightPx - gap
     } else {
         rect.bottom.toFloat() + gap
     }
-    val xDp = with(density) { xPx.toDp() }
-    val yDp = with(density) { yPx.toDp() }
 
     CompositionLocalProvider(LocalTipSide provides tipSideFor(barAbove)) {
         Row(
             modifier = Modifier
-                .offset(xDp, yDp)
+                .layout { measurable, constraints ->
+                    val margin = 8.dp.roundToPx()
+                    val bar = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0, maxWidth = (constraints.maxWidth - 2 * margin).coerceAtLeast(0)))
+                    val x = (centerX - bar.width / 2f).toInt().coerceIn(margin, (constraints.maxWidth - bar.width - margin).coerceAtLeast(margin))
+                    layout(bar.width, bar.height) { bar.place(x, yPx.toInt()) }
+                }
                 .clip(MaterialTheme.shapes.medium)
                 .background(palette.menuBg.toComposeColor())
-                .border(1.dp, palette.border.toComposeColor(), MaterialTheme.shapes.medium),
+                .border(1.dp, palette.border.toComposeColor(), MaterialTheme.shapes.medium)
+                .horizontalScroll(rememberScrollState()),
         ) {
             if (audio != null) {
                 val playing = AudioPlayback.session?.let { it.item === audio && it.playing } == true
@@ -354,6 +358,24 @@ fun SelectionMenu(
                 }
             }
             ActionIcon(XnotesIcons.duplicate, stringResource(R.string.duplicate)) { host.duplicateSelection() }
+            ActionIcon(XnotesIcons.lock, stringResource(R.string.lock)) { host.lockSelection() }
+            if (mirrors) Box {
+                ActionIcon(XnotesIcons.mirror, stringResource(R.string.mirror)) { mirrorOpen = true }
+                DropdownMenu(
+                    expanded = mirrorOpen,
+                    onDismissRequest = { mirrorOpen = false },
+                    properties = PopupProperties(focusable = false),
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.mirror_left_right)) },
+                        onClick = { mirrorOpen = false; host.mirrorSelection(upsideDown = false) },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.mirror_upside_down)) },
+                        onClick = { mirrorOpen = false; host.mirrorSelection(upsideDown = true) },
+                    )
+                }
+            }
             Box {
                 ActionIcon(XnotesIcons.more, stringResource(R.string.more)) { overflowOpen = true }
                 DropdownMenu(
@@ -484,17 +506,6 @@ fun SelectionMenu(
                             onClick = { overflowOpen = false; host.rerouteSelection() },
                         )
                     }
-                    val mirrors = host.canMirrorSelection()
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.mirror_left_right)) },
-                        enabled = mirrors,
-                        onClick = { overflowOpen = false; host.mirrorSelection(upsideDown = false) },
-                    )
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.mirror_upside_down)) },
-                        enabled = mirrors,
-                        onClick = { overflowOpen = false; host.mirrorSelection(upsideDown = true) },
-                    )
                     if (host.canGroupSelection()) {
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.group)) },
@@ -517,10 +528,6 @@ fun SelectionMenu(
                             onClick = { overflowOpen = false; host.selectionImageForShare()?.let(share) },
                         )
                     }
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.lock)) },
-                        onClick = { overflowOpen = false; host.lockSelection() },
-                    )
                 }
                 if (styleOpen) {
                     // Closing settles any preview the slider left open.

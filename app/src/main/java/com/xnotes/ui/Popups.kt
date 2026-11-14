@@ -94,6 +94,10 @@ import com.xnotes.core.model.TemplateSettings
 import com.xnotes.core.pal.FontFace
 import com.xnotes.core.tools.EraseMode
 import com.xnotes.core.tools.MarkupMode
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.vectorResource
+import com.xnotes.core.tools.SelectKind
 import com.xnotes.core.tools.ShapeConfig
 import com.xnotes.core.shapes.ShapeKind
 import com.xnotes.core.tools.Tool
@@ -1170,23 +1174,68 @@ fun EraserConfigPopup(editor: ToolPopupHost, onDismiss: () -> Unit) {
     }
 }
 
-/** Select/lasso configuration popup: whether a selection needs items fully inside it, plus the select tool's SWITCH BACK. */
 @Composable
-fun SelectConfigPopup(editor: ToolPopupHost, tool: Tool = Tool.SELECT, onDismiss: () -> Unit) {
-    val base = remember { editor.toolConfig(tool) }
-    var switchBack by remember { mutableStateOf(base.switchBackAfterSelect) }
-    var whole by remember { mutableStateOf(base.selectWholeItems) }
+private fun KindChips(kinds: Set<SelectKind>, modifier: Modifier = Modifier, onChange: (Set<SelectKind>) -> Unit) {
+    val context = LocalContext.current
+    FlowRow(modifier, horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (k in SelectKind.entries) {
+            val on = k in kinds
+            KindChip(selectKindIcon(k), stringResource(k.labelRes), on) {
+                if (on && kinds.size == 1) Toast.makeText(context, R.string.toast_filter_needs_one, Toast.LENGTH_SHORT).show()
+                else onChange(if (on) kinds - k else kinds + k)
+            }
+        }
+    }
+}
 
-    fun emit() = editor.updateToolConfig(tool, base.copy(switchBackAfterSelect = switchBack, selectWholeItems = whole))
+@Composable
+private fun selectKindIcon(k: SelectKind): ImageVector = when (k) {
+    SelectKind.INK -> ImageVector.vectorResource(R.drawable.ic_stroke_regular)
+    SelectKind.HIGHLIGHTER -> ImageVector.vectorResource(R.drawable.ic_stroke_highlighter)
+    SelectKind.SHAPES -> XnotesIcons.shape
+    SelectKind.TEXT -> XnotesIcons.textBox
+    SelectKind.IMAGES -> XnotesIcons.image
+    SelectKind.TABLES -> XnotesIcons.table
+    SelectKind.TAPE -> XnotesIcons.tape
+    SelectKind.AUDIO -> XnotesIcons.mic
+    SelectKind.STICKY -> XnotesIcons.note
+    SelectKind.MATH -> XnotesIcons.fontFace
+}
+
+/**
+ * Select/lasso configuration popup: rectangle or lasso ([onPick] re-arms the toolbar select as the
+ * other), which kinds of item a selection picks up (shared by both), whether it needs items fully
+ * inside it, plus the select tool's SWITCH BACK and, on a paged note, snap to the text margins.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun SelectConfigPopup(editor: ToolPopupHost, tool: Tool = Tool.SELECT, onPick: (Tool) -> Unit = {}, onDismiss: () -> Unit) {
+    val base = remember(tool) { editor.toolConfig(tool) }
+    var switchBack by remember(tool) { mutableStateOf(base.switchBackAfterSelect) }
+    var whole by remember(tool) { mutableStateOf(base.selectWholeItems) }
+    var snap by remember(tool) { mutableStateOf(base.snapToMargins) }
+    var kinds by remember { mutableStateOf(editor.toolConfig(Tool.SELECT).selectKinds) }
+
+    fun emit() {
+        editor.updateToolConfig(tool, base.copy(switchBackAfterSelect = switchBack, selectWholeItems = whole, snapToMargins = snap))
+        editor.updateToolConfig(Tool.SELECT, editor.toolConfig(Tool.SELECT).copy(selectKinds = kinds))
+    }
 
     DropdownMenu(expanded = true, onDismissRequest = onDismiss) {
         Column(Modifier.width(250.dp).padding(horizontal = 14.dp, vertical = 8.dp)) {
             PopupTitle(stringResource(if (tool == Tool.LASSO) R.string.tool_lasso else R.string.title_select))
+            Row(Modifier.padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                KindChip(XnotesIcons.select, stringResource(R.string.shape_rectangle), tool == Tool.SELECT) { if (tool != Tool.SELECT) onPick(Tool.SELECT) }
+                KindChip(XnotesIcons.lasso, stringResource(R.string.tool_lasso), tool == Tool.LASSO) { if (tool != Tool.LASSO) onPick(Tool.LASSO) }
+            }
+            StyleCaption(stringResource(R.string.caption_select_kinds))
+            KindChips(kinds, Modifier.padding(bottom = 8.dp)) { kinds = it; emit() }
             ToggleRow(stringResource(R.string.caption_select_whole_items), whole) { whole = it; emit() }
             // Re-arm the previous pen/highlighter once a selection action (move, resize, delete,
             // cut, copy, duplicate) finishes, so a quick edit doesn't strand you in select.
             if (tool == Tool.SELECT) {
                 ToggleRow(stringResource(R.string.caption_switch_back), switchBack) { switchBack = it; emit() }
+                if (editor.hostIsPaged) ToggleRow(stringResource(R.string.caption_snap_to_margins), snap) { snap = it; emit() }
             }
         }
     }

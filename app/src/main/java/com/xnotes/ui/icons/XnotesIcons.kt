@@ -195,6 +195,7 @@ object XnotesIcons {
     val contents = icon("M8 6h13", "M8 12h13", "M8 18h13", "M3 6h.01", "M3 12h.01", "M3 18h.01")
     val thumbnails = icon(rect(3.0, 3.0, 7.0, 7.0), rect(14.0, 3.0, 7.0, 7.0), rect(3.0, 14.0, 7.0, 7.0), rect(14.0, 14.0, 7.0, 7.0))
     val lock = icon(rect(3.0, 11.0, 18.0, 11.0), "M7 11V7a5 5 0 0 1 10 0v4")
+    val mirror = icon("M12 3v18", "M3 7v10l6-5z", "M21 7v10l-6-5z")
     val unlock = icon(rect(3.0, 11.0, 18.0, 11.0), "M7 11V7a5 5 0 0 1 9.9-1")
     // The straightedge. The body is wider and the graduations hang from one edge so they read at
     // the 22dp the toolbar draws; they are absolute movetos because icon() concatenates the

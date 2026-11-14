@@ -88,7 +88,12 @@ fun PenMenu(host: PenMenuHost) {
                 tool == Tool.SHAPE -> ShapeConfigPopup(host, close)
                 tool == Tool.TABLE -> (host as? Editor)?.let { TableConfigPopup(it, close) }
                 tool == Tool.ERASER -> EraserConfigPopup(host, close)
-                tool == Tool.SELECT || tool == Tool.LASSO -> SelectConfigPopup(host, tool, close)
+                tool == Tool.SELECT || tool == Tool.LASSO -> SelectConfigPopup(host, tool, onPick = { next ->
+                    when (host) {
+                        is Editor -> host.selectTool(next)
+                        is InfiniteEditor -> host.armTool(next)
+                    }
+                }, close)
                 tool == Tool.MARKUP -> MarkupToolPopup(host, close)
                 tool == Tool.TEXT -> (host as? Editor)?.let { TextToolConfigPopup(it, close) }
                 else -> ToolConfigPopup(host, tool, close)

@@ -10659,6 +10659,7 @@ class Editor(
     override val hostActiveColorIndex: Int get() = activeColorIndex
     override val hostRecentColors: List<Rgba> get() = recentColors
     override val hostHasPdf: Boolean get() = hasPdf
+    override val hostIsPaged: Boolean get() = true
 
     override val hostHiddenShapes: Set<String> get() = settings.prefs.hiddenShapes
 

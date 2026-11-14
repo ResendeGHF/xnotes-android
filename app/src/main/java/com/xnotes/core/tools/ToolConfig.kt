@@ -14,6 +14,38 @@ import kotlin.math.roundToInt
  * Eraser behaviour (spec 04 §2): STROKE removes a whole stroke on contact; AREA removes only the
  * portion of a stroke the eraser passes over, splitting it into fragments. Persisted as [id].
  */
+/** What kinds of item a band or lasso picks up. Persisted as [id]. */
+enum class SelectKind(val id: String) {
+    INK("ink"),
+    HIGHLIGHTER("highlighter"),
+    SHAPES("shapes"),
+    TEXT("text"),
+    IMAGES("images"),
+    TABLES("tables"),
+    TAPE("tape"),
+    AUDIO("audio"),
+    STICKY("sticky"),
+    MATH("math");
+
+    companion object {
+        val ALL: Set<SelectKind> = entries.toSet()
+
+        fun fromId(id: String?): SelectKind? = entries.firstOrNull { it.id == id }
+
+        fun of(item: com.xnotes.core.model.CanvasItem): SelectKind = when (item) {
+            is com.xnotes.core.model.Stroke -> if (item.tool == Tool.HIGHLIGHTER) HIGHLIGHTER else INK
+            is com.xnotes.core.model.TextItem -> TEXT
+            is com.xnotes.core.model.ImageItem -> IMAGES
+            is com.xnotes.core.model.TableItem -> TABLES
+            is TapeItem -> TAPE
+            is com.xnotes.core.model.AudioItem -> AUDIO
+            is com.xnotes.core.model.StickyNoteItem -> STICKY
+            is com.xnotes.core.model.MathStudioInstanceItem -> MATH
+            else -> SHAPES
+        }
+    }
+}
+
 enum class EraseMode(val id: String) {
     STROKE("stroke"),
     AREA("area");
@@ -73,6 +105,10 @@ data class ToolConfig(
     val switchBackAfterSelect: Boolean = false,
     /** Select/lasso: take only items lying fully inside the band or loop, not ones it merely touches. */
     val selectWholeItems: Boolean = false,
+    /** Select/lasso: the kinds of item a band or loop picks up. Kept on [Tool.SELECT] for both. */
+    val selectKinds: Set<SelectKind> = SelectKind.ALL,
+    /** Select: a moved selection snaps to the page's text margins and centre lines. Only [Tool.SELECT]. */
+    val snapToMargins: Boolean = true,
     /** Highlighter: commit each drag as a single straight segment (start → release). Only [Tool.HIGHLIGHTER]. */
     val straightLine: Boolean = false,
     /** When false, the pen draws at a constant on-screen size: at pen-down the width (and the

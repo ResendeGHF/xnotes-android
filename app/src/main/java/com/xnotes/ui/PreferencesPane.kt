@@ -120,6 +120,18 @@ private val tapGestureOptions = listOf(
     "tool_settings" to R.string.open_tool_settings,
 )
 
+private enum class PrefCategory(val title: Int, val summary: Int) {
+    GENERAL(R.string.pref_general, R.string.pref_general_summary),
+    APPEARANCE(R.string.pref_appearance, R.string.pref_appearance_summary),
+    INPUT(R.string.pref_input, R.string.pref_input_summary),
+    OCR(R.string.pref_ocr, R.string.pref_ocr_summary),
+    NEW_NOTES(R.string.pref_new_notes, R.string.pref_new_notes_summary),
+    HOME(R.string.pref_home_explorer, R.string.pref_home_summary),
+    EXPORT_IMPORT(R.string.pref_export_import, R.string.pref_export_import_summary),
+    PERFORMANCE(R.string.pref_performance, R.string.pref_performance_summary),
+    TOOLBAR(R.string.pref_toolbar, R.string.pref_toolbar_summary),
+}
+
 /**
  * Preferences as a backstage pane (spec 10 §8). Edits apply live — each change is
  * pushed straight to the [Editor] (and persisted), so theme/page tweaks are seen
@@ -170,7 +182,15 @@ fun PreferencesPane(
         val y = hits[search.current].second
         searchScope.launch { scrollState.animateScrollTo((y - 24f * search.density).roundToInt().coerceAtLeast(0)) }
     }
-    var sectionsOpen by rememberSaveable { mutableStateOf(!compact) }
+    val categorized = prefs.prefsCategories
+    var categoryName by rememberSaveable { mutableStateOf<String?>(null) }
+    val category = categoryName?.let { name -> PrefCategory.entries.firstOrNull { it.name == name } }
+    val searching = search.query.isNotBlank()
+    val all = searching || !categorized
+    fun shown(c: PrefCategory) = all || category == c
+    var sectionsOpen by rememberSaveable { mutableStateOf(!compact && !categorized) }
+    LaunchedEffect(categoryName) { scrollState.scrollTo(0) }
+    androidx.activity.compose.BackHandler(enabled = categorized && category != null) { categoryName = null }
     var viewport by remember { mutableStateOf(Rect.Zero) }
     // A tap on empty space dismisses the template field's focus; children consume their own taps.
     Box(
@@ -181,24 +201,42 @@ fun PreferencesPane(
         // Leading button inline with the title, at a constant row height so toggling the sidebar never
         // shifts the settings below: a back arrow to Home on compact, else a hamburger when hidden.
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (compact) {
-                Tooltip(stringResource(R.string.back_to_home)) {
-                    IconButton(onClick = onBackToHome) {
-                        Icon(XnotesIcons.prev, stringResource(R.string.back_to_home), tint = palette.text.toComposeColor(), modifier = Modifier.size(24.dp))
+            val open = if (categorized && !searching) category else null
+            when {
+                open != null -> {
+                    Tooltip(stringResource(R.string.back)) {
+                        IconButton(onClick = { categoryName = null }) {
+                            Icon(XnotesIcons.prev, stringResource(R.string.back), tint = palette.text.toComposeColor(), modifier = Modifier.size(24.dp))
+                        }
                     }
                 }
-            } else if (!sidebarOpen) {
-                Tooltip(stringResource(R.string.show_sidebar)) {
-                    IconButton(onClick = onShowSidebar) {
-                        Icon(XnotesIcons.menu, stringResource(R.string.show_sidebar), tint = palette.text.toComposeColor(), modifier = Modifier.size(24.dp))
+                compact -> {
+                    Tooltip(stringResource(R.string.back_to_home)) {
+                        IconButton(onClick = onBackToHome) {
+                            Icon(XnotesIcons.prev, stringResource(R.string.back_to_home), tint = palette.text.toComposeColor(), modifier = Modifier.size(24.dp))
+                        }
+                    }
+                }
+                !sidebarOpen -> {
+                    Tooltip(stringResource(R.string.show_sidebar)) {
+                        IconButton(onClick = onShowSidebar) {
+                            Icon(XnotesIcons.menu, stringResource(R.string.show_sidebar), tint = palette.text.toComposeColor(), modifier = Modifier.size(24.dp))
+                        }
                     }
                 }
             }
-            IconButton(onClick = { sectionsOpen = !sectionsOpen }) {
-                Icon(XnotesIcons.sidebar, stringResource(R.string.side_panel), tint = (if (sectionsOpen) palette.accent else palette.text).toComposeColor(), modifier = Modifier.size(22.dp))
+            if (!categorized || (compact && open != null)) {
+                IconButton(onClick = { sectionsOpen = !sectionsOpen }) {
+                    Icon(XnotesIcons.sidebar, stringResource(R.string.side_panel), tint = (if (sectionsOpen) palette.accent else palette.text).toComposeColor(), modifier = Modifier.size(22.dp))
+                }
             }
             Spacer(Modifier.width(4.dp))
-            Text(stringResource(R.string.preferences), color = palette.text.toComposeColor(), fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            Text(
+                if (open != null) stringResource(open.title) else stringResource(R.string.preferences),
+                color = palette.text.toComposeColor(),
+                fontWeight = FontWeight.Bold,
+                fontSize = 20.sp,
+            )
             Spacer(Modifier.weight(1f))
             IconButton(onClick = { search.open = !search.open; if (!search.open) search.query = "" }) {
                 Icon(XnotesIcons.search, stringResource(R.string.search_settings), tint = palette.text.toComposeColor(), modifier = Modifier.size(22.dp))
@@ -225,16 +263,26 @@ fun PreferencesPane(
             }
         }
         val sectionsPanel = @Composable {
-            PrefSectionsPanel(search.sections.entries.sortedBy { it.value }.map { it.key }, currentSection) { title ->
-                search.sections[title]?.let { y ->
-                    val to = scrollForSection(y, scrollState.maxValue, viewport.height, 24f * search.density)
-                    searchScope.launch { scrollState.animateScrollTo(to) }
+            if (categorized) {
+                val titles = PrefCategory.entries.map { stringResource(it.title) }
+                PrefSectionsPanel(titles, category?.let { titles[it.ordinal] }) { title ->
+                    categoryName = PrefCategory.entries[titles.indexOf(title)].name
+                    if (compact) sectionsOpen = false
                 }
-                if (compact) sectionsOpen = false
+            } else {
+                PrefSectionsPanel(search.sections.entries.sortedBy { it.value }.map { it.key }, currentSection) { title ->
+                    search.sections[title]?.let { y ->
+                        val to = scrollForSection(y, scrollState.maxValue, viewport.height, 24f * search.density)
+                        searchScope.launch { scrollState.animateScrollTo(to) }
+                    }
+                    if (compact) sectionsOpen = false
+                }
             }
         }
+        val panelBeside = if (categorized) category != null && !compact else sectionsOpen && !compact
+        val panelOver = sectionsOpen && compact && (!categorized || category != null)
         Row(Modifier.fillMaxSize()) {
-        if (sectionsOpen && !compact) {
+        if (panelBeside) {
             sectionsPanel()
             Spacer(Modifier.width(16.dp))
         }
@@ -246,7 +294,23 @@ fun PreferencesPane(
                 .onGloballyPositioned { viewport = it.boundsInRoot() },
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            SectionTitle(stringResource(R.string.pref_general))
+            if (categorized && category == null && !searching) {
+                for (c in PrefCategory.entries) {
+                    Column(
+                        Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { categoryName = c.name }.padding(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Text(stringResource(c.title), color = palette.text.toComposeColor(), fontSize = 16.sp)
+                        Text(stringResource(c.summary), color = palette.textDim.toComposeColor(), fontSize = 12.sp)
+                    }
+                }
+            }
+            if (shown(PrefCategory.GENERAL)) {
+                SectionTitle(stringResource(R.string.pref_general))
+                CheckRow(stringResource(R.string.pref_start_fullscreen), editor.fullscreen) { editor.setFullscreenPref(it) }
+            }
+            if (shown(PrefCategory.APPEARANCE)) {
+                if (all) HorizontalDivider(color = palette.border.toComposeColor())
+                SectionTitle(stringResource(R.string.pref_appearance))
             FieldLabel(stringResource(R.string.pref_ui_theme))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Chip(stringResource(R.string.theme_system), prefs.uiAppearance == "system") { update(prefs.copy(uiAppearance = "system")) }
@@ -279,14 +343,21 @@ fun PreferencesPane(
                     Chip(stringResource(label), prefs.cornerStyle == style) { updateHome(prefs.copy(cornerStyle = style)) }
                 }
             }
-            CheckRow(stringResource(R.string.pref_start_fullscreen), editor.fullscreen) { editor.setFullscreenPref(it) }
+            CheckRow(stringResource(R.string.pref_split_categories), prefs.prefsCategories) {
+                updateHome(prefs.copy(prefsCategories = it))
+                if (!it) categoryName = null
+            }
             TextButton(onClick = { update(Preferences()) }) { Text(stringResource(R.string.reset_to_defaults), fontSize = 13.sp) }
+            }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            if (shown(PrefCategory.EXPORT_IMPORT)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_encryption))
             EncryptionSettings(editor)
+            }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            if (shown(PrefCategory.INPUT)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_input))
             CheckRow(stringResource(R.string.pref_finger_draws), prefs.fingerDraws) { update(prefs.copy(fingerDraws = it)) }
             FieldLabel(stringResource(R.string.pref_zoom_lock_pan))
@@ -336,18 +407,14 @@ fun PreferencesPane(
             ) {
                 StylusCalibrationSettings(prefs, ::update)
             }
-
-            HorizontalDivider(color = palette.border.toComposeColor())
-            SectionTitle("OCR")
-            FieldLabel("Handwriting recognition language (Convert to text)")
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Chip("Portuguese (Brazil)", prefs.ocrLanguage == "pt-BR") { update(prefs.copy(ocrLanguage = "pt-BR")) }
-                Chip("English", prefs.ocrLanguage == "en") { update(prefs.copy(ocrLanguage = "en")) }
-            }
             CheckRow(stringResource(R.string.pref_volume_keys_turn_pages), prefs.volumeKeysTurnPages) { update(prefs.copy(volumeKeysTurnPages = it)) }
+            }
+
+            if (shown(PrefCategory.OCR)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
+            SectionTitle(stringResource(R.string.pref_ocr))
+            FieldLabel(stringResource(R.string.pref_ocr_handwriting_language))
+            HandwritingLanguageControls(prefs.ocrLanguage) { update(prefs.copy(ocrLanguage = it)) }
             FieldLabel("Handwritten math (Convert to math)")
             MathAddonControls()
             FieldLabel(stringResource(R.string.latex_ai_section))
@@ -358,7 +425,10 @@ fun PreferencesPane(
             )
             LatexAiControls(prefs, ::update)
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.NEW_NOTES)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_new_notes))
             FieldLabel(stringResource(R.string.pref_filename_template))
             Text(
@@ -385,7 +455,7 @@ fun PreferencesPane(
                 fontSize = 12.sp,
             )
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_page))
             FieldLabel(stringResource(R.string.pref_default_page_size))
             SizeDropdown(prefs.defaultPageSize) { it?.let { size -> update(prefs.copy(defaultPageSize = size)) } }
@@ -434,7 +504,10 @@ fun PreferencesPane(
                 update(prefs.copy(invertColorsByDefault = it))
             }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.HOME)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_home_explorer))
             Text(
                 stringResource(R.string.pref_home_explorer_help),
@@ -521,13 +594,18 @@ fun PreferencesPane(
             CheckRow(stringResource(R.string.pref_show_extensions), prefs.showExtensions) { updateHome(prefs.copy(showExtensions = it)) }
             CheckRow(stringResource(R.string.pref_hide_dot_items), prefs.hideDotItems) { editor.setHideDotItems(it) }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.EXPORT_IMPORT)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_pdf_export))
             CheckRow(stringResource(R.string.pref_pdf_heading_bookmarks), prefs.pdfHeadingBookmarks) {
                 updateHome(prefs.copy(pdfHeadingBookmarks = it))
             }
+            }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            if (shown(PrefCategory.PERFORMANCE)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_performance))
             FieldLabel(stringResource(R.string.pref_max_cache_px, prefs.maxCacheResolution))
             Slider(
@@ -551,8 +629,11 @@ fun PreferencesPane(
                 fontSize = 12.sp,
             )
 
+            }
+
+            if (shown(PrefCategory.APPEARANCE)) {
             if (editor.treeSitterAvailable) {
-                HorizontalDivider(color = palette.border.toComposeColor())
+                if (all) HorizontalDivider(color = palette.border.toComposeColor())
                 SectionTitle(stringResource(R.string.pref_code_highlighting))
 
                 val langOptions = editor.scmLanguages().map { it to it }
@@ -585,7 +666,7 @@ fun PreferencesPane(
                 TextButton(onClick = { onImportCodeTheme() }) { Text(stringResource(R.string.import_theme), fontSize = 13.sp) }
             }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SectionTitle(stringResource(R.string.pref_fonts))
             Text(
                 stringResource(R.string.pref_fonts_help),
@@ -608,7 +689,10 @@ fun PreferencesPane(
                 }
             }
 
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.TOOLBAR)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             SplitToolbarPreferences(prefs, ::updateHome)
             SectionTitle(stringResource(R.string.pref_toolbar))
             TextButton(onClick = { editingToolbars = true }) {
@@ -638,15 +722,22 @@ fun PreferencesPane(
                     }
                 }
             }
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.EXPORT_IMPORT)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             BackupSection(editor)
-            HorizontalDivider(color = palette.border.toComposeColor())
+            }
+
+            if (shown(PrefCategory.GENERAL)) {
+            if (all) HorizontalDivider(color = palette.border.toComposeColor())
             Box(Modifier.searchAnchor(stringResource(R.string.search_keywords_port))) { PortSection(editor) }
+            }
             Spacer(Modifier.size(8.dp))
         }
         }
         // Phones lay the panel over the settings, so opening it never squeezes the column.
-        if (sectionsOpen && compact) {
+        if (panelOver) {
             Box(Modifier.fillMaxSize().background(palette.materialColors.scrim.withAlpha(82).toComposeColor()).clickable { sectionsOpen = false })
             sectionsPanel()
         }
@@ -654,6 +745,45 @@ fun PreferencesPane(
         }
     }
     }
+}
+
+/** Pick the handwriting language and download or delete its model; downloaded ones get a check. */
+@Composable
+private fun HandwritingLanguageControls(selected: String, onSelect: (String) -> Unit) {
+    val palette = LocalPalette.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var downloaded by remember { mutableStateOf(emptySet<String>()) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun act(action: () -> Unit) {
+        busy = true
+        error = null
+        scope.launch {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching(action).onFailure { error = it.message ?: it.toString() }
+                runCatching { com.xnotes.platform.HandwritingOcr.downloadedLanguages() }.onSuccess { downloaded = it }
+            }
+            busy = false
+        }
+    }
+    LaunchedEffect(Unit) { act {} }
+    val tags = com.xnotes.platform.HandwritingOcr.LANGUAGES.let { if (selected in it) it else listOf(selected) + it }
+    val options = tags.map {
+        val locale = java.util.Locale.forLanguageTag(it)
+        it to locale.getDisplayName(java.util.Locale.ENGLISH).replaceFirstChar(Char::titlecase)
+    }
+    if (options.isEmpty()) return
+    val isDownloaded = selected in downloaded
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OptionDropdown(options, selected, downloaded, onSelect)
+        TextButton(enabled = !busy && !isDownloaded, onClick = { act { com.xnotes.platform.HandwritingOcr.ensureModelDownloaded(selected) } }) {
+            Text(stringResource(if (busy) R.string.working else R.string.download), fontSize = 13.sp)
+        }
+        TextButton(enabled = !busy && isDownloaded, onClick = { act { com.xnotes.platform.HandwritingOcr.deleteModel(selected) } }) {
+            Text(stringResource(R.string.delete), fontSize = 13.sp)
+        }
+    }
+    error?.let { Text(stringResource(R.string.failed_reason, it), color = palette.danger.toComposeColor(), fontSize = 12.sp) }
 }
 
 /** Stylus parallax correction: guided calibration plus manual fine-tune, applied live to pen input. */
@@ -1304,7 +1434,7 @@ private fun MillimetreField(label: String, value: Double, onChange: (Double) -> 
 }
 
 @Composable
-internal fun OptionDropdown(options: List<Pair<String, String>>, selectedId: String, onSelect: (String) -> Unit) {
+internal fun OptionDropdown(options: List<Pair<String, String>>, selectedId: String, checked: Set<String> = emptySet(), onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val palette = LocalPalette.current
     val label = options.firstOrNull { it.first == selectedId }?.second ?: options.first().second
@@ -1323,7 +1453,13 @@ internal fun OptionDropdown(options: List<Pair<String, String>>, selectedId: Str
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             options.forEach { (id, lbl) ->
-                DropdownMenuItem(text = { Text(lbl) }, onClick = { onSelect(id); expanded = false })
+                DropdownMenuItem(
+                    text = { Text(lbl) },
+                    trailingIcon = if (id in checked) {
+                        { Icon(XnotesIcons.check, null, tint = palette.textDim.toComposeColor(), modifier = Modifier.size(14.dp)) }
+                    } else null,
+                    onClick = { onSelect(id); expanded = false },
+                )
             }
         }
     }

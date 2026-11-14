@@ -398,7 +398,10 @@ private fun ToolButton(
                 tool == Tool.SHAPE -> ShapeConfigPopup(editor) { setConfigForTool(null) }
                 tool == Tool.TABLE -> TableConfigPopup(editor) { setConfigForTool(null) }
                 tool == Tool.ERASER -> EraserConfigPopup(editor) { setConfigForTool(null) }
-                tool == Tool.SELECT || tool == Tool.LASSO -> SelectConfigPopup(editor, tool) { setConfigForTool(null) }
+                tool == Tool.SELECT || tool == Tool.LASSO -> SelectConfigPopup(editor, tool, onPick = { next ->
+                    editor.selectTool(next)
+                    setConfigForTool(next)
+                }) { setConfigForTool(null) }
                 tool == Tool.TEXT -> TextToolConfigPopup(editor) { setConfigForTool(null) }
                 tool == Tool.MARKUP -> MarkupToolPopup(editor) { setConfigForTool(null) }
                 tool == Tool.TAPE -> TapeConfigPopup(editor) { setConfigForTool(null) }
